@@ -85,12 +85,14 @@ export const DENY_RULES = [
 ];
 
 export function permissionsFor(kind, cwd = '/nonexistent') {
-  const extra = config.project.extraAllowedBash || [];
+  // With the OS sandbox on, it is the boundary: allow any shell command (deny rules still win). Without this,
+  // dontAsk silently denies harmless commands Claude Code wants to confirm, e.g. anything with $(...).
+  const extra = [...(config.project.extraAllowedBash || []), ...(config.sandbox.enabled && kind !== 'triage' ? ['Bash(*)'] : [])];
   if (kind === 'implement') return { tools: TOOLSET.write, allow: [...READ_RULES, ...TEST_RULES, ...WRITE_RULES, ...writeRules(cwd), ...extra] };
   if (kind === 'qa' || kind === 'review' || kind === 'investigate') return { tools: TOOLSET.read, allow: [...READ_RULES, ...TEST_RULES, ...extra] };
   if (kind === 'triage') return { tools: TOOLSET.triage, allow: ['Read', 'Grep', 'Glob', 'Bash(desk *)'] };
-  if (kind === 'research') return { tools: TOOLSET.research, allow: [...READ_RULES, 'WebSearch', 'WebFetch'] };
-  return { tools: TOOLSET.read, allow: READ_RULES }; // groom, consult
+  if (kind === 'research') return { tools: TOOLSET.research, allow: [...READ_RULES, 'WebSearch', 'WebFetch', ...extra] };
+  return { tools: TOOLSET.read, allow: [...READ_RULES, ...extra] }; // groom, consult
 }
 
 // ---------------- briefing ----------------

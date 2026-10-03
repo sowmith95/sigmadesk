@@ -246,6 +246,8 @@ test('security: edit tools are scoped to the seat workspace; web tools only for 
   assert.ok(!impl.tools.includes('WebFetch'));
   assert.ok(team.permissionsFor('research').tools.includes('WebFetch'));
   assert.ok(!team.permissionsFor('qa').tools.includes('WebSearch'));
+  assert.ok(impl.allow.includes('Bash(*)'), 'sandboxed seats may run any shell command');
+  assert.ok(!team.permissionsFor('triage').allow.includes('Bash(*)'), 'support stays desk-only');
 });
 
 test('security: sandbox hides desk state + transcripts and write-protects read-only paths', () => {
