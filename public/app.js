@@ -1,4 +1,5 @@
 // SigmaDesk client: one snapshot, then a live SSE stream of deltas. No framework, no innerHTML for data.
+import * as prsUi from './prs.js';
 import { portrait, presenceOf } from './avatars.js';
 
 const COLUMNS = [
@@ -164,6 +165,7 @@ function renderTeamSheet() {
   ];
   sheetShell(head, body);
 }
+const prsCtx = () => ({ h, api, act, avatar, toast, sheetShell, closeSheet, openTicket, S, render });
 const act = (fn, ok) => async (...a) => {
   const button = a[0]?.currentTarget;
   if (button?.disabled) return;
@@ -697,6 +699,7 @@ function renderSheet() {
   if (!sh) return;
   if (sh.type === 'new') return renderNewSheet();
   if (sh.type === 'team') return renderTeamSheet();
+  if (sh.type === 'pr') return prsUi.renderSheet(prsCtx());
   if (sh.type === 'architecture') return renderArchitectureSheet();
   if (sh.type === 'seat') return renderSeatSheet();
   const t = S.tickets.find((x) => x.key === sh.key) || sh.detail?.ticket;
@@ -725,8 +728,11 @@ function renderSheet() {
   const send = act(async () => { if (!reply.value.trim()) return false; const result = await api('POST', `/api/tickets/${t.key}/reply`, { body: reply.value, mode: sh.messageMode || 'auto' });
     sh.reply = ''; toast(result.message_route === 'discussion' ? 'Routed to manager · ticket blocker preserved' : result.message_route === 'comment' ? 'Comment saved' : 'Answer received · task can continue'); if (S.sheet === sh) openTicket(t.key); });
   const decide = (decision) => act(async () => {
-    await api('POST', `/api/tickets/${t.key}/decision`, { decision, message: reply.value, expected_updated_at: t.updated_at, discussion_id: decisionTarget === 'ticket' ? undefined : Number(decisionTarget) });
-    sh.reply = ''; if (S.sheet === sh) openTicket(t.key);
+    const result = await api('POST', `/api/tickets/${t.key}/decision`, { decision, message: reply.value, expected_updated_at: t.updated_at, discussion_id: decisionTarget === 'ticket' ? undefined : Number(decisionTarget) });
+    sh.reply = '';
+    // An approval on a ticket with a PR is mirrored to GitHub; then ask what to do with the PR.
+    if (decision === 'approve' && result?.pr_next) { prsUi.openActions(prsCtx(), result.pr_next, result.already ? { mode: 'already' } : (result.github_approval || {})); return; }
+    if (S.sheet === sh) openTicket(t.key);
   }, decision === 'approve' ? 'Approved' : decision === 'correction' ? 'Corrections sent' : 'Rejected · local work retained');
   const taskDecision = ['needs_human', 'ready_for_human'].includes(t.status);
   const proposals = (d?.discussions || []).filter((x) => x.status === 'complete');
@@ -858,7 +864,7 @@ function render() {
   const activeId = document.activeElement?.id;
   const selection = document.activeElement?.selectionStart;
   const keepX = view.querySelector('.board')?.scrollLeft;
-  const content = S.view === 'board' ? renderBoard() : S.view === 'desk' ? renderFloor() : S.view === 'tape' ? renderTape() : S.view === 'watch' ? renderWatch() : renderSettings();
+  const content = S.view === 'board' ? renderBoard() : S.view === 'desk' ? renderFloor() : S.view === 'tape' ? renderTape() : S.view === 'watch' ? renderWatch() : S.view === 'prs' ? prsUi.renderPage(prsCtx()) : renderSettings();
   const hot = S.incidents.filter((i) => ['investigating', 'paged'].includes(i.status) || (i.status === 'watching' && (i.window_count || 0) >= (S.meta.watch?.min_count || 3))).length;
   const badge = $('watch-badge');
   badge.hidden = !hot;
@@ -875,7 +881,7 @@ function render() {
   }
   if (keepX) { const b = view.querySelector('.board'); if (b) b.scrollLeft = keepX; }
   const sheetBusy = $('sheet').contains(document.activeElement) && ['TEXTAREA', 'INPUT', 'SELECT'].includes(document.activeElement.tagName);
-  if (S.sheet && !sheetBusy && !['new', 'team', 'architecture'].includes(S.sheet.type)) renderSheet();
+  if (S.sheet && !sheetBusy && !['new', 'team', 'architecture', 'pr'].includes(S.sheet.type)) renderSheet();
   lastSeenEvent = S.events.length ? S.events[S.events.length - 1].id : lastSeenEvent;
 }
 

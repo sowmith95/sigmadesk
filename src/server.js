@@ -11,6 +11,7 @@ import * as github from './github.js';
 import * as sched from './scheduler.js';
 import * as watch from './watch.js';
 import * as prsync from './prsync.js';
+import * as prs from './prs.js';
 import * as dispatch from './dispatch.js';
 import * as advisors from './advisors.js';
 import * as runtime from './runtime.js';
@@ -138,6 +139,23 @@ async function ownerRoute(req, res) {
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode)); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
+  // ---- PR console (owner only; agents have no route to these) ----
+  if (req.method === 'GET' && p === '/api/prs') {
+    return send(res, 200, { prs: await prs.listPrs({ refresh: url.searchParams.get('refresh') === '1' }), busy_window: sched.inBusyWindow(),
+      override_phrase: prs.OVERRIDE_PHRASE, base: config.project.baseBranch, repo: config.project.githubRepo, last_sync: store.kvGet('prsync:last_ok') });
+  }
+  if (req.method === 'POST' && (mm = m('^/api/prs/(\\d+)/(approve|ready|merge|close|reviewer|tags)$'))) {
+    const b = await readBody(req);
+    const n = Number(mm[1]);
+    const out = mm[2] === 'approve' ? await prs.approve(n, String(b.message || '').slice(0, 4000))
+      : mm[2] === 'ready' ? await prs.ready(n)
+        : mm[2] === 'merge' ? await prs.merge(n, { method: b.method || 'squash', override: b.override || '', inBusyWindow: sched.inBusyWindow() })
+          : mm[2] === 'close' ? await prs.close(n, String(b.comment || '').slice(0, 2000))
+            : mm[2] === 'reviewer' ? await prs.addReviewer(n, b.login)
+              : await prs.setTags(n, { add: b.add || [], remove: b.remove || [] });
+    prsync.reconcile(sched.prActions).catch(() => {}); // reflect merges/closes on the board right away
+    return send(res, 200, { ok: true, ...out });
+  }
   if (req.method === 'POST' && p === '/api/github/sync') {
     const n = await prsync.reconcile(sched.prActions);
     return send(res, 200, { ok: true, actions: n, last_ok: store.kvGet('prsync:last_ok') });

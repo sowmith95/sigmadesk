@@ -8,6 +8,9 @@ import * as github from './github.js';
 import * as watch from './watch.js';
 import { notify } from './notify.js';
 import * as prsync from './prsync.js';
+import * as prs from './prs.js';
+
+const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 import { selectionFor } from './dispatch.js';
 
 // ---------------- publish guard ----------------
@@ -912,8 +915,16 @@ export async function ownerDecision(key, { decision, message = '', expected_upda
     await ownerApprovePublish(key); return store.getTicket(key);
   }
   if (decision === 'approve' && t.status === 'ready_for_human') {
+    // One approval per commit (repeat taps used to stack duplicate approvals).
+    const approvedKey = `owner-approved:${key}:${t.head_sha || 'none'}`;
+    if (store.kvGet(approvedKey) === '1') return { ...store.getTicket(key), pr_next: t.pr_url ? prNumberOf(t.pr_url) : null, already: true };
+    store.kvSet(approvedKey, '1');
     store.addComment(key, 'owner', `✅ **${t.pr_url ? 'Owner review approved' : 'Approved for draft publication'}**${note ? `\n\n${note}` : ''}. Final merge remains with the owner.`);
-    if (!t.pr_url) publishBranch(key); return store.getTicket(key);
+    if (!t.pr_url) { publishBranch(key); return store.getTicket(key); }
+    // Reflect the approval on GitHub, then let the UI ask: merge, close, add a reviewer, or mark ready.
+    const n = prNumberOf(t.pr_url);
+    const gh = await prs.approve(n, note).catch((err) => ({ error: err.message }));
+    return { ...store.getTicket(key), pr_next: n, github_approval: gh };
   }
   if (decision === 'approve') return ownerReply(key, `✅ **Approved the requested decision.**${note ? `\n\n${note}` : ''}`, 'answer');
   store.addComment(key, 'owner', `${decision === 'correction' ? '🔁 **Owner requested changes**' : '⛔ **Rejected by owner**'}${note ? `\n\n${note}` : ''}`);
