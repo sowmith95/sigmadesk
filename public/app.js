@@ -539,8 +539,9 @@ function renderSheet() {
         h('button', { class: 'btn small danger', type: 'button', onclick: act(() => api('POST', `/api/runs/${run.id}/kill`, {}), 'stopping run') }, 'Stop run')) : null),
     t.status === 'needs_human' && /publish guard/.test(t.progress_msg || '') ? h('div', { class: 'ask' }, h('b', {}, '🛑 Publish guard'),
       h('div', { class: 'msg-t' }, 'This branch touches protected paths (CI, containers, hooks, lockfiles…) or is unusually large, so it was not pushed. Review the clone locally, then approve if it is safe.'),
-      h('div', { class: 'row-actions' }, h('button', { class: 'btn danger', type: 'button', onclick: act(async () => {
-        if (!confirm(`Push ${t.key} and open a draft PR even though it touches protected paths?`)) return;
+      h('div', { class: 'row-actions' }, h('button', { class: 'btn danger', type: 'button', onclick: act(async (e) => {
+        if (!confirm(`Push ${t.key} and open a draft PR even though the publish guard stopped it?`)) return;
+        e.target.disabled = true;
         await api('POST', `/api/tickets/${t.key}/approve-publish`, {});
       }, 'publishing') }, 'Approve publish'))) : null,
     d ? h('div', { class: 'thread' }, threadItems(d).map(bubble)) : h('div', { class: 'empty' }, 'Loading…'),

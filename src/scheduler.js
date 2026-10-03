@@ -619,6 +619,7 @@ async function publishBranch(key) {
 export async function ownerApprovePublish(key) {
   const t = store.getTicket(key);
   need(t && t.head_sha && store.kvGet(`guard:${key}`) === t.head_sha, 'nothing awaiting publish approval for this commit');
+  store.kvSet(`guard:${key}`, ''); // one approval per parked commit
   store.addComment(key, 'owner', `✅ Publish approved for \`${t.head_sha.slice(0, 10)}\` despite the guard.`);
   setStatus(key, 'ready_for_human', { resume_status: null, progress_msg: 'owner approved publish' });
   if (publishing.has(key)) return;
