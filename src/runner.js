@@ -188,9 +188,15 @@ export async function stageApproved(key, cloneDir, sha) {
   return withGitLock(async () => {
     const pub = await publisher();
     const base = config.project.baseBranch;
-    // Trusted base: the owner's checkout's view of origin/<base>, fetched straight from the owner repo.
-    const { stdout: baseSha } = await git(['-C', config.project.repoPath, 'rev-parse', `refs/remotes/origin/${base}`]).catch(() => git(['-C', config.project.repoPath, 'rev-parse', base]));
-    await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', config.project.repoPath, `+${baseSha.trim()}:refs/sigmadesk/base`]);
+    // Trusted base: fetched fresh from the owner's remote (falls back to the owner's local checkout). Never from a clone.
+    const { stdout: url } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
+    const fromRemote = url.trim()
+      ? await git([...SAFE, '-C', pub, 'fetch', '-q', '--no-tags', url.trim(), `+refs/heads/${base}:refs/sigmadesk/base`], { timeout: 120_000 }).then(() => true, () => false)
+      : false;
+    if (!fromRemote) {
+      const { stdout: baseSha } = await git(['-C', config.project.repoPath, 'rev-parse', `refs/remotes/origin/${base}`]).catch(() => git(['-C', config.project.repoPath, 'rev-parse', base]));
+      await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', config.project.repoPath, `+${baseSha.trim()}:refs/sigmadesk/base`]);
+    }
     await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', cloneDir, `+${sha}:refs/sigmadesk/${key}`]);
     const { stdout: got } = await git(['-C', pub, 'rev-parse', `refs/sigmadesk/${key}`]);
     if (got.trim() !== sha) throw new Error('fetched commit does not match the approved SHA');
