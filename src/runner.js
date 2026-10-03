@@ -253,6 +253,16 @@ export function buildCommand(agent, kind, cwd, { resume = null, fork = false, ex
   });
 }
 
+// Provenance: which charter/playbook/engine/model produced this run, so scorecards can be split by version.
+const engineVersions = {};
+export function provenanceOf(agent, kind) {
+  const e = engineOf(agent);
+  if (!(e.id in engineVersions)) engineVersions[e.id] = '';
+  const parts = [e.id, engineVersions[e.id], agent.model || 'default', agent.effort || '', charterFor(agent.id), kind];
+  return crypto.createHash('sha1').update(parts.join('\u0000')).digest('hex').slice(0, 10);
+}
+export function setEngineVersion(id, v) { engineVersions[id] = v || ''; }
+
 // Each run gets its own unix socket, allowlisted only in that run's sandbox: a token read from elsewhere is useless.
 let socketFactory = null;
 export function setSocketFactory(fn) { socketFactory = fn; }
@@ -287,7 +297,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   if (fence != null && fence !== epoch) return Promise.resolve({ run: null, result: null, aborted: true });
   const agent = agentById[agentId];
   const token = crypto.randomBytes(18).toString('hex');
-  const run = store.createRun({ nonce, agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId });
+  const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId });
   const ctx = { run, cwd, result: null, state: {} };
   if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
   store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'run',

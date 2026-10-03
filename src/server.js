@@ -242,6 +242,7 @@ export function main() {
   }
   store.openDb();
   try { applyTeamOverrides(JSON.parse(store.getSettings().team || '{}')); } catch { /* ignore bad JSON */ }
+  detectEngines().then((es) => es.forEach((e) => runner.setEngineVersion(e.id, e.version))).catch(() => {});
   sched.recoverOrphans();
   for (const host of config.server.hosts) {
     const srv = http.createServer(handler(ownerRoute));

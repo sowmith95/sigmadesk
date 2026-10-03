@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS runs (
   incident_id INTEGER,
   nonce TEXT,
   cost_estimated INTEGER DEFAULT 0,
+  provenance TEXT,
   model TEXT,
   cost_usd REAL DEFAULT 0,
   num_turns INTEGER,
@@ -132,7 +133,7 @@ function migrate() {
   const want = {
     tickets: { stalls: 'INTEGER DEFAULT 0', head_sha: 'TEXT', origin_session: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
-    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0' },
+    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT' },
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -272,8 +273,8 @@ export function updateAgent(id, patch) {
 // ---------- runs ----------
 const publicRun = (r) => { if (!r) return r; const { token, nonce, ...rest } = r; return rest; };
 export function createRun(r) {
-  const info = q('INSERT INTO runs(agent_id,ticket_key,kind,token,model,cwd,resumed_from,incident_id,nonce) VALUES (?,?,?,?,?,?,?,?,?)').run(
-    r.agent_id, r.ticket_key ?? null, r.kind, r.token, r.model, r.cwd ?? null, r.resumed_from ?? null, r.incident_id ?? null, r.nonce ?? null);
+  const info = q('INSERT INTO runs(agent_id,ticket_key,kind,token,model,cwd,resumed_from,incident_id,nonce,provenance) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
+    r.agent_id, r.ticket_key ?? null, r.kind, r.token, r.model, r.cwd ?? null, r.resumed_from ?? null, r.incident_id ?? null, r.nonce ?? null, r.provenance ?? null);
   const run = getRun(info.lastInsertRowid);
   bus.emit('msg', { type: 'run', data: publicRun(run) });
   return run;
@@ -317,11 +318,16 @@ export function agentStats(agentId) {
   const merged = q("SELECT COUNT(*) n FROM tickets WHERE assignee=? AND status='done'").get(agentId).n;
   const firstPass = q("SELECT COUNT(*) n FROM tickets WHERE assignee=? AND status IN ('review','ready_for_human','done') AND qa_loops=0").get(agentId).n;
   const runs = q('SELECT COUNT(*) n, COALESCE(SUM(cost_usd),0) cost, COALESCE(SUM(CASE WHEN status=\'success\' THEN 1 ELSE 0 END),0) ok FROM runs WHERE agent_id=?').get(agentId);
+  const closedUnmerged = q("SELECT COUNT(*) n FROM tickets WHERE assignee=? AND status='wontdo' AND pr_url IS NOT NULL").get(agentId).n;
+  const versions = q('SELECT provenance, COUNT(*) n, SUM(CASE WHEN status=\'success\' THEN 1 ELSE 0 END) ok, SUM(cost_usd) cost FROM runs WHERE agent_id=? AND provenance IS NOT NULL GROUP BY provenance ORDER BY MAX(id) DESC LIMIT 5').all(agentId);
   const week = q("SELECT COALESCE(SUM(cost_usd),0) c FROM runs WHERE agent_id=? AND started_at >= ?").get(agentId, new Date(Date.now() - 7 * 864e5).toISOString()).c;
   const byKind = q('SELECT kind, COUNT(*) n FROM runs WHERE agent_id=? GROUP BY kind').all(agentId);
   const proposed = q("SELECT COUNT(*) n FROM tickets WHERE reporter=?").get(agentId).n;
   return { shipped, merged, first_pass_rate: shipped ? firstPass / shipped : null, runs: runs.n, run_success_rate: runs.n ? runs.ok / runs.n : null,
-    cost_total: runs.cost, cost_7d: week, cost_per_shipped: shipped ? runs.cost / shipped : null, by_kind: byKind, reported: proposed };
+    cost_total: runs.cost, cost_7d: week, cost_per_shipped: shipped ? runs.cost / shipped : null, by_kind: byKind, reported: proposed,
+    // desk P&L: outcomes, not output
+    merge_rate: merged + closedUnmerged ? merged / (merged + closedUnmerged) : null, closed_unmerged: closedUnmerged,
+    cost_per_merged: merged ? runs.cost / merged : null, versions };
 }
 
 export function runCountFor(ticketKey, kind) {
