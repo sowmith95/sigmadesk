@@ -213,7 +213,7 @@ test('engines: codex seat builds a sandboxed, network-off command with an isolat
   const resumed = runner.buildCommand(seat, 'implement', '/tmp/ws', { resume: 'thread-1' });
   assert.deepEqual(resumed.args.slice(1, 3), ['exec', 'resume']);
   assert.equal(ENGINES.codex.canFork, false);
-  assert.deepEqual(suggestFor('principal-be', 'claude'), { model: 'fable', effort: 'xhigh' });
+  assert.deepEqual(suggestFor('principal-be', 'claude'), { model: 'fable', effort: 'high' });
   assert.equal(suggestFor('support', 'claude').model, 'haiku');
   const mixed = presets(['claude', 'codex']).find((p) => p.id === 'mixed');
   assert.equal(mixed.engine('qa'), 'codex');

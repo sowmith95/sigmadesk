@@ -3,6 +3,7 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { config, validateConfig } from './config.js';
+import { detectEngines } from './engines/index.js';
 
 const ok = (m) => console.log(`  ✔ ${m}`);
 const bad = (m) => { console.log(`  ✖ ${m}`); process.exitCode = 1; };
@@ -16,7 +17,9 @@ problems.length ? problems.forEach(bad) : ok(`project "${config.project.name}" �
 const [maj, min] = process.versions.node.split('.').map(Number);
 maj > 22 || (maj === 22 && min >= 13) ? ok(`node ${process.versions.node}`) : bad(`node ${process.versions.node} — need ≥ 22.13 (node:sqlite)`);
 
-try { ok(`claude ${run(config.bins.claude, ['--version'])}`); } catch { bad(`claude CLI not runnable at ${config.bins.claude}`); }
+const engines = await detectEngines();
+for (const e of engines) e.available ? ok(`${e.label}: ${e.version}`) : warn(`${e.label} unavailable`);
+if (!engines.some((e) => e.available)) bad('No runnable engine');
 try { run('git', ['--version']); ok('git'); } catch { bad('git missing'); }
 
 if (config.github.sync) {

@@ -10,6 +10,10 @@ import * as runner from './runner.js';
 import * as github from './github.js';
 import * as sched from './scheduler.js';
 import * as watch from './watch.js';
+import * as dispatch from './dispatch.js';
+import * as advisors from './advisors.js';
+import * as runtime from './runtime.js';
+import * as usage from './usage.js';
 
 const PUBLIC = path.join(config.root, 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -44,9 +48,11 @@ export function snapshot() {
     incidents: config.watch.enabled ? store.listIncidents({ limit: 150 }).map((i) => ({ ...i, window_count: watch.windowCount(i.signature) })) : [],
     meta: {
       watch: { enabled: config.watch.enabled, sources: watch.health(), window_minutes: config.watch.windowMinutes, min_count: config.watch.newSignatureMinCount },
-      project: config.project.name, repo: config.project.githubRepo, spend_today: store.spendSince(sched.startOfToday()),
-      capacity: sched.capacity(settings), busy_window: sched.inBusyWindow(), running: runner.runningCount(),
+      project: config.project.name, repo: config.project.githubRepo, preview: config.server.preview === true, spend_today: store.spendSince(sched.startOfToday()),
+      capacity: sched.capacity(settings), busy_window: sched.inBusyWindow(), running: runner.runningCount() + advisors.runningCount(),
       quota: JSON.parse(store.kvGet('quota:claude') || 'null'), plan_hold_at: config.limits.planHoldAt,
+      providers: dispatch.providerHealth(), scheduler: sched.health(), advisors: advisors.status(), background: runtime.status(), usage: usage.status(),
+      routing: Object.fromEntries(AGENTS.map((a) => { const s = dispatch.selectionFor(a.id); return [a.id, { engine: s.seat?.engine, model: s.seat?.model, effort: s.seat?.effort, tier: SEAT_TIER[a.id], fallback: s.fallback || false, reason: s.reason }]; })),
       engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
   };
@@ -97,10 +103,28 @@ async function ownerRoute(req, res) {
     return;
   }
   if (req.method === 'GET' && p === '/api/state') return send(res, 200, snapshot());
+  if (req.method === 'GET' && p === '/api/advisors') return send(res, 200, advisors.status());
+  if (req.method === 'POST' && p === '/api/providers/refresh') return send(res, 200, await usage.refresh());
+  if (req.method === 'POST' && p === '/api/providers/desktop-usage') return send(res, 200, usage.recordDesktop(await readBody(req)));
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/architecture-reviews$')))
+    return send(res, 201, advisors.createBrief(mm[1], await readBody(req)));
+  if (req.method === 'GET' && (mm = m('^/api/architecture-reviews/(\\d+)$'))) {
+    const review = store.getArchitectureReview(Number(mm[1]));
+    return send(res, review ? 200 : 404, review || { error: 'Review not found' });
+  }
+  if (req.method === 'POST' && (mm = m('^/api/architecture-reviews/(\\d+)/import$')))
+    return send(res, 200, advisors.importReport(Number(mm[1]), (await readBody(req)).result || ''));
+  if (req.method === 'POST' && (mm = m('^/api/architecture-reviews/(\\d+)/run$'))) {
+    const id = Number(mm[1]);
+    advisors.assertCanRun(id);
+    advisors.runReview(id).catch((err) => store.logEvent({ kind: 'error', agent_id: 'architecture-board', text: err.message }));
+    return send(res, 202, { ok: true, id });
+  }
+  if (req.method === 'GET' && p === '/api/health') return send(res, 200, { at: store.now(), providers: dispatch.providerHealth(), scheduler: sched.health(), watch: snapshot().meta.watch });
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
-    return send(res, 200, { ticket: t, comments: store.listComments(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
+    return send(res, 200, { ticket: t, comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)/events$'))) return send(res, 200, store.recentEvents({ agent_id: mm[1], limit: 300 }));
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)$'))) {
@@ -110,7 +134,8 @@ async function ownerRoute(req, res) {
 
   if (req.method === 'POST' && p === '/api/tickets') return send(res, 201, sched.ownerCreate(await readBody(req)));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/approve-publish$'))) { await sched.ownerApprovePublish(mm[1]); return send(res, 200, { ok: true }); }
-  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) return send(res, 200, sched.ownerReply(mm[1], (await readBody(req)).body));
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode)); }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
   if (req.method === 'POST' && p === '/api/settings') {
     const b = await readBody(req);
@@ -120,6 +145,7 @@ async function ownerRoute(req, res) {
   }
   if (req.method === 'GET' && p === '/api/engines') {
     const engines = await detectEngines();
+    dispatch.setAvailability(engines);
     const available = engines.filter((e) => e.available).map((e) => e.id);
     return send(res, 200, {
       engines, tiers: TIER_TEXT,
@@ -131,13 +157,15 @@ async function ownerRoute(req, res) {
   }
   if (req.method === 'POST' && p === '/api/team') {
     const b = await readBody(req);
-    const clean = {};
+    const clean = JSON.parse(store.getSettings().team || '{}');
     const avail = new Set((await detectEngines()).filter((e) => e.available).map((e) => e.id));
     for (const [id, o] of Object.entries(b.seats || {})) {
-      if (!agentById[id]) continue;
+      if (!agentById[id] || !o || typeof o !== 'object') return send(res, 400, { error: `invalid seat ${id}` });
       if (o.engine && !ENGINES[o.engine]) return send(res, 400, { error: `unknown engine ${o.engine}` });
       if (o.engine && !avail.has(o.engine)) return send(res, 400, { error: `${ENGINES[o.engine].label} is not installed on this machine` });
-      clean[id] = { engine: o.engine, model: String(o.model ?? '').slice(0, 80), effort: o.effort, enabled: o.enabled !== false };
+      const engine = o.engine || agentById[id].engine;
+      if (o.effort && !ENGINES[engine].efforts.includes(o.effort)) return send(res, 400, { error: `invalid effort ${o.effort}` });
+      clean[id] = { engine, model: String(o.model ?? agentById[id].model ?? '').slice(0, 80), effort: o.effort || agentById[id].effort, enabled: o.enabled !== false };
     }
     store.setSetting('team', JSON.stringify(clean));
     applyTeamOverrides(clean);
@@ -160,13 +188,17 @@ async function ownerRoute(req, res) {
   if (req.method === 'POST' && p === '/api/control/stop-all') {
     store.setSetting('paused', 'true');
     runner.killAll('owner circuit breaker');
+    advisors.cancelAll();
     store.logEvent({ kind: 'system', agent_id: 'owner', text: '⛔ Circuit breaker — desk halted and every running seat stopped' });
     return send(res, 200, { ok: true });
   }
   if (req.method === 'POST' && p === '/api/control/research') {
     const b = await readBody(req);
+    if (store.getSettings().paused === 'true') return send(res, 409, { error: 'Open the desk before starting research' });
+    if (!dispatch.selectionFor('pm').seat) return send(res, 409, { error: `PM: ${dispatch.selectionFor('pm').reason}` });
+    if (store.getAgentState('pm')?.status === 'working') return send(res, 409, { error: 'PM is busy' });
     if (sched.budgetHeadroom() < runner.runBudget('pm')) return send(res, 409, { error: 'daily risk limit would be exceeded' });
-    if (store.listAgentStates().filter((a) => a.status === 'working').length >= sched.capacity()) return send(res, 409, { error: 'desk is at capacity — try again when a seat frees up' });
+    if (sched.workCount() >= sched.capacity()) return send(res, 409, { error: 'desk is at capacity — try again when a seat frees up' });
     sched.launchResearch(String(b.focus || '').slice(0, 500)).catch((err) => store.logEvent({ kind: 'error', agent_id: 'pm', text: err.message }));
     return send(res, 202, { ok: true });
   }
@@ -205,6 +237,7 @@ async function agentRoute(req, res, boundRunId) {
 
 // File-mailbox transport for engines whose sandbox blocks the socket (e.g. Codex with network off).
 const inFlight = new Set();
+const mailboxReplies = new Map();
 // The mailbox lives in an agent-writable clone: never follow symlinks, and never write into it directly.
 function mailboxIsSafe(runId, dir) {
   try {
@@ -215,7 +248,7 @@ function mailboxIsSafe(runId, dir) {
     return real === path.join(cwd, '.desk-mailbox', `r${runId}`) && fs.lstatSync(path.join(cwd, '.desk-mailbox')).isDirectory();
   } catch { return false; }
 }
-function pollMailboxes() {
+export function pollMailboxes() {
   for (const [runId, dir] of runner.openMailboxes()) {
     if (!mailboxIsSafe(runId, dir)) continue;
     let names;
@@ -225,32 +258,55 @@ function pollMailboxes() {
       if (inFlight.has(`${runId}:${id}`)) continue;
       inFlight.add(`${runId}:${id}`);
       const reply = (obj) => {
+        const replyKey = `${runId}:${id}`;
+        mailboxReplies.set(replyKey, obj);
+        let tmp;
         try {
           if (!mailboxIsSafe(runId, dir)) return;
           // Write privately, then rename INTO the mailbox: rename replaces a planted symlink instead of following it.
-          const tmp = path.join(config.root, 'run', `mbx-${runId}-${id}.tmp`);
+          const privateDir = path.join(config.root, 'run');
+          fs.mkdirSync(privateDir, { recursive: true, mode: 0o700 });
+          tmp = path.join(privateDir, `mbx-${runId}-${id}-${crypto.randomBytes(6).toString('hex')}.tmp`);
           fs.writeFileSync(tmp, JSON.stringify(obj), { flag: 'wx', mode: 0o644 });
           fs.renameSync(tmp, path.join(dir, `res-${id}.json`));
-        } catch { /* mailbox gone or tampered: drop the reply */ } finally { inFlight.delete(`${runId}:${id}`); }
+          try { fs.unlinkSync(path.join(dir, name)); } catch { /* consumed or removed by the seat */ }
+          mailboxReplies.delete(replyKey);
+        } catch (err) {
+          if (!obj._replyErrorReported) {
+            store.logEvent({ kind: 'error', run_id: runId, text: `Desk mailbox reply failed: ${err.code || 'I/O error'}; response retained for retry` });
+            Object.defineProperty(obj, '_replyErrorReported', { value: true });
+          }
+        } finally {
+          if (tmp) { try { fs.unlinkSync(tmp); } catch { /* renamed */ } }
+          inFlight.delete(replyKey);
+        }
       };
+      if (mailboxReplies.has(`${runId}:${id}`)) { reply(mailboxReplies.get(`${runId}:${id}`)); continue; }
       (async () => {
         let req;
         try {
           const file = path.join(dir, name);
           if (!fs.lstatSync(file).isFile()) throw new Error('not a regular file');
           const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-          const raw = fs.readFileSync(fd, 'utf8');
-          fs.closeSync(fd);
-          fs.unlinkSync(file);
+          let raw;
+          try {
+            const st = fs.fstatSync(fd);
+            if (!st.isFile() || st.size > 1e6) throw new Error('invalid mailbox request');
+            raw = fs.readFileSync(fd, 'utf8');
+          } finally { fs.closeSync(fd); }
           if (raw.length > 1e6) throw new Error('too large');
           req = JSON.parse(raw);
-        } catch { inFlight.delete(`${runId}:${id}`); return; }
+        } catch {
+          if (mailboxIsSafe(runId, dir)) { try { fs.unlinkSync(path.join(dir, name)); } catch { /* gone */ } }
+          inFlight.delete(`${runId}:${id}`); return;
+        }
         const run = store.runByToken(req.token);
         if (!run || run.id !== runId) return reply({ error: 'invalid or finished run token' });
         try { reply({ ok: true, output: await sched.deskAction(run, String(req.cmd), req.body || {}) }); } catch (err) { reply({ error: err.message }); }
       })();
     }
   }
+  for (const key of mailboxReplies.keys()) if (!store.getRun(Number(key.split(':')[0]))?.token) mailboxReplies.delete(key);
 }
 
 const handler = (route) => (req, res) => {
@@ -258,7 +314,7 @@ const handler = (route) => (req, res) => {
 };
 
 // ---------------- main ----------------
-export function main() {
+export async function main() {
   const problems = validateConfig();
   if (problems.length) {
     console.error(`SigmaDesk config problems (${config.configFile}):\n - ${problems.join('\n - ')}\nCopy sigmadesk.config.example.json to sigmadesk.config.json and edit it.`);
@@ -266,8 +322,13 @@ export function main() {
   }
   store.openDb();
   try { applyTeamOverrides(JSON.parse(store.getSettings().team || '{}')); } catch { /* ignore bad JSON */ }
-  detectEngines().then((es) => es.forEach((e) => runner.setEngineVersion(e.id, e.version))).catch(() => {});
+  const engines = await dispatch.refreshAvailability();
+  engines.forEach((e) => runner.setEngineVersion(e.id, e.version));
   sched.recoverOrphans();
+  advisors.recoverOrphans();
+  runtime.start();
+  usage.refresh().then(() => sched.tick());
+  setInterval(() => usage.refresh(), 120000).unref();
   for (const host of config.server.hosts) {
     const srv = http.createServer(handler(ownerRoute));
     srv.on('error', (err) => console.error(`listen ${host}:${config.server.port} failed: ${err.message}`));
@@ -308,7 +369,7 @@ export function main() {
   setTimeout(() => github.poll(importIssue, redChecks), 10_000);
   setInterval(() => github.flushComments(), 60_000);
   setInterval(() => sched.retryPublications(), 5 * 60_000);
-  const shutdown = () => { runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
+  const shutdown = () => { advisors.cancelAll(); runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }

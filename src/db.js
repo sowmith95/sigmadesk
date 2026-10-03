@@ -10,6 +10,11 @@ export const bus = new EventEmitter();
 bus.setMaxListeners(200);
 
 let db;
+let transactionMessages = null;
+function announce(message) {
+  if (transactionMessages) transactionMessages.push(message);
+  else bus.emit('msg', message);
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tickets (
@@ -66,6 +71,8 @@ CREATE TABLE IF NOT EXISTS runs (
   incident_id INTEGER,
   nonce TEXT,
   cost_estimated INTEGER DEFAULT 0,
+  reserve_usd REAL DEFAULT 0,
+  usage_json TEXT,
   provenance TEXT,
   model TEXT,
   cost_usd REAL DEFAULT 0,
@@ -114,6 +121,30 @@ CREATE TABLE IF NOT EXISTS incidents (
   resolved_at TEXT
 );
 CREATE INDEX IF NOT EXISTS incidents_status ON incidents(status);
+CREATE TABLE IF NOT EXISTS architecture_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT,
+  reviewer TEXT NOT NULL,
+  challenger TEXT,
+  status TEXT NOT NULL DEFAULT 'awaiting_result',
+  brief TEXT NOT NULL,
+  result TEXT,
+  error TEXT,
+  run_id INTEGER,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ended_at TEXT
+);
+CREATE TABLE IF NOT EXISTS owner_discussions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT NOT NULL,
+  question TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  response TEXT,
+  error TEXT,
+  run_id INTEGER,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ended_at TEXT
+);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -134,7 +165,7 @@ function migrate() {
   const want = {
     tickets: { stalls: 'INTEGER DEFAULT 0', head_sha: 'TEXT', origin_session: 'TEXT', after_key: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
-    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT' },
+    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT' },
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -144,6 +175,16 @@ function migrate() {
 
 export const now = () => new Date().toISOString();
 const q = (sql) => db.prepare(sql);
+export function transaction(fn) {
+  db.exec('BEGIN IMMEDIATE');
+  transactionMessages = [];
+  let result, messages;
+  try { result = fn(); db.exec('COMMIT'); messages = transactionMessages; }
+  catch (err) { db.exec('ROLLBACK'); throw err; }
+  finally { transactionMessages = null; }
+  for (const message of messages) announce(message);
+  return result;
+}
 
 // ---------- settings ----------
 // Live knobs the owner can turn from the UI. Seeded from the config file; the DB value wins afterwards.
@@ -159,6 +200,7 @@ export function settingDefaults() {
     open_draft_prs: String(config.github.openDraftPrs),
     team: '{}', // per-seat {engine, model, effort, enabled} chosen in the UI
     team_confirmed: 'false', // the owner must confirm who runs on what before the first open
+    auto_fallback: String(config.engines.autoFallback),
   };
 }
 
@@ -167,8 +209,16 @@ export function getSettings() {
 }
 export function setSetting(key, value) {
   if (!(key in settingDefaults())) throw Object.assign(new Error(`unknown setting ${key}`), { status: 400 });
+  const ranges = { max_concurrent: [1, 20], daily_budget_usd: [0, 100000], pm_interval_min: [1, 525600], max_open_proposals: [1, 100] };
+  if (ranges[key]) {
+    const n = Number(value), [min, max] = ranges[key];
+    if (!String(value).trim() || !Number.isFinite(n) || n < min || n > max || (key !== 'daily_budget_usd' && !Number.isInteger(n)))
+      throw Object.assign(new Error(`${key} must be ${key === 'daily_budget_usd' ? 'a number' : 'an integer'} from ${min} to ${max}`), { status: 400 });
+  }
+  if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'team_confirmed', 'auto_fallback'].includes(key) && !['true', 'false'].includes(String(value)))
+    throw Object.assign(new Error(`${key} must be true or false`), { status: 400 });
   q('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value));
-  bus.emit('msg', { type: 'settings', data: getSettings() });
+  announce({ type: 'settings', data: getSettings() });
 }
 
 // ---------- tickets ----------
@@ -195,7 +245,7 @@ export function createTicket(t) {
   const key = `${config.project.ticketPrefix}-${info.lastInsertRowid}`;
   q('UPDATE tickets SET key=? WHERE id=?').run(key, info.lastInsertRowid);
   const ticket = getTicket(key);
-  bus.emit('msg', { type: 'ticket', data: ticket });
+  announce({ type: 'ticket', data: ticket });
   logEvent({ ticket_key: key, agent_id: t.reporter, kind: 'created', text: `created “${ticket.title}” → ${ticket.status}` });
   return ticket;
 }
@@ -212,7 +262,7 @@ export function updateTicket(key, patch) {
     for (const inc of q("SELECT id FROM incidents WHERE ticket_key=? AND status='ticketed'").all(key)) updateIncident(inc.id, { status: 'resolved', resolved_at: now() });
   }
   const ticket = getTicket(key);
-  bus.emit('msg', { type: 'ticket', data: ticket });
+  announce({ type: 'ticket', data: ticket });
   return ticket;
 }
 
@@ -220,7 +270,7 @@ export function updateTicket(key, patch) {
 export function addComment(ticket_key, author, body) {
   const info = q('INSERT INTO comments(ticket_key,author,body) VALUES (?,?,?)').run(ticket_key, author, redact(body).slice(0, 20000));
   const c = q('SELECT * FROM comments WHERE id=?').get(info.lastInsertRowid);
-  bus.emit('msg', { type: 'comment', data: c });
+  announce({ type: 'comment', data: c });
   return c;
 }
 export function listComments(ticket_key) {
@@ -253,7 +303,7 @@ export function logEvent(e) {
   const info = q('INSERT INTO events(run_id,agent_id,ticket_key,kind,text) VALUES (?,?,?,?,?)').run(
     e.run_id ?? null, e.agent_id ?? null, e.ticket_key ?? null, e.kind, redact(e.text).slice(0, 4000));
   const ev = q('SELECT * FROM events WHERE id=?').get(info.lastInsertRowid);
-  bus.emit('msg', { type: 'event', data: ev });
+  announce({ type: 'event', data: ev });
   return ev;
 }
 export function recentEvents({ ticket_key, agent_id, limit = 200 } = {}) {
@@ -272,7 +322,7 @@ export function listAgentStates() {
 export function updateAgent(id, patch) {
   const cols = Object.keys(patch);
   q(`UPDATE agents SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
-  bus.emit('msg', { type: 'agent', data: getAgentState(id) });
+  announce({ type: 'agent', data: getAgentState(id) });
 }
 
 // ---------- runs ----------
@@ -281,7 +331,7 @@ export function createRun(r) {
   const info = q('INSERT INTO runs(agent_id,ticket_key,kind,token,model,cwd,resumed_from,incident_id,nonce,provenance) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
     r.agent_id, r.ticket_key ?? null, r.kind, r.token, r.model, r.cwd ?? null, r.resumed_from ?? null, r.incident_id ?? null, r.nonce ?? null, r.provenance ?? null);
   const run = getRun(info.lastInsertRowid);
-  bus.emit('msg', { type: 'run', data: publicRun(run) });
+  announce({ type: 'run', data: publicRun(run) });
   return run;
 }
 export function getRun(id) {
@@ -293,7 +343,7 @@ export function runByToken(token) {
 export function updateRun(id, patch) {
   const cols = Object.keys(patch);
   q(`UPDATE runs SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
-  bus.emit('msg', { type: 'run', data: publicRun(getRun(id)) });
+  announce({ type: 'run', data: publicRun(getRun(id)) });
 }
 export function unfinishedRuns() {
   return q('SELECT * FROM runs WHERE ended_at IS NULL').all();
@@ -302,7 +352,7 @@ export function runningRuns() {
   return q("SELECT * FROM runs WHERE status='running'").all();
 }
 export function recentRuns(limit = 50) {
-  return q('SELECT id,agent_id,ticket_key,kind,status,model,cost_usd,num_turns,started_at,ended_at FROM runs ORDER BY id DESC LIMIT ?').all(limit);
+  return q('SELECT id,agent_id,ticket_key,kind,status,model,cost_usd,cost_estimated,reserve_usd,usage_json,num_turns,started_at,ended_at FROM runs ORDER BY id DESC LIMIT ?').all(limit);
 }
 export function spendSince(isoTs) {
   return q('SELECT COALESCE(SUM(cost_usd),0) AS s FROM runs WHERE started_at >= ?').get(isoTs).s;
@@ -356,7 +406,7 @@ export function recordIncident({ signature, normalized, source_index, label, pro
   }
   const inc = q('SELECT * FROM incidents WHERE signature=?').get(signature);
   // Throttle the live stream: announce early occurrences and every 10th after.
-  if (inc.count <= 5 || inc.count % 10 === 0) bus.emit('msg', { type: 'incident', data: inc });
+  if (inc.count <= 5 || inc.count % 10 === 0) announce({ type: 'incident', data: inc });
   return inc;
 }
 export function getIncident(id) {
@@ -372,14 +422,43 @@ export function updateIncident(id, patch) {
   if (!cols.length) return getIncident(id);
   q(`UPDATE incidents SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
   const inc = getIncident(id);
-  bus.emit('msg', { type: 'incident', data: inc });
+  announce({ type: 'incident', data: inc });
   return inc;
 }
 export function investigationsSince(isoTs) {
   return q("SELECT COUNT(*) n FROM runs WHERE kind='investigate' AND started_at >= ?").get(isoTs).n;
 }
 
+// Advisory reports are attached to the ticket; they never count as a QA verdict.
+export function createArchitectureReview(r) {
+  const info = q('INSERT INTO architecture_reviews(ticket_key,reviewer,challenger,brief,status) VALUES(?,?,?,?,?)').run(r.ticket_key, r.reviewer, r.challenger || null, r.brief, r.status || 'awaiting_result');
+  const review = getArchitectureReview(info.lastInsertRowid);
+  announce({ type: 'architecture-review', data: review });
+  return review;
+}
+export const getArchitectureReview = (id) => q('SELECT * FROM architecture_reviews WHERE id=?').get(id) || null;
+export const listArchitectureReviews = (key) => key ? q('SELECT * FROM architecture_reviews WHERE ticket_key=? ORDER BY id DESC LIMIT 30').all(key) : q('SELECT * FROM architecture_reviews ORDER BY id DESC LIMIT 30').all();
+export function updateArchitectureReview(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['status', 'result', 'error', 'run_id', 'ended_at'].includes(k));
+  if (cols.length) q(`UPDATE architecture_reviews SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
+  const review = getArchitectureReview(id);
+  announce({ type: 'architecture-review', data: review });
+  return review;
+}
+
 // ---------- small durable key/value store (watch cursors etc.) ----------
+export function createDiscussion(ticketKey, question) {
+  const info = q('INSERT INTO owner_discussions(ticket_key,question) VALUES(?,?)').run(ticketKey, question);
+  const d = getDiscussion(info.lastInsertRowid); announce({ type: 'discussion', data: d }); return d;
+}
+export const getDiscussion = (id) => q('SELECT * FROM owner_discussions WHERE id=?').get(id) || null;
+export const pendingDiscussions = () => q("SELECT * FROM owner_discussions WHERE status IN ('queued','running') ORDER BY id").all();
+export const ticketDiscussions = (key) => q('SELECT * FROM owner_discussions WHERE ticket_key=? ORDER BY id DESC LIMIT 20').all(key);
+export function updateDiscussion(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['status', 'response', 'error', 'run_id', 'ended_at'].includes(k));
+  if (cols.length) q(`UPDATE owner_discussions SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
+  const d = getDiscussion(id); announce({ type: 'discussion', data: d }); return d;
+}
 export function kvGet(key) {
   db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
   return q('SELECT value FROM kv WHERE key=?').get(key)?.value ?? null;

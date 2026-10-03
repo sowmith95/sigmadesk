@@ -2,16 +2,16 @@
 import { portrait, presenceOf } from './avatars.js';
 
 const COLUMNS = [
-  { id: 'triage', title: 'Intake', sub: 'new orders · support triages' },
-  { id: 'proposed', title: 'Research', sub: 'ideas · manager grooms' },
-  { id: 'todo', title: 'Order book', sub: 'groomed · waiting for a seat' },
-  { id: 'in_progress', title: 'Executing', sub: 'engineers at work' },
-  { id: 'qa', title: 'Risk check', sub: 'independent QA' },
-  { id: 'review', title: 'Confirmation', sub: 'requester checks intent' },
-  { id: 'needs_human', title: 'Margin call', sub: 'needs you', alert: true },
-  { id: 'ready_for_human', title: 'Settlement', sub: 'draft PR · your review' },
-  { id: 'done', title: 'Filled', sub: 'merged' },
-  { id: 'wontdo', title: 'Cancelled', sub: 'rejected / closed' },
+  { id: 'triage', title: 'Intake', sub: 'Support triages new tickets' },
+  { id: 'proposed', title: 'Backlog', sub: 'Manager scopes and assigns' },
+  { id: 'todo', title: 'Ready', sub: 'Scoped and waiting for a seat' },
+  { id: 'in_progress', title: 'In progress', sub: 'Design and implementation' },
+  { id: 'qa', title: 'QA', sub: 'Independent tests and review' },
+  { id: 'review', title: 'Acceptance', sub: 'Requester confirms intent' },
+  { id: 'needs_human', title: 'Needs you', sub: 'A decision or answer is needed', alert: true },
+  { id: 'ready_for_human', title: 'Ready to merge', sub: 'Draft PR for your review' },
+  { id: 'done', title: 'Done', sub: 'Merged' },
+  { id: 'wontdo', title: 'Cancelled', sub: 'Rejected or closed' },
 ];
 const STATUS_LABEL = Object.fromEntries(COLUMNS.map((c) => [c.id, c.title]));
 
@@ -22,6 +22,7 @@ const S = {
   tapeFilter: 'all',
   sheet: null, // { type: 'ticket', key, detail } | { type: 'seat', id, events } | { type: 'new' }
   connected: false,
+  search: '', assigneeFilter: '', stageFilter: 'all', showClosed: false, showEmpty: false, loadError: null,
 };
 
 // ---------------- tiny DOM helper ----------------
@@ -66,7 +67,26 @@ function avatar(agentId, size = '') {
   return wrap;
 }
 const modelTag = (m) => h('span', { class: `model ${m}` }, m);
-const seatModel = (a) => (a.engine === 'codex' ? h('span', { class: 'model codex' }, `codex${a.model ? `·${a.model}` : ''}`) : h('span', { class: `model ${a.model}` }, a.model));
+const seatModel = (a) => {
+  const active = S.runs.find((r) => r.id === a.current_run);
+  const route = S.meta.routing?.[a.id];
+  const engine = active ? active.model.split(':')[0] : route?.engine || a.engine;
+  const model = active ? active.model.split(':').slice(1).join(':') : route?.model ?? a.model;
+  return h('span', { class: `model ${engine === 'codex' ? 'codex' : model}`, title: route?.fallback ? `Fallback from ${a.engine}: ${route.reason}` : 'Seat model' }, engine === 'codex' ? `Codex · ${model && model !== 'default' ? model : 'default'}` : model);
+};
+function quotaWindows(q) {
+  if (!q) return [];
+  if (q.windows) return q.windows;
+  return [['five_hour', 300], ['seven_day', 10080]].filter(([key]) => q[key] != null).map(([key, duration]) => ({
+    used_percent: Math.max(0, Math.min(100, q[key] * 100)), remaining_percent: Math.max(0, 100 - q[key] * 100), duration_minutes: duration,
+    resets_at: q[`${key}_resets_at`] || (key === 'five_hour' ? q.resets_at : null), bucket: q.engine || 'claude',
+  }));
+}
+const windowLabel = (w) => w.duration_minutes === 10080 ? 'Weekly' : w.duration_minutes === 300 ? '5-hour' : w.duration_minutes ? `${w.duration_minutes / 60}h window` : w.name || 'Usage';
+function quotaSummary(p) {
+  const windows = quotaWindows(p.quota).filter((w) => (!p.quota?.active_bucket || w.bucket === p.quota.active_bucket) && (!w.resets_at || Date.parse(w.resets_at) > Date.now()));
+  return windows.length ? `${Math.round(Math.min(...windows.map((w) => w.remaining_percent)))}% left` : 'usage unknown';
+}
 
 function toast(msg, err = false) {
   const t = $('toast');
@@ -78,7 +98,7 @@ function toast(msg, err = false) {
 }
 
 async function api(method, url, body) {
-  const res = await fetch(url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  const res = await fetch(url, { method, signal: AbortSignal.timeout(15000), headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
   const j = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
   return j;
@@ -121,15 +141,15 @@ function renderTeamSheet() {
       const models = eng?.models || [];
       const modelOpts = models.some((m) => m.id === dr.model) ? models : [...models, { id: dr.model, note: 'custom' }];
       const set = (k) => (e) => { dr[k] = e.target.type === 'checkbox' ? e.target.checked : e.target.value; if (k === 'engine') { const s2 = seat.suggestions[dr.engine]; if (s2) Object.assign(dr, { model: s2.model, effort: s2.effort }); } renderSheet(); };
-      const en = h('input', { type: 'checkbox', class: 'switch', onchange: set('enabled'), 'aria-label': 'seat enabled' });
+      const en = h('input', { id: `team-${seat.id}-enabled`, type: 'checkbox', class: 'switch', onchange: set('enabled'), 'aria-label': `${seat.name} enabled` });
       en.checked = dr.enabled;
       return h('div', { class: `seatrow ${dr.enabled ? '' : 'off'}` },
         avatar(seat.id, 'md'),
         h('div', { class: 'sr-who' }, h('b', {}, seat.name), h('span', {}, seat.role), h('small', {}, `${seat.tier} · ${d.tiers[seat.tier] || ''}`)),
         h('div', { class: 'sr-ctl' },
-          h('select', { 'aria-label': 'engine', onchange: set('engine') }, d.engines.map((e) => h('option', { value: e.id, selected: e.id === dr.engine, disabled: !e.available }, e.label))),
-          h('select', { 'aria-label': 'model', onchange: set('model') }, modelOpts.map((m) => h('option', { value: m.id, selected: m.id === dr.model }, `${m.id || 'default'}${m.note ? ` — ${m.note}` : ''}`))),
-          h('select', { 'aria-label': 'effort', onchange: set('effort') }, (dr.engine === 'codex' ? ['low', 'medium', 'high', 'xhigh'] : ['low', 'medium', 'high', 'xhigh', 'max']).map((x) => h('option', { value: x, selected: x === dr.effort }, `effort ${x}`))),
+          h('select', { id: `team-${seat.id}-engine`, 'aria-label': `${seat.name} engine`, onchange: set('engine') }, d.engines.map((e) => h('option', { value: e.id, selected: e.id === dr.engine, disabled: !e.available }, e.label))),
+          h('select', { id: `team-${seat.id}-model`, 'aria-label': `${seat.name} model`, onchange: set('model') }, modelOpts.map((m) => h('option', { value: m.id, selected: m.id === dr.model }, `${m.id || 'default'}${m.note ? ` — ${m.note}` : ''}`))),
+          h('select', { id: `team-${seat.id}-effort`, 'aria-label': `${seat.name} effort`, onchange: set('effort') }, (eng?.efforts || []).map((x) => h('option', { value: x, selected: x === dr.effort }, `effort ${x}`))),
           en),
         sug && (sug.model !== dr.model || sug.effort !== dr.effort) ? h('button', { class: 'linkish sr-sug', type: 'button', onclick: () => { Object.assign(dr, { model: sug.model, effort: sug.effort }); renderSheet(); } }, `suggested: ${sug.model || 'default'} · ${sug.effort}`) : null);
     })),
@@ -145,26 +165,44 @@ function renderTeamSheet() {
   sheetShell(head, body);
 }
 const act = (fn, ok) => async (...a) => {
-  try { await fn(...a); if (ok) toast(ok); } catch (e) { toast(e.message, true); }
+  const button = a[0]?.currentTarget;
+  if (button?.disabled) return;
+  if (button?.tagName === 'BUTTON') button.disabled = true;
+  try { const result = await fn(...a); if (ok && result !== false) toast(ok); } catch (e) { toast(e.message, true); }
+  finally { if (button?.tagName === 'BUTTON') button.disabled = false; }
 };
 
 // ---------------- data sync ----------------
 async function loadSnapshot() {
-  const snap = await api('GET', '/api/state');
-  Object.assign(S, snap);
-  render();
+  syncing = true;
+  const seq = ++snapshotSeq;
+  try {
+    const snap = await api('GET', '/api/state');
+    if (seq !== snapshotSeq) return;
+    Object.assign(S, snap);
+    S.loadError = null;
+    const queued = pendingDeltas.splice(0);
+    for (const m of queued) apply(m);
+    render();
+  } catch (e) {
+    if (seq === snapshotSeq) { S.loadError = e.message; for (const m of pendingDeltas.splice(0)) apply(m); renderTop(); }
+    throw e;
+  }
+  finally { if (seq === snapshotSeq) syncing = false; }
 }
 
 let es;
+let syncing = false, snapshotSeq = 0;
+const pendingDeltas = [];
 function connect() {
   es?.close();
   es = new EventSource('/api/stream');
-  es.onopen = () => { S.connected = true; loadSnapshot().catch(() => {}); };
+  es.onopen = () => { S.connected = true; syncing = true; loadSnapshot().catch(() => {}); };
   es.onerror = () => { S.connected = false; renderTop(); };
   es.onmessage = (e) => {
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
-    apply(m);
+    if (syncing) pendingDeltas.push(m); else apply(m);
   };
 }
 
@@ -181,6 +219,17 @@ function schedule() {
 
 function apply(m) {
   switch (m.type) {
+    case 'discussion':
+      if (S.sheet?.type === 'ticket' && S.sheet.key === m.data.ticket_key && S.sheet.detail) {
+        S.sheet.detail.discussions ||= []; upsert(S.sheet.detail.discussions, m.data);
+      }
+      refreshMeta(); break;
+    case 'architecture-review':
+      if (S.sheet?.type === 'architecture' && S.sheet.review?.id === m.data.id) {
+        S.sheet.review = m.data;
+        if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) renderArchitectureSheet();
+      }
+      break;
     case 'ticket': upsert(S.tickets, m.data, 'key'); break;
     case 'agent': {
       const a = S.agents.find((x) => x.id === m.data.id);
@@ -190,15 +239,15 @@ function apply(m) {
     case 'run': upsert(S.runs, m.data); if (m.data.status !== 'running') refreshMeta(); break;
     case 'settings': S.settings = m.data; break;
     case 'incident': upsert(S.incidents, m.data); break;
-    case 'quota': S.meta.quota = m.data; break;
+    case 'quota': if (m.data.engine === 'claude') S.meta.quota = m.data; refreshMeta(); break;
     case 'event':
-      S.events.push(m.data);
+      if (!S.events.some((e) => e.id === m.data.id)) S.events.push(m.data);
       if (S.events.length > 600) S.events.splice(0, S.events.length - 600);
-      if (S.sheet?.type === 'ticket' && S.sheet.key === m.data.ticket_key) S.sheet.detail?.events.push(m.data);
+      if (S.sheet?.type === 'ticket' && S.sheet.key === m.data.ticket_key && S.sheet.detail && !S.sheet.detail.events.some((e) => e.id === m.data.id)) S.sheet.detail.events.push(m.data);
       if (S.sheet?.type === 'seat' && S.sheet.id === m.data.agent_id) S.sheet.events?.push(m.data);
       break;
     case 'comment':
-      if (S.sheet?.type === 'ticket' && S.sheet.key === m.data.ticket_key) S.sheet.detail?.comments.push(m.data);
+      if (S.sheet?.type === 'ticket' && S.sheet.key === m.data.ticket_key && S.sheet.detail && !S.sheet.detail.comments.some((c) => c.id === m.data.id)) S.sheet.detail.comments.push(m.data);
       break;
     default: break;
   }
@@ -208,7 +257,7 @@ function apply(m) {
 let metaTimer = 0;
 function refreshMeta() {
   clearTimeout(metaTimer);
-  metaTimer = setTimeout(() => api('GET', '/api/state').then((s) => { S.meta = s.meta; S.agents = s.agents; schedule(); }).catch(() => {}), 800);
+  metaTimer = setTimeout(() => loadSnapshot().catch(() => {}), 800);
 }
 
 // ---------------- top bar ----------------
@@ -223,15 +272,27 @@ function renderTop() {
     h('span', { class: 'tk' }, h('span', { class: `state ${open ? 'open' : 'halted'}` }, open ? 'OPEN' : 'HALTED')),
     h('span', { class: 'tk' }, 'SEATS', h('b', {}, `${working}/${S.meta.capacity ?? '-'}`), S.meta.busy_window ? h('span', { title: 'busy window: reduced concurrency' }, '◐') : null),
     h('span', { class: 'tk' }, 'BURN', h('b', {}, money(spend)), h('span', { class: 'meter', title: `${pct.toFixed(0)}% of daily risk limit` }, h('i', { class: pct > 90 ? 'over' : pct > 65 ? 'hot' : '', style: `width:${pct}%` })), h('span', {}, `/ ${money(limit)}`)),
-    S.meta.quota ? h('span', { class: 'tk', title: `Claude plan usage · 5-hour window ${Math.round((S.meta.quota.five_hour || 0) * 100)}% · 7-day ${Math.round((S.meta.quota.seven_day || 0) * 100)}% · new runs hold at ${Math.round((S.meta.plan_hold_at || 0.9) * 100)}%` },
-      'PLAN', h('b', { style: (S.meta.quota.five_hour || 0) >= (S.meta.plan_hold_at || 0.9) ? 'color:var(--down)' : '' }, `${Math.round((S.meta.quota.five_hour || 0) * 100)}%`), h('span', {}, `5h · ${Math.round((S.meta.quota.seven_day || 0) * 100)}% 7d`)) : null,
+    (S.meta.providers || []).map((p) => h('button', { class: 'tk quota-link', type: 'button', title: 'View provider usage, reset times and routing', onclick: () => { S.view = 'watch'; localStorage.setItem('sd.view', 'watch'); render(); } }, p.id === 'codex' ? 'CODEX' : 'CLAUDE', h('b', { style: p.ready ? '' : 'color:var(--warn)' }, quotaSummary(p)))),
+    S.meta.usage?.perplexity_desktop ? h('span', { class: 'tk', title: 'Observed Perplexity desktop credits; separate from API credits' }, 'PERPLEXITY', h('b', {}, `${Math.floor(S.meta.usage.perplexity_desktop.credits_remaining).toLocaleString()} credits`)) : null,
     h('span', { class: 'tk' }, 'WIP', h('b', {}, S.tickets.filter((t) => ['in_progress', 'qa'].includes(t.status)).length)),
     h('span', { class: 'tk' }, 'CALLS', h('b', { style: S.tickets.some((t) => t.status === 'needs_human') ? 'color:var(--warn)' : '' }, S.tickets.filter((t) => t.status === 'needs_human').length)),
     h('span', { class: 'tk', title: S.connected ? 'live' : 'reconnecting' }, h('span', { class: `status-dot ${S.connected ? 'on' : ''}` }), S.connected ? 'LIVE' : 'OFFLINE'),
-  ].filter(Boolean));
+  ].flat(Infinity).filter(Boolean));
   const tb = $('btn-toggle');
-  tb.textContent = open ? '⏸ Halt' : '▶ Open desk';
+  tb.textContent = open ? '⏸ Pause' : '▶ Open desk';
   tb.className = `btn ${open ? '' : 'go'}`;
+  tb.disabled = !S.connected || !!S.loadError;
+  const banner = $('health-banner');
+  const held = (S.meta.providers || []).filter((p) => p.available && !p.ready);
+  const switching = Object.values(S.meta.routing || {}).some((r) => r.fallback);
+  const badSources = (S.meta.watch?.sources || []).filter((s) => !s.ok || s.stale);
+  const message = S.loadError ? `Unable to load desk: ${S.loadError}` : !S.connected ? 'Reconnecting to the desk. Updates will resume automatically.'
+    : S.meta.preview ? 'Isolated local preview: execution seats are disabled. The live desk runs on port 8790.'
+    : held.length ? `${held.map((p) => `${p.label}: ${p.reason}`).join(' · ')}. ${switching ? 'Available seats will continue on the fallback provider.' : 'Work waits until a provider is available.'}`
+    : badSources.length ? `${badSources.length} log source${badSources.length > 1 ? 's' : ''} need attention. Check Reliability for details.` : '';
+  banner.hidden = !message;
+  banner.textContent = message;
+  banner.classList.toggle('info', switching && !S.loadError);
 }
 
 // ---------------- board ----------------
@@ -257,21 +318,33 @@ function ticketCard(t) {
       worker && worker.id !== t.assignee ? avatar(worker.id) : null,
       t.assignee ? avatar(t.assignee) : null),
     showProg ? h('div', { class: 'prog', title: `${t.progress}% (agent estimate)` }, h('i', { style: `width:${t.progress || 0}%` })) : null,
-    (live && worker?.last_action) || t.progress_msg ? h('div', { class: 'prog-msg' }, live && worker?.last_action ? `▸ ${worker.last_action}` : t.progress_msg) : null,
+    (live && worker?.last_action) || t.progress_msg ? h('div', { class: 'prog-msg', title: live && worker?.last_action ? worker.last_action : t.progress_msg }, live && worker?.last_action ? `▸ ${worker.last_action}` : t.progress_msg) : null,
+    !live && S.meta.scheduler?.waiting?.find((w) => w.key === t.key) ? h('div', { class: 'queue-reason' }, S.meta.scheduler.waiting.find((w) => w.key === t.key).reason) : null,
   );
 }
 
 function renderBoard() {
   const byStatus = Object.fromEntries(COLUMNS.map((c) => [c.id, []]));
-  for (const t of S.tickets) (byStatus[t.status] || (byStatus[t.status] = [])).push(t);
-  const chips = h('div', { class: 'chips', role: 'tablist' }, COLUMNS.map((c) => h('button', {
-    class: `chip ${c.alert && byStatus[c.id].length ? 'alert' : ''}`, type: 'button', 'aria-pressed': String(S.mobileCol === c.id),
-    onclick: () => { S.mobileCol = c.id; localStorage.setItem('sd.col', c.id); render(); },
+  const query = S.search.trim().toLowerCase();
+  const tickets = S.tickets.filter((t) => (!query || `${t.key} ${t.title} ${t.description}`.toLowerCase().includes(query)) && (!S.assigneeFilter || t.assignee === S.assigneeFilter));
+  for (const t of tickets) (byStatus[t.status] || (byStatus[t.status] = [])).push(t);
+  const search = h('input', { id: 'board-search', type: 'search', placeholder: 'Search tickets…', 'aria-label': 'Search tickets', value: S.search,
+    oninput: (e) => { S.search = e.target.value; render(); } });
+  const assignees = h('select', { id: 'board-assignee', 'aria-label': 'Filter assignee', onchange: (e) => { S.assigneeFilter = e.target.value; render(); } },
+    h('option', { value: '', selected: !S.assigneeFilter }, 'All engineers'), S.agents.filter((a) => (S.meta.engineers || []).includes(a.id)).map((a) => h('option', { value: a.id, selected: S.assigneeFilter === a.id }, a.name)));
+  const toolbar = h('div', { class: 'board-toolbar' }, search, assignees,
+    h('button', { class: 'pill', type: 'button', 'aria-pressed': String(S.showEmpty), onclick: () => { S.showEmpty = !S.showEmpty; render(); } }, 'Show empty stages'),
+    h('button', { class: 'pill', type: 'button', 'aria-pressed': String(S.showClosed), onclick: () => { S.showClosed = !S.showClosed; S.stageFilter = 'all'; render(); } }, 'Show closed'));
+  const stages = COLUMNS.filter((c) => S.showClosed || !['done', 'wontdo'].includes(c.id));
+  const chips = h('div', { class: 'chips', 'aria-label': 'Filter stage' }, h('button', { class: 'chip', type: 'button', 'aria-pressed': String(S.stageFilter === 'all'), onclick: () => { S.stageFilter = 'all'; render(); } }, 'All active'), stages.map((c) => h('button', {
+    class: `chip ${c.alert && byStatus[c.id].length ? 'alert' : ''}`, type: 'button', 'aria-pressed': String(S.stageFilter === c.id),
+    onclick: () => { S.stageFilter = c.id; render(); },
   }, c.title, h('b', {}, byStatus[c.id].length))));
-  const cols = COLUMNS.filter((c) => c.id !== 'wontdo' || byStatus.wontdo.length).map((c) => h('section', { class: `col ${c.alert ? 'alert' : ''} ${S.mobileCol === c.id ? 'sel' : ''}` },
+  const cols = stages.filter((c) => (S.stageFilter === 'all' || S.stageFilter === c.id) && (S.showEmpty || byStatus[c.id].length || S.stageFilter === c.id)).map((c) => h('section', { class: `col ${c.alert ? 'alert' : ''} sel` },
     h('div', { class: 'col-h' }, h('h3', {}, c.title, h('small', {}, c.sub)), h('span', { class: 'count' }, byStatus[c.id].length)),
-    h('div', { class: 'col-b' }, byStatus[c.id].length ? byStatus[c.id].map(ticketCard) : h('div', { class: 'empty' }, c.id === 'triage' ? 'Nothing incoming. Tap ＋ to place an order.' : '—'))));
-  return [chips, h('div', { class: 'board' }, cols)];
+    h('div', { class: 'col-b' }, byStatus[c.id].length ? byStatus[c.id].map(ticketCard) : h('div', { class: 'empty' }, 'No tickets in this stage.'))));
+  return [h('div', { class: 'page-heading' }, h('div', {}, h('h1', {}, 'Engineering board'), h('p', {}, `${S.tickets.filter((t) => !['done', 'wontdo'].includes(t.status)).length} active tickets · ${S.agents.filter((a) => a.status === 'working').length} seats working · ${S.tickets.filter((t) => t.status === 'ready_for_human').length} ready for review`)), h('button', { class: 'btn', type: 'button', onclick: () => openTeam(false) }, 'Manage team')),
+    toolbar, chips, cols.length ? h('div', { class: 'board' }, cols) : h('div', { class: 'board-empty' }, h('h2', {}, query || S.assigneeFilter ? 'No matching tickets' : 'Your board is clear'), h('p', {}, query || S.assigneeFilter ? 'Try another search or engineer.' : 'Create a ticket to give the team work.'))];
 }
 
 // ---------------- floor (team) ----------------
@@ -362,18 +435,22 @@ function incidentCard(i) {
 
 function renderWatch() {
   const w = S.meta.watch || {};
+  const runtime = renderRuntime();
   if (!w.enabled) {
-    return h('div', { class: 'settings' }, h('div', { class: 'set', style: 'flex-direction:column;align-items:stretch' },
+    return [runtime, h('div', { class: 'settings' }, h('div', { class: 'set', style: 'flex-direction:column;align-items:stretch' },
       h('label', {}, 'The watch desk is off'),
-      h('p', {}, 'Enable "watch" in sigmadesk.config.json with a Loki, docker or file source. A deterministic watcher fingerprints errors and wakes the SRE seat only for new, recurring signatures.')));
+      h('p', {}, 'Enable "watch" in sigmadesk.config.json with a Loki, docker or file source. A deterministic watcher fingerprints errors and wakes the SRE seat only for new, recurring signatures.')))];
   }
   const groups = [['Needs attention', ['investigating', 'watching', 'paged']], ['Handed to the team', ['ticketed', 'foreign']], ['Quiet', ['muted', 'resolved']]];
   const sre = agentMap().sre;
   return [
+    runtime,
+    h('div', { class: 'section-title' }, 'Production log monitoring'),
     h('div', { class: 'watch-h' },
       sre ? h('div', { class: 'oncall' }, avatar('sre', 'lg'), h('div', {}, h('b', {}, `${sre.name} is on call`), h('div', { class: 'presence' }, h('span', { class: `pdot ${presenceOf(sre).key}` }), presenceOf(sre).text))) : null,
-      h('div', { class: 'sources' }, (w.sources || []).map((src) => h('span', { class: `src ${src.ok ? 'ok' : 'bad'}`, title: src.error || '' },
-        h('span', { class: `pdot ${src.ok ? 'working' : 'reviewing'}` }), `${src.type} · ${src.project}`, h('span', { class: 'mono' }, src.ok ? ` ${src.lines} lines · ${ago(src.lastPoll)}` : ` ${src.error}`))),
+      h('div', { class: 'sources' }, (w.sources || []).map((src) => h('span', { class: `src ${src.ok && !src.stale ? 'ok' : 'bad'}`, title: src.error || '' },
+        h('span', { class: `pdot ${src.ok && !src.stale ? 'working' : 'reviewing'}` }), `${src.type} · ${src.project}`, h('span', { class: 'mono' }, src.stale ? ' Poll overdue' : src.ok ? ` ${src.lines} lines · ${ago(src.lastPoll)}` : ` ${src.error}`))),
+        !w.sources?.length ? h('span', { class: 'src bad' }, 'No log sources configured') : null,
         h('span', { class: 'hint' }, `New signature → SRE after ${w.min_count}+ hits in ${w.window_minutes} min`))),
     groups.map(([title, sts]) => {
       const items = S.incidents.filter((i) => sts.includes(i.status));
@@ -383,13 +460,46 @@ function renderWatch() {
   ];
 }
 
+function renderRuntime() {
+  const s = S.meta.scheduler || {};
+  return [h('div', { class: 'page-heading' }, h('div', {}, h('h1', {}, 'Reliability desk'), h('p', {}, 'Provider availability, queue health and production incidents'))),
+    h('div', { class: 'row-actions' }, h('button', { class: 'btn', type: 'button', onclick: act(async () => { await api('POST', '/api/providers/refresh', {}); await loadSnapshot(); }, 'provider usage refreshed') }, 'Refresh provider usage')),
+    h('div', { class: 'runtime-grid' },
+      h('div', { class: 'runtime-card' }, h('span', { class: 'eyebrow' }, 'Scheduler'), h('h2', {}, s.paused ? 'Paused' : 'Running'), h('p', {}, s.last_tick ? `Last tick ${ago(s.last_tick)} · ${s.queued || 0} queued` : 'Waiting for the first tick'), h('p', {}, `${money(Math.max(0, s.budget_headroom || 0))} budget headroom`)),
+      (S.meta.providers || []).map((p) => h('div', { class: `runtime-card ${p.ready ? 'healthy' : 'held'}` }, h('span', { class: 'eyebrow' }, p.label), h('h2', {}, p.ready ? 'Ready' : p.available ? 'On hold' : 'Unavailable'), h('p', {}, p.reason || p.version),
+        quotaWindows(p.quota).map((w) => h('div', { class: 'usage-window' }, h('div', { class: 'usage-row' }, h('b', {}, windowLabel(w)), h('b', {}, w.resets_at && Date.parse(w.resets_at) <= Date.now() ? 'Reset passed' : `${Math.round(w.remaining_percent)}% remaining`)),
+          h('div', { class: 'usage-meter' }, h('i', { style: `width:${w.remaining_percent}%` })), h('small', {}, `${Math.round(w.used_percent)}% used${w.resets_at ? ` · resets ${new Date(w.resets_at).toLocaleString()}` : ' · reset time not reported'}`))),
+        !quotaWindows(p.quota).length ? h('p', {}, 'Usage has not been reported. Unknown does not mean zero.') : null,
+        h('small', {}, p.quota?.at ? `${p.quota.source || 'CLI report'} · ${ago(p.quota.at)}` : 'Awaiting account usage'),
+        p.id === 'codex' && S.meta.usage?.codex?.ok === false ? h('p', { class: 'warn' }, `Usage refresh failed: ${S.meta.usage.codex.error}`) : null,
+        p.retry_at ? h('p', {}, `Retry after ${new Date(p.retry_at).toLocaleString()}`) : null)),
+      h('div', { class: 'runtime-card' }, h('span', { class: 'eyebrow' }, 'Perplexity desktop'),
+        h('h2', {}, S.meta.usage?.perplexity_desktop ? `${Math.floor(S.meta.usage.perplexity_desktop.credits_remaining).toLocaleString()} credits` : 'Balance unknown'),
+        h('p', {}, 'Desktop reviews use your signed-in subscription. API credentials and API credit balance are separate.'),
+        h('small', {}, S.meta.usage?.perplexity_desktop ? `Observed snapshot · ${ago(S.meta.usage.perplexity_desktop.at)} · reset time unknown` : 'Check Usage & Billing in the Perplexity app.')),
+      ['perplexity', 'gemini', 'xai'].map((id) => h('div', { class: 'runtime-card' }, h('span', { class: 'eyebrow' }, `${id === 'xai' ? 'xAI' : id[0].toUpperCase() + id.slice(1)} API · advisory`),
+        h('h2', {}, S.meta.advisors?.api_configured?.[id] ? 'Key configured' : 'Key required'), h('p', {}, 'Remaining API balance is not reported. Bounded reviews count against the desk budget.'),
+        S.meta.advisors?.provider_errors?.[id] ? h('p', { class: 'warn' }, S.meta.advisors.provider_errors[id]) : null))),
+    h('p', { class: 'runtime-note' }, S.meta.usage?.policy || 'Automatic provider selection retains the seat role, budget and QA requirements.'),
+    h('div', { class: 'runtime-note' }, h('span', {}, `Automatic provider fallback ${S.settings.auto_fallback === 'true' ? 'enabled' : 'disabled'} · saved team preferences are retained`), h('button', { class: 'linkish', type: 'button', onclick: () => openTeam(false) }, 'Manage team')),
+    h('div', { class: 'section-title' }, 'Engineer routing'),
+    h('p', { class: 'bio' }, 'The scheduler checks provider usage, availability and budget before each job. These are the routes for the next job; running jobs retain their current model.'),
+    h('div', { class: 'routing-table' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Engineer / role', 'Preferred', 'Next job', 'Selection reason'].map((label) => h('th', { scope: 'col' }, label)))),
+      h('tbody', {}, S.agents.map((a) => { const r = S.meta.routing?.[a.id] || {}; return h('tr', {},
+        h('th', { scope: 'row' }, a.name, h('small', {}, a.role)), h('td', {}, `${a.engine} · ${a.model || 'account default'}`),
+        h('td', {}, r.engine ? `${r.engine} · ${r.model || 'account default'}` : 'Waiting', h('small', {}, r.engine ? `${r.tier || 'strong'} tier · ${r.effort || 'default'} effort` : '')),
+        h('td', {}, r.fallback ? `Fallback: ${r.reason}` : r.reason || 'Saved team preference')); })))),
+    s.last_error ? h('div', { class: 'runtime-note warn' }, `Last scheduler error: ${s.last_error.seat} · ${s.last_error.message} · ${ago(s.last_error.at)}`) : null];
+}
+
 // ---------------- settings / limits ----------------
 function setRow(label, help, control) { return h('div', { class: 'set' }, h('div', {}, h('label', {}, label), h('p', {}, help)), control); }
 function numSetting(key, step = 1) {
-  return h('input', { type: 'number', min: '0', step: String(step), value: S.settings[key], onchange: act((e) => api('POST', '/api/settings', { key, value: e.target.value }), 'saved') });
+  return h('input', { type: 'number', 'aria-label': key.replaceAll('_', ' '), min: key === 'daily_budget_usd' ? '0' : '1', step: String(step), value: S.settings[key], onchange: act((e) => api('POST', '/api/settings', { key, value: e.target.value }), 'saved') });
 }
 function boolSetting(key) {
-  const el = h('input', { type: 'checkbox', class: 'switch', onchange: act((e) => api('POST', '/api/settings', { key, value: String(e.target.checked) }), 'saved') });
+  const el = h('input', { type: 'checkbox', class: 'switch', 'aria-label': key.replaceAll('_', ' '), onchange: act((e) => api('POST', '/api/settings', { key, value: String(e.target.checked) }), 'saved') });
   el.checked = S.settings[key] === 'true';
   return el;
 }
@@ -404,8 +514,18 @@ function renderSettings() {
       h('div', { class: 'row-actions' }, h('span', { style: 'flex:1;color:var(--muted);font-size:12px' }, S.settings.team_confirmed === 'true' ? 'Each seat runs on its own engine, model and effort.' : 'Not confirmed yet — the desk asks before it first opens.'),
         h('button', { class: 'btn', type: 'button', onclick: () => openTeam(false) }, 'Edit team'))),
     h('div', { class: 'section-title' }, 'Risk limits'),
+    setRow('Automatic provider fallback', 'When credits run low or a provider is unavailable, seats use the other installed provider. Daily budget, concurrency and review gates still apply.', boolSetting('auto_fallback')),
     setRow('Max concurrent seats', 'How many agents may run at once (a busy window in the config can lower this).', numSetting('max_concurrent')),
     setRow('Daily risk limit (USD)', 'Notional model spend per day. Each running seat reserves its per-run cap.', numSetting('daily_budget_usd', 5)),
+    h('div', { class: 'section-title' }, 'Architecture Review Board'),
+    h('p', { class: 'bio' }, 'On-demand specialist reviewers challenge an RFC. The design owner records the decision in an ADR; engineers implement it and QA verifies it.'),
+    h('div', { class: 'advisor-grid' }, (S.meta.advisors?.roster || []).map((a) => h('div', { class: 'advisor-card' },
+      h('b', {}, `${a.name} · ${a.role}`), h('span', { class: 'tag' }, S.meta.advisors.models.find((m) => m.id === a.model)?.label || a.model),
+      h('p', {}, a.charter), h('small', {}, a.api_configured ? 'API credentials configured · authentication checked on use' : 'Use Perplexity desktop · API credentials needed for unattended reviews')))),
+    h('p', { class: 'bio' }, S.meta.advisors?.note || 'Open a ticket to create an architecture review brief.'),
+    h('div', { class: 'section-title' }, 'Background operation'),
+    h('div', { class: 'set' }, h('div', {}, h('label', {}, 'Works while the screen is locked'), h('p', {}, S.meta.background?.desktop_reviews || 'CLI engineers and the watcher run independently of desktop controls.'),
+      h('p', {}, S.meta.background?.idle_sleep_inhibited ? 'Idle system sleep is inhibited while the desk is running.' : 'The computer must remain awake for background work.'), h('small', {}, S.meta.background?.limits || ''))),
     h('div', { class: 'section-title' }, 'Product research'),
     setRow('PM research enabled', 'The Principal PM proposes features on a cadence while the funnel is thin.', boolSetting('pm_enabled')),
     setRow('Research cadence (minutes)', 'Minimum gap between PM research sessions.', numSetting('pm_interval_min', 30)),
@@ -420,20 +540,78 @@ function renderSettings() {
 }
 
 // ---------------- sheets ----------------
+async function openArchitecture(key) {
+  const sh = { type: 'architecture', key, review: null, imported: '', draft: { reviewer: 'perplexity/kimi-k3', challenger: 'xai/grok-4.7', question: '' } };
+  S.sheet = sh;
+  renderSheet();
+  try {
+    sh.models = await api('GET', '/api/advisors');
+    if (S.sheet === sh) renderSheet();
+  } catch (e) { toast(e.message, true); }
+}
+
+function renderArchitectureSheet() {
+  const sh = S.sheet;
+  if (sh?.type !== 'architecture') return;
+  const r = sh.review, d = sh.models || S.meta.advisors;
+  const head = [h('div', { class: 'row' }, h('h2', {}, `Architecture review · ${sh.key}`), h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')),
+    h('p', { class: 'bio' }, 'Request an independent design review and a challenge from a different model family. Record the resulting decision in an ADR before implementation.')];
+  if (!d?.models) return sheetShell(head, h('p', {}, 'Loading specialist models…'));
+  const select = (field, label, optional = false) => h('div', { class: 'field' }, h('label', { for: `review-${field}` }, label),
+    h('select', { id: `review-${field}`, 'aria-label': label, onchange: (e) => { sh.draft[field] = e.target.value; if (field === 'reviewer' && $('review-fit')) $('review-fit').textContent = d.models.find((m) => m.id === e.target.value)?.fit || ''; } },
+      optional ? h('option', { value: '', selected: !sh.draft[field] }, 'Single reviewer') : null,
+      d.models.map((m) => h('option', { value: m.id, selected: m.id === sh.draft[field] }, `${m.label} · ${m.api_configured ? 'API configured' : m.desktop_verified ? 'desktop verified' : 'API key needed'}`))));
+  const refresh = async () => { if (!r) return; const next = await api('GET', `/api/architecture-reviews/${r.id}`); if (S.sheet === sh) { sh.review = next; renderSheet(); } };
+  const modelName = (id) => d.models.find((m) => m.id === id)?.label || id;
+  const body = r ? [
+    h('div', { class: 'review-status' }, h('b', {}, `${modelName(r.reviewer)}${r.challenger ? ` → ${modelName(r.challenger)}` : ''}`), h('span', { class: 'tag' }, r.status.replaceAll('_', ' '))),
+    r.error ? h('p', { class: 'warn' }, r.error) : null,
+    r.result ? h('pre', { class: 'review-text' }, r.result) : null,
+    h('details', {}, h('summary', {}, 'Review brief'), h('pre', { class: 'review-text' }, r.brief)),
+    r.status === 'awaiting_result' ? [
+      h('p', { class: 'bio' }, 'Perplexity desktop: click the model pill below the composer to switch models. Paste this brief. To debate, switch to the challenger and ask it to critique the first response. Paste the final report below.'),
+      h('div', { class: 'row-actions' },
+        h('button', { class: 'btn', type: 'button', onclick: act(() => navigator.clipboard.writeText(r.brief), 'brief copied') }, 'Copy brief for Perplexity'),
+        h('button', { class: 'btn primary', type: 'button', disabled: S.settings.paused === 'true' || [r.reviewer, r.challenger].filter(Boolean).some((id) => !d.models.find((m) => m.id === id)?.api_configured), onclick: act(async () => {
+          await api('POST', `/api/architecture-reviews/${r.id}/run`, {}); await refresh();
+        }, 'API review started') }, 'Run via API')),
+      h('small', {}, `API reviews reserve ${money((r.challenger ? 2 : 1) * d.reserve_per_model_usd)} from the daily risk limit. ${S.settings.paused === 'true' ? 'Open the desk to enable API execution.' : 'Configured keys are checked on use.'}`),
+      (() => { const input = h('textarea', { 'aria-label': 'Peer review result', placeholder: 'Paste the review and independent challenge…', rows: '6', oninput: (e) => { sh.imported = e.target.value; } }); input.value = sh.imported; return input; })(),
+      h('button', { class: 'btn', type: 'button', onclick: act(async () => { sh.review = await api('POST', `/api/architecture-reviews/${r.id}/import`, { result: sh.imported }); renderSheet(); }, 'peer review attached to ticket') }, 'Attach desktop review'),
+    ] : null,
+    h('div', { class: 'row-actions' }, h('button', { class: 'btn', type: 'button', onclick: act(refresh) }, 'Refresh status'),
+      r.status !== 'running' ? h('button', { class: 'btn', type: 'button', onclick: () => { sh.review = null; sh.imported = ''; renderSheet(); } }, 'New review') : null,
+      h('button', { class: 'btn', type: 'button', onclick: () => openTicket(sh.key) }, 'Back to ticket')),
+  ] : [select('reviewer', 'Design reviewer'), select('challenger', 'Independent challenger', true),
+    h('p', { class: 'bio', id: 'review-fit' }, d.models.find((m) => m.id === sh.draft.reviewer)?.fit || 'Choose a specialist for this question.'),
+    (() => { const q = h('textarea', { 'aria-label': 'Review question', placeholder: 'What assumptions or tradeoffs should the reviewers challenge?', rows: '4', oninput: (e) => { sh.draft.question = e.target.value; } }); q.value = sh.draft.question; return q; })(),
+    h('div', { class: 'row-actions' }, h('button', { class: 'btn primary', type: 'button', onclick: act(async () => { sh.review = await api('POST', `/api/tickets/${sh.key}/architecture-reviews`, sh.draft); renderSheet(); }, 'review brief created') }, 'Create review brief'),
+      h('button', { class: 'btn', type: 'button', onclick: () => openTicket(sh.key) }, 'Back to ticket')),
+    (d.reviews || []).filter((x) => x.ticket_key === sh.key).length ? h('div', { class: 'mini-list' }, d.reviews.filter((x) => x.ticket_key === sh.key).map((x) => h('button', { class: 'mini-t', type: 'button', onclick: act(async () => { sh.review = await api('GET', `/api/architecture-reviews/${x.id}`); renderSheet(); }) }, `Review #${x.id} · ${modelName(x.reviewer)} · ${x.status}`))) : null,
+  ];
+  sheetShell(head, body);
+}
+
+let returnFocus = null;
 function closeSheet() {
   S.sheet = null;
   $('sheet').hidden = true;
   $('sheet').replaceChildren();
+  document.body.classList.remove('dialog-open');
+  returnFocus?.focus();
+  returnFocus = null;
   history.replaceState(null, '', location.pathname);
 }
 
 async function openTicket(key) {
-  S.sheet = { type: 'ticket', key, detail: null };
+  const sh = { type: 'ticket', key, detail: null, reply: '' };
+  S.sheet = sh;
   history.replaceState(null, '', `#${key}`);
   renderSheet();
   try {
-    S.sheet.detail = await api('GET', `/api/tickets/${key}`);
-  } catch (e) { toast(e.message, true); }
+    const detail = await api('GET', `/api/tickets/${key}`);
+    if (S.sheet === sh) sh.detail = detail;
+  } catch (e) { if (S.sheet === sh) sh.error = e.message; toast(e.message, true); }
   if (S.sheet?.key === key) renderSheet();
 }
 
@@ -443,14 +621,27 @@ async function openSeat(id) {
   loadSeat(id);
 }
 
-function sheetShell(head, body) {
-  const panel = h('div', { class: 'sheet-panel', role: 'dialog', 'aria-modal': 'true' }, h('div', { class: 'sheet-h' }, head), h('div', { class: 'sheet-b' }, body));
+function sheetShell(head, body, footer = null) {
+  const panel = h('div', { class: 'sheet-panel', role: 'dialog', 'aria-modal': 'true' }, h('div', { class: 'sheet-h' }, head), h('div', { class: 'sheet-b' }, body), footer);
   const sheet = $('sheet');
+  const firstOpen = sheet.hidden;
+  const focusedId = sheet.contains(document.activeElement) ? document.activeElement.id : null;
+  const focusedSelection = focusedId ? document.activeElement.selectionStart : null;
+  if (firstOpen) returnFocus = document.activeElement;
+  const opened = [...sheet.querySelectorAll('details')].map((d) => d.open);
   const prevScroll = sheet.querySelector('.sheet-b')?.scrollTop;
   const logEl = sheet.querySelector('.log');
   const atBottom = !logEl || logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
   sheet.replaceChildren(panel);
   sheet.hidden = false;
+  document.body.classList.add('dialog-open');
+  panel.setAttribute('aria-label', panel.querySelector('h2')?.textContent || 'Ticket details');
+  [...panel.querySelectorAll('details')].forEach((d, i) => { if (i < opened.length) d.open = opened[i]; });
+  if (firstOpen) panel.querySelector('button, input, textarea, select')?.focus();
+  else if (focusedId) {
+    const next = $(focusedId); next?.focus();
+    if (focusedSelection != null && next?.setSelectionRange && ['text', 'search', 'textarea'].includes(next.type)) next.setSelectionRange(focusedSelection, focusedSelection);
+  }
   sheet.onclick = (e) => { if (e.target === sheet) closeSheet(); };
   if (prevScroll) panel.querySelector('.sheet-b').scrollTop = prevScroll;
   const newLog = panel.querySelector('.log');
@@ -506,9 +697,10 @@ function renderSheet() {
   if (!sh) return;
   if (sh.type === 'new') return renderNewSheet();
   if (sh.type === 'team') return renderTeamSheet();
+  if (sh.type === 'architecture') return renderArchitectureSheet();
   if (sh.type === 'seat') return renderSeatSheet();
   const t = S.tickets.find((x) => x.key === sh.key) || sh.detail?.ticket;
-  if (!t) return sheetShell(h('div', {}, 'Loading…'), null);
+  if (!t) return sheetShell([h('h2', {}, sh.error || 'Loading ticket…'), h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')], null);
   const d = sh.detail;
   const amap = agentMap();
   const worker = S.agents.find((a) => a.current_ticket === t.key && a.status === 'working');
@@ -526,9 +718,38 @@ function renderSheet() {
     t.progress_msg ? h('div', { class: 'prog-msg' }, `${t.progress}% · ${t.progress_msg}`) : null,
   ];
 
-  const reply = h('textarea', { placeholder: t.status === 'needs_human' ? 'Answer — the ticket resumes automatically' : 'Message the team as the owner…', rows: '2' });
-  const send = act(async () => { if (!reply.value.trim()) return; await api('POST', `/api/tickets/${t.key}/reply`, { body: reply.value }); reply.value = ''; openTicket(t.key); }, 'sent');
+  const reply = h('textarea', { id: 'ticket-reply', 'aria-label': 'Reply to ticket', placeholder: 'Message or requested corrections…', rows: '2', oninput: (e) => { sh.reply = e.target.value; } });
+  reply.value = sh.reply || '';
+  const destination = h('select', { id: 'message-mode', 'aria-label': 'Message destination', onchange: (e) => { sh.messageMode = e.target.value; } },
+    [['auto', 'Auto route'], ['discussion', 'Discuss with manager'], ['answer', 'Answer and continue'], ['comment', 'Comment only']].map(([value, label]) => h('option', { value, selected: (sh.messageMode || 'auto') === value }, label)));
+  const send = act(async () => { if (!reply.value.trim()) return false; const result = await api('POST', `/api/tickets/${t.key}/reply`, { body: reply.value, mode: sh.messageMode || 'auto' });
+    sh.reply = ''; toast(result.message_route === 'discussion' ? 'Routed to manager · ticket blocker preserved' : result.message_route === 'comment' ? 'Comment saved' : 'Answer received · task can continue'); if (S.sheet === sh) openTicket(t.key); });
+  const decide = (decision) => act(async () => {
+    await api('POST', `/api/tickets/${t.key}/decision`, { decision, message: reply.value, expected_updated_at: t.updated_at, discussion_id: decisionTarget === 'ticket' ? undefined : Number(decisionTarget) });
+    sh.reply = ''; if (S.sheet === sh) openTicket(t.key);
+  }, decision === 'approve' ? 'Approved' : decision === 'correction' ? 'Corrections sent' : 'Rejected · local work retained');
+  const taskDecision = ['needs_human', 'ready_for_human'].includes(t.status);
+  const proposals = (d?.discussions || []).filter((x) => x.status === 'complete');
+  const options = [...(taskDecision ? [['ticket', 'Current task']] : []), ...proposals.map((x) => [String(x.id), `Design proposal #${x.id}`])];
+  const decisionTarget = options.find(([id]) => id === sh.decisionTarget)?.[0] || (taskDecision ? 'ticket' : proposals[0] ? String(proposals[0].id) : 'ticket');
+  sh.decisionTarget = decisionTarget; // Streamed status changes must not silently switch an in-progress decision.
+  const designDecision = decisionTarget !== 'ticket';
+  const needsDecision = taskDecision || proposals.length;
+  const targetSelect = options.length > 1 ? h('select', { id: 'decision-target', 'aria-label': 'Decision applies to', onchange: (e) => { sh.decisionTarget = e.target.value; renderSheet(); } }, options.map(([value, label]) => h('option', { value, selected: value === decisionTarget }, label))) : null;
+  const question = /publish guard/.test(t.progress_msg || '') ? t.progress_msg : d?.comments?.filter((c) => c.body.startsWith('❓')).at(-1)?.body.replace(/^❓\s*\*\*Question for the owner:\*\*\s*/, '');
+  const decisionCard = needsDecision ? h('div', { class: 'decision-card' }, h('div', { class: 'row' }, h('b', {}, targetSelect ? 'Your decision' : designDecision ? `Design proposal #${decisionTarget}` : t.status === 'needs_human' ? 'Your decision is needed' : 'Ready for your review'), targetSelect),
+      h('p', {}, designDecision ? 'Review the recommendation above. Approval records the design; corrections return it to the manager.' : t.status === 'needs_human' ? question || t.progress_msg || 'The engineer is waiting for your direction.' : t.pr_url ? 'Approval records your review. Open the draft PR for the final merge, or request changes below.' : 'Approve draft publication or request changes. You control the final merge.'),
+      !designDecision && /publish guard/.test(t.progress_msg || '') ? h('p', { class: 'warn' }, 'Approval pushes the guarded commit and opens a draft PR. Review its diff first.') : null,
+      h('small', {}, designDecision ? 'Task decisions and merges stay separate.' : 'Corrections need a message. Rejection retains local work.'),
+      reply,
+      h('div', { class: 'row-actions' }, h('button', { class: 'btn primary', type: 'button', disabled: !designDecision && !!t.active_run, onclick: decide('approve') }, !designDecision && /publish guard/.test(t.progress_msg || '') ? 'Approve publish' : 'Approve'),
+        h('button', { class: 'btn', type: 'button', disabled: !designDecision && !!t.active_run, onclick: decide('correction') }, 'Needs correction'),
+        h('button', { class: 'btn danger', type: 'button', disabled: !designDecision && !!t.active_run, onclick: decide('reject') }, 'Reject'),
+        !designDecision && t.pr_url ? h('a', { class: 'btn', href: t.pr_url, target: '_blank', rel: 'noopener' }, 'Review draft PR') : null)) : null;
   const body = [
+    h('div', { class: 'row-actions' }, h('button', { class: 'btn', type: 'button', onclick: () => openArchitecture(t.key) }, 'Architecture review'),
+      h('small', { class: 'muted' }, `${d?.reviews?.length || 0} peer reviews · advisory findings require design-owner synthesis`)),
+    h('details', { class: 'ticket-description' }, h('summary', {}, 'Task brief and acceptance criteria'), h('div', { class: 'desc' }, t.description || 'No description provided.')),
     h('details', { class: 'meta' }, h('summary', {}, 'Details', h('span', { class: 'meta-s' }, `${t.area || '—'} · ${t.complexity || '—'} · ${t.assignee ? amap[t.assignee]?.name : 'unassigned'}${t.issue_number ? ` · #${t.issue_number}` : ''}`)),
       h('div', { class: 'kv' },
         h('div', {}, h('span', {}, 'Status'), sel('status', 'status', COLUMNS.map((c) => [c.id, c.title]), t.status, 'moved')),
@@ -545,22 +766,19 @@ function renderSheet() {
         return kids.length ? h('div', { class: 'mini-list' }, kids.map((k) => h('button', { class: 'mini-t', type: 'button', onclick: () => openTicket(k.key) },
           h('span', { class: 'mono' }, k.key), avatar(k.assignee), h('span', { class: 'tag' }, STATUS_LABEL[k.status] || k.status), h('span', { class: 'tt' }, `${k.complexity || ''} · ${k.title}`)))) : null;
       })(),
-      h('div', { class: 'desc' }, t.description || '—'),
       run ? h('div', { class: 'row-actions' }, h('span', { style: 'flex:1;color:var(--muted);font-size:12px' }, `run #${run.id} · ${run.kind} · ${run.model}`),
         h('button', { class: 'btn small danger', type: 'button', onclick: act(() => api('POST', `/api/runs/${run.id}/kill`, {}), 'stopping run') }, 'Stop run')) : null),
-    t.status === 'needs_human' && /publish guard/.test(t.progress_msg || '') ? h('div', { class: 'ask' }, h('b', {}, '🛑 Publish guard'),
-      h('div', { class: 'msg-t' }, 'This branch touches protected paths (CI, containers, hooks, lockfiles…) or is unusually large, so it was not pushed. Review the clone locally, then approve if it is safe.'),
-      h('div', { class: 'row-actions' }, h('button', { class: 'btn danger', type: 'button', onclick: act(async (e) => {
-        if (!confirm(`Push ${t.key} and open a draft PR even though the publish guard stopped it?`)) return;
-        e.target.disabled = true;
-        await api('POST', `/api/tickets/${t.key}/approve-publish`, {});
-      }, 'publishing') }, 'Approve publish'))) : null,
+    d?.discussions?.length ? h('div', { class: 'discussion-status' }, d.discussions.slice(0, 3).map((x) => h('p', {}, `Design discussion #${x.id} · ${{ queued: 'Waiting for manager', running: 'Manager reviewing', complete: 'Awaiting your design decision', approved: 'Design approved', rejected: 'Proposal rejected', changes_requested: 'Corrections sent to manager', failed: 'Failed' }[x.status] || x.status}${x.error ? ` · ${x.error}` : ''}`))) : null,
+    designDecision ? h('details', { class: 'ticket-description' }, h('summary', {}, `Read design recommendation #${decisionTarget}`),
+      h('div', { class: 'desc' }, proposals.find((x) => String(x.id) === decisionTarget)?.response || 'Loading recommendation…')) : null,
     d ? h('div', { class: 'thread' }, threadItems(d).map(bubble)) : h('div', { class: 'empty' }, 'Loading…'),
     worker ? h('div', { class: 'msg typing-row' }, avatar(worker.id, 'md'), h('div', { class: 'msg-b' }, h('div', { class: 'msg-t dots' }, h('i'), h('i'), h('i'),
       h('span', {}, worker.last_action ? ` ${worker.last_action}` : '')))) : null,
-    h('div', { class: 'composer' }, reply, h('button', { class: 'btn primary', type: 'button', onclick: send }, t.status === 'needs_human' ? 'Answer' : 'Send')),
   ];
-  sheetShell(head, body);
+  const footer = h('div', { class: 'ticket-footer' }, decisionCard || h('div', { class: 'composer' }, reply),
+    h('div', { class: 'message-actions' }, destination, h('button', { class: 'btn', type: 'button', onclick: send }, 'Send message')),
+    h('small', { class: 'composer-help' }, 'Discussion → manager · Answer → task · Comment → thread'));
+  sheetShell(head, body, footer);
 }
 
 async function loadSeat(id) {
@@ -609,22 +827,25 @@ function renderSeatSheet() {
 }
 
 function renderNewSheet() {
-  const title = h('input', { type: 'text', placeholder: 'What do you need?', maxlength: '200', required: true });
-  const desc = h('textarea', { placeholder: 'Context, links, acceptance criteria. Support triages it and routes it to product, engineering, or back to you.', rows: '8' });
-  const type = h('select', {}, ['feature', 'bug', 'task', 'research'].map((v) => h('option', { value: v }, v)));
-  const pri = h('select', {}, ['P2', 'P1', 'P0', 'P3'].map((v) => h('option', { value: v }, v)));
+  const draft = S.sheet.draft ||= { title: '', description: '', type: 'feature', priority: 'P2' };
+  const update = (field) => (e) => { draft[field] = e.target.value; };
+  const title = h('input', { id: 'new-title', 'aria-label': 'Title', type: 'text', value: draft.title, oninput: update('title'), placeholder: 'What do you need?', maxlength: '200', required: true });
+  const desc = h('textarea', { id: 'new-description', 'aria-label': 'Description', oninput: update('description'), placeholder: 'Context, links, acceptance criteria. Support triages and routes the ticket.', rows: '8' });
+  desc.value = draft.description;
+  const type = h('select', { 'aria-label': 'Ticket type', onchange: update('type') }, ['feature', 'bug', 'task', 'research'].map((v) => h('option', { value: v, selected: v === draft.type }, v)));
+  const pri = h('select', { 'aria-label': 'Ticket priority', onchange: update('priority') }, ['P2', 'P1', 'P0', 'P3'].map((v) => h('option', { value: v, selected: v === draft.priority }, v)));
   sheetShell([
-    h('div', { class: 'row' }, h('h2', {}, 'New order'), h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')),
+    h('div', { class: 'row' }, h('h2', {}, 'New ticket'), h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')),
   ], [
-    h('div', { class: 'field' }, h('label', {}, 'Title'), title),
-    h('div', { class: 'field' }, h('label', {}, 'Description'), desc),
+    h('div', { class: 'field' }, h('label', { for: 'new-title' }, 'Title'), title),
+    h('div', { class: 'field' }, h('label', { for: 'new-description' }, 'Description'), desc),
     h('div', { class: 'kv' }, h('div', {}, h('span', {}, 'Type'), type), h('div', {}, h('span', {}, 'Priority'), pri)),
     h('div', { class: 'row-actions' }, h('button', { class: 'btn primary', type: 'button', onclick: act(async () => {
       if (!title.value.trim()) throw new Error('title required');
       const t = await api('POST', '/api/tickets', { title: title.value, description: desc.value, type: type.value, priority: pri.value });
       closeSheet();
       openTicket(t.key);
-    }, 'order placed — support will triage it') }, 'Place order')),
+    }, 'ticket created — support will triage it') }, 'Create ticket')),
   ]);
   setTimeout(() => title.focus(), 50);
 }
@@ -634,6 +855,8 @@ function render() {
   renderTop();
   for (const b of document.querySelectorAll('#tabs button')) b.setAttribute('aria-current', b.dataset.view === S.view ? 'page' : 'false');
   const view = $('view');
+  const activeId = document.activeElement?.id;
+  const selection = document.activeElement?.selectionStart;
   const keepX = view.querySelector('.board')?.scrollLeft;
   const content = S.view === 'board' ? renderBoard() : S.view === 'desk' ? renderFloor() : S.view === 'tape' ? renderTape() : S.view === 'watch' ? renderWatch() : renderSettings();
   const hot = S.incidents.filter((i) => ['investigating', 'paged'].includes(i.status) || (i.status === 'watching' && (i.window_count || 0) >= (S.meta.watch?.min_count || 3))).length;
@@ -644,10 +867,15 @@ function render() {
   if (!(S.view === 'settings' && view.contains(document.activeElement) && view.dataset.view === 'settings')) {
     view.replaceChildren(...[content].flat(Infinity).filter(Boolean));
     view.dataset.view = S.view;
+    if (activeId?.startsWith('board-')) {
+      const next = $(activeId);
+      next?.focus();
+      if (next?.type === 'search' && selection != null) next.setSelectionRange(selection, selection);
+    }
   }
   if (keepX) { const b = view.querySelector('.board'); if (b) b.scrollLeft = keepX; }
   const sheetBusy = $('sheet').contains(document.activeElement) && ['TEXTAREA', 'INPUT', 'SELECT'].includes(document.activeElement.tagName);
-  if (S.sheet && !sheetBusy && !['new', 'team'].includes(S.sheet.type)) renderSheet();
+  if (S.sheet && !sheetBusy && !['new', 'team', 'architecture'].includes(S.sheet.type)) renderSheet();
   lastSeenEvent = S.events.length ? S.events[S.events.length - 1].id : lastSeenEvent;
 }
 
@@ -668,10 +896,19 @@ $('btn-breaker').addEventListener('click', act(async () => {
   await api('POST', '/api/control/stop-all', {});
 }, 'breaker tripped'));
 $('btn-new').addEventListener('click', () => { S.sheet = { type: 'new' }; renderSheet(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.sheet) closeSheet(); });
+document.addEventListener('keydown', (e) => {
+  if (!S.sheet) return;
+  if (e.key === 'Escape') closeSheet();
+  if (e.key === 'Tab') {
+    const focusable = [...$('sheet').querySelectorAll('button:not(:disabled), input:not(:disabled), textarea, select, a[href], summary')].filter((el) => el.getClientRects().length);
+    const first = focusable[0], last = focusable.at(-1);
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
+  }
+});
 // Phones suspend tabs: on return, re-sync from a fresh snapshot instead of trusting a stale stream.
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { connect(); } });
-setInterval(() => { if (S.view === 'desk') schedule(); }, 15_000); // keep "x ago" labels fresh
+setInterval(() => { if (document.visibilityState === 'visible' && S.connected) loadSnapshot().catch(() => {}); }, 15_000);
 
 connect();
 if (location.hash.length > 1) openTicket(location.hash.slice(1));

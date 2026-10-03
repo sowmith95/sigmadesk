@@ -8,7 +8,8 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/server.js",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
-    "doctor": "node --disable-warning=ExperimentalWarning src/doctor.js"
+    "doctor": "node --disable-warning=ExperimentalWarning src/doctor.js",
+    "preview": "node --disable-warning=ExperimentalWarning scripts/local-preview.mjs"
   },
   "engines": { "node": ">=22.13" },
   "keywords": ["ai-agents", "claude-code", "multi-agent", "kanban", "jira", "devops", "sre", "github"]

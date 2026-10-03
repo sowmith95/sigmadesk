@@ -8,6 +8,7 @@ import { config } from './config.js';
 import { agentById, charterFor, permissionsFor, promptFor, DENY_RULES } from './team.js';
 import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
+import { selectionFor, classifyProviderFailure, holdProvider } from './dispatch.js';
 import * as store from './db.js';
 
 const pexec = promisify(execFile);
@@ -55,7 +56,7 @@ export function applyEvents(events, ctx) {
         store.logEvent({ ...base, kind: 'plan', text: todos.map((t) => `${t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '▸' : '·'} ${t.text}`).join('\n') });
         break;
       }
-      case 'error': store.logEvent({ ...base, kind: 'error', text: short(e.text, 300) }); break;
+      case 'error': ctx.state.lastError = e.text; store.logEvent({ ...base, kind: 'error', text: short(e.text, 300) }); break;
       case 'wait': store.logEvent({ ...base, kind: 'system', text: e.text }); break;
       case 'cmd-start': {
         const ev = evidence.get(run.id) || { pending: new Map(), done: [] };
@@ -72,13 +73,15 @@ export function applyEvents(events, ctx) {
       case 'quota': {
         const w = e.info.unifiedWindows || {};
         const q = { engine: e.engine, status: e.info.status, five_hour: w.five_hour?.utilization ?? null, seven_day: w.seven_day?.utilization ?? null,
-          resets_at: e.info.resetsAt ? new Date(e.info.resetsAt * 1000).toISOString() : null, at: store.now() };
+          resets_at: e.info.resetsAt ? new Date(e.info.resetsAt * 1000).toISOString() : null,
+          five_hour_resets_at: w.five_hour?.resetsAt ? new Date(w.five_hour.resetsAt * 1000).toISOString() : null,
+          seven_day_resets_at: w.seven_day?.resetsAt ? new Date(w.seven_day.resetsAt * 1000).toISOString() : null, at: store.now() };
         store.kvSet(`quota:${e.engine}`, JSON.stringify(q));
         store.bus.emit('msg', { type: 'quota', data: q });
         if (q.status && q.status !== 'allowed') store.logEvent({ ...base, kind: 'system', text: `plan limit: ${q.status} until ${q.resets_at || '?'}` });
         break;
       }
-      case 'result': ctx.result = { is_error: !e.ok, subtype: e.subtype, total_cost_usd: e.costUsd || 0, num_turns: e.turns ?? null, result: e.text || ctx.state.lastSay || '', usage: e.usage }; break;
+      case 'result': ctx.result = { is_error: !e.ok, subtype: e.subtype, total_cost_usd: e.costUsd || 0, cost_known: e.costKnown !== false, num_turns: e.turns ?? null, result: e.text || ctx.state.lastSay || '', usage: e.usage }; break;
       default: break;
     }
   }
@@ -167,9 +170,10 @@ export function ensureWorkspace(ticket) {
 
 // Shared scratch clone for read-only seats (PM research, grooming, consults, triage), reset to the base
 // branch before each use, so nothing ever runs with the owner's real checkout as a writable cwd.
-export function ensureReadonlyWorkspace() {
+export function ensureReadonlyWorkspace(seatId = 'scratch') {
   return withGitLock(async () => {
-    const dir = path.join(config.workspaceRoot, '_desk');
+    if (!/^[a-z0-9-]+$/.test(seatId)) throw new Error('invalid scratch seat');
+    const dir = path.join(config.workspaceRoot, `_desk-${seatId}`);
     const base = config.project.baseBranch;
     if (!fs.existsSync(path.join(dir, '.git'))) {
       fs.mkdirSync(config.workspaceRoot, { recursive: true });
@@ -252,14 +256,20 @@ export function sessionFile(cwd, sessionId) {
 }
 export function canResume(run, maxAgeHours) {
   if (!run?.session_id || !run.cwd) return false;
+  const seat = selectionFor(run.agent_id).seat;
+  const [provider, ...modelParts] = String(run.model || '').split(':');
+  if (!seat || provider !== engineOf(seat).id || modelParts.join(':') !== (seat.model || 'default')) return false;
+  if (run.provenance && run.provenance !== provenanceOf(seat, run.kind)) return false;
   const ended = Date.parse(run.ended_at || run.started_at);
-  return Date.now() - ended < maxAgeHours * 3600_000 && fs.existsSync(sessionFile(run.cwd, run.session_id)) && fs.existsSync(run.cwd);
+  const transcript = provider === 'codex' || fs.existsSync(sessionFile(run.cwd, run.session_id));
+  return Date.now() - ended < maxAgeHours * 3600_000 && transcript && fs.existsSync(run.cwd);
 }
 
 export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketPath = config.socketPath) {
   const deny = [...config.sandbox.denyRead,
     // desk state: run tokens, verdict codes, config, private notes, and every seat's session transcript
     path.join(config.root, 'data'), config.configFile, path.join(config.root, 'local'), '~/.claude', '~/.codex'];
+  if (config.advisors.keyFile) deny.push(config.advisors.keyFile);
   if (config.project.repoPath) deny.push(path.join(config.project.repoPath, '.env'));
   const asRule = (p) => (p.startsWith('~') ? p : `/${p}`);
   return {
@@ -281,11 +291,12 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
   };
 }
 
-function childEnv(token) {
+function childEnv(token, engine) {
   const env = { ...process.env, ...config.project.env };
   for (const k of Object.keys(env)) if (k === 'CLAUDECODE' || k.startsWith('CLAUDE_CODE_')) delete env[k];
   // Strip obvious secrets from the agent environment (keep Claude's own auth variables).
   for (const k of Object.keys(env)) if (/(_TOKEN|_SECRET|_KEY|PASSWORD|_DSN)$/i.test(k) && !/^(DESK_|ANTHROPIC_|CLAUDE_)/.test(k)) delete env[k];
+  if (engine !== 'claude') for (const k of Object.keys(env)) if (/^(ANTHROPIC_|CLAUDE_)/.test(k)) delete env[k];
   env.PATH = [path.join(config.root, 'bin'), ...String(process.env.PATH || '/usr/bin:/bin').split(':')].join(':');
   if (config.bins.agentShell && fs.existsSync(config.bins.agentShell)) env.SHELL = config.bins.agentShell;
   env.DESK_SOCKET = config.socketPath;
@@ -307,7 +318,7 @@ const engineVersions = {};
 export function provenanceOf(agent, kind) {
   const e = engineOf(agent);
   if (!(e.id in engineVersions)) engineVersions[e.id] = '';
-  const parts = [e.id, engineVersions[e.id], agent.model || 'default', agent.effort || '', charterFor(agent.id), kind];
+  const parts = ['seat-contract-v2', e.id, engineVersions[e.id], agent.model || 'default', agent.effort || '', charterFor(agent.id), kind];
   return crypto.createHash('sha1').update(parts.join('\u0000')).digest('hex').slice(0, 10);
 }
 export function setEngineVersion(id, v) { engineVersions[id] = v || ''; }
@@ -325,7 +336,7 @@ export const buildArgs = (agent, kind, cwd, opts) => buildCommand({ ...agent, en
 // ---------------- file mailbox (desk transport for engines whose sandbox blocks unix sockets) ----------------
 const mailboxes = new Map(); // runId -> dir
 function openMailbox(runId, cwd) {
-  // One subfolder per run (read-only seats share a scratch clone).
+  // One subfolder per run inside that seat's own clone.
   const dir = path.join(cwd, '.desk-mailbox', `r${runId}`);
   fs.mkdirSync(dir, { recursive: true });
   const exclude = path.join(cwd, '.git', 'info', 'exclude');
@@ -338,29 +349,47 @@ function openMailbox(runId, cwd) {
 export const openMailboxes = () => [...mailboxes.entries()];
 export const runCwd = (runId) => store.getRun(runId)?.cwd;
 
-export const runBudget = (agentId) => engineOf(agentById[agentId]).budgetUsd(agentById[agentId] || {});
+export const runBudget = (agentId) => {
+  const seat = selectionFor(agentId).seat || agentById[agentId] || {};
+  return engineOf(seat).budgetUsd(seat);
+};
+export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: String(run?.model || '').split(':')[0] }).budgetUsd({ model: String(run?.model || '').split(':').slice(1).join(':') });
 
 /**
  * Start one agent run. Resolves when the process exits with {run, result}.
  * The prompt goes over stdin so the variadic tool flags cannot swallow it.
  */
-export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null }) {
+export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null }) {
   if (fence != null && fence !== epoch) return Promise.resolve({ run: null, result: null, aborted: true });
-  const agent = agentById[agentId];
+  const selected = selectionFor(agentId);
+  if (!selected.seat) throw Object.assign(new Error(`${agentId}: ${selected.reason}`), { status: 409, providerUnavailable: true });
+  const agent = selected.seat;
   const token = crypto.randomBytes(18).toString('hex');
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId });
+  store.updateRun(run.id, { reserve_usd: engineOf(agent).budgetUsd(agent) });
   const ctx = { run, cwd, result: null, state: {} };
   if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
   store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'run',
     text: `${agent.role} started ${kind} on ${agent.engine && agent.engine !== 'claude' ? `${agent.engine}${agent.model ? `/${agent.model}` : ''}` : agent.model}${agent.effort ? ` (${agent.effort})` : ''}${resume ? ` (${fork ? 'forked from' : 'continuing'} session ${resume.slice(0, 8)})` : ''}` });
+  if (selected.fallback) store.logEvent({ ...{ run_id: run.id, agent_id: agentId, ticket_key: ticketKey }, kind: 'system',
+    text: `Automatic fallback: ${agentById[agentId].engine || 'claude'} → ${agent.engine} (${selected.reason}). Saved seat preference retained.` });
 
   const engine = engineOf(agent);
-  const sock = engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
-  const cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath });
-  const env = { ...childEnv(token), ...cmd.env };
+  let sock, cmd, env;
+  try {
+    sock = engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
+    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath });
+    env = { ...childEnv(token, engine.id), ...cmd.env };
+    if (cmd.mailbox) env.DESK_MAILBOX = openMailbox(run.id, cwd);
+  } catch (err) {
+    sock?.close();
+    mailboxes.delete(run.id);
+    store.updateRun(run.id, { status: 'error', token: null, ended_at: store.now(), result_text: `Run setup failed: ${store.redact(err.message)}` });
+    if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null });
+    throw err;
+  }
   if (sock) env.DESK_SOCKET = sock.path;
   else delete env.DESK_SOCKET;
-  if (cmd.mailbox) env.DESK_MAILBOX = openMailbox(run.id, cwd);
   const child = spawn(cmd.bin, cmd.args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
   children.set(run.id, child);
   store.updateRun(run.id, { pid: child.pid });
@@ -385,11 +414,11 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     while ((i = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, i);
       buf = buf.slice(i + 1);
-      if (line.trim()) applyEvents(engine.parse(line, cwd, ctx.state), ctx);
+      if (line.trim()) { onStreamLine?.(line); applyEvents(engine.parse(line, cwd, ctx.state), ctx); }
     }
   });
   let stderr = '';
-  child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-4000); });
+  child.stderr.on('data', (d) => { lastOutput = Date.now(); stderr = (stderr + d).slice(-4000); });
 
   const timeoutMin = config.limits.runTimeoutMin[kind] ?? 30;
   const timer = setTimeout(() => {
@@ -406,24 +435,29 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (idleTimer) clearInterval(idleTimer);
       children.delete(run.id);
       mailboxes.delete(run.id);
-      setTimeout(() => evidence.delete(run.id), 60_000);
+      setTimeout(() => evidence.delete(run.id), 60_000).unref();
       sock?.close();
       if (buf.trim()) applyEvents(engine.parse(buf, cwd, ctx.state), ctx);
       const r = ctx.result;
       const prev = store.getRun(run.id);
       const status = prev.status === 'killed' ? 'killed' : r && !r.is_error && code === 0 ? 'success' : 'error';
+      const failure = status === 'error' ? classifyProviderFailure(`${r?.result || ''}\n${stderr}`) : null;
+      if (failure) holdProvider(engine.id, failure, r?.result || stderr || ctx.state.lastError);
       // No terminal result (killed, crashed, timed out): charge the full per-run cap so the risk limit stays honest.
-      const cost = r && (r.total_cost_usd || !r.is_error) ? (r.total_cost_usd ?? 0) : engine.budgetUsd(agent);
+      const knownCost = r?.cost_known !== false && r && (r.total_cost_usd || !r.is_error);
+      const cost = knownCost ? (r.total_cost_usd ?? 0) : engine.budgetUsd(agent);
       store.updateRun(run.id, {
-        status, ended_at: store.now(), cost_usd: cost, cost_estimated: r && (r.total_cost_usd || !r.is_error) ? 0 : 1, num_turns: r?.num_turns ?? null,
+        status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
         result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
       });
-      const estimated = !(r && (r.total_cost_usd || !r.is_error));
-      const costTxt = cost ? ` · ${estimated ? '≤' : ''}$${cost.toFixed(2)}${estimated ? ' (charged at cap: no final cost report)' : ''}` : '';
-      store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: status === 'success' ? 'done' : 'error',
-        text: `${kind} ${status}${r?.subtype && r.subtype !== 'success' ? ` (${r.subtype})` : ''}${costTxt}${status !== 'success' && stderr ? ` — ${short(stderr, 200)}` : ''}` });
+      const estimated = !knownCost;
+      const costTxt = cost ? ` · $${cost.toFixed(2)}${estimated ? ' estimated charge (provider cost unreported)' : ''}` : '';
+      const blocked = kind === 'implement' && ticketKey && store.getTicket(ticketKey)?.status === 'needs_human';
+      const outcome = blocked && status === 'success' ? 'Implementation paused: needs your decision' : `${kind.replaceAll('_', ' ')} run ${status === 'success' ? 'finished' : status}`;
+      store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: status !== 'success' ? 'error' : blocked ? 'system' : 'done',
+        text: `${outcome}${r?.subtype && r.subtype !== 'success' ? ` (${r.subtype})` : ''}${costTxt}${status !== 'success' && stderr ? ` — ${short(stderr, 200)}` : ''}` });
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
-      resolve({ run: store.getRun(run.id), result: r });
+      resolve({ run: store.getRun(run.id), result: r, failure });
     };
     child.on('close', finish);
     child.on('error', (err) => {
@@ -459,7 +493,7 @@ export async function shutdownAll(reason) {
 }
 
 export const runningCount = () => children.size;
-export const runningBudget = () => [...children.keys()].reduce((s, id) => s + runBudget(store.getRun(id)?.agent_id), 0);
+export const runningBudget = () => store.unfinishedRuns().reduce((s, run) => s + reservationFor(run), 0);
 
 // The manager's planning discussion: a short, read-only principal run, answered synchronously.
 const inMeeting = new Set();
@@ -471,10 +505,12 @@ export async function consult({ agentId, ticketKey, question }) {
 async function consultInner({ agentId, ticketKey, question }) {
   const ticket = ticketKey ? store.getTicket(ticketKey) : null;
   const busy = store.getAgentState(agentId)?.status === 'working';
-  const cwd = await ensureReadonlyWorkspace();
+  if (busy) throw Object.assign(new Error(`${agentById[agentId].name} is busy; groom without a consult`), { status: 409 });
+  store.updateAgent(agentId, { status: 'working', last_action: 'preparing consultation', last_action_at: store.now() });
   store.updateAgent('manager', { meeting: agentId });
   store.updateAgent(agentId, { meeting: 'manager' });
   try {
+    const cwd = await ensureReadonlyWorkspace(agentId);
     const { result } = await startRun({
       agentId, kind: 'consult', ticketKey, cwd, track: !busy,
       prompt: promptFor('consult', { ticket, extra: question }),
@@ -483,5 +519,6 @@ async function consultInner({ agentId, ticketKey, question }) {
   } finally {
     store.updateAgent('manager', { meeting: null });
     store.updateAgent(agentId, { meeting: null });
+    if (!store.getAgentState(agentId)?.current_run) store.updateAgent(agentId, { status: 'idle', current_ticket: null });
   }
 }

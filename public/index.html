@@ -19,19 +19,20 @@
     <div class="controls">
       <button class="btn" id="btn-toggle" type="button"></button>
       <button class="btn danger" id="btn-breaker" type="button" title="Circuit breaker: halt the desk and stop every running seat">⛔<span class="hide-sm"> Breaker</span></button>
-      <button class="btn primary" id="btn-new" type="button">＋<span class="hide-sm"> New order</span></button>
+      <button class="btn primary" id="btn-new" type="button" aria-label="New ticket">＋<span class="hide-sm"> New ticket</span></button>
     </div>
   </header>
   <nav class="tabs" id="tabs" aria-label="Views">
     <button data-view="board" type="button"><span class="ti">▦</span><span>Board</span></button>
     <button data-view="desk" type="button"><span class="ti">◉</span><span>Floor</span></button>
-    <button data-view="tape" type="button"><span class="ti">≋</span><span>Tape</span></button>
-    <button data-view="watch" type="button"><span class="ti">⚠</span><span>Watch</span><span class="badge" id="watch-badge" hidden></span></button>
-    <button data-view="settings" type="button"><span class="ti">⚙</span><span>Limits</span></button>
+    <button data-view="tape" type="button"><span class="ti">≋</span><span>Activity</span></button>
+    <button data-view="watch" type="button"><span class="ti">⚠</span><span>Reliability</span><span class="badge" id="watch-badge" hidden></span></button>
+    <button data-view="settings" type="button"><span class="ti">⚙</span><span>Settings</span></button>
   </nav>
-  <main id="view" aria-live="polite"></main>
+  <div id="health-banner" class="health-banner" role="status" hidden></div>
+  <main id="view"></main>
   <div id="sheet" class="sheet" hidden></div>
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" role="status" hidden></div>
   <noscript>SigmaDesk needs JavaScript.</noscript>
   <script type="module" src="/app.js"></script>
 </body>

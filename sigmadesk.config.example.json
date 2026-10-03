@@ -4,7 +4,8 @@
     "hosts": [
       "127.0.0.1"
     ],
-    "ownerToken": ""
+    "ownerToken": "",
+    "preventIdleSleep": true
   },
   "project": {
     "name": "my-app",
@@ -84,5 +85,20 @@
       "ready_for_human",
       "page"
     ]
+  },
+  "engines": {
+    "autoFallback": true,
+    "fallbackCooldownMinutes": 15,
+    "codex": {
+      "bin": "",
+      "runBudgetUsd": 3,
+      "models": []
+    }
+  },
+  "advisors": {
+    "keyFile": "~/projects/sigmadesk/local/advisor-keys.json",
+    "reserveUsd": 1,
+    "timeoutSeconds": 120,
+    "maxOutputTokens": 3000
   }
 }

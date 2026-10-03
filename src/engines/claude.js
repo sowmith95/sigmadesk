@@ -1,6 +1,6 @@
 // Claude Code engine: `claude -p --output-format stream-json`, OS sandbox via --settings.
 import { execFileSync } from 'node:child_process';
-import { config } from '../config.js';
+import { config, wrapperProblem } from '../config.js';
 
 const short = (s, n = 160) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 const rel = (p, cwd) => (p && cwd && String(p).startsWith(cwd) ? String(p).slice(cwd.length + 1) : p);
@@ -39,9 +39,10 @@ export const claude = {
   ],
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
   suggest(tier) {
-    return { frontier: { model: 'fable', effort: 'xhigh' }, strong: { model: 'opus', effort: 'high' }, fast: { model: 'sonnet', effort: 'medium' }, cheap: { model: 'haiku', effort: 'low' } }[tier];
+    return { frontier: { model: 'fable', effort: 'high' }, strong: { model: 'opus', effort: 'high' }, fast: { model: 'sonnet', effort: 'medium' }, cheap: { model: 'haiku', effort: 'low' } }[tier];
   },
   async detect() {
+    if (wrapperProblem(config.bins.claude)) return { available: false, error: 'CLI wrapper changes permissions' };
     try { return { available: true, version: execFileSync(config.bins.claude, ['--version'], { encoding: 'utf8', timeout: 15_000 }).trim() }; } catch { return { available: false }; }
   },
   budgetUsd: (seat) => config.limits.runBudgetUsd[seat.model] ?? 3,
@@ -99,7 +100,7 @@ export const claude = {
     } else if (ev.type === 'system' && ev.subtype === 'api_retry') {
       out.push({ type: 'wait', text: `API retry ${ev.attempt ?? ''}${ev.error_status ? ` (HTTP ${ev.error_status})` : ''} — waiting` });
     } else if (ev.type === 'result') {
-      out.push({ type: 'result', ok: !ev.is_error && ev.subtype === 'success', subtype: ev.subtype, costUsd: ev.total_cost_usd || 0, turns: ev.num_turns, text: ev.result });
+      out.push({ type: 'result', ok: !ev.is_error && ev.subtype === 'success', subtype: ev.subtype, costUsd: ev.total_cost_usd || 0, turns: ev.num_turns, text: ev.result || (ev.errors || []).join('\n') });
     }
     return out;
   },

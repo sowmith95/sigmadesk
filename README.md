@@ -70,9 +70,82 @@ without you.
 | Cost | USD per run, hard per-run cap (`--max-budget-usd`) | tokens; USD if you set `engines.codex.pricing`. **No per-run hard cap** — bounded by the run timeout and a reservation |
 | Resume / fork | both | resume only |
 
-The header shows your Claude plan's 5-hour and 7-day usage (reported by the CLI); new Claude runs pause at
-`limits.planHoldAt` (90%) so the desk never eats the headroom you need for your own work. Adding another engine means
+The header and Reliability view show remaining provider usage, independent reset times and the effective route for
+each engineer. Claude usage comes from CLI reports during runs. Codex account limits refresh every two minutes using
+read-only app-server RPC, without a model turn. Unknown windows stay unknown. Perplexity desktop credits are dated
+observed snapshots, separate from API billing; API balances are not fabricated. New runs switch to the other healthy
+installed provider at `limits.planHoldAt` (80% by default). Settings → Automatic provider fallback controls this.
+Saved seat preferences remain intact; credit/auth failures hold the provider instead of consuming ticket stall retries.
+Cooldowns persist across restarts, weekly and five-hour resets are independent, and sessions resume only when provider,
+model and seat contract match. Partial changes stay in the ticket clone and must be inspected by the next engineer.
+Adding another execution engine means
 implementing one file in `src/engines/` (`command()` + `parse()` → normalized events).
+
+## Owner decisions and discussions
+
+Tickets awaiting you show **Approve**, **Needs correction** and **Reject** beside one message box. Approval continues
+the pending task (or explicitly approves guarded draft publication); corrections require instructions and return work
+to the engineer; rejection closes the ticket while retaining local work. Stale decisions are rejected. Draft approval
+does not merge a PR: use **Review draft PR** for the final owner-controlled merge.
+
+**Auto route** recognizes explicit requests to discuss with the manager/principals. These enter a durable read-only
+discussion queue and preserve the implementation blocker. The manager restates intent, consults up to two principals
+once each, and records a response on the same ticket. The composer also offers explicit discussion, answer and comment
+destinations. Discussions cannot alter status, create tickets/issues, change code, merge or publish; they respect the
+same provider, budget and concurrency gates. This follows the compact approve/edit/reject pattern in
+[LangChain's human review interface](https://reference.langchain.com/javascript/langchain/browser/humanInTheLoopMiddleware).
+Completed design proposals have their own decision target: approval/rejection records the design decision; corrections
+queue a revised manager response. Those decisions preserve the underlying task state and its implementation/merge gates.
+
+## Architecture Review Board and model selection
+
+Open a ticket → **Architecture review**. Choose a design reviewer and an independent challenger from a different model
+family. Create the brief, then either run it through an API or copy it into Perplexity and attach the returned report.
+In the Mac app, the model pill below the composer switches the next message's model; we verified Kimi K3, GLM 5.3
+and Grok 4.7 in its Computer picker. Gemini availability differs by surface and requires the native Gemini API or a
+compatible Perplexity API route here. A desktop subscription does not provide API credentials.
+
+| Specialist | Starting model | Responsibility |
+|---|---|---|
+| Principal Architecture Reviewer | Kimi K3 | Alternatives, invariants, migration costs |
+| Principal Systems & Frontend Reviewer | Gemini 3.1 Pro | Systems interactions, UX, accessibility |
+| Staff Delivery & Efficiency Reviewer | GLM 5.3 | Complexity, implementation slices, cost |
+| Principal Reliability Reviewer | Grok 4.7 | Failure modes, races, recovery |
+| Product Discovery Researcher | Sonar | Cited public research |
+
+These are task-specific starting choices, not measured claims of universal model superiority. Evaluate useful findings,
+QA outcomes and cost on your own tickets. Gemini Flash and GLM Flash are offered for smaller reviews.
+The software-company terms are **independent design review**, **Architecture Review Board**, **RFC**, and **ADR**.
+The design owner resolves disagreements in an Architecture Decision Record. Advisory reports never grant QA approval.
+Principals/managers can call `desk peer-review "<specific design question>"` once per run; missing credentials do not
+block their design work. Reviews have no shell, desk token, repo access or merge permissions. Inputs are bounded and
+redacted; only Sonar may use public web search. Daily reservations, concurrency, timeout and the circuit breaker apply.
+USD charges without a provider cost report are estimates; reservations and token caps are not an upstream billing cap.
+
+Configure `advisors.keyFile` to an owner-only, gitignored JSON file with `perplexity`, `gemini`, and/or `xai` keys.
+Alternatively use `PERPLEXITY_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, or `XAI_API_KEY` in the service environment.
+Credentials stay with the server and are stripped from engineer environments. Native Gemini/xAI routes are preferred;
+Perplexity's Agent API routes the other model families. “Configured” means a key is present; authentication is checked on use.
+Provider IDs and request formats were checked against [Perplexity](https://docs.perplexity.ai/docs/agent-api/models),
+[Gemini](https://ai.google.dev/gemini-api/docs/models), and [xAI](https://docs.x.ai/developers/grok-4-7).
+
+## Background reliability and local checks
+
+The launchd user service, CLI engineers and deterministic watcher continue when the screen is locked. On macOS,
+`server.preventIdleSleep: true` holds `caffeinate -i -w <desk PID>` while the desk runs. It does not prevent screen lock,
+lid-close sleep, explicit sleep, low-battery sleep, shutdown or logout. User LaunchAgents end at logout. Desktop clicks
+require an unlocked session; API reviews are independent of it. Interrupted runs are charged conservatively and their
+tickets return to the queue on restart. Setup errors back off from one minute to fifteen rather than retrying every tick.
+
+Reliability shows source health, stale polls, provider holds, scheduler liveness, headroom and queue reasons. Watcher
+cursors and incidents commit atomically; rolled-back events never reach the UI. Each read-only seat has its own scratch
+clone. Mailbox replies create their private staging directory, retain completed responses on I/O failures, and retry
+without executing the action twice. Use `scripts/restart-when-idle.sh <service-name>` to drain and restart between runs.
+
+`npm test` runs the regressions and isolated HTTP tests. `npm run preview` starts a disposable UI fixture on port 8791
+with every execution seat disabled and no publishing, notifications or credentials. `node scripts/smoke-seat.mjs`
+explicitly spends a bounded real Codex run on a disposable repo to verify quota fallback, mailbox, denied reads/writes
+outside the clone and blocked network. It retains private diagnostics on failure.
 
 ## Safety model (read this)
 
@@ -146,6 +219,7 @@ Live knobs (concurrency, budget, PM cadence, GitHub sync, draft PRs) are also ed
 Agents talk to the desk only through `bin/desk` over the socket: `desk progress 40 "writing tests"`, `desk comment`,
 `desk needs-human "<question>"`, `desk propose`, `desk groom`, `desk consult`, `desk submit`, `desk qa pass|fail`,
 `desk accept pass|changes`, `desk incident file|mute|page`. Run `bin/desk --help` for the full list.
+Every subcommand also accepts `--help` or `-h`; help never submits a desk action.
 
 ## How it compares
 

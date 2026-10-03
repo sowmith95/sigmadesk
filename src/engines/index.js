@@ -39,6 +39,6 @@ export function presets(available) {
 
 export async function detectEngines() {
   const out = [];
-  for (const e of Object.values(ENGINES)) out.push({ id: e.id, label: e.label, isolation: e.isolation, ...(await e.detect()), models: e.models(), costs: e.costNote });
+  for (const e of Object.values(ENGINES)) out.push({ id: e.id, label: e.label, isolation: e.isolation, ...(await e.detect()), models: e.models(), efforts: e.efforts, costs: e.costNote });
   return out;
 }

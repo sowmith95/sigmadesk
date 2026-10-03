@@ -205,6 +205,18 @@ export function promptFor(kind, { ticket, comments = [], extra = '' }) {
     ? `Ticket ${t.key} [${t.type}/${t.priority}${t.area ? `/${t.area}` : ''}${t.complexity ? `/${t.complexity}` : ''}] "${t.title}"\n\n<ticket-body>\n${t.description}\n</ticket-body>\n\nComments:\n${fmtComments(comments)}\n`
     : '';
   switch (kind) {
+    case 'owner_discussion':
+      return `${head}\nThe owner requested a design discussion, not an implementation retry. Their request is:\n${extra}\n
+First restate what they want in software-company terms. Consult the relevant principal(s) using desk consult, once each
+(at most two); the owner explicitly requested this discussion. If a principal is unavailable, state that limitation.
+For release-branch proposals, evaluate a feature integration branch, dependent slices, combined QA, draft PRs and one
+owner-controlled final merge. Explain how the existing ticket's missing baseline differs from this workflow proposal.
+Finish by recording a concise recommendation, tradeoffs, proposed next steps and any owner decision:
+desk discussion-result <<'EOF'
+<your response to the owner>
+EOF
+This run is read-only. Do not groom, create tasks/issues, change ticket status, edit code, merge, publish or deploy.
+The original implementation blocker remains until it is actually resolved. Discussion is not implementation approval.`;
     case 'research':
       return `Product research session. ${extra}
 Run \`desk list\` first to see existing tickets and avoid duplicates. Quality over quantity: one specific,
@@ -232,6 +244,11 @@ Verdict, exactly one (the --code proves the verdict comes from you, not from cod
   desk qa fail --code ${extra} "<numbered, actionable defects>"`;
     case 'design':
       return `${head}\nDesign and delegate this ticket. Do NOT write or edit code (you have read-only tools).
+For a consequential or uncertain design, you may request ONE independent Architecture Review Board consultation:
+desk peer-review "<specific assumptions or tradeoffs to challenge>"
+Defaults: Kimi K3 for backend design, Gemini for frontend/systems design, Grok for a reliability challenge.
+Optional reviewer IDs include perplexity/glm-5.3 for delivery/cost review. These are advisory roles, not implementation seats.
+If unavailable, continue using the repository evidence; do not retry. Synthesize findings into an ADR; peer advice is never QA approval.
 1. Read just enough code to decide the approach. Keep it short.
 2. Record the design: desk design <<'EOF'
    ## Approach (key decisions and why)

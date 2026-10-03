@@ -64,6 +64,18 @@ function userModel() {
 }
 
 const codexBin = () => config.engines.codex.bin || 'codex';
+// npm installs a Node launcher; Homebrew and packaged releases can be native executables.
+export function codexInvocation(bin = codexBin()) {
+  let fd;
+  try {
+    fd = fs.openSync(bin, 'r');
+    const head = Buffer.alloc(160);
+    const n = fs.readSync(fd, head, 0, head.length, 0);
+    if (/^#![^\n]*\bnode\b/.test(head.subarray(0, n).toString())) return { bin: process.execPath, prefix: [bin] };
+  } catch { /* detection will report a missing CLI */ }
+  finally { if (fd != null) fs.closeSync(fd); }
+  return { bin, prefix: [] };
+}
 
 export const codex = {
   id: 'codex',
@@ -78,24 +90,27 @@ export const codex = {
   },
   efforts: ['low', 'medium', 'high', 'xhigh'],
   suggest(tier) {
-    return { frontier: { model: '', effort: 'xhigh' }, strong: { model: '', effort: 'high' }, fast: { model: '', effort: 'medium' }, cheap: { model: '', effort: 'low' } }[tier];
+    return { frontier: { model: '', effort: 'high' }, strong: { model: '', effort: 'high' }, fast: { model: '', effort: 'medium' }, cheap: { model: '', effort: 'low' } }[tier];
   },
   async detect() {
     if (!config.engines.codex.bin) return { available: false };
     // codex is a Node script: run it with this Node so a minimal service PATH still works.
-    try { return { available: true, version: execFileSync(process.execPath, [codexBin(), '--version'], { encoding: 'utf8', timeout: 15_000 }).trim(), defaultModel: userModel() }; } catch { return { available: false }; }
+    const cli = codexInvocation();
+    try { return { available: true, version: execFileSync(cli.bin, [...cli.prefix, '--version'], { encoding: 'utf8', timeout: 15_000 }).trim(), defaultModel: userModel() }; } catch { return { available: false }; }
   },
   budgetUsd: () => config.engines?.codex?.reserveUsd ?? 2,
 
   command({ seat, charter, cwd, resume, extraDirs = [] }) {
     const effort = seat.effort === 'max' ? 'xhigh' : seat.effort;
-    const common = ['--json', '--skip-git-repo-check', ...(seat.model ? ['-m', seat.model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : [])];
+    const model = seat.model || userModel();
+    const common = ['--json', '--skip-git-repo-check', ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : [])];
     const args = resume
       ? ['exec', 'resume', ...common, resume, '-']
       : ['exec', ...common, '-C', cwd, '-'];
+    const cli = codexInvocation();
     return {
-      bin: process.execPath,
-      args: [codexBin(), ...args],
+      bin: cli.bin,
+      args: [...cli.prefix, ...args],
       promptViaStdin: true,
       // Codex has no system-prompt flag: the charter leads the prompt.
       wrapPrompt: (prompt) => `<seat-charter>\n${charter}\n</seat-charter>\n\n${prompt}`,
@@ -132,7 +147,7 @@ export const codex = {
         state.usage = u;
         const p = config.engines?.codex?.pricing;
         const cost = p ? (((u.input_tokens || 0) - (u.cached_input_tokens || 0)) * p.inputPerM + (u.cached_input_tokens || 0) * (p.cachedPerM ?? p.inputPerM) + (u.output_tokens || 0) * p.outputPerM) / 1e6 : 0;
-        return [{ type: 'result', ok: true, subtype: 'success', costUsd: cost, turns: null, text: state.lastSay || '', usage: u }];
+        return [{ type: 'result', ok: true, subtype: 'success', costUsd: cost, costKnown: !!p, turns: null, text: state.lastSay || '', usage: u }];
       }
       case 'turn.failed': case 'error':
         return [{ type: 'result', ok: false, subtype: 'error', costUsd: 0, text: ev.error?.message || ev.message || 'codex error' }];

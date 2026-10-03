@@ -15,9 +15,11 @@ const USAGE = `usage:
   desk groom KEY --complexity S|M|L|XL --area A [--priority P] [--risk high] [--assign SEAT] [--title T]   (spec on stdin)
   desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT]   (body on stdin)
   desk design   (design doc on stdin; principals)
+  desk discussion-result   (response on stdin; manager in an owner discussion)
   desk delegate "<summary>"   (principals, after creating slices with create-task [--after SLICE])
   desk reject KEY "<reason>"
   desk consult principal-be|principal-fe|dba "<question>"
+  desk peer-review [--reviewer MODEL] [--challenger MODEL] "<design question>"  (manager/principals; once per run)
   desk route KEY pm|manager|human "<why>" [--type T] [--priority P]
   desk submit "<summary>"
   desk qa pass|fail "<notes>"
@@ -26,7 +28,10 @@ const USAGE = `usage:
   desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>"`;
 
 const [cmd, ...rest] = process.argv.slice(2);
-if (!cmd || cmd === '-h' || cmd === '--help') { console.log(USAGE); process.exit(cmd ? 0 : 2); }
+// Help must exit before parsing flags, reading stdin or sending a mutating request.
+if (!cmd || [cmd, ...rest].some((arg) => arg === '-h' || arg === '--help')) {
+  console.log(USAGE); process.exit(cmd ? 0 : 2);
+}
 
 const flags = {};
 const pos = [];

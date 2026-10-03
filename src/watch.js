@@ -91,13 +91,12 @@ async function readFile(src, key) {
   const fd = fs.openSync(src.path, 'r');
   const len = Math.min(st.size - pos, 8 << 20);
   const buf = Buffer.alloc(len);
-  fs.readSync(fd, buf, 0, len, pos);
-  fs.closeSync(fd);
-  const text = buf.toString('utf8');
+  let bytes;
+  try { bytes = fs.readSync(fd, buf, 0, len, pos); } finally { fs.closeSync(fd); }
   // Keep an unfinished last line for the next poll instead of splitting a write in two.
-  const lastNl = text.lastIndexOf('\n');
-  const complete = lastNl >= 0 ? text.slice(0, lastNl) : (len === 8 << 20 ? text : '');
-  const consumed = lastNl >= 0 ? Buffer.byteLength(text.slice(0, lastNl + 1)) : (len === 8 << 20 ? len : 0);
+  const lastNl = buf.subarray(0, bytes).lastIndexOf(10);
+  const complete = buf.subarray(0, lastNl >= 0 ? lastNl : bytes === 8 << 20 ? bytes : 0).toString('utf8');
+  const consumed = lastNl >= 0 ? lastNl + 1 : (bytes === 8 << 20 ? bytes : 0);
   staged.set(key, { ino: st.ino, pos: pos + consumed });
   const now = new Date().toISOString();
   return complete.split('\n').filter((l) => l.trim()).map((line) => ({ label: src.label || src.path, line, ts: now }));
@@ -140,25 +139,37 @@ export async function pollOnce() {
     try {
       const lines = src.type === 'loki' ? await readLoki(src, key) : src.type === 'docker' ? await readDocker(src, key) : await readFile(src, key);
       health.lines = lines.length;
+      const hits = [];
+      store.transaction(() => {
       for (const { label, line, ts } of lines) {
         if (!errRe.test(line) || ign.some((r) => r.test(line))) continue;
         const { norm, sig } = signatureOf(label, line);
         store.recordIncident({ signature: sig, normalized: norm, source_index: i, label, project: src.project || config.project.name, line: store.redact(line).slice(0, 1500), ts });
-        bump(sig, Date.parse(ts) || Date.now());
-        touched.add(sig);
+        hits.push({ sig, ts });
       }
       // Checkpoint only after every incident in the batch is stored: a crash re-reads instead of losing lines.
       if (staged.has(key)) { cursors.set(key, staged.get(key)); staged.delete(key); }
+      });
+      for (const { sig, ts } of hits) { bump(sig, Date.parse(ts) || Date.now()); touched.add(sig); }
     } catch (err) {
       health.ok = false;
-      health.error = String(err.message).slice(0, 200);
+      health.error = store.redact(String(err.message)).slice(0, 200);
     }
+    const previous = sourceHealth.get(key);
+    if (!health.ok && previous?.error !== health.error) store.logEvent({ agent_id: 'sre', kind: 'error', text: `Log source ${src.type}: ${health.error}` });
+    else if (health.ok && previous?.ok === false) store.logEvent({ agent_id: 'sre', kind: 'system', text: `Log source ${src.type} recovered` });
     sourceHealth.set(key, health);
   }
+  for (const [sig, times] of recent) if (!times.some((t) => Date.now() - t < W().windowMinutes * 60_000)) recent.delete(sig);
   return touched;
 }
 
-export const health = () => [...sourceHealth.values()];
+export const health = () => (W().sources || []).map((src, i) => {
+  const h = sourceHealth.get(`${i}:${src.type}`);
+  return { type: src.type, project: src.project || config.project.name, label: src.label || src.type,
+    ...(h || { ok: false, error: 'Waiting for first poll', lastPoll: null, lines: 0 }),
+    stale: h ? Date.now() - Date.parse(h.lastPoll) > Math.max(120000, W().intervalSeconds * 3000) : false };
+});
 
 // Decide what deserves attention. Returns { investigate: [incident], page: {incidents}|null, regressions: [incident], foreign: [incident] }
 export function triageIncidents() {

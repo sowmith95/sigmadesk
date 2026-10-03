@@ -15,6 +15,7 @@ const DEFAULTS = {
     hosts: ['127.0.0.1'],
     // Optional shared secret for the web UI. Open /?token=<value> once per device.
     ownerToken: '',
+    preventIdleSleep: process.platform === 'darwin',
   },
   project: {
     name: 'my-project',
@@ -113,7 +114,16 @@ const DEFAULTS = {
   bins: { claude: '', gh: '', git: 'git', agentShell: '/bin/bash' },
   // Optional extra engines. codex.bin is auto-detected from PATH (and common Node version-manager dirs) if empty.
   engines: {
+    autoFallback: true,
+    fallbackCooldownMinutes: 15,
     codex: { bin: '', models: [], pricing: null, reserveUsd: 2 },
+  },
+  advisors: {
+    // Optional JSON file with perplexity/gemini/xai keys. Never expose it to a seat.
+    keyFile: '',
+    reserveUsd: 1,
+    timeoutSeconds: 120,
+    maxOutputTokens: 3000,
   },
 };
 
@@ -161,7 +171,9 @@ export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT
   c.project.repoPath = expandHome(c.project.repoPath);
   c.project.playbook = path.isAbsolute(expandHome(c.project.playbook)) ? expandHome(c.project.playbook) : path.join(ROOT, c.project.playbook);
   c.project.readOnlyPaths = c.project.readOnlyPaths.map(expandHome);
-  c.bins.claude = c.bins.claude || which('claude') || path.join(os.homedir(), '.local/bin/claude');
+  c.advisors.keyFile = expandHome(c.advisors.keyFile);
+  const pathClaude = which('claude');
+  c.bins.claude = c.bins.claude || (pathClaude && !wrapperProblem(pathClaude) ? pathClaude : path.join(os.homedir(), '.local/bin/claude'));
   c.bins.gh = c.bins.gh || which('gh') || 'gh';
   c.engines.codex.bin = c.engines.codex.bin || which('codex') || findInNodeManagers('codex') || '';
   if (!c.project.githubRepo && c.project.repoPath) {
@@ -179,7 +191,7 @@ export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT
   // Real path matters: the sandbox matches resolved paths. macOS caps socket paths at 104 bytes.
   c.socketPath = env.SIGMADESK_SOCKET || path.join(fs.realpathSync(ROOT), 'run', 'agent.sock');
   if (c.socketPath.length > 100) c.socketPath = path.join(fs.realpathSync(os.tmpdir()), `sigmadesk-${c.server.port}.sock`);
-  c.workspaceRoot = path.join(fs.realpathSync(ROOT), 'workspaces');
+  c.workspaceRoot = env.SIGMADESK_WORKSPACES || path.join(fs.realpathSync(ROOT), 'workspaces');
   c.configFile = file;
   return c;
 }
@@ -200,12 +212,16 @@ export function wrapperProblem(bin) {
 export function validateConfig(c = config) {
   const problems = [];
   if (!c.project.repoPath || !fs.existsSync(path.join(c.project.repoPath, '.git'))) problems.push('project.repoPath must point at a git checkout');
-  if (!fs.existsSync(c.bins.claude)) problems.push(`claude CLI not found (${c.bins.claude})`);
-  else {
+  const claudeInstalled = fs.existsSync(c.bins.claude);
+  const codexInstalled = !!c.engines.codex.bin && fs.existsSync(c.engines.codex.bin);
+  if (!claudeInstalled && !codexInstalled) problems.push('install a Claude Code or Codex CLI');
+  if (claudeInstalled) {
     const w = wrapperProblem(c.bins.claude);
     if (w) problems.push(w);
   }
   if (c.github.sync && !c.project.githubRepo) problems.push('github.sync is on but project.githubRepo is unknown');
   if (!fs.existsSync(c.project.playbook)) problems.push(`playbook not found: ${c.project.playbook}`);
+  if (!(c.engines.fallbackCooldownMinutes >= 1 && c.engines.fallbackCooldownMinutes <= 1440)) problems.push('engines.fallbackCooldownMinutes must be between 1 and 1440');
+  if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');
   return problems;
 }
