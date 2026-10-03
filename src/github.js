@@ -108,7 +108,7 @@ export function openDraftPr(ticketKey, summary) {
 }
 
 // Import trusted-author issues carrying the desk label; detect merged/closed PRs.
-export function poll(onNewIssue, onRedChecks) {
+export function poll(onNewIssue) {
   if (!enabled()) return null;
   return enqueue('poll', async () => {
     const known = new Set(store.listTickets().map((t) => t.issue_number).filter(Boolean));
@@ -118,27 +118,6 @@ export function poll(onNewIssue, onRedChecks) {
       if (!config.github.trustedAuthors.includes(i.author?.login)) continue; // only trusted authors feed the desk (prompt-injection guard)
       onNewIssue(i);
     }
-    for (const t of store.ticketsByStatus('ready_for_human')) {
-      if (!t.pr_url) continue;
-      const pr = JSON.parse(await gh(['pr', 'view', t.pr_url, '-R', config.project.githubRepo, '--json', 'state,mergeable,statusCheckRollup,headRefOid']));
-      // PR health: red checks on the approved commit send the work back to its engineer.
-      const failed = (pr.statusCheckRollup || []).filter((c) => ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED'].includes(c.conclusion || c.state));
-      if (pr.state === 'OPEN' && failed.length && onRedChecks) onRedChecks(t, failed.map((c) => c.name || c.context).join(', '));
-      else if (pr.state === 'OPEN' && pr.mergeable === 'CONFLICTING' && !t.progress_msg?.includes('conflict')) {
-        store.addComment(t.key, 'system', `⚠️ The draft PR now conflicts with ${config.project.baseBranch}. Rebase before merging.`);
-        store.updateTicket(t.key, { progress_msg: 'PR has merge conflicts' });
-      }
-      if (pr.state === 'MERGED') {
-        store.updateTicket(t.key, { status: 'done', progress: 100 });
-        removeWorkspace(t.key);
-        store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: 'PR merged → done' });
-        syncIssueState(t.key);
-      } else if (pr.state === 'CLOSED') {
-        store.updateTicket(t.key, { status: 'wontdo' });
-        removeWorkspace(t.key);
-        store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: 'PR closed without merge → won\'t do' });
-        syncIssueState(t.key);
-      }
-    }
+    // PR state (merges, closes, reviews, checks) is reconciled by prsync.js every minute.
   });
 }

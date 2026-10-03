@@ -7,6 +7,7 @@ import * as runner from './runner.js';
 import * as github from './github.js';
 import * as watch from './watch.js';
 import { notify } from './notify.js';
+import * as prsync from './prsync.js';
 import { selectionFor } from './dispatch.js';
 
 // ---------------- publish guard ----------------
@@ -940,3 +941,47 @@ export function ownerPatch(key, patch) {
   github.syncIssueState(key);
   return out;
 }
+
+// ---------------- GitHub → desk (driven by prsync.reconcile) ----------------
+// Every transition goes through setStatus, so epics roll up, clones are cleaned and the owner is notified.
+function sendBack(t, comment, msg) {
+  const loops = (t.qa_loops || 0) + 1;
+  store.addComment(t.key, 'owner', comment);
+  // pr_url is cleared so the reworked commit is published again (the existing PR is found by branch and updated).
+  if (loops > config.limits.maxQaLoops) setStatus(t.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', pr_url: null, progress_msg: `${msg} (review loop limit)` });
+  else setStatus(t.key, 'todo', { qa_loops: loops, pr_url: null, progress: 50, progress_msg: msg });
+}
+
+export const prActions = {
+  merged(t, a) {
+    store.addComment(t.key, 'system', `🎉 **Merged on GitHub**${a.at ? ` at ${a.at}` : ''}.`);
+    setStatus(t.key, 'done', { progress: 100, progress_msg: 'merged' });
+  },
+  closed(t, a) {
+    store.addComment(t.key, 'system', `🚫 PR closed on GitHub without merging${a.at ? ` at ${a.at}` : ''}.`);
+    setStatus(t.key, 'wontdo', { progress_msg: 'PR closed without merging' });
+  },
+  changes(t, a) {
+    sendBack(t, `🔁 **Changes requested on GitHub** by @${a.who}\n\n${a.text}`, `changes requested by @${a.who}`);
+  },
+  approved(t, a) {
+    store.addComment(t.key, 'owner', `👍 **Approved on GitHub** by @${a.who}${a.text ? `\n\n${a.text}` : ''}`);
+    store.updateTicket(t.key, { progress_msg: `approved on GitHub by @${a.who} — ready to merge` });
+  },
+  comment(t, a) {
+    const text = `💬 **On GitHub** (@${a.who}): ${a.text}`;
+    if (t.status === 'needs_human') ownerReply(t.key, text); // answering from GitHub resumes the ticket
+    else store.addComment(t.key, 'owner', text);
+  },
+  checks_failed(t, a) { prChecksFailed(t, a.names); },
+  conflict(t) {
+    store.addComment(t.key, 'system', `⚠️ The draft PR conflicts with ${config.project.baseBranch}. Rebase before merging.`);
+    store.updateTicket(t.key, { progress_msg: 'PR has merge conflicts' });
+  },
+  async landed(t, pr) {
+    const msg = `Closing: everything this PR changes is already on \`${config.project.baseBranch}\` (it landed through another PR, e.g. a stacked slice). — SigmaDesk`;
+    await prsync.closePr(pr, msg);
+    store.addComment(t.key, 'system', `✅ Already landed on ${config.project.baseBranch} via another PR; closed #${pr.number}.`);
+    setStatus(t.key, 'done', { progress: 100, progress_msg: 'landed via another PR' });
+  },
+};

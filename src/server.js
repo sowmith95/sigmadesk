@@ -10,6 +10,7 @@ import * as runner from './runner.js';
 import * as github from './github.js';
 import * as sched from './scheduler.js';
 import * as watch from './watch.js';
+import * as prsync from './prsync.js';
 import * as dispatch from './dispatch.js';
 import * as advisors from './advisors.js';
 import * as runtime from './runtime.js';
@@ -137,6 +138,10 @@ async function ownerRoute(req, res) {
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode)); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
+  if (req.method === 'POST' && p === '/api/github/sync') {
+    const n = await prsync.reconcile(sched.prActions);
+    return send(res, 200, { ok: true, actions: n, last_ok: store.kvGet('prsync:last_ok') });
+  }
   if (req.method === 'POST' && p === '/api/settings') {
     const b = await readBody(req);
     store.setSetting(b.key, b.value);
@@ -364,9 +369,13 @@ export async function main() {
     const t = store.createTicket({ title: i.title, description: i.body || '', status: 'triage', reporter: 'owner', source: 'github', issue_number: i.number });
     store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: `imported issue #${i.number}` });
   };
-  const redChecks = (t, names) => sched.prChecksFailed(t, names);
-  setInterval(() => github.poll(importIssue, redChecks), config.github.pollMinutes * 60_000);
-  setTimeout(() => github.poll(importIssue, redChecks), 10_000);
+  setInterval(() => github.poll(importIssue), config.github.pollMinutes * 60_000);
+  setTimeout(() => github.poll(importIssue), 10_000);
+  // PRs: poll is the source of truth; the optional webhook only asks for an immediate reconcile.
+  const syncPrs = () => prsync.reconcile(sched.prActions).catch((err) => console.error('prsync:', err.message));
+  setInterval(syncPrs, prsync.pollSeconds() * 1000);
+  setTimeout(syncPrs, 15_000);
+  prsync.startWebhook((event) => { store.logEvent({ kind: 'github', agent_id: 'github', text: `webhook: ${event} → syncing PRs` }); syncPrs(); });
   setInterval(() => github.flushComments(), 60_000);
   setInterval(() => sched.retryPublications(), 5 * 60_000);
   const shutdown = () => { advisors.cancelAll(); runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
