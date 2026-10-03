@@ -192,3 +192,19 @@ export async function closePr(pr, comment) {
   await pexec(config.bins.gh, ['pr', 'close', String(pr.number), '-R', config.project.githubRepo, '--comment', comment],
     { cwd: config.project.repoPath, timeout: 60_000 });
 }
+
+// Stacked work: if the approved commit contains another open desk PR's unmerged commits, the new PR should target
+// that PR's branch (so it shows only its own changes) instead of duplicating them against the base branch.
+export async function stackBaseFor(t) {
+  if (!t?.head_sha) return null;
+  const pub = path.join(config.root, 'data', 'publisher.git');
+  const git = (args) => pexec('git', [...SAFE, '-C', pub, ...args], { timeout: 60_000 });
+  const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).then(() => true, () => false);
+  const candidates = store.listTickets().filter((u) => u.key !== t.key && u.head_sha && u.branch && u.pr_url && !TERMINAL.has(u.status));
+  for (const u of candidates) {
+    if (!(await isAncestor(u.head_sha, t.head_sha))) continue;
+    if (await isAncestor(u.head_sha, 'refs/sigmadesk/base')) continue; // already merged into base
+    return { key: u.key, branch: u.branch, pr: prNumber(u.pr_url) };
+  }
+  return null;
+}

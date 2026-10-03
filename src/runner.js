@@ -81,7 +81,7 @@ export function applyEvents(events, ctx) {
         if (q.status && q.status !== 'allowed') store.logEvent({ ...base, kind: 'system', text: `plan limit: ${q.status} until ${q.resets_at || '?'}` });
         break;
       }
-      case 'result': ctx.result = { is_error: !e.ok, subtype: e.subtype, total_cost_usd: e.costUsd || 0, cost_known: e.costKnown !== false, num_turns: e.turns ?? null, result: e.text || ctx.state.lastSay || '', usage: e.usage }; break;
+      case 'result': ctx.result = { is_error: !e.ok, subtype: e.subtype, total_cost_usd: e.costUsd || 0, cost_known: e.costKnown !== false, num_turns: e.turns ?? null, errors: e.errors || [], result: e.text || ctx.state.lastSay || '', usage: e.usage }; break;
       default: break;
     }
   }
@@ -444,7 +444,10 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       const r = ctx.result;
       const prev = store.getRun(run.id);
       const status = prev.status === 'killed' ? 'killed' : r && !r.is_error && code === 0 ? 'success' : 'error';
-      const failure = status === 'error' ? classifyProviderFailure(`${r?.result || ''}\n${stderr}`) : null;
+      // Only text the CLI itself produced may put a provider on hold — never the agent's own words (an SRE quoting
+      // "rate limit exceeded" from production logs must not stall a whole engine).
+      const cliText = /^(API Error|Claude AI usage limit|You've hit your|Credit balance|Invalid API key|Please run \/login|usage limit|rate[ _-]?limit|unexpected status 4(01|29))/i.test(String(r?.result || '').trim()) ? r.result : '';
+      const failure = status === 'error' ? classifyProviderFailure(`${(r?.errors || []).join('\n')}\n${cliText}\n${stderr}`) : null;
       if (failure) holdProvider(engine.id, failure, r?.result || stderr || ctx.state.lastError);
       // No terminal result (killed, crashed, timed out): charge the full per-run cap so the risk limit stays honest.
       const knownCost = r?.cost_known !== false && r && (r.total_cost_usd || !r.is_error);

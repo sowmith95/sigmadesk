@@ -100,7 +100,7 @@ export const claude = {
     } else if (ev.type === 'system' && ev.subtype === 'api_retry') {
       out.push({ type: 'wait', text: `API retry ${ev.attempt ?? ''}${ev.error_status ? ` (HTTP ${ev.error_status})` : ''} — waiting` });
     } else if (ev.type === 'result') {
-      out.push({ type: 'result', ok: !ev.is_error && ev.subtype === 'success', subtype: ev.subtype, costUsd: ev.total_cost_usd || 0, turns: ev.num_turns, text: ev.result || (ev.errors || []).join('\n') });
+      out.push({ type: 'result', ok: !ev.is_error && ev.subtype === 'success', subtype: ev.subtype, costUsd: ev.total_cost_usd || 0, turns: ev.num_turns, text: ev.result || (ev.errors || []).join('\n'), errors: ev.errors || [] });
     }
     return out;
   },

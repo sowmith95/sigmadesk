@@ -9,6 +9,9 @@ import * as github from './github.js';
 import * as watch from './watch.js';
 import { notify } from './notify.js';
 import * as prsync from './prsync.js';
+import * as prs from './prs.js';
+
+const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 import { selectionFor } from './dispatch.js';
 
 // ---------------- publish guard ----------------
@@ -32,6 +35,8 @@ export function guardReasons(files, lines, complexity) {
   if (cap && lines > cap) reasons.push(`diff is ${lines} lines (cap for ${complexity || 'M'} is ${cap})`);
   return reasons;
 }
+
+export const isDocPath = (f) => /\.(md|mdx|rst|txt|adoc)$/i.test(f) || /^docs\//.test(f);
 
 // A test command must START a shell segment (so `printf pytest` or `echo npm test` don't count).
 export function isTestCommand(cmd) {
@@ -199,6 +204,22 @@ function completeDiscussion(id, response) {
   github.flushComments();
 }
 
+// A slice ordered after a sibling that was closed without merging would otherwise wait forever.
+function orphanedSlice(t) {
+  store.addComment(t.key, 'system', `⚠️ This slice was waiting for ${t.after_key}, which was closed without merging. Decide: continue without it (reply), rescope, or close.`);
+  setStatus(t.key, 'needs_human', { after_key: null, resume_status: 'todo', progress_msg: `predecessor ${t.after_key} closed unmerged` });
+}
+
+// Preparing a clone takes seconds; if the owner moved, rejected or reassigned the ticket meanwhile, do not start.
+function stillWanted(key, status, agentId) {
+  const now = store.getTicket(key);
+  if (now?.status === status && (!now.assignee || now.assignee === agentId || status !== 'in_progress')) return true;
+  store.updateAgent(agentId, { status: 'idle', current_ticket: null, current_run: null });
+  if (now?.active_run === -1) store.updateTicket(key, { active_run: null });
+  store.logEvent({ agent_id: agentId, ticket_key: key, kind: 'system', text: `start cancelled: the ticket changed (${now?.status || 'gone'}) while its workspace was being prepared` });
+  return false;
+}
+
 async function launchImplement(ticket, agentId, fence) {
   store.updateAgent(agentId, { status: 'working', current_ticket: ticket.key, last_action: 'cloning workspace', last_action_at: store.now() });
   store.logEvent({ agent_id: agentId, ticket_key: ticket.key, kind: 'pickup', text: `${agentById[agentId].role} picked up ${ticket.key}` });
@@ -212,6 +233,7 @@ async function launchImplement(ticket, agentId, fence) {
     setStatus(ticket.key, 'needs_human', { active_run: null, resume_status: 'todo', progress_msg: 'workspace setup failed' });
     return;
   }
+  if (!stillWanted(ticket.key, 'in_progress', agentId)) return;
   const t = store.updateTicket(ticket.key, { branch: ws.branch });
   const comments = store.listComments(t.key);
   const prev = store.lastRunFor(t.key, agentId, 'implement');
@@ -254,6 +276,7 @@ async function launchQa(ticket, fence) {
     store.updateTicket(ticket.key, { active_run: null });
     throw err;
   }
+  if (!stillWanted(ticket.key, 'qa', 'qa')) return;
   store.logEvent({ agent_id: 'qa', ticket_key: ticket.key, kind: 'pickup', text: `QA picked up ${ticket.key}` });
   // The verdict code lives only in the prompt: code under test (which inherits the shell) cannot know it.
   const code = nonce();
@@ -271,6 +294,7 @@ async function launchReview(ticket, seat, fence) {
     store.updateTicket(ticket.key, { active_run: null });
     throw err;
   }
+  if (!stillWanted(ticket.key, 'review', seat)) return;
   store.logEvent({ agent_id: seat, ticket_key: ticket.key, kind: 'pickup', text: `${agentById[seat].role} is reviewing ${ticket.key} against the original intent` });
   const comments = store.listComments(ticket.key);
   // Opt-in: fork the requester's original session (where the idea was born) if it is recent enough.
@@ -473,6 +497,7 @@ export async function tick() {
     for (const t of store.ticketsByStatus('todo')) {
       if (slots <= 0) break;
       if (t.active_run) continue;
+      if (t.after_key && store.getTicket(t.after_key)?.status === 'wontdo') { orphanedSlice(t); continue; }
       if (t.after_key && store.getTicket(t.after_key)?.status !== 'done') continue; // waits for its predecessor to merge
       const who = t.assignee && ENGINEERS.includes(t.assignee) && agentById[t.assignee].enabled !== false ? t.assignee : routeTicket(t);
       if (!agentIdle(who)) continue;
@@ -741,7 +766,11 @@ export async function deskAction(run, cmd, body = {}) {
       }
       // Evidence gate: QA must have actually run a test/build command successfully in this run.
       const ran = runner.evidenceFor(run.id);
-      need(ran.some((e) => e.ok && isTestCommand(e.cmd)), `no passing test run in your session yet — run the relevant tests (e.g. ${ran.length ? 'the playbook test command' : 'pytest / npm test'}) and pass only if they succeed`);
+      // Documentation-only changes have nothing to execute: the diff itself (from the desk's publisher) is the evidence.
+      const docsOnly = await runner.headSha(runner.workspaceDir(ticket.key))
+        .then((sha) => runner.stageApproved(ticket.key, runner.workspaceDir(ticket.key), sha))
+        .then(({ files }) => files.length > 0 && files.every(isDocPath), () => false); // any doubt → not docs-only
+      need(docsOnly || ran.some((e) => e.ok && isTestCommand(e.cmd)), `no passing test run in your session yet — run the relevant tests (e.g. ${ran.length ? 'the playbook test command' : 'pytest / npm test'}) and pass only if they succeed`);
       // The verdict only counts for the exact commit that was submitted.
       const sha = await runner.headSha(runner.workspaceDir(ticket.key));
       need(!ticket.head_sha || sha === ticket.head_sha, `HEAD moved since submission (${sha.slice(0, 7)} ≠ ${String(ticket.head_sha).slice(0, 7)}); QA must not commit`);
@@ -863,7 +892,9 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch}` });
     const cs = store.listComments(key);
     const last = (prefix) => cs.filter((c) => c.body.startsWith(prefix)).pop()?.body.replace(/^[^\n]*\n*/, '') || '';
-    await github.openDraftPr(key, [`## Summary\n${last('🚀')}`, `## QA (correctness)\n${last('✅')}`, last('🤝') ? `## Acceptance (requester intent)\n${last('🤝')}` : ''].filter(Boolean).join('\n\n'));
+    const stack = await prsync.stackBaseFor(store.getTicket(key));
+    if (stack) store.addComment(key, 'system', `🧱 Contains unmerged commits from ${stack.key}, so the draft PR targets its branch (\`${stack.branch}\`) and shows only this ticket's changes. GitHub retargets it to ${config.project.baseBranch} when ${stack.key} merges.`);
+    await github.openDraftPr(key, [stack ? `> Stacked on #${stack.pr} (${stack.key}) — merge that first.` : '', `## Summary\n${last('🚀')}`, `## QA (correctness)\n${last('✅')}`, last('🤝') ? `## Acceptance (requester intent)\n${last('🤝')}` : ''].filter(Boolean).join('\n\n'), stack ? { base: stack.branch } : {});
   } catch (err) {
     store.logEvent({ kind: 'error', ticket_key: key, text: `publish failed: ${err.message}` });
   }
@@ -928,8 +959,16 @@ export async function ownerDecision(key, { decision, message = '', expected_upda
     await ownerApprovePublish(key); return store.getTicket(key);
   }
   if (decision === 'approve' && t.status === 'ready_for_human') {
+    // One approval per commit (repeat taps used to stack duplicate approvals).
+    const approvedKey = `owner-approved:${key}:${t.head_sha || 'none'}`;
+    if (store.kvGet(approvedKey) === '1') return { ...store.getTicket(key), pr_next: t.pr_url ? prNumberOf(t.pr_url) : null, already: true };
+    store.kvSet(approvedKey, '1');
     store.addComment(key, 'owner', `✅ **${t.pr_url ? 'Owner review approved' : 'Approved for draft publication'}**${note ? `\n\n${note}` : ''}. Final merge remains with the owner.`);
-    if (!t.pr_url) publishBranch(key); return store.getTicket(key);
+    if (!t.pr_url) { publishBranch(key); return store.getTicket(key); }
+    // Reflect the approval on GitHub, then let the UI ask: merge, close, add a reviewer, or mark ready.
+    const n = prNumberOf(t.pr_url);
+    const gh = await prs.approve(n, note).catch((err) => ({ error: err.message }));
+    return { ...store.getTicket(key), pr_next: n, github_approval: gh };
   }
   if (decision === 'approve') return ownerReply(key, `✅ **Approved the requested decision.**${note ? `\n\n${note}` : ''}`, 'answer');
   store.addComment(key, 'owner', `${decision === 'correction' ? '🔁 **Owner requested changes**' : '⛔ **Rejected by owner**'}${note ? `\n\n${note}` : ''}`);
