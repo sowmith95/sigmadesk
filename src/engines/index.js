@@ -29,8 +29,8 @@ export function suggestFor(seatId, engineId) {
 export function presets(available) {
   const has = (id) => available.includes(id);
   const out = [];
-  if (has('claude')) out.push({ id: 'claude', label: 'All Claude', note: 'Strongest isolation (OS sandbox blocks secret reads). Recommended default.', engine: () => 'claude' });
-  if (has('codex')) out.push({ id: 'codex', label: 'All Codex (GPT)', note: 'Writes and network sandboxed; file reads are not restricted.', engine: () => 'codex' });
+  if (has('claude')) out.push({ id: 'claude', label: 'All Claude', note: 'Mature OS sandbox; recommended default.', engine: () => 'claude' });
+  if (has('codex')) out.push({ id: 'codex', label: 'All Codex (GPT)', note: 'Same isolation via a Codex permission profile (beta feature).', engine: () => 'codex' });
   if (has('claude') && has('codex')) {
     out.push({ id: 'mixed', label: 'Mixed: Claude builds, Codex reviews', note: 'Engineers on Claude; QA and the SRE on Codex for cross-vendor review.', engine: (id) => (['qa', 'sre'].includes(id) ? 'codex' : 'claude') });
   }

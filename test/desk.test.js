@@ -200,11 +200,15 @@ test('engines: codex seat builds a sandboxed, network-off command with an isolat
   const seat = { ...team.agentById.qa, engine: 'codex', model: '', effort: 'max' };
   const cmd = runner.buildCommand(seat, 'qa', '/tmp/ws');
   assert.equal(cmd.args[1], 'exec');
-  assert.ok(cmd.args.includes('workspace-write'));
+  assert.ok(!cmd.args.includes('workspace-write'), 'the permission profile replaces -s');
   assert.ok(cmd.args.includes('model_reasoning_effort=xhigh'), 'max maps to xhigh for codex');
   assert.ok(cmd.mailbox);
   const toml = fs.readFileSync(path.join(cmd.env.CODEX_HOME, 'config.toml'), 'utf8');
-  assert.match(toml, /network_access = false/);
+  assert.match(toml, /default_permissions = "sigmadesk_seat"/);
+  assert.match(toml, /\[permissions.sigmadesk_seat.network\]\nenabled = false/);
+  assert.match(toml, /"\.git" = "write"/);
+  assert.ok(!toml.includes('.ssh'), 'home secrets are never listed as readable');
+  assert.match(toml, /apps = false/);
   assert.match(cmd.wrapPrompt('do it'), /<seat-charter>[\s\S]*Taylor[\s\S]*do it$/);
   const resumed = runner.buildCommand(seat, 'implement', '/tmp/ws', { resume: 'thread-1' });
   assert.deepEqual(resumed.args.slice(1, 3), ['exec', 'resume']);

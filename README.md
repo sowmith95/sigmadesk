@@ -56,10 +56,10 @@ without you.
 
 | | Claude Code | Codex (OpenAI) |
 |---|---|---|
-| How it runs | `claude -p --output-format stream-json` | `codex exec --json` with a desk-owned `CODEX_HOME` |
+| How it runs | `claude -p --output-format stream-json` | `codex exec --json` with a desk-owned `CODEX_HOME` (apps, plugins, browser/computer use, hooks off) |
 | Writes | own clone only (OS sandbox) | own clone only (Codex sandbox) |
-| Network | blocked | blocked (`network_access = false`) |
-| Secret reads | **blocked** (`~/.ssh`, credentials, desk state) | **not restricted** — keep Codex off seats near secrets |
+| Network | blocked | blocked (permission profile) |
+| Secret reads | **blocked** (`~/.ssh`, credentials, desk state) | **blocked** — reads denied outside system/toolchain paths and the clone (Codex permission profiles, beta) |
 | Desk transport | per-run unix socket | file mailbox inside the clone |
 | Cost | USD per run (notional on a subscription) | tokens; USD if you set `engines.codex.pricing` |
 | Resume / fork | both | resume only |

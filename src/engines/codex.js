@@ -1,7 +1,8 @@
 // Codex engine: `codex exec --json` (OpenAI GPT models via the Codex CLI), workspace-write sandbox, network off.
 // Runs with a desk-owned CODEX_HOME so the owner's personal Codex config (MCP servers, hooks, notify, full-access
-// defaults) never applies to agents; only auth.json is linked in. With network off the sandbox also blocks unix
-// sockets, so Codex seats talk to the desk through a file mailbox inside their own workspace.
+// defaults) never applies to agents; only auth.json is linked in. A permission profile denies reads outside an
+// allowlist and blocks the network; that also blocks unix sockets, so Codex seats talk to the desk through a file
+// mailbox inside their own workspace.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -24,13 +25,29 @@ export function codexHome() {
     'computer_use', 'in_app_browser', 'in_app_chat', 'in_app_local_automation', 'image_generation', 'multi_agent', 'hooks', 'goals',
     'skill_mcp_dependency_install', 'skill_search', 'workspace_dependencies', 'system_proxy_fallback', 'daemon_auto_start',
     'shell_snapshot', 'realtime_conversation', 'tool_suggest', 'worktrees'];
+  // Permission profile (Codex beta): deny reads from the filesystem root, allow only system/toolchain paths, the
+  // owner's read-only paths and the seat's own clone (+ its .git, which Codex otherwise keeps read-only).
+  const hm = os.homedir();
+  const readable = ['/System', '/usr', '/private/etc', '/opt/homebrew', '/Library/Developer/CommandLineTools',
+    path.dirname(path.dirname(process.execPath)), path.join(config.root, 'bin'), path.join(hm, '.gitconfig'), path.join(hm, '.config', 'git'),
+    ...config.project.readOnlyPaths].filter((p, i, a) => p && a.indexOf(p) === i && fs.existsSync(p));
+  const q = (p) => JSON.stringify(p);
   fs.writeFileSync(path.join(home, 'config.toml'), [
     'approval_policy = "never"',
-    'sandbox_mode = "workspace-write"',
+    'default_permissions = "sigmadesk_seat"',
     'web_search = "disabled"',
     '',
-    '[sandbox_workspace_write]',
-    'network_access = false',
+    '[permissions.sigmadesk_seat.filesystem]',
+    '":minimal" = "read"',
+    '":tmpdir" = "write"',
+    ...readable.map((p) => `${q(p)} = "read"`),
+    '',
+    '[permissions.sigmadesk_seat.filesystem.":workspace_roots"]',
+    '"." = "write"',
+    '".git" = "write"',
+    '',
+    '[permissions.sigmadesk_seat.network]',
+    'enabled = false',
     '',
     '[features]',
     ...off.map((f) => `${f} = false`),
@@ -51,7 +68,7 @@ const codexBin = () => config.engines.codex.bin || 'codex';
 export const codex = {
   id: 'codex',
   label: 'Codex (OpenAI)',
-  isolation: { reads: 'NOT restricted', writes: 'workspace only', network: 'blocked', note: 'Codex sandbox confines writes and network, but an agent can read any file your user can (e.g. ~/.ssh). Keep it off seats near secrets.' },
+  isolation: { reads: 'restricted', writes: 'workspace only', network: 'blocked', note: 'Codex permission profile (beta): reads denied outside system/toolchain paths and the seat clone; writes only in the clone; no network.' },
   costNote: 'Token usage reported by Codex; USD only if you set engines.codex.pricing (notional on a ChatGPT plan).',
   canFork: false,
   usesSocket: false,
@@ -75,7 +92,7 @@ export const codex = {
     const common = ['--json', '--skip-git-repo-check', ...(seat.model ? ['-m', seat.model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : [])];
     const args = resume
       ? ['exec', 'resume', ...common, resume, '-']
-      : ['exec', ...common, '-s', 'workspace-write', '-C', cwd, ...extraDirs.flatMap((d) => ['--add-dir', d]), '-'];
+      : ['exec', ...common, '-C', cwd, '-'];
     return {
       bin: process.execPath,
       args: [codexBin(), ...args],
