@@ -60,8 +60,8 @@ without you.
 | Writes | own clone only (OS sandbox) | own clone only (Codex sandbox) |
 | Network | blocked | blocked (permission profile) |
 | Secret reads | **blocked** (`~/.ssh`, credentials, desk state) | **blocked** — reads denied outside system/toolchain paths and the clone (Codex permission profiles, beta) |
-| Desk transport | per-run unix socket | file mailbox inside the clone |
-| Cost | USD per run (notional on a subscription) | tokens; USD if you set `engines.codex.pricing` |
+| Desk transport | per-run unix socket | per-run file mailbox inside the clone (symlink-safe) |
+| Cost | USD per run, hard per-run cap (`--max-budget-usd`) | tokens; USD if you set `engines.codex.pricing`. **No per-run hard cap** — bounded by the run timeout and a reservation |
 | Resume / fork | both | resume only |
 
 The header shows your Claude plan's 5-hour and 7-day usage (reported by the CLI); new Claude runs pause at
@@ -78,15 +78,18 @@ Agents run on your machine, so SigmaDesk treats them as untrusted:
 | **One narrow door per run** | Each run gets its own unix socket, allowlisted only in that run's sandbox and bound to that run: a token copied from elsewhere is useless. Commands are role- and ticket-checked (an engineer cannot pass its own QA; support can only route the ticket it was given). The owner UI is a separate TCP listener agents cannot reach. |
 | **Desk state is invisible** | The desk database, config, private notes and every seat's session transcripts (`~/.claude`, `~/.codex`) are unreadable from agent shells. |
 | **Scoped file tools** | Claude's `Edit`/`Write` run outside the Bash sandbox, so they are allowed only under the seat's own clone. Web tools (also outside the sandbox) exist only for the PM's research. |
-| **Verdicts can't be forged by code** | QA and acceptance verdicts need a one-time code that lives only in the reviewer's prompt — tests written by the engineer (which QA executes) cannot read it. QA may only pass after its own run executed a test command successfully. |
-| **No inherited config** | `--setting-sources ''` (none of your hooks/plugins), `--strict-mcp-config` (no MCP servers), `--tools` limits the toolset, deny rules for `git push`, `gh`, `docker`, `curl`, …; agent shells use plain `bash` (no personal aliases). |
+| **Verdicts can't be forged by code** | QA and acceptance verdicts need a one-time code that lives only in the reviewer's prompt — tests written by the engineer (which QA executes) cannot read it (they can still post comments with the run's token). QA may only pass after its own run executed a test command — one that starts a shell segment — successfully. |
+| **No inherited config** | `--setting-sources ''` (none of your hooks/plugins), `--strict-mcp-config` (no MCP servers), `--tools` limits the toolset, deny rules for `git push`, `gh`, `docker`, `curl`, …; agent shells use plain `bash` (no personal aliases). The desk refuses to start if `claude` resolves to a wrapper script that adds permission bypasses. |
 | **Isolated clones** | Each ticket gets its own `--no-hardlinks` clone (no shared `.git`, hooks or object files with your checkout). Read-only seats use a scratch clone reset each time. Clones are deleted when the ticket closes. |
-| **Publisher, not agents** | Only the desk pushes, and only the exact commit QA approved (hooks disabled, your remote, not the clone's). PRs are always drafts. Nothing is ever merged automatically. |
-| **Publish guard** | Branches touching CI/workflows, Dockerfiles/compose, git hooks, lockfiles or shell scripts — or bigger than the size cap for their complexity — are parked for your explicit approval. An agent-edited workflow would otherwise run on your CI runners with repo secrets. |
-| **Risk limits** | Per-run budget caps, a daily limit that reserves every working seat's cap (including jobs still preparing), runs without a final report charged at their cap, max concurrency, a quieter "busy window" (e.g. market hours), an idle watchdog, a halt switch and a circuit breaker that also cancels jobs still preparing. |
+| **Publisher, not agents** | Only the desk pushes, and only the exact commit QA approved. It fetches that commit into a desk-owned bare repo and pushes from there to your remote, so no git command ever runs with an agent clone's config or hooks. PRs are always drafts. Nothing is ever merged automatically. |
+| **Publish guard** | Computed in the publisher against *your* checkout's base commit (an agent cannot move it). Branches touching CI/workflows, Dockerfiles/compose, git hooks, lockfiles or shell scripts — or bigger than the size cap for their complexity — are parked for your explicit approval. An agent-edited workflow would otherwise run on your CI runners with repo secrets. |
+| **Risk limits** | Per-run budget caps (Claude), a daily limit that reserves every working seat's cap (including jobs still preparing), runs without a final cost report charged at their cap, max concurrency, a quieter "busy window" (e.g. market hours), an idle watchdog, a halt switch and a circuit breaker that also cancels jobs still preparing. |
 | **Untrusted text** | Ticket bodies, issue bodies, web pages and log lines are fenced and labelled as untrusted data in prompts. Secrets are redacted from the activity log. |
 
-It is still your machine: read the playbook rules, keep `sandbox.enabled: true`, and review every PR.
+It is still your machine: read the playbook rules, keep `sandbox.enabled: true`, and review every PR. The design has
+been through two adversarial reviews (findings and fixes are in the commit history); treat it as defence in depth, not
+a guarantee — Codex permission profiles are a beta feature, and anything you add to `readOnlyPaths` is readable by
+every seat.
 
 ## Quick start
 

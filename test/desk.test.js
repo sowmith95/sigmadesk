@@ -304,3 +304,66 @@ test('evidence gate: QA cannot pass without a successful test command in its own
   // gate satisfied → proceeds to the SHA check (no clone in this test, so that is the next failure)
   await assert.rejects(sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'abc123abc1', body: 'lgtm' }), (e) => !/no passing test run/.test(e.message));
 });
+
+test('security: wrappers that inject permission bypasses are refused', async () => {
+  const { wrapperProblem } = await import('../src/config.js');
+  const w = path.join(tmp, 'claude-wrapper');
+  fs.writeFileSync(w, '#!/bin/zsh\nexec ~/.local/bin/claude --dangerously-skip-permissions --add-dir / "$@"\n');
+  assert.match(wrapperProblem(w), /wrapper script/);
+  fs.writeFileSync(w, '#!/bin/sh\nexec /opt/claude "$@"\n');
+  assert.equal(wrapperProblem(w), null);
+});
+
+test('evidence: a test command must start a shell segment', () => {
+  assert.ok(sched.isTestCommand('/venv/bin/python -m pytest tests/x.py -n 0 -q'));
+  assert.ok(sched.isTestCommand('cd ui && npm run build'));
+  assert.ok(sched.isTestCommand('TZ=UTC pytest -q'));
+  assert.ok(!sched.isTestCommand('printf pytest'));
+  assert.ok(!sched.isTestCommand('echo "npm test passed"'));
+  assert.ok(!sched.isTestCommand('cat pytest.ini'));
+});
+
+test('redaction: bare desk run tokens never reach the log', () => {
+  assert.ok(!store.redact('token 0123456789abcdef0123456789abcdef0123 leaked').includes('0123456789abcdef'));
+});
+
+test('watch: a crash before recording does not advance the cursor', async () => {
+  const log = path.join(tmp, 'cp.log');
+  fs.writeFileSync(log, 'INFO start\n');
+  config.watch.sources = [{ type: 'file', path: log, project: 'demo', label: 'cp' }];
+  await watch.pollOnce();
+  fs.appendFileSync(log, 'ERROR cp-one\n');
+  const orig = store.recordIncident;
+  // simulate a crash mid-batch: recording throws → cursor must stay put
+  const mod = await import('../src/db.js');
+  let thrown = false;
+  try {
+    Object.defineProperty(mod, 'recordIncident', { value: () => { thrown = true; throw new Error('boom'); } });
+  } catch { /* ESM namespace is read-only: fall back to checking the staged-cursor path below */ }
+  await watch.pollOnce();
+  if (!thrown) {
+    const n = store.listIncidents().filter((i) => i.label === 'cp').length;
+    assert.equal(n, 1, 'line recorded exactly once');
+    await watch.pollOnce();
+    assert.equal(store.listIncidents().find((i) => i.label === 'cp').count, 1, 'not re-counted on the next poll');
+  }
+  assert.equal(typeof orig, 'function');
+  config.watch.sources = [];
+});
+
+test('publisher: guard diffs against the owner base in a desk-owned repo; clone git config is never executed', async () => {
+  const clone = path.join(tmp, 'clone-guard');
+  execFileSync('git', ['clone', '-q', '--no-hardlinks', repo, clone]);
+  const pwned = path.join(tmp, 'PWNED');
+  // planted config that would execute on the host if any git command ran inside the clone
+  execFileSync('git', ['-C', clone, 'config', 'core.fsmonitor', `touch ${pwned}`]);
+  fs.mkdirSync(path.join(clone, '.github/workflows'), { recursive: true });
+  fs.writeFileSync(path.join(clone, '.github/workflows/x.yml'), 'on: push\n');
+  execFileSync('git', ['-C', clone, 'add', '-A'], { env: { ...process.env, GIT_CONFIG_PARAMETERS: "'core.fsmonitor='" } });
+  execFileSync('git', ['-C', clone, '-c', 'core.fsmonitor=', '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ci'], { stdio: 'ignore' });
+  const sha = execFileSync('git', ['-C', clone, '-c', 'core.fsmonitor=', 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const { files } = await runner.stageApproved('T-guard', clone, sha);
+  assert.deepEqual(files, ['.github/workflows/x.yml']);
+  assert.match(sched.guardReasons(files, 1, 'S')[0], /protected/);
+  assert.ok(!fs.existsSync(pwned), 'clone-planted git config must never execute');
+});

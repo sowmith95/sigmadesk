@@ -29,6 +29,15 @@ export function guardReasons(files, lines, complexity) {
   return reasons;
 }
 
+// A test command must START a shell segment (so `printf pytest` or `echo npm test` don't count).
+export function isTestCommand(cmd) {
+  const re = new RegExp(`^(?:[A-Z_]+=\\S*\\s+)*(?:\\S*/)?(?:python3?\\S*\\s+-m\\s+)?(?:${config.project.testCommandPattern.replace(/^\\b|\\b$/g, '')})`);
+  return String(cmd).split(/&&|\|\||;|\n/).some((seg) => {
+    const s = seg.trim().replace(/^\(+/, '').replace(/^(?:cd\s+\S+\s*)$/, '');
+    return re.test(s);
+  });
+}
+
 // ---------------- limits ----------------
 function localParts(d, tz) {
   const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
@@ -151,6 +160,7 @@ async function launchImplement(ticket, agentId, fence) {
     const run = await launch({ fence, agentId, kind: 'implement', ticket: t, cwd: ws.dir, resume: prev.session_id,
       prompt: 'Your previous request stalled and was restarted. Continue exactly where you left off: finish the ticket, commit, and run desk submit.' });
     if (!(run && run.status === 'error' && !run.num_turns)) return;
+    if (budgetHeadroom() < runner.runBudget(agentId)) { stall(store.getTicket(t.key), 'resume failed and the daily risk limit is reached'); return; }
   }
   // Rework: continue this engineer's own session (same clone, full memory of what it tried) when it is recent.
   const notes = comments.filter((c) => /^(❌|🔁)/.test(c.body)).pop();
@@ -158,6 +168,7 @@ async function launchImplement(ticket, agentId, fence) {
     const run = await launch({ fence, agentId, kind: 'implement', ticket: t, cwd: ws.dir, resume: prev.session_id, prompt: promptFor('rework', { ticket: t, extra: notes.body }) });
     if (run && run.status === 'error' && !run.num_turns) {
       store.logEvent({ agent_id: agentId, ticket_key: t.key, kind: 'system', text: 'session resume failed — starting fresh' });
+      if (budgetHeadroom() < runner.runBudget(agentId)) { stall(store.getTicket(t.key), 'daily risk limit reached'); return; }
     } else return;
   }
   await launch({ fence, agentId, kind: 'implement', ticket: store.getTicket(t.key), cwd: ws.dir, prompt: promptFor('implement', { ticket: store.getTicket(t.key), comments: store.listComments(t.key) }) });
@@ -202,6 +213,7 @@ async function launchReview(ticket, seat, fence) {
     const run = await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: origin.cwd, resume: origin.session_id, fork: true, extraDirs: [ws.dir], nonce: code,
       prompt: promptFor('review-resumed', { ticket: { ...ticket, nonce: code }, comments, extra: ws.dir }) });
     if (!(run && run.status === 'error' && !run.num_turns)) return;
+    if (budgetHeadroom() < runner.runBudget(seat)) { stall(store.getTicket(ticket.key), 'daily risk limit reached'); return; }
   }
   const code = nonce();
   await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: ws.dir, nonce: code, prompt: promptFor('review', { ticket, comments, extra: code }) });
@@ -267,13 +279,13 @@ export function watchDecisions() {
   return d;
 }
 
-export async function launchResearch(focus = '') {
+export async function launchResearch(focus = '', fence = runner.currentEpoch()) {
   if (!agentIdle('pm')) throw new Error('PM is busy');
   const s = store.getSettings();
   const room = Math.max(1, Number(s.max_open_proposals) - store.ticketsByStatus('proposed').length);
   const extra = `${focus ? `The owner asked you to focus on: ${focus}. ` : ''}File at most ${Math.min(3, room)} proposals.`;
   const { cwd } = await readonlyJob('pm', null);
-  return launch({ agentId: 'pm', kind: 'research', ticket: null, cwd, prompt: promptFor('research', { extra }) });
+  return launch({ fence, agentId: 'pm', kind: 'research', ticket: null, cwd, prompt: promptFor('research', { extra }) });
 }
 
 // ---------------- the tick ----------------
@@ -349,7 +361,7 @@ export async function tick() {
     // 5. PM researches on a cadence while the funnel is thin.
     if (s.pm_enabled === 'true' && slots > 0 && agentIdle('pm') && store.ticketsByStatus('proposed').length < Number(s.max_open_proposals)) {
       const last = store.lastRunOfKind('research');
-      if (!last || Date.now() - Date.parse(last.started_at) > Number(s.pm_interval_min) * 60_000) go('pm', () => launchResearch());
+      if (!last || Date.now() - Date.parse(last.started_at) > Number(s.pm_interval_min) * 60_000) go('pm', (f) => launchResearch('', f));
     }
   } finally {
     ticking = false;
@@ -360,7 +372,10 @@ export async function tick() {
 export function recoverOrphans() {
   for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });
   for (const run of store.unfinishedRuns()) {
-    if (run.pid) { try { process.kill(-run.pid, 'SIGTERM'); } catch { /* gone */ } }
+    if (run.pid) {
+      try { process.kill(-run.pid, 'SIGTERM'); } catch { /* gone */ }
+      setTimeout(() => { try { process.kill(-run.pid, 'SIGKILL'); } catch { /* gone */ } }, 5000).unref();
+    }
     // No terminal report survived the restart: charge the cap so interrupted spend is never forgotten.
     store.updateRun(run.id, { status: 'killed', ended_at: store.now(), result_text: 'desk restarted', token: null,
       cost_usd: run.cost_usd || runner.runBudget(run.agent_id), cost_estimated: run.cost_usd ? 0 : 1 });
@@ -518,8 +533,7 @@ export async function deskAction(run, cmd, body = {}) {
       }
       // Evidence gate: QA must have actually run a test/build command successfully in this run.
       const ran = runner.evidenceFor(run.id);
-      const testRe = new RegExp(config.project.testCommandPattern);
-      need(ran.some((e) => e.ok && testRe.test(e.cmd)), `no passing test run in your session yet — run the relevant tests (e.g. ${ran.length ? 'the playbook test command' : 'pytest / npm test'}) and pass only if they succeed`);
+      need(ran.some((e) => e.ok && isTestCommand(e.cmd)), `no passing test run in your session yet — run the relevant tests (e.g. ${ran.length ? 'the playbook test command' : 'pytest / npm test'}) and pass only if they succeed`);
       // The verdict only counts for the exact commit that was submitted.
       const sha = await runner.headSha(runner.workspaceDir(ticket.key));
       need(!ticket.head_sha || sha === ticket.head_sha, `HEAD moved since submission (${sha.slice(0, 7)} ≠ ${String(ticket.head_sha).slice(0, 7)}); QA must not commit`);
@@ -617,8 +631,15 @@ export function retryPublications() {
 }
 
 async function publishInner(t, key, { ownerApproved = false } = {}) {
+  let staged;
+  try {
+    staged = await runner.stageApproved(key, runner.workspaceDir(key), t.head_sha);
+  } catch (err) {
+    store.logEvent({ kind: 'error', ticket_key: key, text: `publish staging failed: ${err.message}` });
+    return;
+  }
   if (!ownerApproved) {
-    const { files, lines } = await runner.diffSummary(runner.workspaceDir(key), t.head_sha);
+    const { files, lines } = staged;
     const reasons = guardReasons(files, lines, t.complexity);
     if (reasons.length) {
       store.addComment(key, 'system', `🛑 **Publish guard** — not pushed: ${reasons.join('; ')}.\nReview the branch locally (${runner.workspaceDir(key)}) and press "Approve publish" if it is safe.`);
@@ -629,7 +650,7 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
   }
   try {
     if (!t.issue_number) await github.createIssue(key);
-    await runner.pushBranch(runner.workspaceDir(key), t.branch, t.head_sha);
+    await runner.pushBranch(key, t.branch, t.head_sha);
     store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch}` });
     const cs = store.listComments(key);
     const last = (prefix) => cs.filter((c) => c.body.startsWith(prefix)).pop()?.body.replace(/^[^\n]*\n*/, '') || '';

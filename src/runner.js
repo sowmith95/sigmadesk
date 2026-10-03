@@ -172,23 +172,41 @@ export async function commitsAhead(dir) {
   } catch { return 0; }
 }
 
-// Publish exactly the approved commit. Hooks and repo-local config in the (agent-writable) clone are ignored.
-export function pushBranch(dir, branch, sha) {
-  if (!/^[0-9a-f]{40}$/.test(String(sha))) return Promise.reject(new Error('refusing to push without an approved commit SHA'));
-  const safe = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'protocol.file.allow=never'];
+// ---------------- publisher: a desk-owned bare repo ----------------
+// Agent clones are untrusted (their .git/config can set sshCommand, fsmonitor, filters, hooks…). The publisher only
+// FETCHES objects out of a clone into a bare repo the desk owns, computes the guard diff there against the OWNER's
+// base commit, and pushes from there. No git command ever runs with a clone's config.
+const SAFE = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'diff.external=', '-c', 'core.sshCommand=ssh'];
+const publisherDir = () => path.join(config.root, 'data', 'publisher.git');
+async function publisher() {
+  const dir = publisherDir();
+  if (!fs.existsSync(path.join(dir, 'HEAD'))) await git(['init', '-q', '--bare', dir]);
+  return dir;
+}
+export async function stageApproved(key, cloneDir, sha) {
+  if (!/^[0-9a-f]{40}$/.test(String(sha))) throw new Error('refusing to publish without an approved commit SHA');
   return withGitLock(async () => {
-    const { stdout: url } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']); // owner's remote, not the clone's
-    await git([...safe, '-C', dir, 'cat-file', '-e', `${sha}^{commit}`]);
-    return git([...safe, '-C', dir, 'push', url.trim(), `${sha}:refs/heads/${branch}`], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } });
+    const pub = await publisher();
+    const base = config.project.baseBranch;
+    // Trusted base: the owner's checkout's view of origin/<base>, fetched straight from the owner repo.
+    const { stdout: baseSha } = await git(['-C', config.project.repoPath, 'rev-parse', `refs/remotes/origin/${base}`]).catch(() => git(['-C', config.project.repoPath, 'rev-parse', base]));
+    await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', config.project.repoPath, `+${baseSha.trim()}:refs/sigmadesk/base`]);
+    await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', cloneDir, `+${sha}:refs/sigmadesk/${key}`]);
+    const { stdout: got } = await git(['-C', pub, 'rev-parse', `refs/sigmadesk/${key}`]);
+    if (got.trim() !== sha) throw new Error('fetched commit does not match the approved SHA');
+    const { stdout: names } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--name-only', `refs/sigmadesk/base...${sha}`]);
+    const { stdout: stat } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--shortstat', `refs/sigmadesk/base...${sha}`]);
+    const lines = Number(stat.match(/(\d+) insertion/)?.[1] || 0) + Number(stat.match(/(\d+) deletion/)?.[1] || 0);
+    return { files: names.split('\n').filter(Boolean), lines };
   });
 }
-
-export async function diffSummary(dir, sha) {
-  const base = `origin/${config.project.baseBranch}`;
-  const { stdout: names } = await git(['-C', dir, 'diff', '--name-only', `${base}...${sha}`]);
-  const { stdout: stat } = await git(['-C', dir, 'diff', '--shortstat', `${base}...${sha}`]);
-  const lines = Number(stat.match(/(\d+) insertion/)?.[1] || 0) + Number(stat.match(/(\d+) deletion/)?.[1] || 0);
-  return { files: names.split('\n').filter(Boolean), lines };
+export function pushBranch(key, branch, sha) {
+  if (!/^[0-9a-f]{40}$/.test(String(sha))) return Promise.reject(new Error('refusing to push without an approved commit SHA'));
+  return withGitLock(async () => {
+    const pub = await publisher();
+    const { stdout: url } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']); // owner's remote
+    return git([...SAFE, '-C', pub, 'push', url.trim(), `${sha}:refs/heads/${branch}`], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } });
+  });
 }
 
 export function removeWorkspace(key) {
@@ -276,7 +294,8 @@ export const buildArgs = (agent, kind, cwd, opts) => buildCommand({ ...agent, en
 // ---------------- file mailbox (desk transport for engines whose sandbox blocks unix sockets) ----------------
 const mailboxes = new Map(); // runId -> dir
 function openMailbox(runId, cwd) {
-  const dir = path.join(cwd, '.desk-mailbox');
+  // One subfolder per run (read-only seats share a scratch clone).
+  const dir = path.join(cwd, '.desk-mailbox', `r${runId}`);
   fs.mkdirSync(dir, { recursive: true });
   const exclude = path.join(cwd, '.git', 'info', 'exclude');
   try {
@@ -286,6 +305,7 @@ function openMailbox(runId, cwd) {
   return dir;
 }
 export const openMailboxes = () => [...mailboxes.entries()];
+export const runCwd = (runId) => store.getRun(runId)?.cwd;
 
 export const runBudget = (agentId) => engineOf(agentById[agentId]).budgetUsd(agentById[agentId] || {});
 
@@ -362,12 +382,13 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       const prev = store.getRun(run.id);
       const status = prev.status === 'killed' ? 'killed' : r && !r.is_error && code === 0 ? 'success' : 'error';
       // No terminal result (killed, crashed, timed out): charge the full per-run cap so the risk limit stays honest.
-      const cost = r ? (r.total_cost_usd ?? 0) : engine.budgetUsd(agent);
+      const cost = r && (r.total_cost_usd || !r.is_error) ? (r.total_cost_usd ?? 0) : engine.budgetUsd(agent);
       store.updateRun(run.id, {
-        status, ended_at: store.now(), cost_usd: cost, cost_estimated: r ? 0 : 1, num_turns: r?.num_turns ?? null,
+        status, ended_at: store.now(), cost_usd: cost, cost_estimated: r && (r.total_cost_usd || !r.is_error) ? 0 : 1, num_turns: r?.num_turns ?? null,
         result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
       });
-      const costTxt = cost ? ` · ${r ? '' : '≤'}$${cost.toFixed(2)}${r ? '' : ' (charged at cap: no final report)'}` : '';
+      const estimated = !(r && (r.total_cost_usd || !r.is_error));
+      const costTxt = cost ? ` · ${estimated ? '≤' : ''}$${cost.toFixed(2)}${estimated ? ' (charged at cap: no final cost report)' : ''}` : '';
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: status === 'success' ? 'done' : 'error',
         text: `${kind} ${status}${r?.subtype && r.subtype !== 'success' ? ` (${r.subtype})` : ''}${costTxt}${status !== 'success' && stderr ? ` — ${short(stderr, 200)}` : ''}` });
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });

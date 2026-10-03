@@ -184,10 +184,25 @@ export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT
 
 export const config = loadConfig();
 
+// A shell wrapper that injects --dangerously-skip-permissions / --add-dir / would silently void the sandbox.
+export function wrapperProblem(bin) {
+  try {
+    const head = fs.readFileSync(bin, { encoding: 'utf8', flag: 'r' }).slice(0, 4096);
+    if (head.startsWith('#!') && /dangerously|bypassPermissions|--add-dir\s+\/(\s|"|$)|--permission-mode/.test(head)) {
+      return `${bin} is a wrapper script that changes permissions (${head.split('\n').slice(1, 3).join(' ').slice(0, 120)}). Point bins.claude at the real CLI (e.g. ~/.local/bin/claude).`;
+    }
+  } catch { /* binary or unreadable: fine */ }
+  return null;
+}
+
 export function validateConfig(c = config) {
   const problems = [];
   if (!c.project.repoPath || !fs.existsSync(path.join(c.project.repoPath, '.git'))) problems.push('project.repoPath must point at a git checkout');
   if (!fs.existsSync(c.bins.claude)) problems.push(`claude CLI not found (${c.bins.claude})`);
+  else {
+    const w = wrapperProblem(c.bins.claude);
+    if (w) problems.push(w);
+  }
   if (c.github.sync && !c.project.githubRepo) problems.push('github.sync is on but project.githubRepo is unknown');
   if (!fs.existsSync(c.project.playbook)) problems.push(`playbook not found: ${c.project.playbook}`);
   return problems;

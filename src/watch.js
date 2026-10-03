@@ -39,6 +39,7 @@ const cursors = {
   get: (k) => { const v = store.kvGet(`watch:${k}`); return v == null ? undefined : JSON.parse(v); },
   set: (k, v) => store.kvSet(`watch:${k}`, JSON.stringify(typeof v === 'bigint' ? `${v}n` : v)),
 };
+const staged = new Map(); // key -> cursor to commit once the batch is safely recorded
 const big = (v) => (typeof v === 'string' && v.endsWith('n') ? BigInt(v.slice(0, -1)) : v);
 const sourceHealth = new Map(); // source key -> { ok, error, lastPoll, lines }
 
@@ -64,7 +65,7 @@ async function readLoki(src, key) {
       out.push({ label, line, ts: new Date(Number(t / 1_000_000n)).toISOString() });
     }
   }
-  cursors.set(key, max);
+  staged.set(key, max);
   return out;
 }
 
@@ -76,7 +77,7 @@ async function readDocker(src, key) {
     const { stdout, stderr } = await pexec('docker', ['logs', '--since', since, '--until', now, c], { maxBuffer: 32 << 20, timeout: 30_000 });
     for (const line of `${stdout}\n${stderr}`.split('\n')) if (line.trim()) out.push({ label: c, line, ts: now });
   }
-  cursors.set(key, now);
+  staged.set(key, now);
   return out;
 }
 
@@ -86,7 +87,7 @@ async function readFile(src, key) {
   // Start at the end on first sight; restart from 0 when the file was replaced (new inode) or truncated.
   let pos = cur ? cur.pos : st.size;
   if (cur && (cur.ino !== st.ino || st.size < cur.pos)) pos = 0;
-  if (st.size === pos) { cursors.set(key, { ino: st.ino, pos }); return []; }
+  if (st.size === pos) { staged.set(key, { ino: st.ino, pos }); return []; }
   const fd = fs.openSync(src.path, 'r');
   const len = Math.min(st.size - pos, 8 << 20);
   const buf = Buffer.alloc(len);
@@ -97,7 +98,7 @@ async function readFile(src, key) {
   const lastNl = text.lastIndexOf('\n');
   const complete = lastNl >= 0 ? text.slice(0, lastNl) : (len === 8 << 20 ? text : '');
   const consumed = lastNl >= 0 ? Buffer.byteLength(text.slice(0, lastNl + 1)) : (len === 8 << 20 ? len : 0);
-  cursors.set(key, { ino: st.ino, pos: pos + consumed });
+  staged.set(key, { ino: st.ino, pos: pos + consumed });
   const now = new Date().toISOString();
   return complete.split('\n').filter((l) => l.trim()).map((line) => ({ label: src.label || src.path, line, ts: now }));
 }
@@ -146,6 +147,8 @@ export async function pollOnce() {
         bump(sig, Date.parse(ts) || Date.now());
         touched.add(sig);
       }
+      // Checkpoint only after every incident in the batch is stored: a crash re-reads instead of losing lines.
+      if (staged.has(key)) { cursors.set(key, staged.get(key)); staged.delete(key); }
     } catch (err) {
       health.ok = false;
       health.error = String(err.message).slice(0, 200);

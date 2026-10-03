@@ -166,6 +166,7 @@ async function ownerRoute(req, res) {
   if (req.method === 'POST' && p === '/api/control/research') {
     const b = await readBody(req);
     if (sched.budgetHeadroom() < runner.runBudget('pm')) return send(res, 409, { error: 'daily risk limit would be exceeded' });
+    if (store.listAgentStates().filter((a) => a.status === 'working').length >= sched.capacity()) return send(res, 409, { error: 'desk is at capacity — try again when a seat frees up' });
     sched.launchResearch(String(b.focus || '').slice(0, 500)).catch((err) => store.logEvent({ kind: 'error', agent_id: 'pm', text: err.message }));
     return send(res, 202, { ok: true });
   }
@@ -204,23 +205,46 @@ async function agentRoute(req, res, boundRunId) {
 
 // File-mailbox transport for engines whose sandbox blocks the socket (e.g. Codex with network off).
 const inFlight = new Set();
+// The mailbox lives in an agent-writable clone: never follow symlinks, and never write into it directly.
+function mailboxIsSafe(runId, dir) {
+  try {
+    const cwd = fs.realpathSync(runner.runCwd(runId) || '/nonexistent');
+    const st = fs.lstatSync(dir);
+    if (!st.isDirectory() || st.isSymbolicLink()) return false;
+    const real = fs.realpathSync(dir);
+    return real === path.join(cwd, '.desk-mailbox', `r${runId}`) && fs.lstatSync(path.join(cwd, '.desk-mailbox')).isDirectory();
+  } catch { return false; }
+}
 function pollMailboxes() {
   for (const [runId, dir] of runner.openMailboxes()) {
+    if (!mailboxIsSafe(runId, dir)) continue;
     let names;
-    try { names = fs.readdirSync(dir).filter((n) => /^req-[\w-]+\.json$/.test(n)); } catch { continue; }
+    try { names = fs.readdirSync(dir).filter((n) => /^req-[0-9a-f]{16}\.json$/.test(n)); } catch { continue; }
     for (const name of names) {
       const id = name.slice(4, -5);
       if (inFlight.has(`${runId}:${id}`)) continue;
       inFlight.add(`${runId}:${id}`);
       const reply = (obj) => {
-        const tmp = path.join(dir, `.res-${id}.tmp`);
-        fs.writeFileSync(tmp, JSON.stringify(obj));
-        fs.renameSync(tmp, path.join(dir, `res-${id}.json`));
-        inFlight.delete(`${runId}:${id}`);
+        try {
+          if (!mailboxIsSafe(runId, dir)) return;
+          // Write privately, then rename INTO the mailbox: rename replaces a planted symlink instead of following it.
+          const tmp = path.join(config.root, 'run', `mbx-${runId}-${id}.tmp`);
+          fs.writeFileSync(tmp, JSON.stringify(obj), { flag: 'wx', mode: 0o644 });
+          fs.renameSync(tmp, path.join(dir, `res-${id}.json`));
+        } catch { /* mailbox gone or tampered: drop the reply */ } finally { inFlight.delete(`${runId}:${id}`); }
       };
       (async () => {
         let req;
-        try { req = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')); fs.unlinkSync(path.join(dir, name)); } catch { inFlight.delete(`${runId}:${id}`); return; }
+        try {
+          const file = path.join(dir, name);
+          if (!fs.lstatSync(file).isFile()) throw new Error('not a regular file');
+          const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+          const raw = fs.readFileSync(fd, 'utf8');
+          fs.closeSync(fd);
+          fs.unlinkSync(file);
+          if (raw.length > 1e6) throw new Error('too large');
+          req = JSON.parse(raw);
+        } catch { inFlight.delete(`${runId}:${id}`); return; }
         const run = store.runByToken(req.token);
         if (!run || run.id !== runId) return reply({ error: 'invalid or finished run token' });
         try { reply({ ok: true, output: await sched.deskAction(run, String(req.cmd), req.body || {}) }); } catch (err) { reply({ error: err.message }); }
@@ -252,7 +276,7 @@ export function main() {
   // One unix socket per run, created on spawn and closed on exit (see runner.setSocketFactory).
   const sockDir = path.dirname(config.socketPath);
   fs.mkdirSync(sockDir, { recursive: true });
-  for (const f of fs.readdirSync(sockDir)) if (f.endsWith('.sock')) fs.rmSync(path.join(sockDir, f), { force: true });
+  for (const f of fs.readdirSync(sockDir)) if (/^r\d+\.sock$/.test(f)) fs.rmSync(path.join(sockDir, f), { force: true });
   runner.setSocketFactory((runId) => {
     const p = path.join(sockDir, `r${runId}.sock`);
     try { fs.unlinkSync(p); } catch { /* none */ }

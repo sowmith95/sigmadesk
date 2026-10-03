@@ -241,6 +241,7 @@ export function redact(text) {
   t = t.replace(SECRET_PATTERNS[0], '[redacted]');
   t = t.replace(SECRET_PATTERNS[1], '$1[redacted]');
   t = t.replace(SECRET_PATTERNS[2], '$1[redacted]$3');
+  t = t.replace(/\b[0-9a-f]{36}\b/g, '[redacted]'); // desk run tokens
   return t;
 }
 

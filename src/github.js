@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { config } from './config.js';
 import { agentById } from './team.js';
 import * as store from './db.js';
+import { removeWorkspace } from './runner.js';
 
 const pexec = promisify(execFile);
 const enabled = () => store.getSettings().github_sync === 'true' && Boolean(config.project.githubRepo);
@@ -43,7 +44,7 @@ export async function ensureLabels() {
 }
 
 function issueBody(t) {
-  return `${t.description}\n\n---\n_SigmaDesk ticket **${t.key}** · area: ${t.area || '-'} · complexity: ${t.complexity || '-'} · priority: ${t.priority} · assignee: ${t.assignee ? agentById[t.assignee].role : '-'}_\n_Worked by the SigmaDesk AI engineering desk. Reply on the desk board._`;
+  return `${t.description}\n\n<!-- sigmadesk:${t.key} -->\n---\n_SigmaDesk ticket **${t.key}** · area: ${t.area || '-'} · complexity: ${t.complexity || '-'} · priority: ${t.priority} · assignee: ${t.assignee ? agentById[t.assignee].role : '-'}_\n_Worked by the SigmaDesk AI engineering desk. Reply on the desk board._`;
 }
 
 export function createIssue(ticketKey) {
@@ -52,8 +53,9 @@ export function createIssue(ticketKey) {
     const t = store.getTicket(ticketKey);
     if (!t || t.issue_number) return t?.issue_number;
     // Crash-safe dedupe: an earlier attempt may have created the issue before we recorded it.
-    const existing = JSON.parse(await gh(['issue', 'list', '-R', config.project.githubRepo, '--state', 'all', '--search', `"[${t.key}]" in:title`, '--json', 'number,title', '--limit', '5']))
-      .find((i) => i.title.startsWith(`[${t.key}] `));
+    // Identity is a hidden body marker (titles can be edited by people).
+    const existing = JSON.parse(await gh(['issue', 'list', '-R', config.project.githubRepo, '--state', 'all', '--search', `"sigmadesk:${t.key}" in:body`, '--json', 'number,body', '--limit', '5']))
+      .find((i) => (i.body || '').includes(`<!-- sigmadesk:${t.key} -->`));
     if (existing) { store.updateTicket(t.key, { issue_number: existing.number }); return existing.number; }
     const labels = [LABEL, STATUS_LABELS[t.status], ROLE_LABEL(t.assignee)].filter(Boolean);
     const url = await gh(['issue', 'create', '-R', config.project.githubRepo, '--title', `[${t.key}] ${t.title}`, '--body', issueBody(t), ...labels.flatMap((l) => ['--label', l])]);
@@ -128,10 +130,12 @@ export function poll(onNewIssue, onRedChecks) {
       }
       if (pr.state === 'MERGED') {
         store.updateTicket(t.key, { status: 'done', progress: 100 });
+        removeWorkspace(t.key);
         store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: 'PR merged → done' });
         syncIssueState(t.key);
       } else if (pr.state === 'CLOSED') {
         store.updateTicket(t.key, { status: 'wontdo' });
+        removeWorkspace(t.key);
         store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: 'PR closed without merge → won\'t do' });
         syncIssueState(t.key);
       }
