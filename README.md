@@ -106,7 +106,9 @@ npm start                                                # http://127.0.0.1:8790
 No `npm install`: there are zero runtime dependencies (Node's built-in `http`, `node:sqlite`, `child_process`).
 The desk starts **halted**; press **Open desk** in the UI when you're ready.
 
-Run it as a service: `scripts/install-service.sh` (launchd on macOS, a systemd user unit on Linux).
+Run it as a service: `scripts/install-service.sh` (launchd on macOS, a systemd user unit on Linux). After pulling an
+update, `scripts/restart-when-idle.sh <name>` restarts the service the first moment no seat is working (interrupted
+seats resume their own sessions anyway, but an idle restart charges nothing).
 
 ### Phone access
 

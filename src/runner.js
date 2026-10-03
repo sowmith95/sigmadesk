@@ -105,6 +105,29 @@ const git = (args, opts = {}) => pexec(config.bins.git, args, { timeout: 180_000
 
 export const workspaceDir = (key) => path.join(config.workspaceRoot, key);
 
+// Clones made before --no-hardlinks share object files with the owner's repo. Give every such file its own inode
+// (copy + atomic rename), which leaves the owner's file untouched and is safe while the clone is in use.
+export function breakHardlinks(dir) {
+  const root = path.join(dir, '.git', 'objects');
+  if (!fs.existsSync(root)) return 0;
+  let fixed = 0;
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile() && fs.statSync(p).nlink > 1) {
+        const tmp = `${p}.unlink-${process.pid}`;
+        fs.copyFileSync(p, tmp);
+        fs.chmodSync(tmp, fs.statSync(p).mode);
+        fs.renameSync(tmp, p);
+        fixed += 1;
+      }
+    }
+  };
+  walk(root);
+  return fixed;
+}
+
 // A clone (not a worktree): its own .git inside the sandbox-writable dir, and none of the main checkout's hooks.
 export function ensureWorkspace(ticket) {
   return withGitLock(async () => {
@@ -137,6 +160,7 @@ export function ensureWorkspace(ticket) {
           .catch(() => pexec('cp', ['-R', src, dst], { timeout: 600_000 }));
       }
     }
+    breakHardlinks(dir);
     return { dir, branch };
   });
 }
@@ -153,6 +177,7 @@ export function ensureReadonlyWorkspace() {
       const { stdout: origin } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
       if (origin.trim()) await git(['-C', dir, 'remote', 'set-url', 'origin', origin.trim()]);
     }
+    breakHardlinks(dir);
     const hasOrigin = await git(['-C', dir, 'remote']).then((r) => r.stdout.includes('origin'));
     const lastFetch = fs.existsSync(path.join(dir, '.git', 'FETCH_HEAD')) ? fs.statSync(path.join(dir, '.git', 'FETCH_HEAD')).mtimeMs : 0;
     if (hasOrigin && Date.now() - lastFetch > 10 * 60_000) await git(['-C', dir, 'fetch', '--quiet', 'origin', base]).catch(() => {});
