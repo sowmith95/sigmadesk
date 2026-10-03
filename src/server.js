@@ -13,6 +13,7 @@ import * as watch from './watch.js';
 import * as prsync from './prsync.js';
 import * as dispatch from './dispatch.js';
 import * as advisors from './advisors.js';
+import * as council from './council.js';
 import * as runtime from './runtime.js';
 import * as usage from './usage.js';
 
@@ -50,9 +51,9 @@ export function snapshot() {
     meta: {
       watch: { enabled: config.watch.enabled, sources: watch.health(), window_minutes: config.watch.windowMinutes, min_count: config.watch.newSignatureMinCount },
       project: config.project.name, repo: config.project.githubRepo, preview: config.server.preview === true, spend_today: store.spendSince(sched.startOfToday()),
-      capacity: sched.capacity(settings), busy_window: sched.inBusyWindow(), running: runner.runningCount() + advisors.runningCount(),
+      capacity: sched.capacity(settings), busy_window: sched.inBusyWindow(), running: runner.runningCount() + advisors.runningCount() + council.externalRunningCount(),
       quota: JSON.parse(store.kvGet('quota:claude') || 'null'), plan_hold_at: config.limits.planHoldAt,
-      providers: dispatch.providerHealth(), scheduler: sched.health(), advisors: advisors.status(), background: runtime.status(), usage: usage.status(),
+      providers: dispatch.providerHealth(), scheduler: sched.health(), advisors: advisors.status(), council: council.status(), background: runtime.status(), usage: usage.status(),
       routing: Object.fromEntries(AGENTS.map((a) => { const s = dispatch.selectionFor(a.id); return [a.id, { engine: s.seat?.engine, model: s.seat?.model, effort: s.seat?.effort, tier: SEAT_TIER[a.id], fallback: s.fallback || false, reason: s.reason }]; })),
       engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
@@ -87,6 +88,8 @@ async function ownerRoute(req, res) {
   const m = (re) => p.match(new RegExp(re.replace('KEY', KEY)));
   let mm;
 
+  // These routes are below the same owner authentication boundary as ticket decisions.
+
   if (url.searchParams.get('token') && config.server.ownerToken) {
     if (url.searchParams.get('token') !== config.server.ownerToken) return send(res, 401, 'bad token', 'text/plain');
     return send(res, 302, '', 'text/plain', { Location: '/', 'Set-Cookie': `${COOKIE}=${config.server.ownerToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000` });
@@ -105,6 +108,15 @@ async function ownerRoute(req, res) {
   }
   if (req.method === 'GET' && p === '/api/state') return send(res, 200, snapshot());
   if (req.method === 'GET' && p === '/api/advisors') return send(res, 200, advisors.status());
+  if (req.method === 'GET' && p === '/api/councils') return send(res, 200, council.status());
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/councils$'))) return send(res, 201, council.create(mm[1], await readBody(req)));
+  if (req.method === 'GET' && (mm = m('^/api/councils/(\\d+)$'))) return send(res, 200, council.current(Number(mm[1])));
+  if (req.method === 'POST' && (mm = m('^/api/councils/(\\d+)/(run|cancel|retry|decision)$'))) {
+    const id = Number(mm[1]), action = mm[2];
+    const result = action === 'run' ? council.queue(id) : action === 'cancel' ? council.cancel(id) : action === 'retry' ? council.retry(id) : council.decide(id, await readBody(req));
+    council.pump();
+    return send(res, action === 'run' || action === 'retry' ? 202 : 200, result);
+  }
   if (req.method === 'POST' && p === '/api/providers/refresh') return send(res, 200, await usage.refresh());
   if (req.method === 'POST' && p === '/api/providers/desktop-usage') return send(res, 200, usage.recordDesktop(await readBody(req)));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/architecture-reviews$')))
@@ -187,6 +199,7 @@ async function ownerRoute(req, res) {
   }
   if (req.method === 'POST' && p === '/api/control/pause') {
     store.setSetting('paused', 'true');
+    council.cancelAll();
     store.logEvent({ kind: 'system', agent_id: 'owner', text: '⏸ Desk halted — running work finishes, nothing new starts' });
     return send(res, 200, { ok: true });
   }
@@ -194,6 +207,7 @@ async function ownerRoute(req, res) {
     store.setSetting('paused', 'true');
     runner.killAll('owner circuit breaker');
     advisors.cancelAll();
+    council.cancelAll();
     store.logEvent({ kind: 'system', agent_id: 'owner', text: '⛔ Circuit breaker — desk halted and every running seat stopped' });
     return send(res, 200, { ok: true });
   }
@@ -331,6 +345,7 @@ export async function main() {
   engines.forEach((e) => runner.setEngineVersion(e.id, e.version));
   sched.recoverOrphans();
   advisors.recoverOrphans();
+  council.recoverOrphans();
   runtime.start();
   usage.refresh().then(() => sched.tick());
   setInterval(() => usage.refresh(), 120000).unref();
@@ -378,7 +393,7 @@ export async function main() {
   prsync.startWebhook((event) => { store.logEvent({ kind: 'github', agent_id: 'github', text: `webhook: ${event} → syncing PRs` }); syncPrs(); });
   setInterval(() => github.flushComments(), 60_000);
   setInterval(() => sched.retryPublications(), 5 * 60_000);
-  const shutdown = () => { advisors.cancelAll(); runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
+  const shutdown = () => { council.cancelAll(); advisors.cancelAll(); runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }

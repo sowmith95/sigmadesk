@@ -20,6 +20,8 @@ const USAGE = `usage:
   desk reject KEY "<reason>"
   desk consult principal-be|principal-fe|dba "<question>"
   desk peer-review [--reviewer MODEL] [--challenger MODEL] "<design question>"  (manager/principals; once per run)
+  desk council-models              approved review models, readiness and lenses
+  desk council [--profile LENS] [--reviewer MODEL] [--challenger MODEL] "<question>"  (manager/principals; once per run)
   desk route KEY pm|manager|human "<why>" [--type T] [--priority P]
   desk submit "<summary>"
   desk qa pass|fail "<notes>"

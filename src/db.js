@@ -145,6 +145,41 @@ CREATE TABLE IF NOT EXISTS owner_discussions (
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   ended_at TEXT
 );
+CREATE TABLE IF NOT EXISTS councils (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  input_hash TEXT NOT NULL,
+  brief TEXT NOT NULL,
+  question TEXT NOT NULL,
+  chair TEXT NOT NULL,
+  strategy TEXT NOT NULL DEFAULT 'parallel',
+  challenge INTEGER DEFAULT 0,
+  result TEXT,
+  error TEXT,
+  decision TEXT,
+  decision_note TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ended_at TEXT
+);
+CREATE TABLE IF NOT EXISTS council_members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  council_id INTEGER NOT NULL REFERENCES councils(id),
+  stage TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  family TEXT NOT NULL,
+  lens TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  reserve_usd REAL NOT NULL,
+  run_id INTEGER,
+  result TEXT,
+  error TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  UNIQUE(council_id,stage,ordinal)
+);
+CREATE INDEX IF NOT EXISTS councils_status ON councils(status);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -278,7 +313,7 @@ export function listComments(ticket_key) {
 }
 export function unsyncedComments() {
   return q(`SELECT c.*, t.issue_number FROM comments c JOIN tickets t ON t.key=c.ticket_key
-    WHERE c.gh_synced=0 AND t.issue_number IS NOT NULL AND c.author != 'github' ORDER BY c.id LIMIT 20`).all();
+    WHERE c.gh_synced=0 AND t.issue_number IS NOT NULL AND c.author NOT IN ('github','council') ORDER BY c.id LIMIT 20`).all();
 }
 export function markCommentSynced(id) {
   q('UPDATE comments SET gh_synced=1 WHERE id=?').run(id);
@@ -306,6 +341,9 @@ export function logEvent(e) {
   announce({ type: 'event', data: ev });
   return ev;
 }
+// Redact string values before serialization: regex replacement on JSON can consume closing quotes.
+export const redactValue = (v) => typeof v === 'string' ? redact(v) : Array.isArray(v) ? v.map(redactValue)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactValue(x)])) : v;
 export function recentEvents({ ticket_key, agent_id, limit = 200 } = {}) {
   if (ticket_key) return q('SELECT * FROM events WHERE ticket_key=? ORDER BY id DESC LIMIT ?').all(ticket_key, limit).reverse();
   if (agent_id) return q('SELECT * FROM events WHERE agent_id=? ORDER BY id DESC LIMIT ?').all(agent_id, limit).reverse();
@@ -444,6 +482,37 @@ export function updateArchitectureReview(id, patch) {
   const review = getArchitectureReview(id);
   announce({ type: 'architecture-review', data: review });
   return review;
+}
+
+export const councilMembers = (id) => q('SELECT * FROM council_members WHERE council_id=? ORDER BY id').all(id);
+export function getCouncil(id) {
+  const c = q('SELECT * FROM councils WHERE id=?').get(id);
+  return c ? { ...c, members: councilMembers(id) } : null;
+}
+export const listCouncils = (key) => (key
+  ? q('SELECT id FROM councils WHERE ticket_key=? ORDER BY id DESC LIMIT 30').all(key)
+  : q('SELECT id FROM councils ORDER BY id DESC LIMIT 30').all()).map((c) => getCouncil(c.id));
+export const pendingCouncils = () => q("SELECT id FROM councils WHERE status IN ('queued','running') ORDER BY id").all().map((c) => getCouncil(c.id));
+export function createCouncil(c, members) {
+  return transaction(() => {
+    const info = q('INSERT INTO councils(ticket_key,input_hash,brief,question,chair,strategy,challenge) VALUES(?,?,?,?,?,?,?)')
+      .run(c.ticket_key, c.input_hash, c.brief, c.question, c.chair, c.strategy, c.challenge ? 1 : 0);
+    const id = Number(info.lastInsertRowid);
+    for (const m of members) q('INSERT INTO council_members(council_id,stage,ordinal,model,family,lens,reserve_usd) VALUES(?,?,?,?,?,?,?)')
+      .run(id, m.stage, m.ordinal, m.model, m.family, m.lens, m.reserve_usd);
+    const result = getCouncil(id); announce({ type: 'council', data: result }); return result;
+  });
+}
+export function updateCouncil(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['status','result','error','decision','decision_note','ended_at'].includes(k));
+  if (cols.length) q(`UPDATE councils SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
+  const c = getCouncil(id); announce({ type: 'council', data: c }); return c;
+}
+export function updateCouncilMember(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['status','run_id','result','error','started_at','ended_at'].includes(k));
+  if (cols.length) q(`UPDATE council_members SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
+  const m = q('SELECT * FROM council_members WHERE id=?').get(id);
+  announce({ type: 'council', data: getCouncil(m.council_id) }); return m;
 }
 
 // ---------- small durable key/value store (watch cursors etc.) ----------

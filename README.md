@@ -99,7 +99,7 @@ queue a revised manager response. Those decisions preserve the underlying task s
 
 ## Architecture Review Board and model selection
 
-Open a ticket → **Architecture review**. Choose a design reviewer and an independent challenger from a different model
+Open a ticket → **Architecture review** → **Desktop / API review**. Choose a design reviewer and an independent challenger from a different model
 family. Create the brief, then either run it through an API or copy it into Perplexity and attach the returned report.
 In the Mac app, the model pill below the composer switches the next message's model; we verified Kimi K3, GLM 5.3
 and Grok 4.7 in its Computer picker. Gemini availability differs by surface and requires the native Gemini API or a
@@ -128,6 +128,36 @@ Credentials stay with the server and are stripped from engineer environments. Na
 Perplexity's Agent API routes the other model families. “Configured” means a key is present; authentication is checked on use.
 Provider IDs and request formats were checked against [Perplexity](https://docs.perplexity.ai/docs/agent-api/models),
 [Gemini](https://ai.google.dev/gemini-api/docs/models), and [xAI](https://docs.x.ai/developers/grok-4-7).
+
+## On-demand engineering councils
+
+Open **Architecture review** → **Model council**. Choose two or three reviewers from different model families,
+their lenses, and a principal synthesis model. The manager may choose approved models with `desk council-models`
+and `desk council --profile data --reviewer codex/default --challenger claude/sonnet "<decision>"`, once per run.
+The domain principal chairs the decision; the coordinator checks provider readiness, budget and capacity.
+
+Each independent reviewer sees the identical frozen, redacted ticket specification, design notes, constraints and
+candidate SHA. Reviewers cannot use tools or inspect a changing checkout. Supply code evidence in the brief when
+needed; a design council does not perform implementation QA. Individual JSON findings, evidence and exposing tests
+are retained. An optional single blinded challenge runs when verdicts disagree. The chair weighs evidence and keeps
+unresolved dissent. **Approve / Needs correction / Reject** records the design decision; corrections queue a fresh
+council with the message. Partial or stale reports cannot be approved. These records remain in the local desk.
+
+All planned calls, including challenge and synthesis, reserve their individual caps (maximum $20 per council).
+At most two calls run at once and one capacity slot is preserved for QA/SRE. A failed reviewer does not discard the
+others. **Retry failed calls** reuses completed first judgments on the same input and runs a fresh synthesis. An
+interrupted paid call needs an explicit retry. Never-started queued work survives restart. Changed specification,
+dependency, branch or SHA invalidates the brief. Pausing or the circuit breaker cancels councils and retains reports.
+
+CLI councils use existing Claude/Codex authentication headlessly. Gemini, xAI, Kimi and GLM use the separately
+configured advisor APIs. Perplexity Computer OAuth is a separate connection: follow
+[the connection verification guide](docs/perplexity-connection.md). Its native Model Council MCP interface, live
+balance and remote cancellation remain unverified; the desktop snapshot does not establish server connectivity.
+
+Automatic council triggers are disabled. Run `node scripts/evaluate-council.mjs --real` for an isolated, opt-in
+comparison of single, sequential and parallel review against two defect fixtures and a clean control. The first pilot
+matched all three expected judgments for each strategy, with 3/6/9 calls respectively. It did not establish an accuracy
+advantage for councils. Codex USD is a conservative estimate when no provider cost is reported, not subscription credits.
 
 ## Background reliability and local checks
 

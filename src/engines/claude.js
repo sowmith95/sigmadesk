@@ -63,7 +63,7 @@ export const claude = {
         '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
         '--permission-mode', 'dontAsk',
         '--tools', perms.tools.join(','),
-        '--allowedTools', ...perms.allow,
+        ...(perms.allow.length ? ['--allowedTools', ...perms.allow] : []),
         '--disallowedTools', ...denyRules,
       ],
       promptViaStdin: true,

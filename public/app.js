@@ -224,6 +224,15 @@ function apply(m) {
         S.sheet.detail.discussions ||= []; upsert(S.sheet.detail.discussions, m.data);
       }
       refreshMeta(); break;
+    case 'council': {
+      if (S.meta.council) upsert(S.meta.council.councils, { id: m.data.id, ticket_key: m.data.ticket_key, status: m.data.status, decision: m.data.decision });
+      const sh = S.sheet;
+      if (sh?.type === 'architecture') {
+        if (sh.councilModels) upsert(sh.councilModels.councils, { id: m.data.id, ticket_key: m.data.ticket_key, status: m.data.status, decision: m.data.decision });
+        if (sh.council?.id === m.data.id) api('GET', `/api/councils/${m.data.id}`).then((c) => { if (S.sheet === sh && sh.council?.id === c.id) { sh.council = c; renderArchitectureSheet(); } }).catch(() => {});
+      }
+      refreshMeta(); break;
+    }
     case 'architecture-review':
       if (S.sheet?.type === 'architecture' && S.sheet.review?.id === m.data.id) {
         S.sheet.review = m.data;
@@ -541,21 +550,22 @@ function renderSettings() {
 
 // ---------------- sheets ----------------
 async function openArchitecture(key) {
-  const sh = { type: 'architecture', key, review: null, imported: '', draft: { reviewer: 'perplexity/kimi-k3', challenger: 'xai/grok-4.7', question: '' } };
+  const sh = { type: 'architecture', key, mode: 'council', council: null, ownerNote: '', councilModels: S.meta.council, councilDraft: structuredClone(S.meta.council?.defaults || {}), review: null, imported: '', draft: { reviewer: 'perplexity/kimi-k3', challenger: 'xai/grok-4.7', question: '' } };
   S.sheet = sh;
   renderSheet();
   try {
-    sh.models = await api('GET', '/api/advisors');
+    [sh.models, sh.councilModels] = await Promise.all([api('GET', '/api/advisors'), api('GET', '/api/councils')]);
+    if (!sh.councilDraft.members) sh.councilDraft = structuredClone(sh.councilModels.defaults);
     if (S.sheet === sh) renderSheet();
   } catch (e) { toast(e.message, true); }
 }
 
-function renderArchitectureSheet() {
+function renderDesktopReviewSheet() {
   const sh = S.sheet;
   if (sh?.type !== 'architecture') return;
   const r = sh.review, d = sh.models || S.meta.advisors;
   const head = [h('div', { class: 'row' }, h('h2', {}, `Architecture review · ${sh.key}`), h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')),
-    h('p', { class: 'bio' }, 'Request an independent design review and a challenge from a different model family. Record the resulting decision in an ADR before implementation.')];
+    h('p', { class: 'bio' }, 'Desktop imports and sequential API challenges. Use the council for parallel independent reviews.'), reviewModes(sh)];
   if (!d?.models) return sheetShell(head, h('p', {}, 'Loading specialist models…'));
   const select = (field, label, optional = false) => h('div', { class: 'field' }, h('label', { for: `review-${field}` }, label),
     h('select', { id: `review-${field}`, 'aria-label': label, onchange: (e) => { sh.draft[field] = e.target.value; if (field === 'reviewer' && $('review-fit')) $('review-fit').textContent = d.models.find((m) => m.id === e.target.value)?.fit || ''; } },
@@ -590,6 +600,71 @@ function renderArchitectureSheet() {
     (d.reviews || []).filter((x) => x.ticket_key === sh.key).length ? h('div', { class: 'mini-list' }, d.reviews.filter((x) => x.ticket_key === sh.key).map((x) => h('button', { class: 'mini-t', type: 'button', onclick: act(async () => { sh.review = await api('GET', `/api/architecture-reviews/${x.id}`); renderSheet(); }) }, `Review #${x.id} · ${modelName(x.reviewer)} · ${x.status}`))) : null,
   ];
   sheetShell(head, body);
+}
+
+function reviewModes(sh) {
+  return h('div', { class: 'row-actions review-modes', 'aria-label': 'Review mode' },
+    ['council', 'legacy'].map((mode) => h('button', { class: `btn ${sh.mode === mode ? 'primary' : ''}`, type: 'button', 'aria-pressed': sh.mode === mode ? 'true' : 'false', onclick: () => { sh.mode = mode; renderSheet(); } }, mode === 'council' ? 'Model council' : 'Desktop / API review')));
+}
+function councilReport(text) {
+  let r; try { r = JSON.parse(text); } catch { return h('pre', { class: 'review-text' }, text); }
+  return h('div', { class: 'council-report' },
+    h('div', { class: 'review-status' }, h('b', {}, 'Recommendation'), h('span', { class: 'tag' }, r.verdict)),
+    h('p', {}, r.recommendation),
+    (r.findings || []).map((f) => h('div', { class: 'council-finding' }, h('b', {}, `${f.severity} · ${f.issue}`), h('p', { class: 'bio' }, f.evidence), h('p', {}, `Test: ${f.test}`))),
+    ['alternatives', 'dissent', 'conditions'].filter((k) => r[k]?.length).map((k) => h('div', {}, h('b', {}, k === 'dissent' ? 'Unresolved dissent' : k === 'conditions' ? 'Required validation' : 'Alternatives'), h('ul', {}, r[k].map((v) => h('li', {}, v))))));
+}
+function renderArchitectureSheet() {
+  const sh = S.sheet;
+  if (sh?.type !== 'architecture') return;
+  if (sh.mode === 'legacy') return renderDesktopReviewSheet();
+  const d = sh.councilModels || S.meta.council, c = sh.council, draft = sh.councilDraft;
+  const head = [h('div', { class: 'row' }, h('h2', {}, `Engineering council · ${sh.key}`), h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')),
+    h('p', { class: 'bio' }, 'Independent reviews run in parallel. A principal weighs evidence, alternatives and dissent. You decide what happens next.'), reviewModes(sh)];
+  if (!d?.models || !draft.members) return sheetShell(head, h('p', {}, 'Loading approved models…'));
+  const label = (id) => d.models.find((m) => m.id === id)?.label || id;
+  const ready = c?.members.every((m) => m.status !== 'pending' || d.models.find((x) => x.id === m.model)?.ready);
+  const load = async (id) => { const next = await api('GET', `/api/councils/${id}`); if (S.sheet === sh) { sh.council = next; renderSheet(); } };
+  const action = (name) => act(async () => { sh.council = await api('POST', `/api/councils/${c.id}/${name}`, {}); if (S.sheet === sh) renderSheet(); }, name === 'run' ? 'council queued' : name === 'retry' ? 'failed calls queued; completed reviews reused' : 'council cancelled');
+  const modelSelect = (id, value, change) => h('select', { id, 'aria-label': id.startsWith('council-reviewer') ? `Reviewer ${id.slice(-1)} model` : 'Synthesis model', onchange: (e) => { change(e.target.value); renderSheet(); } }, d.models.map((m) => h('option', { value: m.id, selected: m.id === value }, `${m.label} · ${m.ready ? 'ready' : m.reason || 'connection required'}`)));
+  const rows = draft.members.map((m, i) => h('div', { class: 'council-selection' }, h('label', { for: `council-reviewer-${i + 1}` }, `Reviewer ${i + 1}`), modelSelect(`council-reviewer-${i + 1}`, m.model, (v) => { m.model = v; }),
+    h('label', { for: `council-lens-${i}` }, 'Review lens'), h('select', { id: `council-lens-${i}`, 'aria-label': `Reviewer ${i + 1} lens`, onchange: (e) => { m.lens = e.target.value; } }, Object.keys(d.lenses).map((l) => h('option', { value: l, selected: l === m.lens }, l)))));
+  const reserve = draft.members.reduce((n, m) => n + (d.models.find((x) => x.id === m.model)?.reserve_usd || 0), 0) * (draft.challenge ? 2 : 1) + (d.models.find((m) => m.id === draft.synthesizer)?.reserve_usd || 0);
+  const body = c ? [
+    h('div', { class: 'review-status' }, h('b', {}, `Council #${c.id}`), h('span', { class: 'tag' }, c.status), c.decision ? h('span', { class: 'tag' }, `Owner: ${c.decision}`) : null),
+    h('p', { class: 'bio' }, `Chair: ${agentMap()[c.chair]?.name || c.chair} · ${c.strategy} · input ${c.input_hash.slice(0, 10)} · ${money(c.members.reduce((n, m) => n + m.reserve_usd, 0))} maximum reservation`),
+    c.stale ? h('p', { class: 'warn' }, 'Ticket evidence changed. Create a fresh council before making a decision.') : null,
+    c.error ? h('p', { class: 'warn' }, c.error) : null,
+    ['queued','running'].includes(c.status) ? h('p', { class: 'bio', role: 'status' }, S.settings.paused === 'true' ? 'Queued until the desk opens.' : 'Up to two calls run at once; one slot stays available for QA or SRE. Each planned call is reserved.') : null,
+    c.result ? councilReport(c.result) : null,
+    h('div', { class: 'council-members' }, c.members.map((m) => h('details', {}, h('summary', {}, `${m.stage === 'synthesis' ? 'Principal synthesis' : `${m.stage === 'challenge' ? 'Challenge' : 'Reviewer'} ${m.ordinal + 1}`} · ${m.lens} · ${label(m.model)} · ${m.status === 'preparing' && m.run_id ? 'running' : m.status}`),
+      h('p', { class: 'bio' }, m.run ? `${m.run.model} · ${m.run.status} · ${m.run.ended_at ? `${money(m.run.cost_usd)}${m.run.cost_estimated ? ' estimated' : ' reported'}` : `${money(m.reserve_usd)} reserved`}` : `${money(m.reserve_usd)} per-call reservation`),
+      m.error ? h('p', { class: 'warn' }, m.error) : null, m.result ? councilReport(m.result) : null))),
+    h('details', {}, h('summary', {}, 'Frozen review brief'), h('pre', { class: 'review-text' }, c.brief)),
+    h('div', { class: 'row-actions' }, c.status === 'draft' ? h('button', { class: 'btn primary', type: 'button', disabled: !ready || c.stale, onclick: action('run') }, S.settings.paused === 'true' ? 'Queue council' : 'Start council') : null,
+      ['draft','queued','running'].includes(c.status) ? h('button', { class: 'btn danger', type: 'button', onclick: action('cancel') }, 'Cancel council') : null,
+      ['partial','failed','cancelled'].includes(c.status) && !c.stale ? h('button', { class: 'btn', type: 'button', onclick: action('retry') }, 'Retry failed calls') : null,
+      h('button', { class: 'btn', type: 'button', onclick: act(() => load(c.id)) }, 'Refresh'),
+      !['running','queued'].includes(c.status) ? h('button', { class: 'btn', type: 'button', onclick: () => { sh.council = null; sh.ownerNote = ''; renderSheet(); } }, 'New council') : null),
+    c.status === 'draft' && !ready ? h('p', { class: 'warn' }, 'Choose ready models to run automatically. Perplexity desktop OAuth and API keys are separate connections; use Desktop / API review for a manual brief.') : null,
+  ] : [h('div', { class: 'council-grid' }, rows),
+    h('div', { class: 'field' }, h('label', { for: 'council-synthesizer' }, 'Principal synthesis model'), modelSelect('council-synthesizer', draft.synthesizer, (v) => { draft.synthesizer = v; })),
+    (() => { const q = h('textarea', { id: 'council-question', 'aria-label': 'Council question', placeholder: 'What decision should the council assess? Include constraints or evidence.', rows: '3', maxlength: '2000', oninput: (e) => { draft.question = e.target.value; } }); q.value = draft.question || ''; return q; })(),
+    h('label', { class: 'council-check' }, h('input', { type: 'checkbox', checked: !!draft.challenge, onchange: (e) => { draft.challenge = e.target.checked; renderSheet(); } }), 'One blinded challenge if reviewers disagree'),
+    h('p', { class: 'bio' }, `Maximum ${money(reserve)} reserved for all reviewers, any challenge and synthesis. Reservations limit local scheduling; providers may bill differently. Automatic triggers are off.`),
+    h('p', { class: 'bio' }, 'Perplexity Computer: connection pending. Existing desktop credit snapshots do not establish a working server connection. ', h('a', { href: d.computer?.guide_url, target: '_blank', rel: 'noopener noreferrer' }, 'Official connection guide')),
+    h('div', { class: 'row-actions' }, h('button', { class: 'btn primary', type: 'button', onclick: act(async () => { sh.council = await api('POST', `/api/tickets/${sh.key}/councils`, draft); renderSheet(); }, 'frozen council brief created') }, 'Create council'),
+      h('button', { class: 'btn', type: 'button', onclick: () => { if (draft.members.length < 3) draft.members.push({ model: d.models.find((m) => m.ready && !draft.members.some((p) => d.models.find((x) => x.id === p.model)?.family === m.family))?.id || d.models.find((m) => !draft.members.some((p) => d.models.find((x) => x.id === p.model)?.family === m.family))?.id || draft.members[0].model, lens: 'delivery' }); else draft.members.pop(); renderSheet(); } }, draft.members.length === 3 ? 'Remove third reviewer' : 'Add third reviewer')),
+    h('div', { class: 'mini-list' }, (d.councils || []).filter((x) => x.ticket_key === sh.key).map((x) => h('button', { class: 'mini-t', type: 'button', onclick: act(() => load(x.id)) }, `Council #${x.id} · ${x.status}${x.decision ? ` · ${x.decision}` : ''}`))),
+  ];
+  const decision = (value) => act(async () => { const next = await api('POST', `/api/councils/${c.id}/decision`, { decision: value, message: sh.ownerNote }); sh.council = next.followup || next.council; sh.ownerNote = ''; renderSheet(); }, value === 'correction' ? 'corrections queued for a fresh council' : 'design decision recorded');
+  const footer = c && ['complete','partial'].includes(c.status) && !c.decision ? h('div', { class: 'ticket-footer council-footer' },
+    (() => { const note = h('textarea', { id: 'council-owner-note', 'aria-label': 'Council decision message', placeholder: 'Add a note, or describe the correction…', rows: '2', maxlength: '2000', oninput: (e) => { sh.ownerNote = e.target.value; if ($('council-correction')) $('council-correction').disabled = c.stale || !sh.ownerNote.trim(); } }); note.value = sh.ownerNote; return note; })(),
+    h('div', { class: 'row-actions' }, h('button', { class: 'btn primary', type: 'button', disabled: c.stale || c.status === 'partial', onclick: decision('approve') }, 'Approve'),
+      h('button', { class: 'btn', id: 'council-correction', type: 'button', disabled: c.stale || !sh.ownerNote.trim(), onclick: decision('correction') }, 'Needs correction'),
+      h('button', { class: 'btn danger', type: 'button', disabled: c.stale, onclick: decision('reject') }, 'Reject')),
+    h('small', {}, 'Records a design decision. Implementation, QA and final merge keep their existing approvals.')) : null;
+  sheetShell(head, body, footer);
 }
 
 let returnFocus = null;
@@ -748,7 +823,7 @@ function renderSheet() {
         !designDecision && t.pr_url ? h('a', { class: 'btn', href: t.pr_url, target: '_blank', rel: 'noopener' }, 'Review draft PR') : null)) : null;
   const body = [
     h('div', { class: 'row-actions' }, h('button', { class: 'btn', type: 'button', onclick: () => openArchitecture(t.key) }, 'Architecture review'),
-      h('small', { class: 'muted' }, `${d?.reviews?.length || 0} peer reviews · advisory findings require design-owner synthesis`)),
+      h('small', { class: 'muted' }, `${(S.meta.council?.councils || []).filter((c) => c.ticket_key === t.key).length} councils · ${d?.reviews?.length || 0} peer reviews · advisory only`)),
     h('details', { class: 'ticket-description' }, h('summary', {}, 'Task brief and acceptance criteria'), h('div', { class: 'desc' }, t.description || 'No description provided.')),
     h('details', { class: 'meta' }, h('summary', {}, 'Details', h('span', { class: 'meta-s' }, `${t.area || '—'} · ${t.complexity || '—'} · ${t.assignee ? amap[t.assignee]?.name : 'unassigned'}${t.issue_number ? ` · #${t.issue_number}` : ''}`)),
       h('div', { class: 'kv' },

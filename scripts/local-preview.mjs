@@ -64,3 +64,10 @@ for (const [status, title, assignee, priority, area, complexity] of tickets) {
 store.logEvent({ kind: 'system', text: 'Isolated demo: all execution seats disabled. No production state or credentials are used.' });
 console.log(`Preview fixture: ${tmp}`);
 process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
+// Explicit demo council: no model calls; useful for validating the owner decision UX.
+const council = await import('../src/council.js');
+const ticket = store.listTickets().find((t) => t.status === 'proposed');
+const sample = council.create(ticket.key, { question: 'Demo: assess durable provider routing and safe review boundaries.', members: [{ model: 'codex/default', lens: 'architecture' }, { model: 'claude/sonnet', lens: 'reliability' }], synthesizer: 'codex/default' });
+const report = { verdict: 'changes', recommendation: 'Demo recommendation: freeze the review brief, reserve each call, and preserve dissent before the owner makes a design decision.', findings: [{ severity: 'medium', evidence: 'Demo acceptance contract: a changed candidate invalidates an earlier report.', issue: 'A stale report could guide a changed implementation.', test: 'Change the candidate SHA and verify approval is disabled.' }], alternatives: ['Use one reviewer for routine small work.'], dissent: ['A second reviewer may cost more without finding additional defects.'], conditions: ['Run independent QA on the exact implementation commit.'] };
+for (const m of sample.members) store.updateCouncilMember(m.id, { status: 'complete', result: JSON.stringify(report), ended_at: store.now() });
+store.updateCouncil(sample.id, { status: 'complete', result: JSON.stringify(report), ended_at: store.now() });

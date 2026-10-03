@@ -8,7 +8,7 @@ import { config } from './config.js';
 import { agentById, charterFor, permissionsFor, promptFor, DENY_RULES } from './team.js';
 import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
-import { selectionFor, classifyProviderFailure, holdProvider } from './dispatch.js';
+import { selectionFor, reviewSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
 import * as store from './db.js';
 
 const pexec = promisify(execFile);
@@ -42,11 +42,11 @@ export function applyEvents(events, ctx) {
       case 'say':
         ctx.state.lastSay = e.text;
         store.logEvent({ ...base, kind: 'say', text: short(e.text, 1200) });
-        store.updateAgent(run.agent_id, { last_action: short(e.text, 140), last_action_at: store.now() });
+        if (ctx.presence !== false) store.updateAgent(run.agent_id, { last_action: short(e.text, 140), last_action_at: store.now() });
         break;
       case 'tool':
         store.logEvent({ ...base, kind: 'tool', text: e.text });
-        store.updateAgent(run.agent_id, { last_action: e.text, last_action_at: store.now() });
+        if (ctx.presence !== false) store.updateAgent(run.agent_id, { last_action: e.text, last_action_at: store.now() });
         break;
       case 'todos': {
         const todos = e.todos.map((t) => ({ ...t, content: t.text, activeForm: t.active }));
@@ -309,7 +309,7 @@ export const engineOf = (seat) => ENGINES[seat?.engine || 'claude'] || ENGINES.c
 export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath } = {}) {
   return engineOf(agent).command({
     seat: agent, kind, cwd, resume, fork, extraDirs,
-    perms: permissionsFor(kind, cwd), denyRules: DENY_RULES, charter: charterFor(agent.id), settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
+    perms: permissionsFor(kind, cwd), denyRules: DENY_RULES, charter: kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.' : charterFor(agent.id), settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
   });
 }
 
@@ -359,15 +359,17 @@ export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: St
  * Start one agent run. Resolves when the process exits with {run, result}.
  * The prompt goes over stdin so the variadic tool flags cannot swallow it.
  */
-export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null }) {
+export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null }) {
   if (fence != null && fence !== epoch) return Promise.resolve({ run: null, result: null, aborted: true });
-  const selected = selectionFor(agentId);
+  if (reviewProfile && (kind !== 'council_review' || track || resume)) throw new Error('Per-job review models are restricted to fresh, untracked council calls');
+  const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : selectionFor(agentId);
   if (!selected.seat) throw Object.assign(new Error(`${agentId}: ${selected.reason}`), { status: 409, providerUnavailable: true });
   const agent = selected.seat;
   const token = crypto.randomBytes(18).toString('hex');
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId });
   store.updateRun(run.id, { reserve_usd: engineOf(agent).budgetUsd(agent) });
-  const ctx = { run, cwd, result: null, state: {} };
+  onStart?.(run);
+  const ctx = { run, cwd, result: null, state: {}, presence: track };
   if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
   store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'run',
     text: `${agent.role} started ${kind} on ${agent.engine && agent.engine !== 'claude' ? `${agent.engine}${agent.model ? `/${agent.model}` : ''}` : agent.model}${agent.effort ? ` (${agent.effort})` : ''}${resume ? ` (${fork ? 'forked from' : 'continuing'} session ${resume.slice(0, 8)})` : ''}` });
@@ -377,9 +379,10 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const engine = engineOf(agent);
   let sock, cmd, env;
   try {
-    sock = engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
+    sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
     cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath });
     env = { ...childEnv(token, engine.id), ...cmd.env };
+    if (kind === 'council_review') { delete env.DESK_RUN_TOKEN; delete env.DESK_SOCKET; }
     if (cmd.mailbox) env.DESK_MAILBOX = openMailbox(run.id, cwd);
   } catch (err) {
     sock?.close();

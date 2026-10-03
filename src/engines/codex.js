@@ -49,6 +49,13 @@ export function codexHome() {
     '[permissions.sigmadesk_seat.network]',
     'enabled = false',
     '',
+    '[permissions.sigmadesk_review.filesystem]',
+    '":minimal" = "read"', '":tmpdir" = "write"',
+    ...readable.map((p) => `${q(p)} = "read"`),
+    '[permissions.sigmadesk_review.filesystem.":workspace_roots"]',
+    '"." = "read"', '".git" = "read"',
+    '[permissions.sigmadesk_review.network]', 'enabled = false',
+    '',
     '[features]',
     ...off.map((f) => `${f} = false`),
     '',
@@ -100,10 +107,11 @@ export const codex = {
   },
   budgetUsd: () => config.engines?.codex?.reserveUsd ?? 2,
 
-  command({ seat, charter, cwd, resume, extraDirs = [] }) {
+  command({ seat, charter, cwd, resume, extraDirs = [], kind }) {
     const effort = seat.effort === 'max' ? 'xhigh' : seat.effort;
     const model = seat.model || userModel();
-    const common = ['--json', '--skip-git-repo-check', ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : [])];
+    const common = ['--json', '--skip-git-repo-check', ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : []),
+      ...(kind === 'council_review' ? ['-c', 'default_permissions="sigmadesk_review"', '-c', 'features.shell_tool=false'] : [])];
     const args = resume
       ? ['exec', 'resume', ...common, resume, '-']
       : ['exec', ...common, '-C', cwd, '-'];
@@ -115,7 +123,7 @@ export const codex = {
       // Codex has no system-prompt flag: the charter leads the prompt.
       wrapPrompt: (prompt) => `<seat-charter>\n${charter}\n</seat-charter>\n\n${prompt}`,
       env: { CODEX_HOME: codexHome() },
-      mailbox: true,
+      mailbox: kind !== 'council_review',
     };
   },
 

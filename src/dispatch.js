@@ -41,7 +41,7 @@ export function providerHealth(now = Date.now()) {
       || (!expired && ['rejected', 'blocked'].includes(quota.status)));
     const cooling = hold && Date.parse(hold.until) > now;
     const available = detected?.available === true;
-    return { id: e.id, label: e.label, available, version: detected?.version || '', quota,
+    return { id: e.id, label: e.label, available, version: detected?.version || '', default_model: detected?.defaultModel || '', quota,
       ready: available && !full && !cooling,
       reason: !detected ? 'Detecting CLI' : !available ? 'CLI unavailable' : cooling ? hold.reason : full ? 'Plan usage limit reached' : null,
       retry_at: cooling ? hold.until : full ? (() => {
@@ -50,6 +50,15 @@ export function providerHealth(now = Date.now()) {
         return times.length ? new Date(Math.max(...times)).toISOString() : quota.resets_at || null;
       })() : null };
   });
+}
+// Per-job choices stay inside the configured catalog and never rewrite a seat preference.
+export function reviewSelection(agentId, profile) {
+  const engine = ENGINES[profile?.engine];
+  const health = providerHealth().find((p) => p.id === profile?.engine);
+  if (!engine || !engine.models().some((m) => m.id === profile.model) || !engine.efforts.includes(profile.effort))
+    throw Object.assign(new Error('Review model or effort is outside the approved catalog'), { status: 400 });
+  if (!health?.ready) return { seat: null, reason: health?.reason || 'Provider unavailable' };
+  return { seat: { ...agentById[agentId], engine: engine.id, model: profile.model || health.default_model, effort: profile.effort, role: 'Council Reviewer' }, fallback: false };
 }
 export function selectionFor(agentId, now = Date.now()) {
   const seat = agentById[agentId];

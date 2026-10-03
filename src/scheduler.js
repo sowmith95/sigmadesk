@@ -3,6 +3,7 @@ import { config } from './config.js';
 import { agentById, ENGINEERS, PRINCIPALS, BUILDERS, AREAS, COMPLEXITIES, STATUSES, routeTicket, routeSlice, promptFor } from './team.js';
 import * as store from './db.js';
 import * as advisors from './advisors.js';
+import * as council from './council.js';
 import * as runner from './runner.js';
 import * as github from './github.js';
 import * as watch from './watch.js';
@@ -390,11 +391,11 @@ export function health() {
 export function budgetHeadroom(settings = store.getSettings()) {
   // Reserve each running seat's full per-run cap so concurrent runs can't jointly blow the daily limit.
   const preparing = store.listAgentStates().filter((a) => a.status === 'working' && !a.current_run).reduce((sum, a) => sum + runner.runBudget(a.id), 0);
-  return Number(settings.daily_budget_usd) - store.spendSince(startOfToday()) - preparing - runner.runningBudget();
+  return Number(settings.daily_budget_usd) - store.spendSince(startOfToday()) - preparing - runner.runningBudget() - council.reservations();
 }
 export function workCount() {
   return store.listAgentStates().filter((a) => a.status === 'working').length
-    + store.unfinishedRuns().filter((r) => r.kind === 'architecture_review').length;
+    + store.unfinishedRuns().filter((r) => ['architecture_review','council_review'].includes(r.kind)).length + council.preparingCount();
 }
 
 export async function tick() {
@@ -467,6 +468,8 @@ export async function tick() {
       go(seat, (f) => launchReview(t, seat, f));
     }
     // 3. Engineers pick up groomed work by routing (area × complexity × risk).
+    council.pump();
+    slots = capacity(s) - workCount(); headroom = budgetHeadroom(s);
     for (const t of store.ticketsByStatus('todo')) {
       if (slots <= 0) break;
       if (t.active_run) continue;
@@ -512,7 +515,7 @@ export function recoverOrphans() {
 // ---------------- desk CLI actions (called by seats with their run token) ----------------
 const PERMS = {
   propose: ['pm'], groom: ['manager'], 'create-task': ['manager', ...PRINCIPALS], reject: ['manager'], consult: ['manager'],
-  design: PRINCIPALS, delegate: PRINCIPALS, 'peer-review': ['manager', ...PRINCIPALS],
+  design: PRINCIPALS, delegate: PRINCIPALS, 'peer-review': ['manager', ...PRINCIPALS], council: ['manager', ...PRINCIPALS],
   route: ['support'], submit: ENGINEERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
 };
@@ -529,6 +532,7 @@ function fmtTicket(t, comments) {
 
 export async function deskAction(run, cmd, body = {}) {
   const agentId = run.agent_id;
+  if (run.kind === 'council_review') need(false, 'council calls cannot invoke desk commands');
   if (run.kind === 'owner_discussion') {
     need(['list', 'show', 'comment', 'consult', 'discussion-result'].includes(cmd), 'design discussions can only read, consult and respond');
     need(!body.key || body.key === run.ticket_key, 'discussion belongs to its original ticket');
@@ -541,6 +545,18 @@ export async function deskAction(run, cmd, body = {}) {
   const ev = (text, k = key) => store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: k, kind: 'action', text });
 
   switch (cmd) {
+    case 'council-models': return JSON.stringify({ models: council.models(), lenses: council.LENSES });
+    case 'council': {
+      ownTicket();
+      need(!peerReviewsByRun.has(run.id), 'one peer review or council per run');
+      const d = council.defaults();
+      const c = council.create(key, { question: body.body, members: [
+        { model: body.reviewer || d.members[0].model, lens: body.profile || 'architecture' },
+        { model: body.challenger || d.members[1].model, lens: 'reliability' }], synthesizer: body.synthesizer || d.synthesizer });
+      peerReviewsByRun.add(run.id);
+      try { council.queue(c.id); } catch (e) { return `Council #${c.id} brief saved; ${e.message}. Continue planning without another council request this run.`; }
+      return `Council #${c.id} queued. Read-only, up to two independent calls, followed by a principal synthesis. Your saved seat preferences are retained. Continue planning; the owner reviews the council in Architecture review. Do not request another council this run.`;
+    }
     case 'peer-review': {
       ownTicket();
       need(!peerReviewsByRun.has(run.id), 'one architecture peer review per run; use the existing findings');

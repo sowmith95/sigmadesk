@@ -45,7 +45,7 @@ const DEFAULTS = {
     busyWindow: { enabled: false, timezone: 'America/New_York', days: [1, 2, 3, 4, 5], start: '09:30', end: '16:15', maxConcurrent: 1 },
     dailyBudgetUsd: 150,
     runBudgetUsd: { fable: 8, opus: 5, sonnet: 3, haiku: 0.75 },
-    runTimeoutMin: { implement: 45, qa: 20, review: 20, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, design: 20 },
+    runTimeoutMin: { implement: 45, qa: 20, review: 20, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, design: 20, council_review: 5 },
     maxQaLoops: 2,
     planHoldAt: 0.8, // hold new runs when the Claude plan's 5-hour window is this full (leave room for you)
     maxConsultsPerGroom: 1,

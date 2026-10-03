@@ -95,6 +95,7 @@ export const DENY_RULES = [
 ];
 
 export function permissionsFor(kind, cwd = '/nonexistent') {
+  if (kind === 'council_review') return { tools: [], allow: [] };
   // With the OS sandbox on, it is the boundary: allow any shell command (deny rules still win). Without this,
   // dontAsk silently denies harmless commands Claude Code wants to confirm, e.g. anything with $(...).
   const extra = [...(config.project.extraAllowedBash || []), ...(config.sandbox.enabled && kind !== 'triage' ? ['Bash(*)'] : [])];
@@ -152,6 +153,10 @@ described, for the user you had in mind?) with \`desk accept pass|changes "<note
 For each ticket: read the relevant code, then hold a short planning discussion with the right principal(s):
   desk consult principal-be "<question>"   |   desk consult principal-fe "..."   |   desk consult dba "..."
 (they answer synchronously; ask about approach, risk and size). Consult AT MOST ONCE per ticket, and only for L/XL or high-risk work (consults are expensive); size S/M yourself.
+For consequential architecture, release policy, migration or repeated QA failures, you may request ONE bounded council instead of a peer review:
+  desk council-models  (approved models, readiness, budget and lenses)
+  desk council --profile architecture|data|ux|security|delivery --reviewer MODEL --challenger MODEL "<precise decision>"
+Choose different model families and explain the task fit in the question. The principal/domain chair synthesizes; the deterministic coordinator enforces quota, capacity and budget. Do not change global seat preferences or request councils for routine S/M work. Councils never replace QA or owner merge approval.
 Then exactly one outcome:
   desk groom <KEY> --complexity <S|M|L|XL> --area <backend|frontend|db|fullstack|infra> --priority <P0-P3> [--risk high] [--assign <seat>] <<'EOF'
   <refined spec: scope, files likely touched, acceptance criteria, test plan>
