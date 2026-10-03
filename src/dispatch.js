@@ -60,7 +60,7 @@ export function selectionFor(agentId, now = Date.now()) {
   const resolveSeat = (s) => ({ ...s, model: s.engine === 'codex' && !s.model ? availability.codex?.defaultModel || '' : s.model });
   if (primary?.ready) return { seat: resolveSeat(seat), fallback: false };
   if (store.getSettings().auto_fallback === 'true') {
-    const alt = health.find((e) => e.id !== preferred && e.ready);
+    const alt = health.find((e) => e.id !== preferred && e.ready && ENGINES[e.id]?.autoFallback !== false); // never fall back onto Perplexity
     if (alt) return { seat: resolveSeat({ ...seat, engine: alt.id, ...suggestFor(agentId, alt.id) }), fallback: true, reason: primary?.reason };
   }
   return { seat: null, reason: primary?.reason || 'Provider unavailable', retry_at: primary?.retry_at };

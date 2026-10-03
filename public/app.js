@@ -1,5 +1,6 @@
 // SigmaDesk client: one snapshot, then a live SSE stream of deltas. No framework, no innerHTML for data.
 import * as prsUi from './prs.js';
+import { nameOf, linkKeys } from './names.js';
 import { portrait, presenceOf } from './avatars.js';
 
 const COLUMNS = [
@@ -148,7 +149,13 @@ function renderTeamSheet() {
         avatar(seat.id, 'md'),
         h('div', { class: 'sr-who' }, h('b', {}, seat.name), h('span', {}, seat.role), h('small', {}, `${seat.tier} · ${d.tiers[seat.tier] || ''}`)),
         h('div', { class: 'sr-ctl' },
-          h('select', { id: `team-${seat.id}-engine`, 'aria-label': `${seat.name} engine`, onchange: set('engine') }, d.engines.map((e) => h('option', { value: e.id, selected: e.id === dr.engine, disabled: !e.available }, e.label))),
+          h('select', { id: `team-${seat.id}-engine`, 'aria-label': `${seat.name} engine`, onchange: set('engine') }, d.engines.map((e) => {
+            // Perplexity can only think (no local file edits): not offered to seats that build or test.
+            const kinds = agentMap()[seat.id]?.kinds || [];
+            const unfit = Array.isArray(e.supports) && !kinds.every((k) => e.supports.includes(k));
+            return h('option', { value: e.id, selected: e.id === dr.engine, disabled: !e.available || unfit, title: unfit ? `${e.label} can only run thinking seats` : '' },
+              `${e.label}${unfit ? ' (thinking seats only)' : !e.available ? ' (not connected)' : ''}`);
+          })),
           h('select', { id: `team-${seat.id}-model`, 'aria-label': `${seat.name} model`, onchange: set('model') }, modelOpts.map((m) => h('option', { value: m.id, selected: m.id === dr.model }, `${m.id || 'default'}${m.note ? ` — ${m.note}` : ''}`))),
           h('select', { id: `team-${seat.id}-effort`, 'aria-label': `${seat.name} effort`, onchange: set('effort') }, (eng?.efforts || []).map((x) => h('option', { value: x, selected: x === dr.effort }, `effort ${x}`))),
           en),
@@ -165,7 +172,12 @@ function renderTeamSheet() {
   ];
   sheetShell(head, body);
 }
-const prsCtx = () => ({ h, api, act, avatar, toast, sheetShell, closeSheet, openTicket, S, render });
+const prsCtx = () => ({ h, api, act, avatar, toast, sheetShell, closeSheet, openTicket, S, render, nameOf: tname });
+// Human names: "Eastern session helpers" instead of "SD-5". Ticket mentions in text become named, tappable chips.
+const ticketByKey = (k) => S.tickets.find((x) => x.key === k);
+const tname = (k) => nameOf(typeof k === 'string' ? ticketByKey(k) || { title: k } : k);
+const named = (text) => linkKeys(text, ticketByKey).map((p) => (typeof p === 'string' ? p
+  : h('button', { class: 'kchip', type: 'button', title: p.key, onclick: (e) => { e.stopPropagation(); openTicket(p.key); } }, p.name)));
 const act = (fn, ok) => async (...a) => {
   const button = a[0]?.currentTarget;
   if (button?.disabled) return;
@@ -304,13 +316,15 @@ function ticketCard(t) {
   const worker = S.agents.find((a) => a.current_ticket === t.key && a.status === 'working');
   const showProg = ['in_progress', 'qa', 'ready_for_human'].includes(t.status) || t.progress > 0;
   return h('button', { class: `card ${live ? 'live' : ''}`, type: 'button', onclick: () => openTicket(t.key) },
-    h('div', { class: 'card-top' }, h('span', { class: 'key' }, t.key), h('span', { class: `pri ${t.priority}` }, t.priority), h('span', {}, t.type),
-      h('span', { class: 'spacer' }), t.issue_number ? h('span', { title: 'GitHub issue' }, `#${t.issue_number}`) : null, t.pr_url ? h('span', { title: 'draft PR' }, '⇡PR') : null),
-    h('div', { class: 'card-title' }, t.title),
+    h('div', { class: 'card-top' }, h('span', { class: `pri ${t.priority}` }, t.priority), h('span', {}, t.type),
+      h('span', { class: 'spacer' }), t.issue_number ? h('span', { title: 'GitHub issue' }, `#${t.issue_number}`) : null, t.pr_url ? h('span', { title: 'draft PR' }, '⇡PR') : null,
+      h('span', { class: 'key' }, t.key)),
+    h('div', { class: 'card-title' }, nameOf(t)),
+    nameOf(t) !== t.title ? h('div', { class: 'card-sub' }, t.title) : null,
     (() => {
       const kids = S.tickets.filter((x) => x.parent_key === t.key);
       if (kids.length) return h('div', { class: 'epic' }, `🧭 ${kids.length} slice${kids.length > 1 ? 's' : ''} · ${kids.filter((k) => k.status === 'done').length} merged`);
-      if (t.parent_key) return h('div', { class: 'slice' }, `↳ slice of ${t.parent_key}${t.after_key ? ` · after ${t.after_key}` : ''}`);
+      if (t.parent_key) return h('div', { class: 'slice' }, `↳ part of ${tname(t.parent_key)}${t.after_key ? ` · after ${tname(t.after_key)}` : ''}`);
       return null;
     })(),
     h('div', { class: 'card-meta' },
@@ -320,7 +334,7 @@ function ticketCard(t) {
       worker && worker.id !== t.assignee ? avatar(worker.id) : null,
       t.assignee ? avatar(t.assignee) : null),
     showProg ? h('div', { class: 'prog', title: `${t.progress}% (agent estimate)` }, h('i', { style: `width:${t.progress || 0}%` })) : null,
-    (live && worker?.last_action) || t.progress_msg ? h('div', { class: 'prog-msg', title: live && worker?.last_action ? worker.last_action : t.progress_msg }, live && worker?.last_action ? `▸ ${worker.last_action}` : t.progress_msg) : null,
+    (live && worker?.last_action) || t.progress_msg ? h('div', { class: 'prog-msg', title: live && worker?.last_action ? worker.last_action : t.progress_msg }, live && worker?.last_action ? `▸ ${worker.last_action}` : named(t.progress_msg)) : null,
     !live && S.meta.scheduler?.waiting?.find((w) => w.key === t.key) ? h('div', { class: 'queue-reason' }, S.meta.scheduler.waiting.find((w) => w.key === t.key).reason) : null,
   );
 }
@@ -402,7 +416,7 @@ function evRow(e, compact = false) {
   return h('div', { class: `ev ${e.kind} ${fresh ? 'fresh' : ''}` },
     h('span', { class: 't' }, hhmm(e.ts)),
     e.agent_id ? avatar(e.agent_id) : h('span', {}),
-    compact ? null : h('span', { class: 'kcol' }, e.ticket_key ? h('button', { class: 'k', type: 'button', onclick: () => openTicket(e.ticket_key) }, e.ticket_key) : ''),
+    compact ? null : h('span', { class: 'kcol' }, e.ticket_key ? h('button', { class: 'k', type: 'button', title: e.ticket_key, onclick: () => openTicket(e.ticket_key) }, tname(e.ticket_key)) : ''),
     h('span', { class: 'x' }, e.text));
 }
 
@@ -684,14 +698,14 @@ function bubble(it) {
       h('div', { class: 'work-l' }, it.lines.map((l) => h('div', { class: l.kind }, l.text))));
   }
   if (['pickup', 'action', 'done', 'github', 'created', 'system', 'run'].includes(it.kind)) {
-    return h('div', { class: `sys ${it.kind}` }, h('span', { class: 't' }, hhmm(it.ts).slice(0, 5)), ' ', it.text);
+    return h('div', { class: `sys ${it.kind}` }, h('span', { class: 't' }, hhmm(it.ts).slice(0, 5)), ' ', named(it.text));
   }
   const mine = it.who === 'owner';
   const ask = it.text.startsWith('❓');
   return h('div', { class: `msg ${mine ? 'mine' : ''} ${ask ? 'ask' : ''} ${it.kind === 'say' ? 'say' : ''}` },
     mine ? null : avatar(it.who, 'md'),
     h('div', { class: 'msg-b' }, h('div', { class: 'msg-h' }, h('b', {}, name), a ? h('span', {}, a.role) : null, h('span', { class: 't' }, ago(it.ts))),
-      h('div', { class: 'msg-t' }, it.text)));
+      h('div', { class: 'msg-t' }, named(it.text))));
 }
 
 function renderSheet() {
@@ -716,7 +730,13 @@ function renderSheet() {
     h('div', { class: 'row' }, h('span', { class: 'mono' }, t.key), h('span', { class: `pri ${t.priority}` }, t.priority), h('span', { class: 'tag' }, STATUS_LABEL[t.status] || t.status),
       worker ? h('span', { class: 'live-tag' }, avatar(worker.id), h('span', { class: 'typing' }), ` ${worker.name} is ${presenceOf(worker).text.toLowerCase()}`) : null,
       h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')),
-    h('h2', {}, t.title),
+    h('h2', {}, nameOf(t), h('button', { class: 'linkish rename', type: 'button', title: 'Rename', 'aria-label': 'Rename ticket', onclick: act(async () => {
+      const v = prompt('Short name for this ticket (2–5 words):', nameOf(t));
+      if (v == null) return false;
+      await api('POST', `/api/tickets/${t.key}/name`, { name: v });
+      await loadSnapshot();
+    }, 'renamed') }, '✎')),
+    nameOf(t) !== t.title ? h('div', { class: 'sheet-sub' }, t.title) : null,
     t.progress ? h('div', { class: 'prog', title: 'agent-reported estimate' }, h('i', { style: `width:${t.progress}%` })) : null,
     t.progress_msg ? h('div', { class: 'prog-msg' }, `${t.progress}% · ${t.progress_msg}`) : null,
   ];

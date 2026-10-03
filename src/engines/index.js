@@ -2,8 +2,9 @@
 // output stream into desk events. Add a new engine by implementing the same shape as claude.js / codex.js.
 import { claude } from './claude.js';
 import { codex } from './codex.js';
+import { perplexity } from './perplexity.js';
 
-export const ENGINES = { claude, codex };
+export const ENGINES = { claude, codex, perplexity };
 
 // Capability tiers: what each seat needs, independent of vendor.
 export const SEAT_TIER = {
@@ -34,11 +35,19 @@ export function presets(available) {
   if (has('claude') && has('codex')) {
     out.push({ id: 'mixed', label: 'Mixed: Claude builds, Codex reviews', note: 'Engineers on Claude; QA and the SRE on Codex for cross-vendor review.', engine: (id) => (['qa', 'sre'].includes(id) ? 'codex' : 'claude') });
   }
+  if (has('perplexity')) {
+    // Thinking seats on Perplexity models (your account credits); builders and QA stay local.
+    const think = { pm: 'perplexity', manager: 'perplexity', 'principal-be': 'perplexity', 'principal-fe': 'perplexity', support: 'perplexity', sre: 'perplexity' };
+    out.push({ id: 'perplexity-thinkers', label: 'Perplexity thinks, Claude builds', note: 'PM, manager, principals, SRE and support on Perplexity models (Kimi/GLM); engineers and QA on local Claude.',
+      engine: (id) => think[id] || (has('claude') ? 'claude' : 'codex') });
+  }
   return out;
 }
 
 export async function detectEngines() {
   const out = [];
-  for (const e of Object.values(ENGINES)) out.push({ id: e.id, label: e.label, isolation: e.isolation, ...(await e.detect()), models: e.models(), efforts: e.efforts, costs: e.costNote });
+  for (const e of Object.values(ENGINES)) out.push({ id: e.id, label: e.label, isolation: e.isolation, ...(await e.detect()), models: e.models(), efforts: e.efforts, costs: e.costNote,
+    // which kinds of work an engine can run (Perplexity: thinking seats only); null = everything
+    supports: e.supports ? ['research', 'groom', 'design', 'consult', 'review', 'triage', 'investigate', 'implement', 'qa'].filter((k) => e.supports(k)) : null });
   return out;
 }

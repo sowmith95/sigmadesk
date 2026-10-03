@@ -598,3 +598,13 @@ main { max-width: 1680px; margin: 0 auto; padding: 24px 24px 48px; }
   .pr-row .pr-age { grid-area: age; } .pr-row .pr-conflict { display: none; }
 }
 .pr-noconflict { display: inline-block; }
+
+/* ---------- human ticket names ---------- */
+.card-title { font-size: 14.5px; }
+.card-sub, .sheet-sub { font-size: 12px; color: var(--muted); line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.sheet-sub { -webkit-line-clamp: 3; margin-top: -4px; }
+.card-top .key { font: 10px var(--mono); color: var(--dim); }
+.kchip { display: inline; border: 0; background: rgba(56, 189, 248, .12); color: #7dd3fc; border-radius: 5px; padding: 0 5px; margin: 0 1px; font: inherit; font-size: .95em; cursor: pointer; }
+.kchip:hover { background: rgba(56, 189, 248, .22); }
+.rename { margin-left: 8px; font-size: 14px; color: var(--dim); }
+.pr-full { color: var(--muted); font-weight: 400; }

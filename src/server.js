@@ -12,6 +12,7 @@ import * as sched from './scheduler.js';
 import * as watch from './watch.js';
 import * as prsync from './prsync.js';
 import * as prs from './prs.js';
+import { nameOf } from '../public/names.js';
 import * as dispatch from './dispatch.js';
 import * as advisors from './advisors.js';
 import * as runtime from './runtime.js';
@@ -37,13 +38,16 @@ async function readBody(req) {
   try { return JSON.parse(data); } catch { throw Object.assign(new Error('bad json'), { status: 400 }); }
 }
 
+// Display name: an explicit alias (owner rename) or one derived from the title. Stored in kv: no schema change.
+const withName = (t) => ({ ...t, name: nameOf({ ...t, name: store.kvGet(`name:${t.key}`) || '' }) });
+
 export function snapshot() {
   const states = Object.fromEntries(store.listAgentStates().map((a) => [a.id, a]));
   const spend = store.spendByAgentSince(sched.startOfToday());
   const settings = store.getSettings();
   return {
     agents: AGENTS.map(({ charter, ...a }) => ({ ...a, ...states[a.id], spend_today: spend[a.id] || 0 })),
-    tickets: store.listTickets(),
+    tickets: store.listTickets().map(withName),
     events: store.recentEvents({ limit: 200 }),
     runs: store.recentRuns(40),
     settings,
@@ -136,6 +140,15 @@ async function ownerRoute(req, res) {
 
   if (req.method === 'POST' && p === '/api/tickets') return send(res, 201, sched.ownerCreate(await readBody(req)));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/approve-publish$'))) { await sched.ownerApprovePublish(mm[1]); return send(res, 200, { ok: true }); }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/name$'))) {
+    const t = store.getTicket(mm[1]);
+    if (!t) return send(res, 404, { error: 'not found' });
+    const name = String((await readBody(req)).name || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    store.kvSet(`name:${t.key}`, name); // empty = back to the derived name
+    store.logEvent({ kind: 'system', agent_id: 'owner', ticket_key: t.key, text: `renamed ${t.key} to “${name || nameOf(t)}”` });
+    store.bus.emit('msg', { type: 'ticket', data: withName(store.getTicket(t.key)) });
+    return send(res, 200, withName(store.getTicket(t.key)));
+  }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode)); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
