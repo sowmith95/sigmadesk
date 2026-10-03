@@ -30,7 +30,7 @@ Use acceptable only when the supplied evidence supports it. Do not invent files,
 export function models() {
   const health = providerHealth();
   return [
-    ...Object.values(ENGINES).flatMap((e) => e.models().filter((m) => m.tier !== 'cheap').map((m) => {
+    ...Object.values(ENGINES).filter((e) => !e.supports || e.supports('council_review')).flatMap((e) => e.models().filter((m) => m.tier !== 'cheap').map((m) => {
       const p = health.find((h) => h.id === e.id);
       return { id: `${e.id}/${m.id || 'default'}`, label: `${e.label} · ${m.id || p?.default_model || 'account default'}`, family: e.id === 'codex' ? 'gpt' : 'claude',
         engine: e.id, engine_model: m.id, ready: !!p?.ready, reason: p?.reason, reserve_usd: e.budgetUsd({ model: m.id }), fit: m.note, effort: 'high' };
@@ -274,5 +274,5 @@ export function decide(id, { decision, message = '' } = {}) {
 export function status() {
   return { models: models(), lenses: LENSES, defaults: defaults(), automatic: false, max_parallel: 2, preserved_slots: 1,
     pending: store.pendingCouncils().length, councils: store.listCouncils().map((c) => ({ id: c.id, ticket_key: c.ticket_key, status: c.status, decision: c.decision })),
-    computer: { connected: false, reason: 'Perplexity Computer OAuth/capabilities have not been verified by SigmaDesk', guide_file: 'docs/perplexity-connection.md', guide_url: 'https://docs.perplexity.ai/docs/getting-started/integrations/computer-mcp-server' } };
+    computer: { scope: 'council', connected: false, reason: 'Computer council billing/cancellation has not been verified; thinking-seat relay connectivity is separate', guide_file: 'docs/perplexity-connection.md', guide_url: 'https://docs.perplexity.ai/docs/getting-started/integrations/computer-mcp-server' } };
 }

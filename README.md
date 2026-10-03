@@ -150,7 +150,7 @@ interrupted paid call needs an explicit retry. Never-started queued work survive
 dependency, branch or SHA invalidates the brief. Pausing or the circuit breaker cancels councils and retains reports.
 
 CLI councils use existing Claude/Codex authentication headlessly. Gemini, xAI, Kimi and GLM use the separately
-configured advisor APIs. Perplexity Computer OAuth is a separate connection: follow
+configured advisor APIs. The separately installed Perplexity thinking-seat relay has its own provider connectivity status. Computer is not yet enabled for this restricted council transport. To verify Computer OAuth, follow
 [the connection verification guide](docs/perplexity-connection.md). Its native Model Council MCP interface, live
 balance and remote cancellation remain unverified; the desktop snapshot does not establish server connectivity.
 

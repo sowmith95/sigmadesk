@@ -139,3 +139,9 @@ test('council evidence stays in the desk instead of being automatically posted t
   assert.ok(store.listComments(t.key).some((c) => c.author === 'council'));
   assert.ok(!store.unsyncedComments().some((c) => c.author === 'council')); assert.equal(store.getTicket(t.key).status, 'needs_human');
 });
+
+test('a thinking-seat relay without council support cannot silently substitute a different reviewer', () => {
+  reset();
+  assert.ok(council.models().filter((m) => m.engine).every((m) => ['claude','codex'].includes(m.engine)));
+  assert.throws(() => dispatch.reviewSelection('principal-be', { engine: 'perplexity', model: 'pplx_asi_kimi_k3', effort: 'high' }), /approved catalog/);
+});

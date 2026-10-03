@@ -1,8 +1,16 @@
 # Verify Perplexity Computer connectivity
 
-Perplexity desktop login, an Agent API key, and Computer MCP OAuth are three different connections. A desktop credit snapshot does not let SigmaDesk call a model. The council currently uses sandboxed Claude/Codex CLIs or separately configured advisor API keys. SigmaDesk's Computer transport stays disconnected until OAuth, capabilities, billing and interruption behavior have been verified.
+Perplexity desktop login, an Agent API key, and Computer MCP OAuth are three different connections. A desktop credit snapshot does not let SigmaDesk call a model. The council currently uses sandboxed Claude/Codex CLIs or separately configured advisor API keys. The separately installed Perplexity thinking-seat relay is distinct from this council coordinator. Computer is not enabled for council calls until OAuth, capabilities, billing and interruption behavior have been verified.
 
-1. Register the official server in your normal Codex client:
+1. Check the client that supplies your connection. For the existing SigmaDesk thinking-seat relay, run:
+
+   ```sh
+   claude mcp get perplexity-computer
+   ```
+
+   Confirm the official endpoint and Connected status. If registration or OAuth is missing, use `claude mcp add perplexity-computer --transport http https://www.perplexity.ai/rest/computer/mcp`, then open Claude's `/mcp` menu and authenticate. Registration in one client does not authenticate another.
+
+   To also register it in your normal Codex client:
 
    ```sh
    codex mcp add perplexity-computer --url https://www.perplexity.ai/rest/computer/mcp
@@ -20,6 +28,6 @@ Perplexity desktop login, an Agent API key, and Computer MCP OAuth are three dif
 
 5. During a harmless task, lock the Mac, leave it awake and connected, then unlock and check the same thread and SigmaDesk's Reliability page. After the initial OAuth, the expected path is headless/cloud execution. Confirm that token refresh and follow-up calls do not require desktop interaction. Sleeping, shutdown, logout and network loss are different conditions from screen lock.
 
-Pass evidence: successful OAuth tool discovery, account model list, successful response with a saved thread ID, observed credit delta, reconciled interruption, and locked-screen continuity. Only then implement a server-owned Computer adapter with isolated credentials, explicit-model independent threads, checkpoint handling and durable remote IDs. Adding MCP to Codex alone does not connect SigmaDesk: its engineering seats deliberately disable personal MCP servers.
+Pass evidence: successful OAuth tool discovery, account model list, successful response with a saved thread ID, observed credit delta, reconciled interruption, and locked-screen continuity. Only then enable a server-owned Computer council adapter with isolated credentials, explicit-model independent threads, checkpoint handling and durable remote IDs. Adding MCP to Codex alone does not connect the council: local council reviewers deliberately disable personal MCP servers. Perplexity thinking seats use a separate explicit relay connection, whose status appears under providers.
 
 Sources: [official Computer MCP documentation](https://docs.perplexity.ai/docs/getting-started/integrations/computer-mcp-server), [Agent API quickstart](https://docs.perplexity.ai/docs/agent-api/quickstart), [Model Council in Computer](https://www.perplexity.ai/en-GB/hub/blog/model-council-comes-to-computer). Codex command syntax was checked against the locally installed CLI.

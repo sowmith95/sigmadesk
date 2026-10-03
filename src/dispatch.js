@@ -55,7 +55,7 @@ export function providerHealth(now = Date.now()) {
 export function reviewSelection(agentId, profile) {
   const engine = ENGINES[profile?.engine];
   const health = providerHealth().find((p) => p.id === profile?.engine);
-  if (!engine || !engine.models().some((m) => m.id === profile.model) || !engine.efforts.includes(profile.effort))
+  if (!engine || engine.supports && !engine.supports('council_review') || !engine.models().some((m) => m.id === profile.model) || !engine.efforts.includes(profile.effort))
     throw Object.assign(new Error('Review model or effort is outside the approved catalog'), { status: 400 });
   if (!health?.ready) return { seat: null, reason: health?.reason || 'Provider unavailable' };
   return { seat: { ...agentById[agentId], engine: engine.id, model: profile.model || health.default_model, effort: profile.effort, role: 'Council Reviewer' }, fallback: false };
