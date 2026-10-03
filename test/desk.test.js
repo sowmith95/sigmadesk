@@ -194,3 +194,109 @@ test('UI owner auth: settings reject unknown keys', () => {
   store.setSetting('max_concurrent', '2');
   assert.equal(store.getSettings().max_concurrent, '2');
 });
+
+test('engines: codex seat builds a sandboxed, network-off command with an isolated CODEX_HOME and the mailbox', async () => {
+  const { ENGINES, suggestFor, presets } = await import('../src/engines/index.js');
+  const seat = { ...team.agentById.qa, engine: 'codex', model: '', effort: 'max' };
+  const cmd = runner.buildCommand(seat, 'qa', '/tmp/ws');
+  assert.equal(cmd.args[1], 'exec');
+  assert.ok(cmd.args.includes('workspace-write'));
+  assert.ok(cmd.args.includes('model_reasoning_effort=xhigh'), 'max maps to xhigh for codex');
+  assert.ok(cmd.mailbox);
+  const toml = fs.readFileSync(path.join(cmd.env.CODEX_HOME, 'config.toml'), 'utf8');
+  assert.match(toml, /network_access = false/);
+  assert.match(cmd.wrapPrompt('do it'), /<seat-charter>[\s\S]*Taylor[\s\S]*do it$/);
+  const resumed = runner.buildCommand(seat, 'implement', '/tmp/ws', { resume: 'thread-1' });
+  assert.deepEqual(resumed.args.slice(1, 3), ['exec', 'resume']);
+  assert.equal(ENGINES.codex.canFork, false);
+  assert.deepEqual(suggestFor('principal-be', 'claude'), { model: 'fable', effort: 'xhigh' });
+  assert.equal(suggestFor('support', 'claude').model, 'haiku');
+  const mixed = presets(['claude', 'codex']).find((p) => p.id === 'mixed');
+  assert.equal(mixed.engine('qa'), 'codex');
+  assert.equal(mixed.engine('junior'), 'claude');
+});
+
+test('engines: codex JSONL normalizes to desk events', async () => {
+  const { ENGINES } = await import('../src/engines/index.js');
+  const st = {};
+  const p = (o) => ENGINES.codex.parse(JSON.stringify(o), '/w', st);
+  assert.deepEqual(p({ type: 'thread.started', thread_id: 't1' }), [{ type: 'session', id: 't1' }]);
+  assert.deepEqual(p({ type: 'item.started', item: { type: 'command_execution', command: "/bin/bash -lc 'pytest -q'" } }), [{ type: 'tool', text: '$ pytest -q' }]);
+  assert.deepEqual(p({ type: 'item.started', item: { type: 'command_execution', command: "/bin/bash -lc 'desk progress 5 x'" } }), []);
+  assert.equal(p({ type: 'item.completed', item: { type: 'file_change', changes: [{ path: '/w/a.py', kind: 'update' }] } })[0].text, 'Editing a.py');
+  assert.equal(p({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } })[0].type, 'result');
+});
+
+test('team overrides switch a seat engine live and can be reverted', () => {
+  team.applyTeamOverrides({ junior: { engine: 'codex', model: '', effort: 'medium' } });
+  assert.equal(team.agentById.junior.engine, 'codex');
+  team.applyTeamOverrides({});
+  assert.equal(team.agentById.junior.engine, 'claude');
+  assert.equal(team.agentById.junior.model, 'sonnet');
+});
+
+test('security: edit tools are scoped to the seat workspace; web tools only for research', () => {
+  const impl = team.permissionsFor('implement', '/ws/T-9');
+  assert.ok(impl.allow.includes('Edit(//ws/T-9/**)'));
+  assert.ok(!impl.allow.includes('Edit'), 'no unscoped Edit');
+  assert.ok(!impl.tools.includes('WebFetch'));
+  assert.ok(team.permissionsFor('research').tools.includes('WebFetch'));
+  assert.ok(!team.permissionsFor('qa').tools.includes('WebSearch'));
+});
+
+test('security: sandbox hides desk state + transcripts and write-protects read-only paths', () => {
+  const s = runner.sandboxSettings('/ws/x', ['/ws/other'], 'qa', '/run/r1.sock');
+  for (const p of [path.join(config.root, 'data'), '~/.claude', '~/.codex', config.configFile]) assert.ok(s.sandbox.filesystem.denyRead.includes(p), p);
+  assert.ok(s.sandbox.filesystem.denyWrite.includes('/ws/other'));
+  assert.ok(s.sandbox.filesystem.denyWrite.includes(config.project.repoPath));
+  assert.deepEqual(s.sandbox.network.allowUnixSockets, ['/run/r1.sock']);
+  assert.deepEqual(s.permissions.additionalDirectories, []);
+});
+
+test('security: QA verdicts need the per-run code; seats cannot act on tickets they were not given', async () => {
+  const t = store.createTicket({ title: 'qa me', status: 'qa' });
+  const qaRun = fakeRun('qa', 'qa', t.key, { nonce: 'c0ffee1234' });
+  await assert.rejects(sched.deskAction(qaRun, 'qa', { verdict: 'fail', body: 'x' }), /--code/);
+  await assert.rejects(sched.deskAction(qaRun, 'qa', { verdict: 'fail', code: 'nope', body: 'x' }), /--code/);
+  await sched.deskAction(qaRun, 'qa', { verdict: 'fail', code: 'c0ffee1234', body: '1. broken' });
+  assert.equal(store.getTicket(t.key).status, 'todo');
+  const a = store.createTicket({ title: 'a', status: 'triage' });
+  const b = store.createTicket({ title: 'b', status: 'triage' });
+  await assert.rejects(sched.deskAction(fakeRun('support', 'triage', a.key), 'route', { key: b.key, to: 'manager' }), /only route the ticket you were given/);
+});
+
+test('security: the publisher only pushes an approved full SHA', async () => {
+  await assert.rejects(runner.pushBranch('/tmp/nowhere', 'b', 'HEAD'), /approved commit SHA/);
+});
+
+test('budget: a run with no final report is charged at its cap', async () => {
+  const r = fakeRun('junior', 'implement');
+  sched.recoverOrphans();
+  const after = store.getRun(r.id);
+  assert.equal(after.status, 'killed');
+  assert.equal(after.cost_estimated, 1);
+  assert.ok(after.cost_usd > 0);
+});
+
+test('publish guard: CI, containers, hooks and lockfiles are protected; big diffs are capped', () => {
+  const r = (files, lines = 10, c = 'S') => sched.guardReasons(files, lines, c);
+  assert.equal(r(['alpaca_trader/app/x.py']).length, 0);
+  assert.match(r(['.github/workflows/deploy.yml'])[0], /protected/);
+  assert.match(r(['infra/Dockerfile.whale'])[0], /protected/);
+  assert.match(r(['ui/package-lock.json'])[0], /protected/);
+  assert.match(r(['scripts/run.sh'])[0], /protected/);
+  assert.match(r(['a.py'], 900, 'S')[0], /cap/);
+  assert.equal(r(['a.py'], 900, 'M').length, 0);
+});
+
+test('evidence gate: QA cannot pass without a successful test command in its own run', async () => {
+  const t = store.createTicket({ title: 'needs evidence', status: 'qa' });
+  const qaRun = fakeRun('qa', 'qa', t.key, { nonce: 'abc123abc1' });
+  await assert.rejects(sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'abc123abc1', body: 'lgtm' }), /no passing test run/);
+  const ctx = { run: qaRun, cwd: '/w', state: {} };
+  runner.applyEvents([{ type: 'cmd-start', id: 'a', cmd: 'python -m pytest tests/x.py -n 0' }, { type: 'cmd-end', id: 'a', ok: false }], ctx);
+  await assert.rejects(sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'abc123abc1', body: 'lgtm' }), /no passing test run/);
+  runner.applyEvents([{ type: 'cmd-start', id: 'b', cmd: 'python -m pytest tests/x.py -n 0' }, { type: 'cmd-end', id: 'b', ok: true }], ctx);
+  // gate satisfied → proceeds to the SHA check (no clone in this test, so that is the next failure)
+  await assert.rejects(sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'abc123abc1', body: 'lgtm' }), (e) => !/no passing test run/.test(e.message));
+});

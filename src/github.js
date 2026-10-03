@@ -51,6 +51,10 @@ export function createIssue(ticketKey) {
   return enqueue('create issue', async () => {
     const t = store.getTicket(ticketKey);
     if (!t || t.issue_number) return t?.issue_number;
+    // Crash-safe dedupe: an earlier attempt may have created the issue before we recorded it.
+    const existing = JSON.parse(await gh(['issue', 'list', '-R', config.project.githubRepo, '--state', 'all', '--search', `"[${t.key}]" in:title`, '--json', 'number,title', '--limit', '5']))
+      .find((i) => i.title.startsWith(`[${t.key}] `));
+    if (existing) { store.updateTicket(t.key, { issue_number: existing.number }); return existing.number; }
     const labels = [LABEL, STATUS_LABELS[t.status], ROLE_LABEL(t.assignee)].filter(Boolean);
     const url = await gh(['issue', 'create', '-R', config.project.githubRepo, '--title', `[${t.key}] ${t.title}`, '--body', issueBody(t), ...labels.flatMap((l) => ['--label', l])]);
     const num = Number(url.match(/\/issues\/(\d+)/)?.[1]);
@@ -81,8 +85,8 @@ export function flushComments() {
   return enqueue('comments', async () => {
     for (const c of store.unsyncedComments()) {
       const who = agentById[c.author] ? `${agentById[c.author].name} · ${agentById[c.author].role}` : c.author;
+      store.markCommentSynced(c.id); // at-most-once: a crash mid-post loses one mirror comment instead of duplicating it
       await gh(['issue', 'comment', String(c.issue_number), '-R', config.project.githubRepo, '--body', `**${who}** · SigmaDesk ${c.ticket_key}\n\n${c.body}`]);
-      store.markCommentSynced(c.id);
     }
   });
 }
@@ -91,8 +95,10 @@ export function openDraftPr(ticketKey, summary) {
   return enqueue('open PR', async () => {
     const t = store.getTicket(ticketKey);
     if (!t?.branch || t.pr_url) return t?.pr_url;
+    const open = JSON.parse(await gh(['pr', 'list', '-R', config.project.githubRepo, '--head', t.branch, '--state', 'all', '--json', 'url', '--limit', '1']));
+    if (open[0]?.url) { store.updateTicket(t.key, { pr_url: open[0].url }); return open[0].url; }
     const body = `${summary}\n\n${t.issue_number ? `Closes #${t.issue_number}\n\n` : ''}---\nBuilt by **${agentById[t.assignee]?.name || 'SigmaDesk'} (${agentById[t.assignee]?.role || 'engineer'})**, independently checked by QA at \`${String(t.head_sha || '').slice(0, 10)}\`. Draft — needs human review before merge.\n\n_Opened by [SigmaDesk](https://github.com/${config.project.githubOwner})._`;
-    const url = await gh(['pr', 'create', '-R', config.project.githubRepo, '--draft', '--base', 'main', '--head', t.branch, '--title', `[${t.key}] ${t.title}`, '--body', body]);
+    const url = await gh(['pr', 'create', '-R', config.project.githubRepo, '--draft', '--base', config.project.baseBranch, '--head', t.branch, '--title', `[${t.key}] ${t.title}`, '--body', body]);
     store.updateTicket(t.key, { pr_url: url.split('\n').pop() });
     store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: `opened draft PR ${url}` });
     return url;
@@ -100,7 +106,7 @@ export function openDraftPr(ticketKey, summary) {
 }
 
 // Import trusted-author issues carrying the desk label; detect merged/closed PRs.
-export function poll(onNewIssue) {
+export function poll(onNewIssue, onRedChecks) {
   if (!enabled()) return null;
   return enqueue('poll', async () => {
     const known = new Set(store.listTickets().map((t) => t.issue_number).filter(Boolean));
@@ -112,7 +118,14 @@ export function poll(onNewIssue) {
     }
     for (const t of store.ticketsByStatus('ready_for_human')) {
       if (!t.pr_url) continue;
-      const pr = JSON.parse(await gh(['pr', 'view', t.pr_url, '-R', config.project.githubRepo, '--json', 'state']));
+      const pr = JSON.parse(await gh(['pr', 'view', t.pr_url, '-R', config.project.githubRepo, '--json', 'state,mergeable,statusCheckRollup,headRefOid']));
+      // PR health: red checks on the approved commit send the work back to its engineer.
+      const failed = (pr.statusCheckRollup || []).filter((c) => ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED'].includes(c.conclusion || c.state));
+      if (pr.state === 'OPEN' && failed.length && onRedChecks) onRedChecks(t, failed.map((c) => c.name || c.context).join(', '));
+      else if (pr.state === 'OPEN' && pr.mergeable === 'CONFLICTING' && !t.progress_msg?.includes('conflict')) {
+        store.addComment(t.key, 'system', `⚠️ The draft PR now conflicts with ${config.project.baseBranch}. Rebase before merging.`);
+        store.updateTicket(t.key, { progress_msg: 'PR has merge conflicts' });
+      }
       if (pr.state === 'MERGED') {
         store.updateTicket(t.key, { status: 'done', progress: 100 });
         store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: 'PR merged → done' });

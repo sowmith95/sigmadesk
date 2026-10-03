@@ -2,6 +2,9 @@
 // desk — the only way a SigmaDesk seat talks to the desk. Speaks HTTP over the unix socket
 // the sandbox allowlists (DESK_SOCKET), authenticated by this run's token (DESK_RUN_TOKEN).
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 
 const USAGE = `usage:
   desk show [KEY] | desk list [status]
@@ -59,23 +62,49 @@ switch (cmd) {
 if (!body.body && !['show', 'list', 'progress'].includes(cmd)) body.body = await stdinText();
 else if (['groom', 'propose', 'create-task', 'incident'].includes(cmd) && !body.body) body.body = await stdinText();
 
-const socketPath = process.env.DESK_SOCKET;
 const token = process.env.DESK_RUN_TOKEN;
-if (!socketPath || !token) { console.error('desk: not inside a SigmaDesk run (DESK_SOCKET/DESK_RUN_TOKEN unset)'); process.exit(2); }
+const mailbox = process.env.DESK_MAILBOX;
+const socketPath = process.env.DESK_SOCKET;
+if (!token || (!mailbox && !socketPath)) { console.error('desk: not inside a SigmaDesk run (DESK_RUN_TOKEN and DESK_SOCKET/DESK_MAILBOX unset)'); process.exit(2); }
 
-const payload = JSON.stringify(body);
-const req = http.request({ socketPath, path: `/desk/${cmd}`, method: 'POST',
-  headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Authorization: `Bearer ${token}` },
-  timeout: 15 * 60_000 }, (res) => {
-  let data = '';
-  res.on('data', (c) => { data += c; });
-  res.on('end', () => {
-    let j;
-    try { j = JSON.parse(data); } catch { j = { error: data }; }
-    if (res.statusCode >= 400) { console.error(`desk ${cmd}: ${j.error || res.statusCode}`); process.exit(1); }
-    console.log(j.output ?? 'ok');
+function finish(status, j) {
+  if (status >= 400 || j.error) { console.error(`desk ${cmd}: ${j.error || status}`); process.exit(1); }
+  console.log(j.output ?? 'ok');
+  process.exit(0);
+}
+
+if (mailbox) {
+  // File transport: drop a request into the mailbox, wait for the desk's reply file.
+  const id = crypto.randomBytes(8).toString('hex');
+  const tmp = path.join(mailbox, `.req-${id}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify({ token, cmd, body }));
+  fs.renameSync(tmp, path.join(mailbox, `req-${id}.json`));
+  const res = path.join(mailbox, `res-${id}.json`);
+  const deadline = Date.now() + 15 * 60_000;
+  const wait = () => {
+    if (fs.existsSync(res)) {
+      const j = JSON.parse(fs.readFileSync(res, 'utf8'));
+      fs.unlinkSync(res);
+      return finish(j.error ? 400 : 200, j);
+    }
+    if (Date.now() > deadline) { console.error('desk: timed out waiting for the desk'); process.exit(1); }
+    setTimeout(wait, 250);
+  };
+  wait();
+} else {
+  const payload = JSON.stringify(body);
+  const req = http.request({ socketPath, path: `/desk/${cmd}`, method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Authorization: `Bearer ${token}` },
+    timeout: 15 * 60_000 }, (res) => {
+    let data = '';
+    res.on('data', (c) => { data += c; });
+    res.on('end', () => {
+      let j;
+      try { j = JSON.parse(data); } catch { j = { error: data }; }
+      finish(res.statusCode, j);
+    });
   });
-});
-req.on('error', (e) => { console.error(`desk: cannot reach the desk (${e.message})`); process.exit(1); });
-req.on('timeout', () => { req.destroy(new Error('timeout')); });
-req.end(payload);
+  req.on('error', (e) => { console.error(`desk: cannot reach the desk (${e.message})`); process.exit(1); });
+  req.on('timeout', () => { req.destroy(new Error('timeout')); });
+  req.end(payload);
+}

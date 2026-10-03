@@ -28,6 +28,15 @@ const DEFAULTS = {
     env: {}, // extra env for agent runs, e.g. {"TZ": "America/New_York"}
     extraAllowedBash: [], // extra Bash permission rules for engineers, e.g. ["Bash(make test *)"]
     readOnlyPaths: [], // extra dirs agents may read (e.g. a shared virtualenv)
+    // Publish guard: a branch touching any of these is NOT pushed until the owner approves it. CI files are the big one:
+    // a workflow edited by an agent would run its code on your CI runners (self-hosted = this machine) with repo secrets.
+    protectedPaths: ['.github/**', '.gitlab-ci.yml', '.circleci/**', '.buildkite/**', 'Jenkinsfile', 'azure-pipelines.yml',
+      '**/Dockerfile*', '**/docker-compose*', '**/compose*.y*ml', '.husky/**', '.githooks/**', '.pre-commit-config.yaml',
+      '**/package-lock.json', '**/yarn.lock', '**/pnpm-lock.yaml', '**/poetry.lock', '**/requirements*.txt', '**/setup.py',
+      '**/.npmrc', '**/Makefile', '**/*.sh', '.env*', '**/.env*'],
+    maxDiffLines: { S: 400, M: 1200, L: 3000, XL: 6000 }, // larger diffs are parked for the owner
+    // QA must have run one of these (successfully) in its own run before it may pass a ticket.
+    testCommandPattern: '\\b(pytest|vitest|jest|mocha|go test|cargo test|npm (run )?(test|build)|pnpm (run )?(test|build)|yarn (test|build)|make (test|check)|mvn test|gradle test|rspec|phpunit|tox|nox)\\b',
   },
   limits: {
     maxConcurrent: 3,
@@ -37,6 +46,8 @@ const DEFAULTS = {
     runBudgetUsd: { fable: 8, opus: 5, sonnet: 3, haiku: 0.75 },
     runTimeoutMin: { implement: 45, qa: 20, review: 20, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20 },
     maxQaLoops: 2,
+    planHoldAt: 0.9, // hold new runs when the Claude plan's 5-hour window is this full (leave room for you)
+    idleTimeoutMin: 5, // no stream output at all (even thinking emits events) = stalled request; the run is stopped and resumed
   },
   review: {
     // After QA passes, the seat that asked for the work (PM / manager) confirms it matches their intent.
@@ -58,6 +69,8 @@ const DEFAULTS = {
     errorPatternCaseInsensitive: false,
     criticalPattern: '', // matching lines skip the min-count threshold (e.g. "order rejected|margin")
     ignorePatterns: [],
+    // Extra fingerprint rules, e.g. [{"pattern": "\\b[A-Z]{1,5}: No earnings", "replace": "<SYM>: No earnings"}]
+    normalizers: [],
     newSignatureMinCount: 3, // bursty: this many hits inside windowMinutes
     windowMinutes: 15,
     chronicMinCount: 5, // chronic: this many hits in total (low-rate errors that never burst)
@@ -90,6 +103,10 @@ const DEFAULTS = {
   team: {},
   // Agents' Bash tool snapshots this shell's aliases; a plain bash avoids personal aliases (grep→rg, find→fd, ...).
   bins: { claude: '', gh: '', git: 'git', agentShell: '/bin/bash' },
+  // Optional extra engines. codex.bin is auto-detected from PATH (and common Node version-manager dirs) if empty.
+  engines: {
+    codex: { bin: '', models: [], pricing: null, reserveUsd: 2 },
+  },
 };
 
 function deepMerge(base, over) {
@@ -103,6 +120,21 @@ function deepMerge(base, over) {
 
 function which(bin) {
   try { return execFileSync('/usr/bin/env', ['which', bin], { encoding: 'utf8' }).trim(); } catch { return ''; }
+}
+
+// Services often start with a minimal PATH; look where nvm / mise / volta / fnm install global CLIs.
+function findInNodeManagers(bin) {
+  const home = os.homedir();
+  const roots = [path.join(home, '.local/share/mise/installs/node'), path.join(home, '.nvm/versions/node'), path.join(home, '.volta/bin'), path.join(home, '.fnm/node-versions')];
+  for (const r of roots) {
+    try {
+      if (fs.existsSync(path.join(r, bin))) return path.join(r, bin);
+      for (const v of fs.readdirSync(r).sort().reverse()) {
+        for (const cand of [path.join(r, v, 'bin', bin), path.join(r, v, 'installation', 'bin', bin)]) if (fs.existsSync(cand)) return cand;
+      }
+    } catch { /* not installed */ }
+  }
+  return '';
 }
 
 const expandHome = (p) => (p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
@@ -123,6 +155,7 @@ export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT
   c.project.readOnlyPaths = c.project.readOnlyPaths.map(expandHome);
   c.bins.claude = c.bins.claude || which('claude') || path.join(os.homedir(), '.local/bin/claude');
   c.bins.gh = c.bins.gh || which('gh') || 'gh';
+  c.engines.codex.bin = c.engines.codex.bin || which('codex') || findInNodeManagers('codex') || '';
   if (!c.project.githubRepo && c.project.repoPath) {
     try {
       const url = execFileSync('git', ['-C', c.project.repoPath, 'remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim();
@@ -136,7 +169,7 @@ export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT
   c.dbPath = env.SIGMADESK_DB || path.join(ROOT, 'data', 'sigmadesk.db');
   // Agents talk to the desk over this unix socket (the sandbox allowlists it; the TCP UI port stays unreachable).
   // Real path matters: the sandbox matches resolved paths. macOS caps socket paths at 104 bytes.
-  c.socketPath = env.SIGMADESK_SOCKET || path.join(fs.realpathSync(ROOT), 'data', 'agent.sock');
+  c.socketPath = env.SIGMADESK_SOCKET || path.join(fs.realpathSync(ROOT), 'run', 'agent.sock');
   if (c.socketPath.length > 100) c.socketPath = path.join(fs.realpathSync(os.tmpdir()), `sigmadesk-${c.server.port}.sock`);
   c.workspaceRoot = path.join(fs.realpathSync(ROOT), 'workspaces');
   c.configFile = file;

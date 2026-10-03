@@ -14,14 +14,16 @@ const ignoreRes = () => (W().ignorePatterns || []).map((p) => new RegExp(p, 'i')
 
 // ---------------- fingerprinting ----------------
 const TS_PREFIX = /^\s*(\[?\d{4}-\d{2}-\d{2}[T ][\d:.,]+Z?\]?|\d{2}:\d{2}:\d{2}[.,]?\d*)\s*/;
+const ANSI = /\u001b\[[0-9;]*[A-Za-z]|\[[0-9;]{1,6}m/g;
 export function normalize(line) {
-  let s = String(line).replace(TS_PREFIX, '');
+  let s = String(line).replace(ANSI, '').replace(TS_PREFIX, '');
+  for (const n of W().normalizers || []) s = s.replace(new RegExp(n.pattern, 'g'), n.replace);
   s = s.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<uuid>')
     .replace(/\b0x[0-9a-f]+\b/gi, '<hex>')
     .replace(/\b[0-9a-f]{12,}\b/gi, '<hash>')
     .replace(/\bO:[A-Z]+\d{6}[CP]\d{8}\b/g, '<option>')
     .replace(/(["'])(?:(?!\1).){0,200}\1/g, '<str>')
-    .replace(/\b\d+(\.\d+)?\b/g, '#')
+    .replace(/\d+(\.\d+)?/g, '#')
     .replace(/\s+/g, ' ')
     .trim();
   return s.slice(0, 240);
@@ -32,12 +34,17 @@ export function signatureOf(source, line) {
 }
 
 // ---------------- sources ----------------
-const cursors = new Map(); // source key -> cursor
+// Cursors are persisted so a restart neither loses nor re-counts history.
+const cursors = {
+  get: (k) => { const v = store.kvGet(`watch:${k}`); return v == null ? undefined : JSON.parse(v); },
+  set: (k, v) => store.kvSet(`watch:${k}`, JSON.stringify(typeof v === 'bigint' ? `${v}n` : v)),
+};
+const big = (v) => (typeof v === 'string' && v.endsWith('n') ? BigInt(v.slice(0, -1)) : v);
 const sourceHealth = new Map(); // source key -> { ok, error, lastPoll, lines }
 
 async function readLoki(src, key) {
   const firstLook = Math.max(W().intervalSeconds * 1000, (W().backfillHours || 0) * 3600_000);
-  const since = cursors.get(key) || BigInt(Date.now() - firstLook) * 1_000_000n;
+  const since = big(cursors.get(key)) || BigInt(Date.now() - firstLook) * 1_000_000n;
   const url = new URL('/loki/api/v1/query_range', src.url);
   url.searchParams.set('query', src.query);
   url.searchParams.set('start', String(since + 1n));
@@ -75,17 +82,24 @@ async function readDocker(src, key) {
 
 async function readFile(src, key) {
   const st = fs.statSync(src.path);
-  let pos = cursors.get(key) ?? st.size; // start at the end: only new lines
-  if (st.size < pos) pos = 0; // rotated
-  if (st.size === pos) { cursors.set(key, pos); return []; }
+  const cur = cursors.get(key);
+  // Start at the end on first sight; restart from 0 when the file was replaced (new inode) or truncated.
+  let pos = cur ? cur.pos : st.size;
+  if (cur && (cur.ino !== st.ino || st.size < cur.pos)) pos = 0;
+  if (st.size === pos) { cursors.set(key, { ino: st.ino, pos }); return []; }
   const fd = fs.openSync(src.path, 'r');
   const len = Math.min(st.size - pos, 8 << 20);
   const buf = Buffer.alloc(len);
   fs.readSync(fd, buf, 0, len, pos);
   fs.closeSync(fd);
-  cursors.set(key, pos + len);
+  const text = buf.toString('utf8');
+  // Keep an unfinished last line for the next poll instead of splitting a write in two.
+  const lastNl = text.lastIndexOf('\n');
+  const complete = lastNl >= 0 ? text.slice(0, lastNl) : (len === 8 << 20 ? text : '');
+  const consumed = lastNl >= 0 ? Buffer.byteLength(text.slice(0, lastNl + 1)) : (len === 8 << 20 ? len : 0);
+  cursors.set(key, { ino: st.ino, pos: pos + consumed });
   const now = new Date().toISOString();
-  return buf.toString('utf8').split('\n').filter((l) => l.trim()).map((line) => ({ label: src.label || src.path, line, ts: now }));
+  return complete.split('\n').filter((l) => l.trim()).map((line) => ({ label: src.label || src.path, line, ts: now }));
 }
 
 export async function lokiContext(src, label, isoTs, lines = 60) {

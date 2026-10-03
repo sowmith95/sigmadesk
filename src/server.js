@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { config, validateConfig } from './config.js';
-import { AGENTS, ENGINEERS, STATUSES } from './team.js';
+import { AGENTS, ENGINEERS, STATUSES, applyTeamOverrides, agentById } from './team.js';
+import { ENGINES, detectEngines, presets, suggestFor, SEAT_TIER, TIER_TEXT } from './engines/index.js';
 import * as store from './db.js';
 import * as runner from './runner.js';
 import * as github from './github.js';
@@ -45,6 +46,7 @@ export function snapshot() {
       watch: { enabled: config.watch.enabled, sources: watch.health(), window_minutes: config.watch.windowMinutes, min_count: config.watch.newSignatureMinCount },
       project: config.project.name, repo: config.project.githubRepo, spend_today: store.spendSince(sched.startOfToday()),
       capacity: sched.capacity(settings), busy_window: sched.inBusyWindow(), running: runner.runningCount(),
+      quota: JSON.parse(store.kvGet('quota:claude') || 'null'), plan_hold_at: config.limits.planHoldAt,
       engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
   };
@@ -107,6 +109,7 @@ async function ownerRoute(req, res) {
   }
 
   if (req.method === 'POST' && p === '/api/tickets') return send(res, 201, sched.ownerCreate(await readBody(req)));
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/approve-publish$'))) { await sched.ownerApprovePublish(mm[1]); return send(res, 200, { ok: true }); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) return send(res, 200, sched.ownerReply(mm[1], (await readBody(req)).body));
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
   if (req.method === 'POST' && p === '/api/settings') {
@@ -115,7 +118,35 @@ async function ownerRoute(req, res) {
     store.logEvent({ kind: 'system', agent_id: 'owner', text: `setting ${b.key} = ${b.value}` });
     return send(res, 200, store.getSettings());
   }
+  if (req.method === 'GET' && p === '/api/engines') {
+    const engines = await detectEngines();
+    const available = engines.filter((e) => e.available).map((e) => e.id);
+    return send(res, 200, {
+      engines, tiers: TIER_TEXT,
+      presets: presets(available).map((pr) => ({ id: pr.id, label: pr.label, note: pr.note,
+        seats: Object.fromEntries(AGENTS.map((a) => { const eng = pr.engine(a.id); return [a.id, { engine: eng, ...suggestFor(a.id, eng) }]; })) })),
+      seats: AGENTS.map((a) => ({ id: a.id, name: a.name, role: a.role, tier: SEAT_TIER[a.id] || 'strong', engine: a.engine, model: a.model, effort: a.effort, enabled: a.enabled,
+        suggestions: Object.fromEntries(available.map((e) => [e, suggestFor(a.id, e)])) })),
+    });
+  }
+  if (req.method === 'POST' && p === '/api/team') {
+    const b = await readBody(req);
+    const clean = {};
+    const avail = new Set((await detectEngines()).filter((e) => e.available).map((e) => e.id));
+    for (const [id, o] of Object.entries(b.seats || {})) {
+      if (!agentById[id]) continue;
+      if (o.engine && !ENGINES[o.engine]) return send(res, 400, { error: `unknown engine ${o.engine}` });
+      if (o.engine && !avail.has(o.engine)) return send(res, 400, { error: `${ENGINES[o.engine].label} is not installed on this machine` });
+      clean[id] = { engine: o.engine, model: String(o.model ?? '').slice(0, 80), effort: o.effort, enabled: o.enabled !== false };
+    }
+    store.setSetting('team', JSON.stringify(clean));
+    applyTeamOverrides(clean);
+    if (b.confirm) store.setSetting('team_confirmed', 'true');
+    store.logEvent({ kind: 'system', agent_id: 'owner', text: `team updated: ${Object.entries(clean).map(([id, o]) => `${agentById[id].name}→${o.engine}${o.model ? `/${o.model}` : ''}${o.effort ? `·${o.effort}` : ''}`).join(', ')}` });
+    return send(res, 200, { ok: true });
+  }
   if (req.method === 'POST' && p === '/api/control/start') {
+    if (store.getSettings().team_confirmed !== 'true') return send(res, 409, { error: 'confirm_team', message: 'Choose which engine and model each seat runs on first.' });
     store.setSetting('paused', 'false');
     store.logEvent({ kind: 'system', agent_id: 'owner', text: '▶ Desk open — seats will pick up work' });
     sched.tick();
@@ -134,6 +165,7 @@ async function ownerRoute(req, res) {
   }
   if (req.method === 'POST' && p === '/api/control/research') {
     const b = await readBody(req);
+    if (sched.budgetHeadroom() < runner.runBudget('pm')) return send(res, 409, { error: 'daily risk limit would be exceeded' });
     sched.launchResearch(String(b.focus || '').slice(0, 500)).catch((err) => store.logEvent({ kind: 'error', agent_id: 'pm', text: err.message }));
     return send(res, 202, { ok: true });
   }
@@ -160,13 +192,41 @@ async function ownerRoute(req, res) {
 }
 
 // ---------------- agent listener (unix socket; the only door agents can reach) ----------------
-async function agentRoute(req, res) {
+async function agentRoute(req, res, boundRunId) {
   const mm = new URL(req.url, 'http://x').pathname.match(/^\/desk\/([\w-]+)$/);
   if (req.method !== 'POST' || !mm) return send(res, 404, { error: 'not found' });
   const run = store.runByToken((req.headers.authorization || '').replace(/^Bearer\s+/, ''));
-  if (!run) return send(res, 401, { error: 'invalid or finished run token' });
+  // The socket itself is bound to one run: a token copied from another run is rejected here.
+  if (!run || run.id !== boundRunId) return send(res, 401, { error: 'invalid or finished run token' });
   const out = await sched.deskAction(run, mm[1], await readBody(req));
   return send(res, 200, { ok: true, output: out });
+}
+
+// File-mailbox transport for engines whose sandbox blocks the socket (e.g. Codex with network off).
+const inFlight = new Set();
+function pollMailboxes() {
+  for (const [runId, dir] of runner.openMailboxes()) {
+    let names;
+    try { names = fs.readdirSync(dir).filter((n) => /^req-[\w-]+\.json$/.test(n)); } catch { continue; }
+    for (const name of names) {
+      const id = name.slice(4, -5);
+      if (inFlight.has(`${runId}:${id}`)) continue;
+      inFlight.add(`${runId}:${id}`);
+      const reply = (obj) => {
+        const tmp = path.join(dir, `.res-${id}.tmp`);
+        fs.writeFileSync(tmp, JSON.stringify(obj));
+        fs.renameSync(tmp, path.join(dir, `res-${id}.json`));
+        inFlight.delete(`${runId}:${id}`);
+      };
+      (async () => {
+        let req;
+        try { req = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')); fs.unlinkSync(path.join(dir, name)); } catch { inFlight.delete(`${runId}:${id}`); return; }
+        const run = store.runByToken(req.token);
+        if (!run || run.id !== runId) return reply({ error: 'invalid or finished run token' });
+        try { reply({ ok: true, output: await sched.deskAction(run, String(req.cmd), req.body || {}) }); } catch (err) { reply({ error: err.message }); }
+      })();
+    }
+  }
 }
 
 const handler = (route) => (req, res) => {
@@ -181,23 +241,35 @@ export function main() {
     process.exit(1);
   }
   store.openDb();
+  try { applyTeamOverrides(JSON.parse(store.getSettings().team || '{}')); } catch { /* ignore bad JSON */ }
   sched.recoverOrphans();
   for (const host of config.server.hosts) {
     const srv = http.createServer(handler(ownerRoute));
     srv.on('error', (err) => console.error(`listen ${host}:${config.server.port} failed: ${err.message}`));
     srv.listen(config.server.port, host, () => console.log(`SigmaDesk UI on http://${host}:${config.server.port}`));
   }
-  try { fs.unlinkSync(config.socketPath); } catch { /* none */ }
-  fs.mkdirSync(path.dirname(config.socketPath), { recursive: true });
-  const sock = http.createServer(handler(agentRoute));
-  sock.listen(config.socketPath, () => fs.chmodSync(config.socketPath, 0o600));
+  // One unix socket per run, created on spawn and closed on exit (see runner.setSocketFactory).
+  const sockDir = path.dirname(config.socketPath);
+  fs.mkdirSync(sockDir, { recursive: true });
+  for (const f of fs.readdirSync(sockDir)) if (f.endsWith('.sock')) fs.rmSync(path.join(sockDir, f), { force: true });
+  runner.setSocketFactory((runId) => {
+    const p = path.join(sockDir, `r${runId}.sock`);
+    try { fs.unlinkSync(p); } catch { /* none */ }
+    const srv = http.createServer((req, res) => agentRoute(req, res, runId).catch((err) => { if (!res.headersSent) send(res, err.status || 500, { error: err.message }); }));
+    srv.listen(p, () => { try { fs.chmodSync(p, 0o600); } catch { /* raced with close */ } });
+    return { path: p, close: () => { srv.close(); try { fs.unlinkSync(p); } catch { /* gone */ } } };
+  });
 
   store.logEvent({ kind: 'system', text: `Desk online for ${config.project.name} (${store.getSettings().paused === 'true' ? 'halted' : 'open'})` });
   github.ensureLabels().catch(() => {});
   setInterval(() => sched.tick(), 15_000);
+  setInterval(pollMailboxes, 400);
   if (config.watch.enabled) {
+    let polling = false; // serialize: overlapping polls would read the same cursor twice and double-count
     const loop = async () => {
-      try { await watch.pollOnce(); sched.watchDecisions(); } catch (err) { console.error('watch:', err.message); }
+      if (polling) return;
+      polling = true;
+      try { await watch.pollOnce(); sched.watchDecisions(); } catch (err) { console.error('watch:', err.message); } finally { polling = false; }
     };
     setInterval(loop, config.watch.intervalSeconds * 1000);
     setTimeout(loop, 3000);
@@ -206,10 +278,12 @@ export function main() {
     const t = store.createTicket({ title: i.title, description: i.body || '', status: 'triage', reporter: 'owner', source: 'github', issue_number: i.number });
     store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: `imported issue #${i.number}` });
   };
-  setInterval(() => github.poll(importIssue), config.github.pollMinutes * 60_000);
-  setTimeout(() => github.poll(importIssue), 10_000);
+  const redChecks = (t, names) => sched.prChecksFailed(t, names);
+  setInterval(() => github.poll(importIssue, redChecks), config.github.pollMinutes * 60_000);
+  setTimeout(() => github.poll(importIssue, redChecks), 10_000);
   setInterval(() => github.flushComments(), 60_000);
-  const shutdown = () => { runner.killAll('desk shutdown'); setTimeout(() => process.exit(0), 700); };
+  setInterval(() => sched.retryPublications(), 5 * 60_000);
+  const shutdown = () => { runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }

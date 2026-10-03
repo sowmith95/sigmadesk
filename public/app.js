@@ -66,6 +66,7 @@ function avatar(agentId, size = '') {
   return wrap;
 }
 const modelTag = (m) => h('span', { class: `model ${m}` }, m);
+const seatModel = (a) => (a.engine === 'codex' ? h('span', { class: 'model codex' }, `codex${a.model ? `·${a.model}` : ''}`) : h('span', { class: `model ${a.model}` }, a.model));
 
 function toast(msg, err = false) {
   const t = $('toast');
@@ -81,6 +82,67 @@ async function api(method, url, body) {
   const j = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
   return j;
+}
+
+// ---------------- team: engine / model / effort per seat ----------------
+async function openTeam(firstRun = false) {
+  S.sheet = { type: 'team', firstRun, data: null, draft: {} };
+  renderSheet();
+  try {
+    const data = await api('GET', '/api/engines');
+    if (S.sheet?.type !== 'team') return;
+    S.sheet.data = data;
+    for (const seat of data.seats) S.sheet.draft[seat.id] = { engine: seat.engine, model: seat.model || '', effort: seat.effort || '', enabled: seat.enabled !== false };
+    renderSheet();
+  } catch (e) { toast(e.message, true); }
+}
+
+function renderTeamSheet() {
+  const sh = S.sheet;
+  const d = sh.data;
+  const head = [h('div', { class: 'row' }, h('h2', {}, sh.firstRun ? 'Staff your desk' : 'Team'), h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')),
+    h('p', { class: 'bio' }, sh.firstRun ? 'Before the desk opens, confirm which engine and model each seat runs on. Suggestions follow each seat\'s tier: frontier for principals and the PM, fast and cheap for triage.' : 'Change any seat\'s engine, model or effort. Takes effect on its next run.')];
+  if (!d) return sheetShell(head, h('div', { class: 'empty' }, 'Detecting installed engines…'));
+  const engines = Object.fromEntries(d.engines.map((e) => [e.id, e]));
+  const avail = d.engines.filter((e) => e.available);
+  const applyPreset = (pr) => { for (const [id, v] of Object.entries(pr.seats)) Object.assign(sh.draft[id], { engine: v.engine, model: v.model || '', effort: v.effort || '' }); renderSheet(); };
+  const body = [
+    h('div', { class: 'engines' }, d.engines.map((e) => h('div', { class: `eng ${e.available ? '' : 'off'}` },
+      h('b', {}, e.label), h('span', { class: 'mono' }, e.available ? e.version : 'not installed'),
+      h('div', { class: 'iso' }, `reads ${e.isolation.reads} · writes ${e.isolation.writes} · network ${e.isolation.network}`),
+      e.isolation.reads !== 'restricted' ? h('div', { class: 'warn' }, `⚠ ${e.isolation.note}`) : null,
+      h('div', { class: 'iso' }, e.costs)))),
+    d.presets.length ? [h('div', { class: 'section-title' }, 'Presets'), h('div', { class: 'presets' }, d.presets.map((pr) => h('button', { class: 'preset', type: 'button', onclick: () => applyPreset(pr) }, h('b', {}, pr.label), h('span', {}, pr.note))))] : null,
+    h('div', { class: 'section-title' }, 'Seats'),
+    h('div', { class: 'seats' }, d.seats.map((seat) => {
+      const dr = sh.draft[seat.id];
+      const eng = engines[dr.engine] || avail[0];
+      const sug = seat.suggestions[dr.engine];
+      const models = eng?.models || [];
+      const modelOpts = models.some((m) => m.id === dr.model) ? models : [...models, { id: dr.model, note: 'custom' }];
+      const set = (k) => (e) => { dr[k] = e.target.type === 'checkbox' ? e.target.checked : e.target.value; if (k === 'engine') { const s2 = seat.suggestions[dr.engine]; if (s2) Object.assign(dr, { model: s2.model, effort: s2.effort }); } renderSheet(); };
+      const en = h('input', { type: 'checkbox', class: 'switch', onchange: set('enabled'), 'aria-label': 'seat enabled' });
+      en.checked = dr.enabled;
+      return h('div', { class: `seatrow ${dr.enabled ? '' : 'off'}` },
+        avatar(seat.id, 'md'),
+        h('div', { class: 'sr-who' }, h('b', {}, seat.name), h('span', {}, seat.role), h('small', {}, `${seat.tier} · ${d.tiers[seat.tier] || ''}`)),
+        h('div', { class: 'sr-ctl' },
+          h('select', { 'aria-label': 'engine', onchange: set('engine') }, d.engines.map((e) => h('option', { value: e.id, selected: e.id === dr.engine, disabled: !e.available }, e.label))),
+          h('select', { 'aria-label': 'model', onchange: set('model') }, modelOpts.map((m) => h('option', { value: m.id, selected: m.id === dr.model }, `${m.id || 'default'}${m.note ? ` — ${m.note}` : ''}`))),
+          h('select', { 'aria-label': 'effort', onchange: set('effort') }, (dr.engine === 'codex' ? ['low', 'medium', 'high', 'xhigh'] : ['low', 'medium', 'high', 'xhigh', 'max']).map((x) => h('option', { value: x, selected: x === dr.effort }, `effort ${x}`))),
+          en),
+        sug && (sug.model !== dr.model || sug.effort !== dr.effort) ? h('button', { class: 'linkish sr-sug', type: 'button', onclick: () => { Object.assign(dr, { model: sug.model, effort: sug.effort }); renderSheet(); } }, `suggested: ${sug.model || 'default'} · ${sug.effort}`) : null);
+    })),
+    h('div', { class: 'row-actions' },
+      h('button', { class: 'btn', type: 'button', onclick: closeSheet }, 'Cancel'),
+      h('button', { class: 'btn primary', type: 'button', onclick: act(async () => {
+        await api('POST', '/api/team', { seats: sh.draft, confirm: true });
+        if (sh.firstRun) await api('POST', '/api/control/start', {});
+        closeSheet();
+        loadSnapshot();
+      }, sh.firstRun ? 'team confirmed — desk open' : 'team saved') }, sh.firstRun ? 'Confirm team & open desk' : 'Save team')),
+  ];
+  sheetShell(head, body);
 }
 const act = (fn, ok) => async (...a) => {
   try { await fn(...a); if (ok) toast(ok); } catch (e) { toast(e.message, true); }
@@ -128,6 +190,7 @@ function apply(m) {
     case 'run': upsert(S.runs, m.data); if (m.data.status !== 'running') refreshMeta(); break;
     case 'settings': S.settings = m.data; break;
     case 'incident': upsert(S.incidents, m.data); break;
+    case 'quota': S.meta.quota = m.data; break;
     case 'event':
       S.events.push(m.data);
       if (S.events.length > 600) S.events.splice(0, S.events.length - 600);
@@ -156,14 +219,16 @@ function renderTop() {
   const limit = Number(S.settings.daily_budget_usd) || 1;
   const pct = Math.min(100, (spend / limit) * 100);
   const working = S.agents.filter((a) => a.status === 'working').length;
-  $('ticker').replaceChildren(
+  $('ticker').replaceChildren(...[
     h('span', { class: 'tk' }, h('span', { class: `state ${open ? 'open' : 'halted'}` }, open ? 'OPEN' : 'HALTED')),
     h('span', { class: 'tk' }, 'SEATS', h('b', {}, `${working}/${S.meta.capacity ?? '-'}`), S.meta.busy_window ? h('span', { title: 'busy window: reduced concurrency' }, '◐') : null),
     h('span', { class: 'tk' }, 'BURN', h('b', {}, money(spend)), h('span', { class: 'meter', title: `${pct.toFixed(0)}% of daily risk limit` }, h('i', { class: pct > 90 ? 'over' : pct > 65 ? 'hot' : '', style: `width:${pct}%` })), h('span', {}, `/ ${money(limit)}`)),
+    S.meta.quota ? h('span', { class: 'tk', title: `Claude plan usage · 5-hour window ${Math.round((S.meta.quota.five_hour || 0) * 100)}% · 7-day ${Math.round((S.meta.quota.seven_day || 0) * 100)}% · new runs hold at ${Math.round((S.meta.plan_hold_at || 0.9) * 100)}%` },
+      'PLAN', h('b', { style: (S.meta.quota.five_hour || 0) >= (S.meta.plan_hold_at || 0.9) ? 'color:var(--down)' : '' }, `${Math.round((S.meta.quota.five_hour || 0) * 100)}%`), h('span', {}, `5h · ${Math.round((S.meta.quota.seven_day || 0) * 100)}% 7d`)) : null,
     h('span', { class: 'tk' }, 'WIP', h('b', {}, S.tickets.filter((t) => ['in_progress', 'qa'].includes(t.status)).length)),
     h('span', { class: 'tk' }, 'CALLS', h('b', { style: S.tickets.some((t) => t.status === 'needs_human') ? 'color:var(--warn)' : '' }, S.tickets.filter((t) => t.status === 'needs_human').length)),
     h('span', { class: 'tk', title: S.connected ? 'live' : 'reconnecting' }, h('span', { class: `status-dot ${S.connected ? 'on' : ''}` }), S.connected ? 'LIVE' : 'OFFLINE'),
-  );
+  ].filter(Boolean));
   const tb = $('btn-toggle');
   tb.textContent = open ? '⏸ Halt' : '▶ Open desk';
   tb.className = `btn ${open ? '' : 'go'}`;
@@ -217,7 +282,7 @@ function deskCard(a) {
     fresh ? h('div', { class: 'bubble' }, say.text.length > 160 ? `${say.text.slice(0, 159)}…` : say.text) : null,
     h('div', { class: 'deskc-h' }, avatar(a.id, 'lg'),
       h('div', { class: 'who' }, h('b', {}, a.name), h('span', {}, a.role)),
-      h('span', { class: `model ${a.model}` }, a.model)),
+      seatModel(a)),
     h('div', { class: 'presence' }, h('span', { class: `pdot ${pr.key}` }), h('span', {}, pr.text),
       mate ? h('span', { class: 'meet' }, avatar(mate.id), `with ${mate.name}`) : null,
       working && a.current_ticket ? h('span', { class: 'on-k mono' }, a.current_ticket) : null,
@@ -325,7 +390,13 @@ function boolSetting(key) {
 
 function renderSettings() {
   const focus = h('input', { type: 'text', placeholder: 'optional focus, e.g. "0DTE risk visibility"', style: 'width:100%' });
+  const amap = agentMap();
   return h('div', { class: 'settings' },
+    h('div', { class: 'section-title' }, 'Team'),
+    h('div', { class: 'set', style: 'flex-direction:column;align-items:stretch' },
+      h('div', { class: 'team-strip' }, S.agents.map((a) => h('span', { class: 'ts', title: `${a.name} · ${a.role}` }, avatar(a.id), h('span', { class: 'mono' }, `${a.engine === 'codex' ? 'codex' : a.model}${a.engine === 'codex' && a.model ? `/${a.model}` : ''}·${a.effort || ''}`)))),
+      h('div', { class: 'row-actions' }, h('span', { style: 'flex:1;color:var(--muted);font-size:12px' }, S.settings.team_confirmed === 'true' ? 'Each seat runs on its own engine, model and effort.' : 'Not confirmed yet — the desk asks before it first opens.'),
+        h('button', { class: 'btn', type: 'button', onclick: () => openTeam(false) }, 'Edit team'))),
     h('div', { class: 'section-title' }, 'Risk limits'),
     setRow('Max concurrent seats', 'How many agents may run at once (a busy window in the config can lower this).', numSetting('max_concurrent')),
     setRow('Daily risk limit (USD)', 'Notional model spend per day. Each running seat reserves its per-run cap.', numSetting('daily_budget_usd', 5)),
@@ -428,6 +499,7 @@ function renderSheet() {
   const sh = S.sheet;
   if (!sh) return;
   if (sh.type === 'new') return renderNewSheet();
+  if (sh.type === 'team') return renderTeamSheet();
   if (sh.type === 'seat') return renderSeatSheet();
   const t = S.tickets.find((x) => x.key === sh.key) || sh.detail?.ticket;
   if (!t) return sheetShell(h('div', {}, 'Loading…'), null);
@@ -465,6 +537,12 @@ function renderSheet() {
       h('div', { class: 'desc' }, t.description || '—'),
       run ? h('div', { class: 'row-actions' }, h('span', { style: 'flex:1;color:var(--muted);font-size:12px' }, `run #${run.id} · ${run.kind} · ${run.model}`),
         h('button', { class: 'btn small danger', type: 'button', onclick: act(() => api('POST', `/api/runs/${run.id}/kill`, {}), 'stopping run') }, 'Stop run')) : null),
+    t.status === 'needs_human' && /publish guard/.test(t.progress_msg || '') ? h('div', { class: 'ask' }, h('b', {}, '🛑 Publish guard'),
+      h('div', { class: 'msg-t' }, 'This branch touches protected paths (CI, containers, hooks, lockfiles…) or is unusually large, so it was not pushed. Review the clone locally, then approve if it is safe.'),
+      h('div', { class: 'row-actions' }, h('button', { class: 'btn danger', type: 'button', onclick: act(async () => {
+        if (!confirm(`Push ${t.key} and open a draft PR even though it touches protected paths?`)) return;
+        await api('POST', `/api/tickets/${t.key}/approve-publish`, {});
+      }, 'publishing') }, 'Approve publish'))) : null,
     d ? h('div', { class: 'thread' }, threadItems(d).map(bubble)) : h('div', { class: 'empty' }, 'Loading…'),
     worker ? h('div', { class: 'msg typing-row' }, avatar(worker.id, 'md'), h('div', { class: 'msg-b' }, h('div', { class: 'msg-t dots' }, h('i'), h('i'), h('i'),
       h('span', {}, worker.last_action ? ` ${worker.last_action}` : '')))) : null,
@@ -493,7 +571,7 @@ function renderSeatSheet() {
       h('div', { class: 'presence' }, h('span', { class: `pdot ${pr.key}` }), pr.text, a.current_ticket ? [' · ', h('button', { class: 'linkish mono', type: 'button', onclick: () => openTicket(a.current_ticket) }, a.current_ticket)] : null)),
       h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')),
     h('p', { class: 'bio' }, a.bio || ''),
-    h('div', { class: 'row' }, h('span', { class: 'brain' }, 'Runs on ', h('span', { class: `model ${a.model}` }, a.model)), h('span', { class: 'tag' }, (a.kinds || []).join(' · ')),
+    h('div', { class: 'row' }, h('span', { class: 'brain' }, 'Runs on ', seatModel(a), a.effort ? h('span', { class: 'tag' }, `effort ${a.effort}`) : null), h('span', { class: 'tag' }, (a.kinds || []).join(' · ')),
       h('span', { class: 'spacer' }), run ? h('button', { class: 'btn small danger', type: 'button', onclick: act(() => api('POST', `/api/runs/${run.id}/kill`, {}), 'stopping run') }, 'Stop current run') : null),
   ], [
     h('div', { class: 'section-title' }, 'Scorecard'),
@@ -553,7 +631,7 @@ function render() {
   }
   if (keepX) { const b = view.querySelector('.board'); if (b) b.scrollLeft = keepX; }
   const sheetBusy = $('sheet').contains(document.activeElement) && ['TEXTAREA', 'INPUT', 'SELECT'].includes(document.activeElement.tagName);
-  if (S.sheet && !sheetBusy && S.sheet.type !== 'new') renderSheet();
+  if (S.sheet && !sheetBusy && !['new', 'team'].includes(S.sheet.type)) renderSheet();
   lastSeenEvent = S.events.length ? S.events[S.events.length - 1].id : lastSeenEvent;
 }
 
@@ -561,7 +639,14 @@ function render() {
 for (const b of document.querySelectorAll('#tabs button')) {
   b.addEventListener('click', () => { S.view = b.dataset.view; localStorage.setItem('sd.view', S.view); render(); window.scrollTo(0, 0); });
 }
-$('btn-toggle').addEventListener('click', act(() => api('POST', S.settings.paused === 'true' ? '/api/control/start' : '/api/control/pause', {})));
+$('btn-toggle').addEventListener('click', async () => {
+  try {
+    await api('POST', S.settings.paused === 'true' ? '/api/control/start' : '/api/control/pause', {});
+  } catch (e) {
+    if (e.message === 'confirm_team' || /Choose which engine/.test(e.message)) openTeam(true);
+    else toast(e.message, true);
+  }
+});
 $('btn-breaker').addEventListener('click', act(async () => {
   if (!confirm('Circuit breaker: halt the desk and stop every running seat now?')) return;
   await api('POST', '/api/control/stop-all', {});

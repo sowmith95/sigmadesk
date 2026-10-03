@@ -73,7 +73,7 @@ export function portrait(agent, { size = 40, presence = 'idle', title } = {}) {
   const look = LOOKS[agent.id] || { hair: ['crop', 'side', 'bob', 'curly'][hash(agent.id) % 4], acc: 'none', hairColor: hash(agent.id) % HAIR.length };
   const skin = SKIN[hash(`${agent.id}:skin`) % SKIN.length];
   const hairColor = HAIR[look.hairColor ?? 0];
-  const glow = MODEL_GLOW[agent.model] || '#a3e635';
+  const glow = agent.engine === 'codex' ? '#f472b6' : MODEL_GLOW[agent.model] || '#a3e635';
   const shirt = agent.color || '#64748b';
   const isBot = agent.id === 'support';
   const ring = { working: '#a3e635', meeting: '#38bdf8', reviewing: '#f59e0b', idle: '#334155', off: '#1f2937' }[presence] || '#334155';

@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS runs (
   resumed_from TEXT,
   cwd TEXT,
   incident_id INTEGER,
+  nonce TEXT,
+  cost_estimated INTEGER DEFAULT 0,
   model TEXT,
   cost_usd REAL DEFAULT 0,
   num_turns INTEGER,
@@ -130,7 +132,7 @@ function migrate() {
   const want = {
     tickets: { stalls: 'INTEGER DEFAULT 0', head_sha: 'TEXT', origin_session: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
-    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER' },
+    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0' },
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -153,6 +155,8 @@ export function settingDefaults() {
     max_open_proposals: String(config.pm.maxOpenProposals),
     github_sync: String(config.github.sync),
     open_draft_prs: String(config.github.openDraftPrs),
+    team: '{}', // per-seat {engine, model, effort, enabled} chosen in the UI
+    team_confirmed: 'false', // the owner must confirm who runs on what before the first open
   };
 }
 
@@ -266,11 +270,12 @@ export function updateAgent(id, patch) {
 }
 
 // ---------- runs ----------
+const publicRun = (r) => { if (!r) return r; const { token, nonce, ...rest } = r; return rest; };
 export function createRun(r) {
-  const info = q('INSERT INTO runs(agent_id,ticket_key,kind,token,model,cwd,resumed_from,incident_id) VALUES (?,?,?,?,?,?,?,?)').run(
-    r.agent_id, r.ticket_key ?? null, r.kind, r.token, r.model, r.cwd ?? null, r.resumed_from ?? null, r.incident_id ?? null);
+  const info = q('INSERT INTO runs(agent_id,ticket_key,kind,token,model,cwd,resumed_from,incident_id,nonce) VALUES (?,?,?,?,?,?,?,?,?)').run(
+    r.agent_id, r.ticket_key ?? null, r.kind, r.token, r.model, r.cwd ?? null, r.resumed_from ?? null, r.incident_id ?? null, r.nonce ?? null);
   const run = getRun(info.lastInsertRowid);
-  bus.emit('msg', { type: 'run', data: run });
+  bus.emit('msg', { type: 'run', data: publicRun(run) });
   return run;
 }
 export function getRun(id) {
@@ -282,7 +287,10 @@ export function runByToken(token) {
 export function updateRun(id, patch) {
   const cols = Object.keys(patch);
   q(`UPDATE runs SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
-  bus.emit('msg', { type: 'run', data: getRun(id) });
+  bus.emit('msg', { type: 'run', data: publicRun(getRun(id)) });
+}
+export function unfinishedRuns() {
+  return q('SELECT * FROM runs WHERE ended_at IS NULL').all();
 }
 export function runningRuns() {
   return q("SELECT * FROM runs WHERE status='running'").all();
@@ -358,4 +366,14 @@ export function updateIncident(id, patch) {
 }
 export function investigationsSince(isoTs) {
   return q("SELECT COUNT(*) n FROM runs WHERE kind='investigate' AND started_at >= ?").get(isoTs).n;
+}
+
+// ---------- small durable key/value store (watch cursors etc.) ----------
+export function kvGet(key) {
+  db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
+  return q('SELECT value FROM kv WHERE key=?').get(key)?.value ?? null;
+}
+export function kvSet(key, value) {
+  db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
+  q('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value));
 }

@@ -17,8 +17,19 @@ const SEATS = [
   { id: 'support', bio: 'Front door. Triages every incoming order in seconds and knows when to call you.', name: 'Skyler', role: 'Support Bot', short: 'SUP', model: 'haiku', color: '#94a3b8', kinds: ['triage'] },
 ];
 
-export const AGENTS = SEATS.map((s) => ({ enabled: true, ...s, ...(config.team[s.id] || {}) }));
+const DEFAULT_EFFORT = { frontier: 'xhigh', strong: 'high', fast: 'medium', cheap: 'low' };
+const TIER = { pm: 'frontier', 'principal-be': 'frontier', 'principal-fe': 'frontier', junior: 'fast', qa: 'fast', support: 'cheap' };
+export const AGENTS = SEATS.map((s) => ({ enabled: true, engine: 'claude', effort: DEFAULT_EFFORT[TIER[s.id] || 'strong'], ...s, ...(config.team[s.id] || {}) }));
 export const agentById = Object.fromEntries(AGENTS.map((a) => [a.id, a]));
+const BASELINE = Object.fromEntries(AGENTS.map((a) => [a.id, { engine: a.engine, model: a.model, effort: a.effort, enabled: a.enabled }]));
+
+// Live per-seat overrides chosen in the UI (stored in the settings table) on top of the config file.
+export function applyTeamOverrides(overrides = {}) {
+  for (const a of AGENTS) {
+    const o = overrides[a.id] || {};
+    Object.assign(a, BASELINE[a.id], Object.fromEntries(Object.entries(o).filter(([k]) => ['engine', 'model', 'effort', 'enabled'].includes(k))));
+  }
+}
 export const ENGINEERS = ['principal-be', 'senior-be', 'principal-fe', 'senior-fe', 'dba', 'junior'];
 export const AREAS = ['backend', 'frontend', 'db', 'fullstack', 'infra'];
 export const COMPLEXITIES = ['S', 'M', 'L', 'XL'];
@@ -38,13 +49,15 @@ export function routeTicket({ area, complexity, risk }) {
 // ---------------- tool permissions ----------------
 // --tools limits which tools exist; --allowedTools pre-approves them (dontAsk denies everything else);
 // --disallowedTools wins over both. The OS sandbox is the real boundary — these rules are defence in depth.
+// Web tools run outside the OS sandbox (they could exfiltrate code), so only the PM's research gets them.
 export const TOOLSET = {
-  read: ['Read', 'Grep', 'Glob', 'Bash', 'TodoWrite', 'WebSearch', 'WebFetch'],
-  write: ['Read', 'Grep', 'Glob', 'Bash', 'TodoWrite', 'WebSearch', 'WebFetch', 'Edit', 'Write', 'NotebookEdit'],
+  research: ['Read', 'Grep', 'Glob', 'Bash', 'TodoWrite', 'WebSearch', 'WebFetch'],
+  read: ['Read', 'Grep', 'Glob', 'Bash', 'TodoWrite'],
+  write: ['Read', 'Grep', 'Glob', 'Bash', 'TodoWrite', 'Edit', 'Write', 'NotebookEdit'],
   triage: ['Read', 'Grep', 'Glob', 'Bash'],
 };
 const READ_RULES = [
-  'Read', 'Grep', 'Glob', 'TodoWrite', 'WebSearch', 'WebFetch',
+  'Read', 'Grep', 'Glob', 'TodoWrite',
   'Bash(desk *)', 'Bash(git log *)', 'Bash(git log)', 'Bash(git diff *)', 'Bash(git diff)', 'Bash(git show *)',
   'Bash(git status *)', 'Bash(git status)', 'Bash(git branch *)', 'Bash(git rev-parse *)', 'Bash(git -C * log *)',
   'Bash(git -C * diff *)', 'Bash(git -C * show *)', 'Bash(git -C * status*)', 'Bash(ls *)', 'Bash(ls)',
@@ -55,8 +68,9 @@ const TEST_RULES = [
   'Bash(npm run *)', 'Bash(npm test *)', 'Bash(npm test)', 'Bash(npx tsc *)', 'Bash(npx vitest *)', 'Bash(npx eslint *)',
   'Bash(node *)', 'Bash(go test *)', 'Bash(cargo test *)', 'Bash(make test *)', 'Bash(cd *)',
 ];
+// File-edit tools are NOT covered by the Bash sandbox, so they are scoped to the seat's own workspace.
+const writeRules = (cwd) => [`Edit(/${cwd}/**)`, `Write(/${cwd}/**)`, `NotebookEdit(/${cwd}/**)`];
 const WRITE_RULES = [
-  'Edit', 'Write', 'NotebookEdit',
   'Bash(git add *)', 'Bash(git commit *)', 'Bash(git restore *)', 'Bash(git mv *)', 'Bash(git rm *)', 'Bash(git stash *)',
   'Bash(mkdir *)', 'Bash(sed *)', 'Bash(awk *)', 'Bash(sort *)', 'Bash(diff *)', 'Bash(touch *)', 'Bash(cp *)',
   'Bash(mv *)', 'Bash(echo *)', 'Bash(test *)', 'Bash(jq *)',
@@ -70,12 +84,13 @@ export const DENY_RULES = [
   'Bash(npm install *)', 'Bash(pip install *)', 'Bash(brew *)', 'Bash(tailscale *)', 'Agent', 'Task',
 ];
 
-export function permissionsFor(kind) {
+export function permissionsFor(kind, cwd = '/nonexistent') {
   const extra = config.project.extraAllowedBash || [];
-  if (kind === 'implement') return { tools: TOOLSET.write, allow: [...READ_RULES, ...TEST_RULES, ...WRITE_RULES, ...extra] };
+  if (kind === 'implement') return { tools: TOOLSET.write, allow: [...READ_RULES, ...TEST_RULES, ...WRITE_RULES, ...writeRules(cwd), ...extra] };
   if (kind === 'qa' || kind === 'review' || kind === 'investigate') return { tools: TOOLSET.read, allow: [...READ_RULES, ...TEST_RULES, ...extra] };
   if (kind === 'triage') return { tools: TOOLSET.triage, allow: ['Read', 'Grep', 'Glob', 'Bash(desk *)'] };
-  return { tools: TOOLSET.read, allow: READ_RULES }; // research, groom, consult
+  if (kind === 'research') return { tools: TOOLSET.research, allow: [...READ_RULES, 'WebSearch', 'WebFetch'] };
+  return { tools: TOOLSET.read, allow: READ_RULES }; // groom, consult
 }
 
 // ---------------- briefing ----------------
@@ -194,17 +209,17 @@ Optional: --type bug|feature|task --priority P0-P3. Be fast; do not investigate 
       return `${head}\nYou are the independent risk check for branch ${t.branch} (cwd is its clone, at the submitted commit).
 Review \`git log origin/${config.project.baseBranch}..HEAD\` and \`git diff origin/${config.project.baseBranch}...HEAD\`.
 Run the relevant tests (see playbook). Check each acceptance criterion. Do not modify or commit code.
-Verdict, exactly one:
-  desk qa pass "<what you verified, with test evidence>"
-  desk qa fail "<numbered, actionable defects>"`;
+Verdict, exactly one (the --code proves the verdict comes from you, not from code you ran — never write it to a file):
+  desk qa pass --code ${extra} "<what you verified, with test evidence>"
+  desk qa fail --code ${extra} "<numbered, actionable defects>"`;
     case 'review':
       return `${head}\nAcceptance review. You asked for this work; it has been built and has passed QA (correctness).
 Your job is different from QA's: judge whether the change delivers YOUR intent — the problem, the user, the scope and the
 acceptance criteria you wrote — without scope creep. The branch ${t.branch} is checked out in your cwd at the QA-passed commit.
 Read \`git diff origin/${config.project.baseBranch}...HEAD\` and the comments above (consults, QA notes). Run something if needed.
-Do not modify or commit code. Verdict, exactly one:
-  desk accept pass "<why this meets the intent; any follow-ups worth filing>"
-  desk accept changes "<numbered, concrete gaps against your intent>"`;
+Do not modify or commit code. Verdict, exactly one (keep the --code out of files):
+  desk accept pass --code ${extra} "<why this meets the intent; any follow-ups worth filing>"
+  desk accept changes --code ${extra} "<numbered, concrete gaps against your intent>"`;
     case 'review-resumed':
       return `Work you asked for in this conversation is back for your acceptance review: ${t.key} "${t.title}".
 It was built by the team and passed QA. Inspect it with:
@@ -212,7 +227,7 @@ It was built by the team and passed QA. Inspect it with:
   git -C ${extra} log --oneline origin/${config.project.baseBranch}..HEAD
 Ticket thread (consults, QA notes):\n${fmtComments(comments)}\n
 Judge it against the intent you had when you asked for it. Do not modify code. Verdict, exactly one:
-  desk accept pass "<why>"   |   desk accept changes "<numbered gaps>"`;
+  desk accept pass --code ${t.nonce} "<why>"   |   desk accept changes --code ${t.nonce} "<numbered gaps>"`;
     case 'rework':
       return `Your work on ${t.key} came back. Latest review notes:\n\n${extra}\n\nYou are in the same clone and branch as before.
 Fix every numbered item, re-run the relevant tests, commit, and finish with: desk submit "<what you changed for each note>".`;

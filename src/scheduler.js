@@ -1,9 +1,32 @@
+import crypto from 'node:crypto';
 import { config } from './config.js';
 import { agentById, ENGINEERS, AREAS, COMPLEXITIES, STATUSES, routeTicket, promptFor } from './team.js';
 import * as store from './db.js';
 import * as runner from './runner.js';
 import * as github from './github.js';
 import * as watch from './watch.js';
+
+// ---------------- publish guard ----------------
+export function globToRegExp(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*' && glob[i + 1] === '*') { re += glob[i + 2] === '/' ? '(?:.*/)?' : '.*'; i += glob[i + 2] === '/' ? 2 : 1; }
+    else if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${re}$`);
+}
+export function guardReasons(files, lines, complexity) {
+  const pats = config.project.protectedPaths.map(globToRegExp);
+  const hit = files.filter((f) => pats.some((r) => r.test(f)));
+  const reasons = [];
+  if (hit.length) reasons.push(`touches protected paths: ${hit.slice(0, 8).join(', ')}${hit.length > 8 ? '…' : ''}`);
+  const cap = config.project.maxDiffLines[complexity || 'M'];
+  if (cap && lines > cap) reasons.push(`diff is ${lines} lines (cap for ${complexity || 'M'} is ${cap})`);
+  return reasons;
+}
 
 // ---------------- limits ----------------
 function localParts(d, tz) {
@@ -40,6 +63,7 @@ const agentIdle = (id) => agentById[id]?.enabled !== false && store.getAgentStat
 function setStatus(key, status, extra = {}) {
   const t = store.updateTicket(key, { status, ...extra });
   github.syncIssueState(key);
+  if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key); // clones are full copies now; free the disk
   return t;
 }
 
@@ -56,11 +80,17 @@ function stall(ticket, reason) {
 }
 
 // ---------------- job launchers ----------------
-async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [] }) {
+async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [], nonce = null, fence = runner.currentEpoch() }) {
   const before = ticket?.status;
-  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs });
+  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs, nonce, fence });
   if (ticket) store.updateTicket(ticket.key, { active_run: store.getAgentState(agentId).current_run });
-  const { run } = await p;
+  const { run, aborted } = await p;
+  if (aborted) {
+    store.updateAgent(agentId, { status: 'idle', current_ticket: null, current_run: null });
+    if (ticket) store.updateTicket(ticket.key, { active_run: null, ...(ticket.status === 'in_progress' ? { status: 'todo' } : {}) });
+    store.logEvent({ agent_id: agentId, ticket_key: ticket?.key, kind: 'system', text: `${kind} cancelled before start (circuit breaker)` });
+    return null;
+  }
   if (!ticket) return run;
   const after = store.getTicket(ticket.key);
   if (after.active_run === run.id) store.updateTicket(ticket.key, { active_run: null });
@@ -86,17 +116,17 @@ async function readonlyJob(agentId, ticket, kind) {
   return { cwd };
 }
 
-async function launchTriage(t) {
+async function launchTriage(t, fence) {
   const { cwd } = await readonlyJob('support', t);
-  await launch({ agentId: 'support', kind: 'triage', ticket: t, cwd, prompt: promptFor('triage', { ticket: t, comments: store.listComments(t.key) }) });
+  await launch({ fence, agentId: 'support', kind: 'triage', ticket: t, cwd, prompt: promptFor('triage', { ticket: t, comments: store.listComments(t.key) }) });
 }
 
-async function launchGroom(t) {
+async function launchGroom(t, fence) {
   const { cwd } = await readonlyJob('manager', t);
-  await launch({ agentId: 'manager', kind: 'groom', ticket: t, cwd, prompt: promptFor('groom', { ticket: t, comments: store.listComments(t.key) }) });
+  await launch({ fence, agentId: 'manager', kind: 'groom', ticket: t, cwd, prompt: promptFor('groom', { ticket: t, comments: store.listComments(t.key) }) });
 }
 
-async function launchImplement(ticket, agentId) {
+async function launchImplement(ticket, agentId, fence) {
   store.updateAgent(agentId, { status: 'working', current_ticket: ticket.key, last_action: 'cloning workspace', last_action_at: store.now() });
   store.logEvent({ agent_id: agentId, ticket_key: ticket.key, kind: 'pickup', text: `${agentById[agentId].role} picked up ${ticket.key}` });
   setStatus(ticket.key, 'in_progress', { assignee: agentId, active_run: -1, progress: Math.max(2, ticket.progress || 0), progress_msg: 'cloning workspace' });
@@ -111,19 +141,27 @@ async function launchImplement(ticket, agentId) {
   }
   const t = store.updateTicket(ticket.key, { branch: ws.branch });
   const comments = store.listComments(t.key);
-  // Rework: continue this engineer's own session (same clone, full memory of what it tried) when it is recent.
   const prev = store.lastRunFor(t.key, agentId, 'implement');
+  // A stalled request (idle watchdog) is resumed in place: same session, same clone, nothing redone.
+  if (prev && prev.status === 'killed' && /idle timeout|desk restarted|desk shutdown/.test(prev.result_text || '') && runner.canResume(prev, 6) && prev.cwd === ws.dir) {
+    const run = await launch({ fence, agentId, kind: 'implement', ticket: t, cwd: ws.dir, resume: prev.session_id,
+      prompt: 'Your previous request stalled and was restarted. Continue exactly where you left off: finish the ticket, commit, and run desk submit.' });
+    if (!(run && run.status === 'error' && !run.num_turns)) return;
+  }
+  // Rework: continue this engineer's own session (same clone, full memory of what it tried) when it is recent.
   const notes = comments.filter((c) => /^(❌|🔁)/.test(c.body)).pop();
   if (config.review.resumeRework && notes && runner.canResume(prev, config.review.resumeReworkMaxAgeHours) && prev.cwd === ws.dir) {
-    const run = await launch({ agentId, kind: 'implement', ticket: t, cwd: ws.dir, resume: prev.session_id, prompt: promptFor('rework', { ticket: t, extra: notes.body }) });
+    const run = await launch({ fence, agentId, kind: 'implement', ticket: t, cwd: ws.dir, resume: prev.session_id, prompt: promptFor('rework', { ticket: t, extra: notes.body }) });
     if (run && run.status === 'error' && !run.num_turns) {
       store.logEvent({ agent_id: agentId, ticket_key: t.key, kind: 'system', text: 'session resume failed — starting fresh' });
     } else return;
   }
-  await launch({ agentId, kind: 'implement', ticket: store.getTicket(t.key), cwd: ws.dir, prompt: promptFor('implement', { ticket: store.getTicket(t.key), comments: store.listComments(t.key) }) });
+  await launch({ fence, agentId, kind: 'implement', ticket: store.getTicket(t.key), cwd: ws.dir, prompt: promptFor('implement', { ticket: store.getTicket(t.key), comments: store.listComments(t.key) }) });
 }
 
-async function launchQa(ticket) {
+const nonce = () => crypto.randomBytes(5).toString('hex');
+
+async function launchQa(ticket, fence) {
   store.updateAgent('qa', { status: 'working', current_ticket: ticket.key, last_action: 'checking out the submitted commit', last_action_at: store.now() });
   store.updateTicket(ticket.key, { active_run: -1 });
   let ws;
@@ -135,10 +173,12 @@ async function launchQa(ticket) {
     throw err;
   }
   store.logEvent({ agent_id: 'qa', ticket_key: ticket.key, kind: 'pickup', text: `QA picked up ${ticket.key}` });
-  await launch({ agentId: 'qa', kind: 'qa', ticket, cwd: ws.dir, prompt: promptFor('qa', { ticket, comments: store.listComments(ticket.key) }) });
+  // The verdict code lives only in the prompt: code under test (which inherits the shell) cannot know it.
+  const code = nonce();
+  await launch({ fence, agentId: 'qa', kind: 'qa', ticket, cwd: ws.dir, nonce: code, prompt: promptFor('qa', { ticket, comments: store.listComments(ticket.key), extra: code }) });
 }
 
-async function launchReview(ticket, seat) {
+async function launchReview(ticket, seat, fence) {
   store.updateAgent(seat, { status: 'working', current_ticket: ticket.key, last_action: 'opening the QA-passed change', last_action_at: store.now() });
   store.updateTicket(ticket.key, { active_run: -1 });
   let ws;
@@ -153,12 +193,14 @@ async function launchReview(ticket, seat) {
   const comments = store.listComments(ticket.key);
   // Opt-in: fork the requester's original session (where the idea was born) if it is recent enough.
   const origin = ticket.origin_session ? store.runBySession(ticket.origin_session) : null;
-  if (config.review.resumeRequester && runner.canResume(origin, config.review.resumeRequesterMaxAgeHours)) {
-    const run = await launch({ agentId: seat, kind: 'review', ticket, cwd: origin.cwd, resume: origin.session_id, fork: true, extraDirs: [ws.dir],
-      prompt: promptFor('review-resumed', { ticket, comments, extra: ws.dir }) });
+  if (config.review.resumeRequester && runner.engineOf(agentById[seat]).canFork && runner.canResume(origin, config.review.resumeRequesterMaxAgeHours)) {
+    const code = nonce();
+    const run = await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: origin.cwd, resume: origin.session_id, fork: true, extraDirs: [ws.dir], nonce: code,
+      prompt: promptFor('review-resumed', { ticket: { ...ticket, nonce: code }, comments, extra: ws.dir }) });
     if (!(run && run.status === 'error' && !run.num_turns)) return;
   }
-  await launch({ agentId: seat, kind: 'review', ticket, cwd: ws.dir, prompt: promptFor('review', { ticket, comments }) });
+  const code = nonce();
+  await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: ws.dir, nonce: code, prompt: promptFor('review', { ticket, comments, extra: code }) });
 }
 
 // ---------------- watch desk ----------------
@@ -171,13 +213,14 @@ function incidentEvidence(inc, context = []) {
     context.length ? ['<log-context untrusted="true">', ...context.map((l) => store.redact(l).slice(0, 400)), '</log-context>'].join('\n') : ''].join('\n');
 }
 
-async function launchInvestigation(inc) {
+async function launchInvestigation(inc, fence) {
   store.updateIncident(inc.id, { status: 'investigating', attempts: (inc.attempts || 0) + 1 });
   const { cwd } = await readonlyJob('sre', null);
   const samples = JSON.parse(inc.samples || '[]');
   const context = await watch.lokiContext(config.watch.sources[inc.source_index], inc.label, samples.at(-1)?.ts || inc.last_seen);
   store.logEvent({ agent_id: 'sre', kind: 'pickup', text: `investigating incident #${inc.id} (${inc.label}): ${inc.normalized.slice(0, 120)}` });
-  const run = await runner.startRun({ agentId: 'sre', kind: 'investigate', cwd, incidentId: inc.id, prompt: promptFor('investigate', { extra: incidentEvidence(inc, context) }) }).then((r) => r.run);
+  const { run, aborted } = await runner.startRun({ fence, agentId: 'sre', kind: 'investigate', cwd, incidentId: inc.id, prompt: promptFor('investigate', { extra: incidentEvidence(inc, context) }) });
+  if (aborted) { store.updateAgent('sre', { status: 'idle' }); store.updateIncident(inc.id, { status: 'watching' }); return; }
   const after = store.getIncident(inc.id);
   if (after.status === 'investigating') {
     const give = (after.attempts || 0) >= 2;
@@ -234,7 +277,8 @@ let budgetWarned = '';
 
 export function budgetHeadroom(settings = store.getSettings()) {
   // Reserve each running seat's full per-run cap so concurrent runs can't jointly blow the daily limit.
-  return Number(settings.daily_budget_usd) - store.spendSince(startOfToday()) - runner.runningBudget();
+  const working = store.listAgentStates().filter((a) => a.status === 'working').reduce((sum, a) => sum + runner.runBudget(a.id), 0);
+  return Number(settings.daily_budget_usd) - store.spendSince(startOfToday()) - Math.max(working, runner.runningBudget());
 }
 
 export async function tick() {
@@ -244,9 +288,13 @@ export async function tick() {
     const s = store.getSettings();
     if (s.paused === 'true') return;
     let headroom = budgetHeadroom(s);
+    const quota = JSON.parse(store.kvGet('quota:claude') || 'null');
+    const planFull = quota && ((quota.five_hour ?? 0) >= config.limits.planHoldAt || (quota.status && quota.status !== 'allowed'));
     // Seats are flipped to "working" synchronously when a job starts, so this counts jobs still in setup too.
     let slots = capacity(s) - store.listAgentStates().filter((a) => a.status === 'working').length;
+    const fence = runner.currentEpoch();
     const go = (agentId, fn) => {
+      if (planFull && runner.engineOf(agentById[agentId]).id === 'claude') return false; // leave the plan's headroom to the owner
       const need = runner.runBudget(agentId);
       if (headroom < need) {
         const day = startOfToday();
@@ -258,29 +306,29 @@ export async function tick() {
       }
       headroom -= need;
       slots -= 1;
-      fn().catch((err) => store.logEvent({ kind: 'error', agent_id: agentId, text: `scheduler: ${err.message}` }));
+      fn(fence).catch((err) => store.logEvent({ kind: 'error', agent_id: agentId, text: `scheduler: ${err.message}` }));
       return true;
     };
 
     // 1. Support triages owner/GitHub tickets (cheap, fast).
     const triage = store.ticketsByStatus('triage').find((t) => !t.active_run);
-    if (triage && slots > 0 && agentIdle('support')) go('support', () => launchTriage(triage));
+    if (triage && slots > 0 && agentIdle('support')) go('support', (f) => launchTriage(triage, f));
     // 1b. On-call SRE investigates new recurring error signatures (rate-limited).
     if (config.watch.enabled && slots > 0 && agentIdle('sre')) {
       const recentCount = store.investigationsSince(new Date(Date.now() - 3600_000).toISOString());
       const next = recentCount < config.watch.maxInvestigationsPerHour
         ? (watch.triageIncidents().investigate || []).sort((a, b) => watch.windowCount(b.signature) - watch.windowCount(a.signature))[0] : null;
-      if (next) go('sre', () => launchInvestigation(next));
+      if (next) go('sre', (f) => launchInvestigation(next, f));
     }
     // 2. QA before new implementation: settle work in flight first.
     const qa = store.ticketsByStatus('qa').find((t) => !t.active_run);
-    if (qa && slots > 0 && agentIdle('qa')) go('qa', () => launchQa(qa));
+    if (qa && slots > 0 && agentIdle('qa')) go('qa', (f) => launchQa(qa, f));
     // 2b. Requesters confirm QA-passed work matches what they asked for.
     for (const t of store.ticketsByStatus('review')) {
       if (slots <= 0) break;
       const seat = requesterOf(t);
       if (t.active_run || !seat || !agentIdle(seat)) continue;
-      go(seat, () => launchReview(t, seat));
+      go(seat, (f) => launchReview(t, seat, f));
     }
     // 3. Engineers pick up groomed work by routing (area × complexity × risk).
     for (const t of store.ticketsByStatus('todo')) {
@@ -288,11 +336,11 @@ export async function tick() {
       if (t.active_run) continue;
       const who = t.assignee && ENGINEERS.includes(t.assignee) && agentById[t.assignee].enabled !== false ? t.assignee : routeTicket(t);
       if (!agentIdle(who)) continue;
-      go(who, () => launchImplement(t, who));
+      go(who, (f) => launchImplement(t, who, f));
     }
     // 4. Manager grooms proposals (consulting principals inside the run).
     const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run);
-    if (proposed && slots > 0 && agentIdle('manager')) go('manager', () => launchGroom(proposed));
+    if (proposed && slots > 0 && agentIdle('manager')) go('manager', (f) => launchGroom(proposed, f));
     // 5. PM researches on a cadence while the funnel is thin.
     if (s.pm_enabled === 'true' && slots > 0 && agentIdle('pm') && store.ticketsByStatus('proposed').length < Number(s.max_open_proposals)) {
       const last = store.lastRunOfKind('research');
@@ -305,9 +353,12 @@ export async function tick() {
 
 // ---------------- recovery ----------------
 export function recoverOrphans() {
-  for (const run of store.runningRuns()) {
+  for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });
+  for (const run of store.unfinishedRuns()) {
     if (run.pid) { try { process.kill(-run.pid, 'SIGTERM'); } catch { /* gone */ } }
-    store.updateRun(run.id, { status: 'killed', ended_at: store.now(), result_text: 'desk restarted', token: null });
+    // No terminal report survived the restart: charge the cap so interrupted spend is never forgotten.
+    store.updateRun(run.id, { status: 'killed', ended_at: store.now(), result_text: 'desk restarted', token: null,
+      cost_usd: run.cost_usd || runner.runBudget(run.agent_id), cost_estimated: run.cost_usd ? 0 : 1 });
     store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: 'run interrupted by a desk restart' });
   }
   for (const a of store.listAgentStates()) store.updateAgent(a.id, { status: 'idle', current_ticket: null, current_run: null });
@@ -378,7 +429,8 @@ export async function deskAction(run, cmd, body = {}) {
       return `created ${t.key}`;
     }
     case 'groom': {
-      need(ticket && ticket.status === 'proposed', 'ticket must be in proposed');
+      need(ticket && ticket.key === run.ticket_key && run.kind === 'groom', 'you can only groom the ticket you were given');
+      need(ticket.status === 'proposed', 'ticket must be in proposed');
       need(COMPLEXITIES.includes(body.complexity), 'complexity S|M|L|XL required');
       need(AREAS.includes(body.area), `area one of ${AREAS.join('|')}`);
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
@@ -401,13 +453,15 @@ export async function deskAction(run, cmd, body = {}) {
       return `created ${t.key} assigned to ${assignee}`;
     }
     case 'reject':
-      need(ticket && ['proposed', 'todo'].includes(ticket.status), 'only proposed/todo tickets can be rejected');
+      need(ticket && (ticket.key === run.ticket_key || ticket.parent_key === run.ticket_key) && run.kind === 'groom', 'you can only reject the ticket you are grooming');
+      need(['proposed', 'todo'].includes(ticket.status), 'only proposed/todo tickets can be rejected');
       store.addComment(ticket.key, agentId, `Closed: ${body.body || 'no reason given'}`);
       setStatus(ticket.key, 'wontdo');
       ev(`rejected ${ticket.key}: ${String(body.body || '').slice(0, 120)}`);
       return 'ok';
     case 'route': {
-      need(ticket && ticket.status === 'triage', 'ticket must be in triage');
+      need(ticket && ticket.key === run.ticket_key && run.kind === 'triage', 'you can only route the ticket you were given');
+      need(ticket.status === 'triage', 'ticket must be in triage');
       need(['pm', 'manager', 'human'].includes(body.to), 'route to pm|manager|human');
       const patch = {};
       if (['feature', 'bug', 'task', 'research'].includes(body.type)) patch.type = body.type;
@@ -421,6 +475,9 @@ export async function deskAction(run, cmd, body = {}) {
     case 'consult': {
       need(['principal-be', 'principal-fe', 'dba'].includes(body.agent), 'consult principal-be | principal-fe | dba');
       need(body.body, 'question required');
+      need(run.kind === 'groom', 'consults happen during grooming');
+      need(budgetHeadroom() >= runner.runBudget(body.agent), 'daily risk limit reached — groom without a consult');
+      need(store.listAgentStates().filter((a) => a.status === 'working').length < capacity() + 1, 'desk at capacity — groom without a consult');
       ev(`🗣 planning discussion with ${agentById[body.agent].role}: ${String(body.body).slice(0, 160)}`);
       const answer = await runner.consult({ agentId: body.agent, ticketKey: key, question: body.body });
       store.logEvent({ agent_id: body.agent, ticket_key: key, kind: 'say', text: `→ Engineering Manager: ${answer.slice(0, 1500)}` });
@@ -442,7 +499,8 @@ export async function deskAction(run, cmd, body = {}) {
       return 'Submitted to QA. Your run is complete — stop now.';
     }
     case 'qa': {
-      need(ticket && ticket.key === run.ticket_key && ticket.status === 'qa', 'ticket is not in QA');
+      need(ticket && ticket.key === run.ticket_key && ticket.status === 'qa' && run.kind === 'qa', 'ticket is not in QA');
+      need(run.nonce && body.code === run.nonce, 'missing or wrong --code (it is in your instructions)');
       need(['pass', 'fail'].includes(body.verdict), 'verdict pass|fail');
       if (body.verdict === 'fail') {
         const loops = (ticket.qa_loops || 0) + 1;
@@ -453,6 +511,10 @@ export async function deskAction(run, cmd, body = {}) {
         github.flushComments();
         return 'Recorded. Stop now.';
       }
+      // Evidence gate: QA must have actually run a test/build command successfully in this run.
+      const ran = runner.evidenceFor(run.id);
+      const testRe = new RegExp(config.project.testCommandPattern);
+      need(ran.some((e) => e.ok && testRe.test(e.cmd)), `no passing test run in your session yet — run the relevant tests (e.g. ${ran.length ? 'the playbook test command' : 'pytest / npm test'}) and pass only if they succeed`);
       // The verdict only counts for the exact commit that was submitted.
       const sha = await runner.headSha(runner.workspaceDir(ticket.key));
       need(!ticket.head_sha || sha === ticket.head_sha, `HEAD moved since submission (${sha.slice(0, 7)} ≠ ${String(ticket.head_sha).slice(0, 7)}); QA must not commit`);
@@ -470,6 +532,7 @@ export async function deskAction(run, cmd, body = {}) {
     }
     case 'accept': {
       need(ticket && ticket.key === run.ticket_key && ticket.status === 'review' && run.kind === 'review', 'ticket is not awaiting your acceptance');
+      need(run.nonce && body.code === run.nonce, 'missing or wrong --code (it is in your instructions)');
       need(requesterOf(ticket) === agentId, 'only the requester accepts this ticket');
       need(['pass', 'changes'].includes(body.verdict), 'verdict pass|changes');
       if (body.verdict === 'changes') {
@@ -497,6 +560,10 @@ export async function deskAction(run, cmd, body = {}) {
       need(['file', 'mute', 'page'].includes(body.action), 'desk incident file|mute|page');
       if (body.action === 'mute') {
         need(body.body, 'say why it is noise');
+        if (inc.count >= (config.watch.muteNeedsOwnerAbove ?? 20)) {
+          const t = pageOwner([inc], `SRE wants to mute a frequent signature (${inc.count}×): ${body.body}`);
+          return `Frequent signatures need the owner's OK to mute; asked them in ${t.key}. Stop now.`;
+        }
         store.updateIncident(inc.id, { status: 'muted', note: String(body.body).slice(0, 500) });
         store.logEvent({ run_id: run.id, agent_id: agentId, kind: 'action', text: `muted incident #${inc.id}: ${String(body.body).slice(0, 140)}` });
         return 'Muted. Stop now.';
@@ -520,12 +587,44 @@ export async function deskAction(run, cmd, body = {}) {
   }
 }
 
+const publishing = new Set();
 async function publishBranch(key) {
   const t = store.getTicket(key);
   if (store.getSettings().open_draft_prs !== 'true' || store.getSettings().github_sync !== 'true') return;
+  if (publishing.has(key) || t.pr_url) return;
+  publishing.add(key);
+  try { await publishInner(t, key); } finally { publishing.delete(key); }
+}
+
+// Crash or transient GitHub failure after QA: retry publishing tickets that are ready but have no PR.
+export async function ownerApprovePublish(key) {
+  const t = store.getTicket(key);
+  need(t && t.head_sha && store.kvGet(`guard:${key}`) === t.head_sha, 'nothing awaiting publish approval for this commit');
+  store.addComment(key, 'owner', `✅ Publish approved for \`${t.head_sha.slice(0, 10)}\` despite the guard.`);
+  setStatus(key, 'ready_for_human', { resume_status: null, progress_msg: 'owner approved publish' });
+  if (publishing.has(key)) return;
+  publishing.add(key);
+  try { await publishInner(store.getTicket(key), key, { ownerApproved: true }); } finally { publishing.delete(key); }
+}
+
+export function retryPublications() {
+  for (const t of store.ticketsByStatus('ready_for_human')) if (!t.pr_url && t.head_sha) publishBranch(t.key);
+}
+
+async function publishInner(t, key, { ownerApproved = false } = {}) {
+  if (!ownerApproved) {
+    const { files, lines } = await runner.diffSummary(runner.workspaceDir(key), t.head_sha);
+    const reasons = guardReasons(files, lines, t.complexity);
+    if (reasons.length) {
+      store.addComment(key, 'system', `🛑 **Publish guard** — not pushed: ${reasons.join('; ')}.\nReview the branch locally (${runner.workspaceDir(key)}) and press "Approve publish" if it is safe.`);
+      setStatus(key, 'needs_human', { resume_status: 'ready_for_human', progress_msg: 'publish guard: needs owner approval' });
+      store.kvSet(`guard:${key}`, t.head_sha);
+      return;
+    }
+  }
   try {
     if (!t.issue_number) await github.createIssue(key);
-    await runner.pushBranch(runner.workspaceDir(key), t.branch);
+    await runner.pushBranch(runner.workspaceDir(key), t.branch, t.head_sha);
     store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch}` });
     const cs = store.listComments(key);
     const last = (prefix) => cs.filter((c) => c.body.startsWith(prefix)).pop()?.body.replace(/^[^\n]*\n*/, '') || '';
@@ -533,6 +632,14 @@ async function publishBranch(key) {
   } catch (err) {
     store.logEvent({ kind: 'error', ticket_key: key, text: `publish failed: ${err.message}` });
   }
+}
+
+// Red CI on a draft PR: back to the engineer with the failing checks (counts as a review round).
+export function prChecksFailed(t, names) {
+  const loops = (t.qa_loops || 0) + 1;
+  store.addComment(t.key, 'system', `❌ **CI failed on the draft PR**: ${names}. Fix and resubmit.`);
+  if (loops > config.limits.maxQaLoops) setStatus(t.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'CI keeps failing' });
+  else setStatus(t.key, 'todo', { qa_loops: loops, pr_url: null, progress: 50, progress_msg: `CI failed: ${names}`.slice(0, 200) });
 }
 
 // ---------------- owner (UI) actions ----------------
