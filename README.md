@@ -126,6 +126,7 @@ Everything lives in `sigmadesk.config.json` (gitignored). See `sigmadesk.config.
 | `watch.*` | Log sources (`loki` / `docker` / `file`), thresholds, storm and regression handling. |
 | `pm.*` | PM persona, competitors to study, cadence. |
 | `sandbox.*` | Extra allowed domains (e.g. a package registry) and paths to keep unreadable. |
+| `notify.*` | A Discord/Slack webhook or ntfy.sh topic: get pinged when a ticket needs you, a PR is ready, or the SRE pages. |
 
 Live knobs (concurrency, budget, PM cadence, GitHub sync, draft PRs) are also editable in the UI under **Limits**.
 

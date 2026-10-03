@@ -79,6 +79,12 @@ const DEFAULTS = {
     maxInvestigationsPerHour: 4,
     regressionGraceMinutes: 45, // a resolved signature seen again after this long = regression
   },
+  // Push to your phone when the desk needs you (Discord/Slack webhook or an ntfy.sh topic URL).
+  notify: {
+    webhookUrl: '',
+    boardUrl: '', // e.g. http://my-mac:8790 — used for deep links
+    events: ['needs_human', 'ready_for_human', 'page'],
+  },
   github: {
     sync: true,
     openDraftPrs: true,

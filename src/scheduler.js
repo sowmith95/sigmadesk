@@ -5,6 +5,7 @@ import * as store from './db.js';
 import * as runner from './runner.js';
 import * as github from './github.js';
 import * as watch from './watch.js';
+import { notify } from './notify.js';
 
 // ---------------- publish guard ----------------
 export function globToRegExp(glob) {
@@ -61,8 +62,11 @@ export function requesterOf(t) {
 const agentIdle = (id) => agentById[id]?.enabled !== false && store.getAgentState(id)?.status !== 'working';
 
 function setStatus(key, status, extra = {}) {
+  const before = store.getTicket(key)?.status;
   const t = store.updateTicket(key, { status, ...extra });
   github.syncIssueState(key);
+  if (status !== before && status === 'needs_human') notify('needs_human', t, 'needs you');
+  if (status !== before && status === 'ready_for_human') notify('ready_for_human', t, 'ready for your review');
   if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key); // clones are full copies now; free the disk
   return t;
 }
@@ -237,6 +241,7 @@ function pageOwner(incidents, why) {
     type: 'bug', status: 'needs_human', priority: incidents.length > 1 ? 'P0' : 'P1', reporter: 'sre', source: 'watch',
   });
   store.updateTicket(t.key, { resume_status: 'proposed' });
+  notify('page', t, 'SRE paged you');
   for (const i of incidents) store.updateIncident(i.id, { status: 'paged', ticket_key: t.key });
   store.logEvent({ agent_id: 'sre', ticket_key: t.key, kind: 'system', text: `paged the owner: ${t.title}` });
   github.createIssue(t.key);
