@@ -1,0 +1,15 @@
+{
+  "name": "sigmadesk",
+  "version": "0.1.0",
+  "description": "An AI engineering desk run like a quant firm: real Claude Code agents per seat, a live Jira-style board, sandboxed execution, GitHub sync, and an on-call SRE that turns production errors into fixes.",
+  "license": "MIT",
+  "type": "module",
+  "bin": { "sigmadesk": "src/server.js" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
+    "doctor": "node --disable-warning=ExperimentalWarning src/doctor.js"
+  },
+  "engines": { "node": ">=22.13" },
+  "keywords": ["ai-agents", "claude-code", "multi-agent", "kanban", "jira", "devops", "sre", "github"]
+}

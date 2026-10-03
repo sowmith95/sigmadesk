@@ -1,0 +1,38 @@
+{
+  "server": {
+    "port": 8790,
+    "hosts": ["127.0.0.1"],
+    "ownerToken": ""
+  },
+  "project": {
+    "name": "my-app",
+    "repoPath": "~/code/my-app",
+    "githubRepo": "",
+    "baseBranch": "main",
+    "branchPrefix": "sigmadesk/",
+    "ticketPrefix": "SD",
+    "playbook": "playbooks/default.md",
+    "copyPaths": ["web/node_modules"],
+    "env": { "TZ": "America/New_York" },
+    "extraAllowedBash": [],
+    "readOnlyPaths": []
+  },
+  "limits": {
+    "maxConcurrent": 2,
+    "busyWindow": { "enabled": false, "timezone": "America/New_York", "days": [1, 2, 3, 4, 5], "start": "09:30", "end": "16:15", "maxConcurrent": 1 },
+    "dailyBudgetUsd": 50,
+    "runBudgetUsd": { "fable": 8, "opus": 5, "sonnet": 3, "haiku": 0.75 }
+  },
+  "github": { "sync": true, "openDraftPrs": true, "label": "sigmadesk", "trustedAuthors": [] },
+  "pm": {
+    "enabled": true,
+    "intervalMinutes": 360,
+    "persona": "a quant trader and 0-5 DTE options scalper who uses this product every day",
+    "competitors": ["Unusual Whales", "SpotGamma", "OptionStrat", "TradingView"]
+  },
+  "sandbox": { "enabled": true, "allowedDomains": [] },
+  "team": {
+    "junior": { "model": "sonnet" },
+    "pm": { "name": "Avery" }
+  }
+}

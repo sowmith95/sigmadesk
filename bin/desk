@@ -1,0 +1,81 @@
+#!/usr/bin/env node
+// desk — the only way a SigmaDesk seat talks to the desk. Speaks HTTP over the unix socket
+// the sandbox allowlists (DESK_SOCKET), authenticated by this run's token (DESK_RUN_TOKEN).
+import http from 'node:http';
+
+const USAGE = `usage:
+  desk show [KEY] | desk list [status]
+  desk progress <0-100> "<msg>"
+  desk comment [--key KEY] "<text>"            (or text on stdin)
+  desk needs-human "<question>"
+  desk propose --title T [--area A] [--priority P] [--type T]   (body on stdin)
+  desk groom KEY --complexity S|M|L|XL --area A [--priority P] [--risk high] [--assign SEAT] [--title T]   (spec on stdin)
+  desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT]   (body on stdin)
+  desk reject KEY "<reason>"
+  desk consult principal-be|principal-fe|dba "<question>"
+  desk route KEY pm|manager|human "<why>" [--type T] [--priority P]
+  desk submit "<summary>"
+  desk qa pass|fail "<notes>"
+  desk accept pass|changes "<notes>"
+  desk incident file --title T --severity P0-P3 --area A   (analysis on stdin)
+  desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>"`;
+
+const [cmd, ...rest] = process.argv.slice(2);
+if (!cmd || cmd === '-h' || cmd === '--help') { console.log(USAGE); process.exit(cmd ? 0 : 2); }
+
+const flags = {};
+const pos = [];
+for (let i = 0; i < rest.length; i++) {
+  if (rest[i].startsWith('--')) { flags[rest[i].slice(2)] = rest[i + 1]; i++; } else pos.push(rest[i]);
+}
+const KEY_RE = /^[A-Z][A-Z0-9]*-\d+$/;
+
+// Read piped text (heredocs), but never hang on an open-but-silent stdin.
+function stdinText() {
+  if (process.stdin.isTTY) return Promise.resolve('');
+  return new Promise((resolve) => {
+    let s = '';
+    const done = () => { process.stdin.pause(); resolve(s.trim()); };
+    const idle = setTimeout(done, 1500);
+    process.stdin.on('data', (c) => { s += c; idle.refresh(); });
+    process.stdin.on('end', () => { clearTimeout(idle); done(); });
+    process.stdin.on('error', () => { clearTimeout(idle); done(); });
+  });
+}
+
+const body = { ...flags };
+const takeKey = () => { if (pos[0] && KEY_RE.test(pos[0])) body.key = pos.shift(); };
+switch (cmd) {
+  case 'show': takeKey(); break;
+  case 'list': body.status = pos[0]; break;
+  case 'progress': body.pct = Number(pos[0]); body.msg = pos.slice(1).join(' '); break;
+  case 'route': takeKey(); body.to = pos.shift(); body.body = pos.join(' '); break;
+  case 'consult': body.agent = pos.shift(); body.body = pos.join(' '); break;
+  case 'qa': case 'accept': body.verdict = pos.shift(); body.body = pos.join(' '); break;
+  case 'incident': body.action = pos.shift(); body.body = pos.join(' '); break;
+  case 'groom': case 'reject': case 'comment': case 'needs-human': takeKey(); body.body = pos.join(' '); break;
+  default: body.body = pos.join(' ');
+}
+if (!body.body && !['show', 'list', 'progress'].includes(cmd)) body.body = await stdinText();
+else if (['groom', 'propose', 'create-task', 'incident'].includes(cmd) && !body.body) body.body = await stdinText();
+
+const socketPath = process.env.DESK_SOCKET;
+const token = process.env.DESK_RUN_TOKEN;
+if (!socketPath || !token) { console.error('desk: not inside a SigmaDesk run (DESK_SOCKET/DESK_RUN_TOKEN unset)'); process.exit(2); }
+
+const payload = JSON.stringify(body);
+const req = http.request({ socketPath, path: `/desk/${cmd}`, method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Authorization: `Bearer ${token}` },
+  timeout: 15 * 60_000 }, (res) => {
+  let data = '';
+  res.on('data', (c) => { data += c; });
+  res.on('end', () => {
+    let j;
+    try { j = JSON.parse(data); } catch { j = { error: data }; }
+    if (res.statusCode >= 400) { console.error(`desk ${cmd}: ${j.error || res.statusCode}`); process.exit(1); }
+    console.log(j.output ?? 'ok');
+  });
+});
+req.on('error', (e) => { console.error(`desk: cannot reach the desk (${e.message})`); process.exit(1); });
+req.on('timeout', () => { req.destroy(new Error('timeout')); });
+req.end(payload);

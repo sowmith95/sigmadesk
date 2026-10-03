@@ -1,0 +1,7 @@
+data/
+workspaces/
+local/
+node_modules/
+*.log
+sigmadesk.config.json
+.DS_Store
