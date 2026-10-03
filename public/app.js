@@ -244,6 +244,12 @@ function ticketCard(t) {
     h('div', { class: 'card-top' }, h('span', { class: 'key' }, t.key), h('span', { class: `pri ${t.priority}` }, t.priority), h('span', {}, t.type),
       h('span', { class: 'spacer' }), t.issue_number ? h('span', { title: 'GitHub issue' }, `#${t.issue_number}`) : null, t.pr_url ? h('span', { title: 'draft PR' }, '⇡PR') : null),
     h('div', { class: 'card-title' }, t.title),
+    (() => {
+      const kids = S.tickets.filter((x) => x.parent_key === t.key);
+      if (kids.length) return h('div', { class: 'epic' }, `🧭 ${kids.length} slice${kids.length > 1 ? 's' : ''} · ${kids.filter((k) => k.status === 'done').length} merged`);
+      if (t.parent_key) return h('div', { class: 'slice' }, `↳ slice of ${t.parent_key}${t.after_key ? ` · after ${t.after_key}` : ''}`);
+      return null;
+    })(),
     h('div', { class: 'card-meta' },
       t.area ? h('span', { class: 'tag' }, t.area) : null,
       t.complexity ? h('span', { class: 'tag' }, t.complexity) : null,
@@ -534,6 +540,11 @@ function renderSheet() {
         h('div', {}, h('span', {}, 'Branch'), h('span', { class: 'mono', style: 'word-break:break-all' }, t.branch || '—')),
         h('div', {}, h('span', {}, 'Requested by'), amap[t.reporter]?.name || t.reporter || '—'),
         h('div', {}, h('span', {}, 'Review rounds'), String(t.qa_loops || 0))),
+      (() => {
+        const kids = S.tickets.filter((x) => x.parent_key === t.key);
+        return kids.length ? h('div', { class: 'mini-list' }, kids.map((k) => h('button', { class: 'mini-t', type: 'button', onclick: () => openTicket(k.key) },
+          h('span', { class: 'mono' }, k.key), avatar(k.assignee), h('span', { class: 'tag' }, STATUS_LABEL[k.status] || k.status), h('span', { class: 'tt' }, `${k.complexity || ''} · ${k.title}`)))) : null;
+      })(),
       h('div', { class: 'desc' }, t.description || '—'),
       run ? h('div', { class: 'row-actions' }, h('span', { style: 'flex:1;color:var(--muted);font-size:12px' }, `run #${run.id} · ${run.kind} · ${run.model}`),
         h('button', { class: 'btn small danger', type: 'button', onclick: act(() => api('POST', `/api/runs/${run.id}/kill`, {}), 'stopping run') }, 'Stop run')) : null),

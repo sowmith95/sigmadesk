@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { config } from './config.js';
-import { agentById, ENGINEERS, AREAS, COMPLEXITIES, STATUSES, routeTicket, promptFor } from './team.js';
+import { agentById, ENGINEERS, PRINCIPALS, BUILDERS, AREAS, COMPLEXITIES, STATUSES, routeTicket, routeSlice, promptFor } from './team.js';
 import * as store from './db.js';
 import * as runner from './runner.js';
 import * as github from './github.js';
@@ -64,7 +64,8 @@ export function capacity(settings = store.getSettings()) {
 // Who asked for this work and should confirm it matches their intent (null = the owner reviews the PR).
 export function requesterOf(t) {
   if (!config.review.acceptance) return null;
-  const seat = ['pm', 'manager', 'sre'].includes(t.reporter) ? t.reporter : null;
+  const seats = ['pm', 'manager', 'sre', ...(config.review.principalAcceptance ? PRINCIPALS : [])];
+  const seat = seats.includes(t.reporter) ? t.reporter : null;
   return seat && agentById[seat]?.enabled !== false ? seat : null;
 }
 
@@ -77,7 +78,29 @@ function setStatus(key, status, extra = {}) {
   if (status !== before && status === 'needs_human') notify('needs_human', t, 'needs you');
   if (status !== before && status === 'ready_for_human') notify('ready_for_human', t, 'ready for your review');
   if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key); // clones are full copies now; free the disk
+  if (t.parent_key) rollupParent(t.parent_key);
   return t;
+}
+
+// An epic (a principal's delegated ticket) tracks its slices: progress rolls up; it closes when every slice is settled.
+export function rollupParent(parentKey) {
+  const p = store.getTicket(parentKey);
+  if (!p || p.status !== 'in_progress' || !PRINCIPALS.includes(p.assignee)) return;
+  const kids = store.childrenOf(parentKey);
+  if (!kids.length) return;
+  const merged = kids.filter((k) => k.status === 'done').length;
+  const settled = kids.filter((k) => ['done', 'wontdo'].includes(k.status)).length;
+  const review = kids.filter((k) => k.status === 'ready_for_human').length;
+  const stuck = kids.filter((k) => k.status === 'needs_human').length;
+  const progress = Math.round(kids.reduce((a, k) => a + (['done', 'wontdo'].includes(k.status) ? 100 : k.progress || 0), 0) / kids.length);
+  const msg = `${merged}/${kids.length} slices merged${review ? ` · ${review} awaiting your review` : ''}${stuck ? ` · ${stuck} need you` : ''}`;
+  if (settled === kids.length) {
+    store.updateTicket(parentKey, { status: merged ? 'done' : 'wontdo', progress: 100, progress_msg: msg });
+    github.syncIssueState(parentKey);
+    store.logEvent({ agent_id: p.assignee, ticket_key: parentKey, kind: 'done', text: `epic ${parentKey} closed: ${msg}` });
+  } else {
+    store.updateTicket(parentKey, { progress: Math.min(99, progress), progress_msg: msg });
+  }
 }
 
 function stall(ticket, reason) {
@@ -175,6 +198,13 @@ async function launchImplement(ticket, agentId, fence) {
 }
 
 const nonce = () => crypto.randomBytes(5).toString('hex');
+
+// Principals design and slice; they never get an implementation run.
+async function launchDesign(t, seat, fence) {
+  const { cwd } = await readonlyJob(seat, t);
+  store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is designing ${t.key} and will delegate the build` });
+  await launch({ fence, agentId: seat, kind: 'design', ticket: t, cwd, prompt: promptFor('design', { ticket: t, comments: store.listComments(t.key) }) });
+}
 
 async function launchQa(ticket, fence) {
   store.updateAgent('qa', { status: 'working', current_ticket: ticket.key, last_action: 'checking out the submitted commit', last_action_at: store.now() });
@@ -351,9 +381,11 @@ export async function tick() {
     for (const t of store.ticketsByStatus('todo')) {
       if (slots <= 0) break;
       if (t.active_run) continue;
+      if (t.after_key && store.getTicket(t.after_key)?.status !== 'done') continue; // waits for its predecessor to merge
       const who = t.assignee && ENGINEERS.includes(t.assignee) && agentById[t.assignee].enabled !== false ? t.assignee : routeTicket(t);
       if (!agentIdle(who)) continue;
-      go(who, (f) => launchImplement(t, who, f));
+      if (PRINCIPALS.includes(who)) go(who, (f) => launchDesign(t, who, f));
+      else go(who, (f) => launchImplement(t, who, f));
     }
     // 4. Manager grooms proposals (consulting principals inside the run).
     const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run);
@@ -389,10 +421,12 @@ export function recoverOrphans() {
 
 // ---------------- desk CLI actions (called by seats with their run token) ----------------
 const PERMS = {
-  propose: ['pm'], groom: ['manager'], 'create-task': ['manager'], reject: ['manager'], consult: ['manager'],
+  propose: ['pm'], groom: ['manager'], 'create-task': ['manager', ...PRINCIPALS], reject: ['manager'], consult: ['manager'],
+  design: PRINCIPALS, delegate: PRINCIPALS,
   route: ['support'], submit: ENGINEERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
 };
 const PRIORITY = /^P[0-3]$/;
+const consultsByRun = new Map();
 
 function need(cond, msg) { if (!cond) throw Object.assign(new Error(msg), { status: 400 }); }
 
@@ -464,6 +498,21 @@ export async function deskAction(run, cmd, body = {}) {
     case 'create-task': {
       need(body.title && body.body, 'title and body required');
       need(COMPLEXITIES.includes(body.complexity) && AREAS.includes(body.area), 'complexity and area required');
+      if (PRINCIPALS.includes(agentId)) {
+        // A principal's slices: small, built by cheaper seats, attached to the ticket being designed.
+        need(run.kind === 'design' && run.ticket_key, 'slices are created during a design run');
+        need(['S', 'M'].includes(body.complexity), 'slices must be S or M — split further');
+        need(store.childrenOf(run.ticket_key).length < 4, 'at most 4 slices per ticket');
+        need(!body.assign || BUILDERS.includes(body.assign), `assign to one of ${BUILDERS.join(', ')}`);
+        if (body.after) need(store.getTicket(body.after)?.parent_key === run.ticket_key, '--after must name an earlier slice of this ticket');
+        const parent = store.getTicket(run.ticket_key);
+        const slice = store.createTicket({ title: body.title, description: body.body, type: parent.type === 'bug' ? 'bug' : 'task', status: 'todo', area: body.area,
+          complexity: body.complexity, priority: parent.priority, assignee: body.assign || routeSlice(body), reporter: agentId, source: 'agent', parent_key: run.ticket_key });
+        if (body.after) store.updateTicket(slice.key, { after_key: body.after });
+        ev(`sliced ${slice.key} (${body.complexity}) for ${agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
+        github.createIssue(slice.key);
+        return `created ${slice.key} → ${slice.assignee}`;
+      }
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
       const t = store.createTicket({ title: body.title, description: body.body, type: body.type || 'task', status: 'todo', area: body.area,
         complexity: body.complexity, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', assignee, reporter: agentId, source: 'agent', parent_key: body.parent || key });
@@ -471,6 +520,24 @@ export async function deskAction(run, cmd, body = {}) {
       ev(`created task ${t.key} for ${agentById[assignee].role}`, t.key);
       github.createIssue(t.key);
       return `created ${t.key} assigned to ${assignee}`;
+    }
+    case 'design':
+      need(ticket && ticket.key === run.ticket_key && run.kind === 'design', 'design only on the ticket you are designing');
+      need(body.body, 'design text required (stdin)');
+      store.addComment(ticket.key, agentId, `📐 **Design** (${agentById[agentId].name})\n\n${body.body}`);
+      ev('recorded the design');
+      github.flushComments();
+      return 'Design recorded. Now create the slices with desk create-task.';
+    case 'delegate': {
+      need(ticket && ticket.key === run.ticket_key && run.kind === 'design', 'delegate only the ticket you are designing');
+      const kids = store.childrenOf(ticket.key);
+      need(kids.length > 0, 'create at least one slice (desk create-task) before delegating');
+      need(store.listComments(ticket.key).some((c) => c.body.startsWith('📐')), 'record the design first (desk design)');
+      store.addComment(ticket.key, agentId, `🧭 **Delegated** into ${kids.map((k) => `${k.key} (${k.complexity}, ${agentById[k.assignee]?.name})`).join(', ')}\n\n${body.body || ''}`);
+      setStatus(ticket.key, 'in_progress', { progress: 5, progress_msg: `delegated: 0/${kids.length} slices merged` });
+      ev(`delegated ${ticket.key} into ${kids.length} slices`);
+      github.flushComments();
+      return 'Delegated. Your run is complete — stop now.';
     }
     case 'reject':
       need(ticket && (ticket.key === run.ticket_key || ticket.parent_key === run.ticket_key) && run.kind === 'groom', 'you can only reject the ticket you are grooming');
@@ -496,6 +563,8 @@ export async function deskAction(run, cmd, body = {}) {
       need(['principal-be', 'principal-fe', 'dba'].includes(body.agent), 'consult principal-be | principal-fe | dba');
       need(body.body, 'question required');
       need(run.kind === 'groom', 'consults happen during grooming');
+      consultsByRun.set(run.id, (consultsByRun.get(run.id) || 0) + 1);
+      need(consultsByRun.get(run.id) <= config.limits.maxConsultsPerGroom, `consult limit (${config.limits.maxConsultsPerGroom}) reached — decide the size yourself`);
       need(budgetHeadroom() >= runner.runBudget(body.agent), 'daily risk limit reached — groom without a consult');
       need(store.listAgentStates().filter((a) => a.status === 'working').length < capacity() + 1, 'desk at capacity — groom without a consult');
       ev(`🗣 planning discussion with ${agentById[body.agent].role}: ${String(body.body).slice(0, 160)}`);

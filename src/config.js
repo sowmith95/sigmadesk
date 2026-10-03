@@ -44,14 +44,16 @@ const DEFAULTS = {
     busyWindow: { enabled: false, timezone: 'America/New_York', days: [1, 2, 3, 4, 5], start: '09:30', end: '16:15', maxConcurrent: 1 },
     dailyBudgetUsd: 150,
     runBudgetUsd: { fable: 8, opus: 5, sonnet: 3, haiku: 0.75 },
-    runTimeoutMin: { implement: 45, qa: 20, review: 20, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20 },
+    runTimeoutMin: { implement: 45, qa: 20, review: 20, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, design: 20 },
     maxQaLoops: 2,
-    planHoldAt: 0.9, // hold new runs when the Claude plan's 5-hour window is this full (leave room for you)
+    planHoldAt: 0.8, // hold new runs when the Claude plan's 5-hour window is this full (leave room for you)
+    maxConsultsPerGroom: 1,
     idleTimeoutMin: 5, // no stream output at all (even thinking emits events) = stalled request; the run is stopped and resumed
   },
   review: {
     // After QA passes, the seat that asked for the work (PM / manager) confirms it matches their intent.
     acceptance: true,
+    principalAcceptance: false, // principals design + delegate; QA checks their slices (saves frontier-model usage)
     // Opt-in: resume the requester's original session (forked) instead of a fresh run with an intent dossier.
     resumeRequester: false,
     resumeRequesterMaxAgeHours: 6,
@@ -95,7 +97,7 @@ const DEFAULTS = {
   },
   pm: {
     enabled: true,
-    intervalMinutes: 360,
+    intervalMinutes: 720,
     maxOpenProposals: 5,
     persona: 'a quant trader and 0-5 DTE options scalper who uses this product every day',
     competitors: ['Unusual Whales', 'Cheddar Flow', 'FlowAlgo', 'Market Chameleon', 'SpotGamma', 'OptionStrat', 'Bookmap', 'TradingView', 'thinkorswim'],

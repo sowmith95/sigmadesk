@@ -14,6 +14,8 @@ const USAGE = `usage:
   desk propose --title T [--area A] [--priority P] [--type T]   (body on stdin)
   desk groom KEY --complexity S|M|L|XL --area A [--priority P] [--risk high] [--assign SEAT] [--title T]   (spec on stdin)
   desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT]   (body on stdin)
+  desk design   (design doc on stdin; principals)
+  desk delegate "<summary>"   (principals, after creating slices with create-task [--after SLICE])
   desk reject KEY "<reason>"
   desk consult principal-be|principal-fe|dba "<question>"
   desk route KEY pm|manager|human "<why>" [--type T] [--priority P]
@@ -60,7 +62,7 @@ switch (cmd) {
   default: body.body = pos.join(' ');
 }
 if (!body.body && !['show', 'list', 'progress'].includes(cmd)) body.body = await stdinText();
-else if (['groom', 'propose', 'create-task', 'incident'].includes(cmd) && !body.body) body.body = await stdinText();
+else if (['groom', 'propose', 'create-task', 'incident', 'design'].includes(cmd) && !body.body) body.body = await stdinText();
 
 const token = process.env.DESK_RUN_TOKEN;
 const mailbox = process.env.DESK_MAILBOX;

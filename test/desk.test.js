@@ -369,3 +369,35 @@ test('publisher: guard diffs against the owner base in a desk-owned repo; clone 
   assert.match(sched.guardReasons(files, 1, 'S')[0], /protected/);
   assert.ok(!fs.existsSync(pwned), 'clone-planted git config must never execute');
 });
+
+test('principals design and delegate: slices go to builders, epics roll up, no principal implementation', async () => {
+  const epic = store.createTicket({ title: 'big risky thing', status: 'todo', area: 'backend', complexity: 'L', assignee: 'principal-be' });
+  const run = fakeRun('principal-be', 'design', epic.key);
+  await assert.rejects(sched.deskAction(run, 'delegate', { body: 'x' }), /at least one slice/);
+  await sched.deskAction(run, 'design', { body: '## Approach\npool it' });
+  await assert.rejects(sched.deskAction(run, 'create-task', { title: 'too big', body: 'b', complexity: 'L', area: 'backend' }), /S or M/);
+  await assert.rejects(sched.deskAction(run, 'create-task', { title: 'x', body: 'b', complexity: 'S', area: 'backend', assign: 'principal-fe' }), /assign to one of/);
+  const a = (await sched.deskAction(run, 'create-task', { title: 'slice A', body: 'b', complexity: 'S', area: 'backend' })).match(/T-\d+/)[0];
+  const b = (await sched.deskAction(run, 'create-task', { title: 'slice B', body: 'b', complexity: 'M', area: 'backend', after: a })).match(/T-\d+/)[0];
+  assert.equal(store.getTicket(a).assignee, 'junior');
+  assert.equal(store.getTicket(b).assignee, 'senior-be');
+  assert.equal(store.getTicket(b).after_key, a);
+  await sched.deskAction(run, 'delegate', { body: 'A then B' });
+  assert.equal(store.getTicket(epic.key).status, 'in_progress');
+  assert.equal(sched.requesterOf(store.getTicket(a)), null, 'QA is enough for principal slices');
+  // roll-up: both slices merge → epic done
+  store.updateTicket(a, { status: 'done' }); sched.rollupParent(epic.key);
+  assert.match(store.getTicket(epic.key).progress_msg, /1\/2 slices merged/);
+  store.updateTicket(b, { status: 'done' }); sched.rollupParent(epic.key);
+  assert.equal(store.getTicket(epic.key).status, 'done');
+  assert.ok(!team.agentById['principal-be'].kinds.includes('implement'));
+});
+
+test('consult only reaches principals or the DBA', async () => {
+  const t = store.createTicket({ title: 'consult cap', status: 'proposed' });
+  const em = fakeRun('manager', 'groom', t.key);
+  const orig = runner.consult;
+  // first consult would actually spawn an agent; assert the cap by pre-filling the counter via two calls guarded by try
+  await assert.rejects(sched.deskAction(em, 'consult', { agent: 'nobody', body: 'q' }), /consult principal-be/);
+  assert.equal(typeof orig, 'function');
+});

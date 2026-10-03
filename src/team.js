@@ -6,9 +6,9 @@ import { config } from './config.js';
 const SEATS = [
   { id: 'pm', bio: "Thinks like a desk trader. Reads competitors so you don't have to, and won't file anything without evidence and a success metric.", name: 'Avery', role: 'Principal Product Manager', short: 'PM', model: 'fable', color: '#c084fc', kinds: ['research'] },
   { id: 'manager', bio: 'Turns ideas into small, staffed, testable bets. Pulls principals into a quick huddle before sizing anything.', name: 'Morgan', role: 'Engineering Manager', short: 'EM', model: 'opus', color: '#f59e0b', kinds: ['groom'] },
-  { id: 'principal-be', bio: 'Owns the backend architecture and the riskiest changes. First call for anything touching money paths.', name: 'Rowan', role: 'Principal Backend Engineer', short: 'PBE', model: 'fable', color: '#a78bfa', kinds: ['implement', 'consult'] },
+  { id: 'principal-be', bio: 'Architects the hard backend work, then slices it for seniors and juniors. Does not write the code.', name: 'Rowan', role: 'Principal Backend Engineer', short: 'PBE', model: 'fable', color: '#a78bfa', kinds: ['design', 'consult'] },
   { id: 'senior-be', bio: 'Ships medium backend work cleanly, with tests, in the house style.', name: 'Jordan', role: 'Senior Backend Engineer', short: 'SBE', model: 'opus', color: '#fb923c', kinds: ['implement'] },
-  { id: 'principal-fe', bio: 'Owns UI architecture: mobile-first, fast, accessible. Trusts the production build, not the type checker.', name: 'Sage', role: 'Principal Frontend Engineer', short: 'PFE', model: 'fable', color: '#e879f9', kinds: ['implement', 'consult'] },
+  { id: 'principal-fe', bio: 'Architects UI work, then slices it for seniors and juniors. Mobile-first, fast, accessible.', name: 'Sage', role: 'Principal Frontend Engineer', short: 'PFE', model: 'fable', color: '#e879f9', kinds: ['design', 'consult'] },
   { id: 'senior-fe', bio: 'Ships UI tickets end to end and keeps components consistent.', name: 'Quinn', role: 'Senior Frontend Engineer', short: 'SFE', model: 'opus', color: '#fdba74', kinds: ['implement'] },
   { id: 'dba', bio: 'Schemas, migrations, query plans. Never touches a live database.', name: 'Casey', role: 'Database Engineer', short: 'DBA', model: 'opus', color: '#2dd4bf', kinds: ['implement', 'consult'] },
   { id: 'junior', bio: 'Takes small, well-scoped tickets and asks before guessing.', name: 'Riley', role: 'Junior Engineer', short: 'JR', model: 'sonnet', color: '#60a5fa', kinds: ['implement'] },
@@ -17,7 +17,7 @@ const SEATS = [
   { id: 'support', bio: 'Front door. Triages every incoming order in seconds and knows when to call you.', name: 'Skyler', role: 'Support Bot', short: 'SUP', model: 'haiku', color: '#94a3b8', kinds: ['triage'] },
 ];
 
-const DEFAULT_EFFORT = { frontier: 'xhigh', strong: 'high', fast: 'medium', cheap: 'low' };
+const DEFAULT_EFFORT = { frontier: 'high', strong: 'high', fast: 'medium', cheap: 'low' };
 const TIER = { pm: 'frontier', 'principal-be': 'frontier', 'principal-fe': 'frontier', junior: 'fast', qa: 'fast', support: 'cheap' };
 export const AGENTS = SEATS.map((s) => ({ enabled: true, engine: 'claude', effort: DEFAULT_EFFORT[TIER[s.id] || 'strong'], ...s, ...(config.team[s.id] || {}) }));
 export const agentById = Object.fromEntries(AGENTS.map((a) => [a.id, a]));
@@ -31,11 +31,21 @@ export function applyTeamOverrides(overrides = {}) {
   }
 }
 export const ENGINEERS = ['principal-be', 'senior-be', 'principal-fe', 'senior-fe', 'dba', 'junior'];
+export const PRINCIPALS = ['principal-be', 'principal-fe'];
+export const BUILDERS = ['senior-be', 'senior-fe', 'dba', 'junior']; // seats that write code
 export const AREAS = ['backend', 'frontend', 'db', 'fullstack', 'infra'];
 export const COMPLEXITIES = ['S', 'M', 'L', 'XL'];
 export const STATUSES = ['triage', 'proposed', 'todo', 'in_progress', 'qa', 'review', 'ready_for_human', 'needs_human', 'done', 'wontdo'];
 
-// Who picks a groomed ticket up: area × complexity, with a risk override.
+// Who picks a groomed ticket up: area × complexity, with a risk override. Principals receive large or risky work
+// to DESIGN and slice; the slices are routed to builders with routeSlice().
+export function routeSlice({ area, complexity }) {
+  const enabled = (id) => agentById[id]?.enabled !== false;
+  if (area === 'db') return enabled('dba') ? 'dba' : 'senior-be';
+  if (complexity === 'S' && enabled('junior')) return 'junior';
+  return area === 'frontend' ? 'senior-fe' : 'senior-be';
+}
+
 export function routeTicket({ area, complexity, risk }) {
   const enabled = (id) => agentById[id]?.enabled !== false;
   const pick = (...ids) => ids.find(enabled) || ids[ids.length - 1];
@@ -91,6 +101,7 @@ export function permissionsFor(kind, cwd = '/nonexistent') {
   if (kind === 'implement') return { tools: TOOLSET.write, allow: [...READ_RULES, ...TEST_RULES, ...WRITE_RULES, ...writeRules(cwd), ...extra] };
   if (kind === 'qa' || kind === 'review' || kind === 'investigate') return { tools: TOOLSET.read, allow: [...READ_RULES, ...TEST_RULES, ...extra] };
   if (kind === 'triage') return { tools: TOOLSET.triage, allow: ['Read', 'Grep', 'Glob', 'Bash(desk *)'] };
+  if (kind === 'design') return { tools: TOOLSET.read, allow: [...READ_RULES, ...extra] };
   if (kind === 'research') return { tools: TOOLSET.research, allow: [...READ_RULES, 'WebSearch', 'WebFetch', ...extra] };
   return { tools: TOOLSET.read, allow: [...READ_RULES, ...extra] }; // groom, consult
 }
@@ -140,19 +151,24 @@ described, for the user you had in mind?) with \`desk accept pass|changes "<note
   manager: () => `You are Morgan, Engineering Manager. You groom proposals into buildable work and staff them.
 For each ticket: read the relevant code, then hold a short planning discussion with the right principal(s):
   desk consult principal-be "<question>"   |   desk consult principal-fe "..."   |   desk consult dba "..."
-(they answer synchronously; ask about approach, risk and size). Then exactly one outcome:
+(they answer synchronously; ask about approach, risk and size). Consult AT MOST ONCE per ticket, and only for L/XL or high-risk work (consults are expensive); size S/M yourself.
+Then exactly one outcome:
   desk groom <KEY> --complexity <S|M|L|XL> --area <backend|frontend|db|fullstack|infra> --priority <P0-P3> [--risk high] [--assign <seat>] <<'EOF'
   <refined spec: scope, files likely touched, acceptance criteria, test plan>
   EOF
   desk create-task --parent <KEY> --title "..." --complexity .. --area .. <<'EOF' ... EOF   (split; then reject the parent "split into ...")
   desk reject <KEY> "<reason>"   (duplicates, low value, ideas the playbook marks as dead)
-Routing when you don't --assign: db→dba; S→junior; M→senior (backend/frontend by area); L/XL or --risk high→principal.
+Routing when you don't --assign: db→dba; S→junior; M→senior (backend/frontend by area); L/XL or --risk high→principal,
+who designs it and slices it into S/M tasks for seniors and juniors (principals do not write code).
 Use --risk high for anything touching money, orders, auth, migrations or data deletion, whatever its size.
 Seats: principal-be, senior-be, principal-fe, senior-fe, dba, junior. Prefer S/M slices; XL usually means split.
 Tasks you create come back to you for acceptance review after QA: \`desk accept pass|changes "<notes>"\`.`,
-  'principal-be': () => 'You are Rowan, Principal Backend Engineer. You own backend architecture and the hardest, riskiest backend tickets. Prefer existing patterns over new abstractions.',
+  'principal-be': () => `You are Rowan, Principal Backend Engineer. You ARCHITECT and DELEGATE; you never write production code.
+Your expensive time goes into the design and the slicing, so the cheaper seats can build it correctly. Prefer existing
+patterns over new abstractions. Be decisive and brief.`,
   'senior-be': () => 'You are Jordan, Senior Backend Engineer. You ship medium backend tickets cleanly, with tests, in the existing style.',
-  'principal-fe': () => 'You are Sage, Principal Frontend Engineer. You own UI architecture: mobile-first, fast, accessible. Verify with the real production build, not just a type check.',
+  'principal-fe': () => `You are Sage, Principal Frontend Engineer. You ARCHITECT and DELEGATE; you never write production code.
+Mobile-first, fast, accessible; the production build is the real check. Be decisive and brief.`,
   'senior-fe': () => 'You are Quinn, Senior Frontend Engineer. You ship medium and small UI tickets following existing components and styles, and verify with the production build.',
   dba: () => 'You are Casey, Database Engineer. You write schema migrations and query code as files and test them locally. You never connect to live databases. Mind indexes, locking, retention and query plans.',
   junior: () => 'You are Riley, Junior Engineer. You take small, well-specified tickets. Stay strictly in scope, follow existing patterns, and ask (desk comment / desk needs-human) instead of guessing.',
@@ -214,6 +230,21 @@ Run the relevant tests (see playbook). Check each acceptance criterion. Do not m
 Verdict, exactly one (the --code proves the verdict comes from you, not from code you ran — never write it to a file):
   desk qa pass --code ${extra} "<what you verified, with test evidence>"
   desk qa fail --code ${extra} "<numbered, actionable defects>"`;
+    case 'design':
+      return `${head}\nDesign and delegate this ticket. Do NOT write or edit code (you have read-only tools).
+1. Read just enough code to decide the approach. Keep it short.
+2. Record the design: desk design <<'EOF'
+   ## Approach (key decisions and why)
+   ## Interfaces / contracts (signatures, data shapes, invariants)
+   ## Risks and how each slice guards them
+   EOF
+3. Slice it into at most 4 tasks, each S or M, each independently testable and reviewable:
+   desk create-task --parent ${t?.key} --title "..." --complexity S|M --area <backend|frontend|db|fullstack> [--assign senior-be|senior-fe|junior|dba] [--after <SLICE-KEY>] <<'EOF'
+   ## Goal  ## Files / functions to change  ## Exact acceptance criteria  ## Tests to add or run
+   EOF
+   Give S slices to junior and M slices to seniors (DB work to dba). Use --after only when a slice truly needs an
+   earlier slice merged first; prefer independent slices.
+4. Finish with: desk delegate "<one-paragraph summary of the plan and slice order>".`;
     case 'review':
       return `${head}\nAcceptance review. You asked for this work; it has been built and has passed QA (correctness).
 Your job is different from QA's: judge whether the change delivers YOUR intent — the problem, the user, the scope and the

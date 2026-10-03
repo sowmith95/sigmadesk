@@ -431,3 +431,5 @@ details.work summary .t { font: 11px var(--mono); color: var(--dim); }
 @media (max-width: 760px) {
   .floor, .incs, .desk { grid-template-columns: minmax(0, 1fr); }
 }
+.epic { font-size: 12px; color: #c4b5fd; }
+.slice { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }

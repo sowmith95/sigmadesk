@@ -21,8 +21,10 @@ without you.
  PM research (competitors, user pain) ───┼─► Manager grooms ◄─► huddle with principals
  SRE (new recurring error in prod logs) ─┘        │ (size S/M/L/XL, area, risk)
                                                   ▼
-                       routed seat: junior (S) · senior (M) · principal (L/XL or high-risk) · DBA (db)
-                                                  ▼  own sandboxed clone, commits, `desk submit`
+             routed seat: junior (S) · senior (M) · DBA (db) · principal (L/XL or high-risk)
+                                                  │        └─► principal designs + slices into ≤4 S/M tasks
+                                                  ▼            for seniors/juniors (principals never write code)
+                                     own sandboxed clone, commits, `desk submit`
                                             QA risk check (pinned to the submitted commit)
                                                   ▼
                               Confirmation: the seat that asked for it checks it matches its intent
@@ -40,6 +42,10 @@ without you.
 - **Live visibility.** Each run's `stream-json` is turned into human-readable activity ("Reading app/feeds.py",
   "$ pytest …", narration, todo-list progress) and pushed to the UI over SSE. The ticket view is a chat thread; the Floor
   shows every seat's desk, monitor and speech bubble; seats have presence (heads-down, in a meeting, reviewing).
+- **Principals architect, others build.** Large or risky tickets go to a principal for a short read-only design run:
+  the design is recorded on the ticket and the work is sliced into at most four S/M tasks for seniors and juniors
+  (optionally ordered with `--after`). The parent becomes an epic whose progress rolls up from its slices. Frontier
+  models spend tokens on decisions, cheaper models on typing.
 - **Planning meetings are real.** The manager calls `desk consult principal-be "…"`, which runs the principal on the
   spot; the answer lands in the ticket thread for every later seat to read.
 - **Requesters review their own asks.** After QA (correctness), the PM / manager / SRE who asked for the work does an

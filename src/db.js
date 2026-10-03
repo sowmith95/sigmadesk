@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   stalls INTEGER DEFAULT 0,
   head_sha TEXT,
   origin_session TEXT,
+  after_key TEXT,
   active_run INTEGER,
   resume_status TEXT,
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -131,7 +132,7 @@ export function openDb(file = config.dbPath) {
 // Additive migrations for databases created by older versions.
 function migrate() {
   const want = {
-    tickets: { stalls: 'INTEGER DEFAULT 0', head_sha: 'TEXT', origin_session: 'TEXT' },
+    tickets: { stalls: 'INTEGER DEFAULT 0', head_sha: 'TEXT', origin_session: 'TEXT', after_key: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT' },
   };
@@ -174,6 +175,9 @@ export function setSetting(key, value) {
 export function getTicket(key) {
   return q('SELECT * FROM tickets WHERE key=?').get(key) || null;
 }
+export function childrenOf(key) {
+  return q('SELECT * FROM tickets WHERE parent_key=? ORDER BY id').all(key);
+}
 export function listTickets() {
   return q('SELECT * FROM tickets ORDER BY id DESC').all();
 }
@@ -197,7 +201,7 @@ export function createTicket(t) {
 }
 
 const TICKET_FIELDS = new Set(['title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
-  'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'active_run', 'resume_status', 'parent_key']);
+  'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key']);
 
 export function updateTicket(key, patch) {
   const cols = Object.keys(patch).filter((k) => TICKET_FIELDS.has(k));
