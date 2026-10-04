@@ -27,12 +27,22 @@ const REPORT = `Return ONLY valid JSON, no markdown, with this shape:
 {"verdict":"acceptable|changes|blocked","recommendation":"specific recommendation","findings":[{"severity":"high|medium|low","evidence":"provided file:line or quoted contract","issue":"concrete defect and consequence","test":"test that exposes it"}],"alternatives":["alternative and tradeoff"],"dissent":["unresolved disagreement and evidence"],"conditions":["required validation or missing evidence"]}.
 Use acceptable only when the supplied evidence supports it. Do not invent files, tests run or facts. Missing evidence belongs in conditions. Prefer concrete evidence to consensus. Keep the JSON under 650 words.`;
 
+// Independent review needs two different model families. Perplexity hosts several vendors' models under one engine,
+// so the family comes from the model id, never from the engine alone.
+export function familyOf(engine, model = '') {
+  if (engine === 'codex') return 'gpt';
+  if (engine === 'claude') return 'claude';
+  const id = String(model).toLowerCase();
+  for (const [re, family] of [[/kimi/, 'kimi'], [/grok/, 'grok'], [/glm/, 'glm'], [/deepseek/, 'deepseek'], [/gemini/, 'gemini'], [/sonar/, 'sonar'],
+    [/gpt|astra|sol/, 'gpt'], [/opus|sonnet|fable|haiku|claude/, 'claude']]) if (re.test(id)) return family;
+  return engine;
+}
 export function models() {
   const health = providerHealth();
   return [
     ...Object.values(ENGINES).filter((e) => !e.supports || e.supports('council_review')).flatMap((e) => e.models().filter((m) => m.tier !== 'cheap').map((m) => {
       const p = health.find((h) => h.id === e.id);
-      return { id: `${e.id}/${m.id || 'default'}`, label: `${e.label} · ${m.id || p?.default_model || 'account default'}`, family: e.id === 'codex' ? 'gpt' : 'claude',
+      return { id: `${e.id}/${m.id || 'default'}`, label: `${e.label} · ${m.id || p?.default_model || 'account default'}`, family: familyOf(e.id, m.id),
         engine: e.id, engine_model: m.id, ready: !!p?.ready, reason: p?.reason, reserve_usd: e.budgetUsd({ model: m.id }), fit: m.note, effort: 'high' };
     })),
     ...advisors.MODEL_CATALOG.map((m) => ({ ...m, ready: !!advisors.routeModel(m.id), reason: advisors.routeModel(m.id) ? 'API key configured; checked on use' : 'API key required; desktop login is separate', reserve_usd: config.advisors.reserveUsd })),
@@ -155,6 +165,13 @@ async function call(c, m, a) {
       cost_estimated: known ? 0 : 1, usage_json: result?.usage ? JSON.stringify(result.usage) : null, result_text: result?.text || 'Advisory call failed or interrupted' });
   }
 }
+// Engine ids (perplexity/pplx_asi_kimi_k3) and advisor ids (perplexity/kimi-k3) share a prefix: decide by catalog, not prefix.
+// A Perplexity member is a Computer task the relay polls for remoteWaitMinutes, so it gets that much more than a CLI call.
+function memberTimeoutMs(m) {
+  const engine = models().find((x) => x.id === m.model)?.engine;
+  if (!engine) return config.advisors.timeoutSeconds * 1000;
+  return (config.limits.runTimeoutMin.council_review + (engine === 'perplexity' ? config.engines.perplexity.remoteWaitMinutes : 0)) * 60000;
+}
 async function execute(c, m) {
   const a = { controller: new AbortController(), run_id: null, external: false, fence: runner.currentEpoch() };
   active.set(m.id, a);
@@ -162,7 +179,7 @@ async function execute(c, m) {
   store.updateCouncilMember(m.id, { status: 'preparing', started_at: store.now() });
   const abort = () => { if (a.run_id && !a.external) runner.killRun(a.run_id, 'council cancelled'); };
   a.controller.signal.addEventListener('abort', abort, { once: true });
-  const timer = setTimeout(() => a.controller.abort(), (m.model.startsWith('claude/') || m.model.startsWith('codex/') ? config.limits.runTimeoutMin.council_review * 60000 : config.advisors.timeoutSeconds * 1000));
+  const timer = setTimeout(() => a.controller.abort(), memberTimeoutMs(m));
   try {
     const text = await call(c, m, a);
     if (a.controller.signal.aborted || terminal.has(store.getCouncil(c.id).status)) throw new Error('Council cancelled or invalidated');
@@ -274,5 +291,13 @@ export function decide(id, { decision, message = '' } = {}) {
 export function status() {
   return { models: models(), lenses: LENSES, defaults: defaults(), automatic: false, max_parallel: 2, preserved_slots: 1,
     pending: store.pendingCouncils().length, councils: store.listCouncils().map((c) => ({ id: c.id, ticket_key: c.ticket_key, status: c.status, decision: c.decision })),
-    computer: { scope: 'council', connected: false, reason: 'Computer council billing/cancellation has not been verified; thinking-seat relay connectivity is separate', guide_file: 'docs/perplexity-connection.md', guide_url: 'https://docs.perplexity.ai/docs/getting-started/integrations/computer-mcp-server' } };
+    computer: computerStatus() };
+}
+// Perplexity models join the council reviewer pool only with engines.perplexity.councilEnabled; until then the UI
+// points at the verification guide. "connected" is the thinking-seat relay's readiness, which the council then shares.
+export function computerStatus() {
+  const guide = { scope: 'council', guide_file: 'docs/perplexity-connection.md', guide_url: 'https://docs.perplexity.ai/docs/getting-started/integrations/computer-mcp-server' };
+  if (!config.engines?.perplexity?.councilEnabled) return { ...guide, enabled: false, connected: false, reason: 'Computer council billing/cancellation has not been verified; thinking-seat relay connectivity is separate. Complete the guide, then set engines.perplexity.councilEnabled' };
+  const p = providerHealth().find((h) => h.id === 'perplexity');
+  return { ...guide, enabled: true, connected: !!p?.ready, reason: p?.ready ? 'Enabled by engines.perplexity.councilEnabled; Perplexity models are selectable council reviewers on your account credits' : (p?.reason || 'Perplexity relay unavailable') };
 }

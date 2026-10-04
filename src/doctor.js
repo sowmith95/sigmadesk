@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { config, validateConfig } from './config.js';
 import { detectEngines } from './engines/index.js';
+import { readCatalog } from './engines/perplexity.js';
 
 const ok = (m) => console.log(`  ✔ ${m}`);
 const bad = (m) => { console.log(`  ✖ ${m}`); process.exitCode = 1; };
@@ -20,6 +21,11 @@ maj > 22 || (maj === 22 && min >= 13) ? ok(`node ${process.versions.node}`) : ba
 const engines = await detectEngines();
 for (const e of engines) e.available ? ok(`${e.label}: ${e.version}`) : warn(`${e.label} unavailable`);
 if (!engines.some((e) => e.available)) bad('No runnable engine');
+if (engines.find((e) => e.id === 'perplexity')?.available) {
+  const catalog = readCatalog();
+  catalog ? ok(`Perplexity catalog: ${catalog.models.length} models on your account${catalog.fetched_at ? ` · listed ${catalog.fetched_at.slice(0, 10)}` : ''}`)
+    : warn('Perplexity: built-in model list only — `npm run models:refresh` records the models your account may use');
+}
 try { run('git', ['--version']); ok('git'); } catch { bad('git missing'); }
 
 if (config.github.sync) {
