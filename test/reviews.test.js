@@ -278,7 +278,9 @@ test('outbox: posts once with a marker, keeps failures pending, and adopts a com
   await github.flushOutbox();
   let row = store.listOutbox(t.key)[0];
   assert.equal(row.status, 'failed'); assert.equal(row.attempts, 1); assert.equal(row.gh_comment_id, null);
-  assert.ok(store.approvalsAt(t.key, 'x').unpublished > 0, 'merge sees unpublished comments');
+  assert.ok(row.next_attempt_at > store.now(), 'a failure backs off');
+  assert.equal(store.pendingOutbox().some((x) => x.id === row.id), false, 'not due yet: other comments go first');
+  store.updateOutbox(row.id, { next_attempt_at: null });
   fs.rmSync(path.join(ghDir, 'fail-post'));
   // Simulate "GitHub accepted the POST but the desk crashed before recording it".
   const comments = JSON.parse(fs.readFileSync(path.join(ghDir, 'comments.json'), 'utf8'));
@@ -298,7 +300,7 @@ test('outbox: posts once with a marker, keeps failures pending, and adopts a com
 
 test('merge authorization matrix', () => {
   const sha = 'a'.repeat(40);
-  const ok = { state: 'OPEN', headRefOid: sha, baseRefName: 'main', mergeable: 'MERGEABLE', statusCheckRollup: [{ conclusion: 'SUCCESS' }, { conclusion: 'SKIPPED' }] };
+  const ok = { state: 'OPEN', headRefOid: sha, baseRefName: 'main', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }, { name: 'lint', conclusion: 'SUCCESS' }] };
   const good = { ok: true, unpublished: 0, context: { seat: 'principal-be', verdict: 'approve' }, independent: { seat: 'senior-be', verdict: 'approve' } };
   const auth = (p, o = {}) => prs.authorizeMerge({ ...ok, ...p }, { expectedSha: sha, gate: { approvals: good, qaSha: sha }, ...o }).blockers;
   assert.deepEqual(auth({}), []);
@@ -310,6 +312,11 @@ test('merge authorization matrix', () => {
   assert.match(auth({ statusCheckRollup: [{ conclusion: 'FAILURE' }] })[0], /failing/);
   assert.match(auth({ statusCheckRollup: [{ status: 'IN_PROGRESS', conclusion: '' }] })[0], /still running/);
   assert.match(auth({ statusCheckRollup: [{ conclusion: 'SKIPPED' }, { conclusion: 'NEUTRAL' }] })[0], /skipped or neutral/);
+  assert.match(auth({ statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }, { name: 'deploy-preview', conclusion: 'SKIPPED' }] })[0], /skipped or neutral/, 'SUCCESS + SKIPPED is not a pass');
+  config.review.optionalChecks = ['deploy-preview'];
+  assert.deepEqual(auth({ statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }, { name: 'deploy-preview', conclusion: 'SKIPPED' }] }), [], 'unless that check is listed as optional');
+  config.review.optionalChecks = [];
+  assert.match(auth({}, { gate: { approvals: good, qaSha: null } })[0], /QA has not passed this commit/, 'a missing QA commit is rejected');
   assert.match(auth({ statusCheckRollup: [] })[0], /no CI result/);
   assert.deepEqual(auth({ statusCheckRollup: [] }, { noChecksConfigured: true }), [], 'a repo with no workflows has no CI to wait for');
   assert.match(auth({}, { inBusyWindow: true })[0], /busy window/);
@@ -371,4 +378,94 @@ test('reviewers get a read-only snapshot pinned to the reviewed commit, not the 
   assert.match(g(dir, 'diff', '--name-only', 'origin/main...HEAD'), /docs\/note.md/);
   assert.ok(team.permissionsFor('pr_review').tools.every((x) => !['Edit', 'Write'].includes(x)));
   assert.ok(team.permissionsFor('respond').tools.includes('Edit'));
+});
+
+// ---------------- release-blocker fixes (independent review) ----------------
+test('contributors can never review: assignment, verdicts and merge authorization all exclude them', async () => {
+  const s = await sliceThroughQa();
+  let t = store.getTicket(s.key);
+  const independent = t.reviewer_independent;
+  await approve(s.key);
+  // the independent reviewer later writes code for this ticket (e.g. a reassignment or a resolution)
+  store.addContributor(s.key, independent);
+  assert.ok(!reviews.selectReviewers({ ...store.getTicket(s.key), reviewer_independent: null }).independent || reviews.selectReviewers(store.getTicket(s.key)).independent !== independent);
+  reviews.advance(s.key);
+  t = store.getTicket(s.key);
+  assert.notEqual(t.reviewer_independent, independent, 'the compromised assignment is replaced');
+  assert.match(store.listComments(s.key).at(-1).body, /can no longer review it as the independent reviewer/);
+  // a verdict from a contributor is refused even if a run is bound to it
+  const job = reviews.nextJobs().find((j) => j.key === s.key);
+  store.addContributor(s.key, job.seat);
+  const code = 'zz1'; const r = run(job.seat, 'pr_review', s.key, code);
+  store.updatePrReview(job.review.id, { nonce: code, run_id: r.id, round: t.review_round || 0 });
+  await assert.rejects(sched.deskAction(r, 'review', { verdict: 'approve', code, checked: 'Read the full diff and the tests it adds', body: 'ok' }), /wrote code for this change/);
+  // approvals by a seat that later contributed do not authorize a merge
+  const ok = await sliceThroughQa();
+  await approve(ok.key); await approve(ok.key);
+  assert.equal(store.approvalsAt(ok.key, ok.sha).ok, true);
+  store.addContributor(ok.key, store.getTicket(ok.key).reviewer_context);
+  assert.equal(store.approvalsAt(ok.key, ok.sha).ok, false);
+});
+
+test('approvals count as published only when their own PR comments have GitHub ids', async () => {
+  const s = await sliceThroughQa();
+  await approve(s.key); await approve(s.key);
+  const before = store.approvalsAt(s.key, s.sha);
+  assert.equal(before.ok, true); assert.equal(before.unpublished, 2);
+  for (const r of store.listPrReviews(s.key)) assert.ok(store.listOutbox(s.key).some((o) => o.review_id === r.id), 'each verdict has its comment row');
+  await github.flushOutbox();
+  assert.equal(store.approvalsAt(s.key, s.sha).unpublished, 0);
+});
+
+test('quoted file names (tabs, newlines) are classified on the real path', async () => {
+  const s = await sliceThroughQa({ file: '.github/workflows/deploy\tx.yml' });
+  assert.equal(store.getTicket(s.key).diff_risk, 'high');
+  assert.deepEqual(JSON.parse(store.kvGet(`diff-files:${s.key}`)), ['.github/workflows/deploy\tx.yml']);
+  assert.ok(sched.guardReasons(['.github/workflows/deploy\tx.yml'], 1, 'S').length, 'and the publish guard sees it');
+});
+
+test('broker credentials and configured secret values never reach a PR comment', () => {
+  const out = store.sanitizeForGithub('APCA_API_SECRET_KEY=abcd1234efgh ALPACA_KEY: PKABCDEFGHIJKLMNOPQR POLYGON_API_KEY="zzzz9999yyyy" key PK1234567890ABCDEFGH');
+  for (const leak of ['abcd1234efgh', 'PKABCDEFGHIJKLMNOPQR', 'zzzz9999yyyy', 'PK1234567890ABCDEFGH']) assert.ok(!out.includes(leak), leak);
+  fs.writeFileSync(path.join(repo, '.env'), 'MASSIVE_API_KEY=very-private-value-42\nPLAIN=not-secret-at-all\n');
+  const t = store.createTicket({ title: 'Secret check', status: 'review' });
+  const row = store.enqueueOutbox(t.key, `${t.key}:secret`, 'the reviewer quoted very-private-value-42 from the logs; not-secret-at-all stays');
+  assert.ok(!row.body.includes('very-private-value-42'));
+  assert.ok(row.body.includes('not-secret-at-all'));
+  fs.rmSync(path.join(repo, '.env'));
+});
+
+test('resolving tickets are left to the merge train (review advancement does nothing)', async () => {
+  const s = await sliceThroughQa();
+  await approve(s.key); await approve(s.key);
+  store.updateTicket(s.key, { status: 'review', review_stage: 'resolving' }); // a conflict appeared after approval
+  assert.equal(reviews.advance(s.key), null);
+  assert.equal(store.getTicket(s.key).status, 'review'); assert.equal(store.getTicket(s.key).review_stage, 'resolving');
+  assert.equal(reviews.nextJobs().some((j) => j.key === s.key), false);
+});
+
+test('outbox: permanent failures escalate without starving other comments; an owner reply retries them', async () => {
+  const a = store.createTicket({ title: 'Broken comments', status: 'review' });
+  store.updateTicket(a.key, { pr_url: 'https://github.com/owner/demo/pull/11' });
+  await github.flushOutbox();
+  fs.writeFileSync(path.join(ghDir, 'fail-post'), '1');
+  store.enqueueOutbox(a.key, `${a.key}:x`, 'will fail');
+  for (let i = 0; i < github.OUTBOX_MAX_ATTEMPTS; i++) {
+    const row = store.listOutbox(a.key)[0];
+    store.updateOutbox(row.id, { next_attempt_at: null });
+    await github.flushOutbox();
+  }
+  fs.rmSync(path.join(ghDir, 'fail-post'));
+  assert.equal(store.listOutbox(a.key)[0].status, 'dead');
+  assert.match(store.listComments(a.key).at(-1).body, /could not be posted to the PR after 8 tries/);
+  const b = store.createTicket({ title: 'Healthy comments', status: 'review' });
+  store.updateTicket(b.key, { pr_url: 'https://github.com/owner/demo/pull/12' });
+  store.enqueueOutbox(b.key, `${b.key}:y`, 'fine');
+  await github.flushOutbox();
+  assert.equal(store.listOutbox(b.key)[0].status, 'sent');
+  store.updateTicket(a.key, { status: 'needs_human' });
+  sched.ownerReply(a.key, 'try again', 'comment');
+  assert.equal(store.listOutbox(a.key)[0].status, 'pending');
+  await github.flushOutbox();
+  assert.equal(store.listOutbox(a.key)[0].status, 'sent');
 });

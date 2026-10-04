@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
 import { AGENTS } from './team.js';
+import { scrubValues } from './secrets.js';
 
 // Every mutation is announced on this bus; server.js fans it out over SSE.
 export const bus = new EventEmitter();
@@ -229,6 +230,7 @@ CREATE TABLE IF NOT EXISTS pr_outbox (
   attempts INTEGER NOT NULL DEFAULT 0,
   gh_comment_id TEXT,
   last_error TEXT,
+  next_attempt_at TEXT,
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   sent_at TEXT
 );
@@ -275,8 +277,9 @@ function migrate() {
       risk: 'TEXT', diff_risk: 'TEXT', designer: 'TEXT', qa_sha: 'TEXT', review_round: 'INTEGER DEFAULT 0', review_stage: 'TEXT',
       reviewer_context: 'TEXT', reviewer_independent: 'TEXT',
       // merge train (#3): original builder, approval time (queue order), scheduled/held merges, light re-confirm reviews
-      builder: 'TEXT', approved_at: 'TEXT', merge_after: 'TEXT', merge_hold: 'TEXT', reconfirm_from: 'TEXT', reconfirm_kind: 'TEXT', reconfirm_base: 'TEXT' },
+      builder: 'TEXT', contributors: "TEXT DEFAULT '[]'", approved_at: 'TEXT', merge_after: 'TEXT', merge_hold: 'TEXT', reconfirm_from: 'TEXT', reconfirm_kind: 'TEXT', reconfirm_base: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
+    pr_outbox: { next_attempt_at: 'TEXT' },
     runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT' },
   };
   for (const [table, cols] of Object.entries(want)) {
@@ -366,7 +369,7 @@ export function createTicket(t) {
 const TICKET_FIELDS = new Set(['title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
   'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key',
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
-  'builder', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base']);
+  'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base']);
 
 export function updateTicket(key, patch) {
   const cols = Object.keys(patch).filter((k) => TICKET_FIELDS.has(k));
@@ -411,8 +414,14 @@ export function redact(text) {
   t = t.replace(SECRET_PATTERNS[1], '$1[redacted]');
   t = t.replace(SECRET_PATTERNS[2], '$1[redacted]$3');
   t = t.replace(/\b[0-9a-f]{36}\b/g, '[redacted]'); // desk run tokens
+  // NAME=value / NAME: value where NAME looks like a credential (APCA_API_SECRET_KEY, POLYGON_API_KEY, *_TOKEN, …)
+  t = t.replace(/\b([A-Za-z][A-Za-z0-9_]*(?:SECRET|KEY|TOKEN|PASSWORD|PASSWD|DSN|CREDENTIAL)[A-Za-z0-9_]*\s*[=:]\s*)(['"]?)([^\s'"]{4,})/gi, '$1$2[redacted]');
+  t = t.replace(/\b((?:APCA|ALPACA|POLYGON|MASSIVE|IBKR)_[A-Z0-9_]*\s*[=:]\s*)(['"]?)([^\s'"]{4,})/g, '$1$2[redacted]');
+  t = t.replace(/\b(?:PK|AK|CK)[A-Z0-9]{16,}\b/g, '[redacted]'); // Alpaca key ids
   return t;
 }
+/** For anything posted to GitHub: pattern redaction plus the configured secret values from the target repo's .env. */
+export const sanitizeForGithub = (text) => redact(scrubValues(text));
 
 export function logEvent(e) {
   const info = q('INSERT INTO events(run_id,agent_id,ticket_key,kind,text) VALUES (?,?,?,?,?)').run(
@@ -620,13 +629,31 @@ export function latestReview(key, role, sha) {
 export function supersedeReviews(key, keepSha = null) {
   q("UPDATE pr_reviews SET state='superseded', updated_at=? WHERE ticket_key=? AND state='active' AND (? IS NULL OR sha<>?)").run(now(), key, keepSha, keepSha);
 }
-/** Did a context AND an independent reviewer approve exactly this commit (and are those approvals on the PR)? */
+/** Every seat that wrote code for a ticket (builder, answers to reviews, conflict resolutions) plus the assignee. */
+export function contributorsOf(t) {
+  if (!t) return new Set();
+  let list = [];
+  try { list = JSON.parse(t.contributors || '[]'); } catch { list = []; }
+  return new Set([...list, t.builder, t.assignee].filter(Boolean));
+}
+export function addContributor(key, seat) {
+  const t = getTicket(key);
+  if (!t || !seat) return t;
+  const set = contributorsOf({ contributors: t.contributors });
+  if (set.has(seat)) return t;
+  return updateTicket(key, { contributors: JSON.stringify([...set, seat]) });
+}
+/**
+ * Did a context AND an independent reviewer — distinct, and neither of them a contributor — approve exactly this
+ * commit? `unpublished` counts current approvals whose PR comment has no GitHub comment id yet.
+ */
 export function approvalsAt(key, sha) {
   const context = sha ? latestReview(key, 'context', sha) : null;
   const independent = sha ? latestReview(key, 'independent', sha) : null;
-  const ok = context?.verdict === 'approve' && independent?.verdict === 'approve' && context.seat !== independent.seat;
-  // Only the reviewers' verdicts and the approval summary must be on the PR before a merge (not status notices).
-  const unpublished = q("SELECT COUNT(*) n FROM pr_outbox WHERE ticket_key=? AND status<>'sent' AND (review_id IS NOT NULL OR marker LIKE ?)").get(key, `${key}:approved:%`).n;
+  const contrib = contributorsOf(getTicket(key));
+  const ok = context?.verdict === 'approve' && independent?.verdict === 'approve' && context.seat !== independent.seat
+    && !contrib.has(context.seat) && !contrib.has(independent.seat);
+  const unpublished = [context, independent].filter((r) => r?.verdict === 'approve' && !r.published_comment_id).length;
   return { ok, context, independent, unpublished };
 }
 export const inReviewFlow = (key) => !!q('SELECT 1 FROM pr_reviews WHERE ticket_key=? LIMIT 1').get(key);
@@ -646,13 +673,20 @@ export function updateFinding(id, patch) {
 
 // Durable outbox for PR comments: a row is 'sent' only after GitHub returned a comment id.
 export function enqueueOutbox(ticketKey, marker, body, reviewId = null) {
-  q('INSERT OR IGNORE INTO pr_outbox(ticket_key,marker,body,review_id) VALUES (?,?,?,?)').run(ticketKey, marker, redact(body).slice(0, 60000), reviewId);
+  q('INSERT OR IGNORE INTO pr_outbox(ticket_key,marker,body,review_id) VALUES (?,?,?,?)').run(ticketKey, marker, sanitizeForGithub(body).slice(0, 60000), reviewId);
   return q('SELECT * FROM pr_outbox WHERE marker=?').get(marker);
 }
-export const pendingOutbox = (limit = 20) => q("SELECT o.*, t.pr_url FROM pr_outbox o JOIN tickets t ON t.key=o.ticket_key WHERE o.status<>'sent' AND t.pr_url IS NOT NULL ORDER BY o.id LIMIT ?").all(limit);
+// Due rows only (failures back off), fewest attempts first so one broken comment never starves the rest.
+export const pendingOutbox = (limit = 20, at = now()) => q(`SELECT o.*, t.pr_url FROM pr_outbox o JOIN tickets t ON t.key=o.ticket_key
+  WHERE o.status IN ('pending','failed') AND t.pr_url IS NOT NULL AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?)
+  ORDER BY o.attempts, o.id LIMIT ?`).all(at, limit);
+/** Dead (escalated) comments of a ticket go back in the queue, e.g. after the owner replied. */
+export function requeueOutbox(key) {
+  q("UPDATE pr_outbox SET status='pending', attempts=0, next_attempt_at=NULL WHERE ticket_key=? AND status='dead'").run(key);
+}
 export const listOutbox = (key) => q('SELECT * FROM pr_outbox WHERE ticket_key=? ORDER BY id').all(key);
 export function updateOutbox(id, patch) {
-  const cols = Object.keys(patch).filter((k) => ['status', 'attempts', 'gh_comment_id', 'last_error', 'sent_at'].includes(k));
+  const cols = Object.keys(patch).filter((k) => ['status', 'attempts', 'gh_comment_id', 'last_error', 'sent_at', 'next_attempt_at'].includes(k));
   if (cols.length) q(`UPDATE pr_outbox SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
   return q('SELECT * FROM pr_outbox WHERE id=?').get(id);
 }

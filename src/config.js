@@ -73,6 +73,7 @@ const DEFAULTS = {
     // "auto": a PR with no checks at all may merge only if the repo has no GitHub Actions workflows.
     // "required": no checks reported = not mergeable. Skipped/neutral-only checks never count as a pass.
     ci: 'auto',
+    optionalChecks: [], // check names allowed to be SKIPPED/NEUTRAL; every other check must be SUCCESS
     // Diff paths that make a change high-risk (trading, broker, risk, schema, deploy). Globs, like protectedPaths.
     riskPaths: ['**/oms/**', '**/*order_execution*', '**/*order_execution*/**', '**/*position_manager*', '**/clients/alpaca*',
       '**/clients/alpaca*/**', '**/risk/**', '**/migrations/**', '**/*migration*.sql', '**/docker-compose*', '**/compose*.y*ml',

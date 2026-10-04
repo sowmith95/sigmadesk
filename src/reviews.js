@@ -71,7 +71,8 @@ const AREA_SEATS = { frontend: ['principal-fe', 'senior-fe'], db: ['dba', 'princ
  */
 export function selectReviewers(t) {
   const author = t.assignee;
-  const ok = (id) => id && seatOn(id) && !NEVER_REVIEW.has(id) && id !== author;
+  const contrib = store.contributorsOf(t); // everyone who wrote code for it, not just the current assignee
+  const ok = (id) => id && seatOn(id) && !NEVER_REVIEW.has(id) && id !== author && !contrib.has(id);
   const context = [t.designer, 'manager'].find((id) => ok(id) && (PRINCIPALS.includes(id) || id === 'manager')) || null;
   if (!context) return { context: null, independent: null, error: 'neither the designer nor the Engineering Manager can review it (switched off, or they built it)' };
   const authorEngine = engineOfSeat(author);
@@ -93,6 +94,19 @@ const footer = (t, sha, extra = '') => `\n\n<sub>SigmaDesk ${t.key} · commit \`
 // ---------------- state machine ----------------
 /** Make sure the frozen reviewers exist and each has an active row for the current commit. */
 function ensureAssignments(t) {
+  // A frozen reviewer who has since written code for this ticket (rework, resolution, reassignment) is no longer
+  // independent: that assignment is cancelled and a new reviewer is chosen.
+  const contrib = store.contributorsOf(t);
+  for (const [col, role] of [['reviewer_context', 'context'], ['reviewer_independent', 'independent']]) {
+    const seat = t[col];
+    if (!seat || !contrib.has(seat)) continue;
+    store.transaction(() => {
+      for (const r of store.listPrReviews(t.key)) if (r.role === role && r.state === 'active') store.updatePrReview(r.id, { state: 'superseded' });
+      store.updateTicket(t.key, { [col]: null });
+    });
+    store.addComment(t.key, 'system', `🔁 ${nameOf(seat)} wrote code for this ticket, so they can no longer review it as the ${role} reviewer; choosing someone else.`);
+    t = store.getTicket(t.key);
+  }
   let { reviewer_context: context, reviewer_independent: independent } = t;
   if (!context || !independent) {
     const pick = selectReviewers(t);
@@ -109,7 +123,7 @@ function ensureAssignments(t) {
 
 /** What should run next for a ticket in review (pure: no writes). */
 export function jobFor(t) {
-  if (t?.status !== 'review' || !t.head_sha) return null;
+  if (t?.status !== 'review' || !t.head_sha || t.review_stage === 'resolving') return null;
   if (t.review_stage === 'responding') return t.assignee ? { kind: 'respond', seat: t.assignee, key: t.key } : null;
   const ctx = store.latestReview(t.key, 'context', t.head_sha);
   const ind = store.latestReview(t.key, 'independent', t.head_sha);
@@ -122,6 +136,7 @@ export function jobFor(t) {
 export function advance(key) {
   const t = store.getTicket(key);
   if (t?.status !== 'review' || !t.head_sha) return null;
+  if (t.review_stage === 'resolving') return null; // a merge conflict is being resolved: the merge train owns it
   if (!t.review_stage) store.updateTicket(key, { review_stage: 'reviewing' });
   if (t.review_stage !== 'responding') {
     const a = ensureAssignments(store.getTicket(key));
@@ -180,11 +195,13 @@ function approved(t, ctx, ind) {
   const policy = autoMergePolicy(t);
   const next = policy.eligible ? 'SigmaDesk merges it next once CI is green (if it redeploys something during market hours, it is scheduled for the end of the window).' : `Waiting for the owner to merge: ${policy.reason}.`;
   const text = `✅ **Two approvals at \`${short(t.head_sha)}\`** — ${nameOf(ctx.seat)} (${roleOf(ctx.seat)}, ${whyContext(t, ctx.seat)}) and ${nameOf(ind.seat)} (${roleOf(ind.seat)}, independent). ${next}`;
+  store.transaction(() => {
   store.enqueueOutbox(t.key, `${t.key}:approved:${t.head_sha}`, `${text}${footer(t, t.head_sha)}`);
   store.addComment(t.key, 'system', text);
   setStatus(t.key, 'ready_for_human', { review_stage: 'approved', progress: 100, approved_at: t.approved_at || store.now(),
     reconfirm_from: null, reconfirm_kind: null, reconfirm_base: null,
     progress_msg: policy.eligible ? `Approved by ${names} — queued to merge` : `Approved by ${names} — waiting for your merge (${policy.reason})` });
+  });
   github.flushOutbox();
 }
 
@@ -221,6 +238,7 @@ export function reviewVerdict(run, t, body) {
   need(run.nonce && body.code === run.nonce, 'missing or wrong --code (it is in your instructions)');
   const row = store.listPrReviews(t.key).find((r) => r.run_id === run.id && r.nonce === run.nonce);
   need(row && row.seat === run.agent_id, 'no review assignment is bound to this run');
+  need(!store.contributorsOf(t).has(row.seat), 'you wrote code for this change, so you cannot review it');
   need(row.state === 'active' && row.verdict === 'pending', 'this review was already recorded or is out of date');
   need(row.sha === t.head_sha, `the change moved since your review started (${short(row.sha)} → ${short(t.head_sha)}); your verdict no longer applies`);
   need(row.round === (t.review_round || 0), 'this review round is over');
@@ -234,14 +252,15 @@ export function reviewVerdict(run, t, body) {
     need(checked.length >= 15, 'say concretely what you checked (--checked "...")');
     const risks = String(body.risks || '').trim().slice(0, 3000) || 'None noted.';
     const earlier = store.listFindings(t.key).filter((f) => f.seat === row.seat && f.resolution === 'open');
+    const resolved = earlier.length ? `\n\n**Earlier points now settled:** ${earlier.map((f) => `${f.id} (${f.response === 'pushback' ? 'accepted the pushback' : f.response === 'fixed' ? 'fix verified' : 'dropped'})`).join(', ')}.` : '';
+    const text = `${header(t, row)} · ✅ Approved\n\n${summary}\n\n**What I checked:** ${checked}\n**Risks I still see:** ${risks}${resolved}`;
+    // The verdict and its PR comment commit together: a crash can never leave an approval without its comment.
     store.transaction(() => {
       store.updatePrReview(row.id, { verdict: 'approve', body: summary, checked, risks });
       for (const f of earlier) store.updateFinding(f.id, { resolution: 'resolved' });
+      store.enqueueOutbox(t.key, `${t.key}:review:${row.id}`, `${text}${footer(t, row.sha, ` · review round ${row.round + 1}`)}`, row.id);
+      store.addComment(t.key, row.seat, text);
     });
-    const resolved = earlier.length ? `\n\n**Earlier points now settled:** ${earlier.map((f) => `${f.id} (${f.response === 'pushback' ? 'accepted the pushback' : f.response === 'fixed' ? 'fix verified' : 'dropped'})`).join(', ')}.` : '';
-    const text = `${header(t, row)} · ✅ Approved\n\n${summary}\n\n**What I checked:** ${checked}\n**Risks I still see:** ${risks}${resolved}`;
-    store.enqueueOutbox(t.key, `${t.key}:review:${row.id}`, `${text}${footer(t, row.sha, ` · review round ${row.round + 1}`)}`, row.id);
-    store.addComment(t.key, row.seat, text);
     store.logEvent({ run_id: run.id, agent_id: row.seat, ticket_key: t.key, kind: 'action', text: `approved ${t.key} at ${short(row.sha)} (${row.role} reviewer)` });
     const next = advance(t.key);
     if (next?.kind === 'pr_review') store.updateTicket(t.key, { progress_msg: `${nameOf(row.seat)} approved — ${nameOf(next.seat)} reviewing next` });
@@ -254,17 +273,17 @@ export function reviewVerdict(run, t, body) {
   const round = (t.review_round || 0) + 1;
   const earlier = store.listFindings(t.key).filter((f) => f.seat === row.seat && f.resolution === 'open');
   const ids = findings.map((_, i) => `R${row.id}-${i + 1}`);
+  const blocking = findings.filter((f) => f.blocking).length;
+  const list = findings.map((f, i) => `${i + 1}. ${where(f)} — ${f.problem}${f.why ? `\n   *Why it matters:* ${f.why}` : ''}${f.fix ? `\n   *Suggested fix:* ${f.fix}` : ''}\n   <sub>${ids[i]} · ${f.blocking ? 'must be fixed or answered' : 'suggestion, optional'}</sub>`).join('\n');
+  const text = `${header(t, row)} · ✏️ Changes requested — ${blocking} ${blocking === 1 ? 'thing' : 'things'} to fix${findings.length > blocking ? ` (+${findings.length - blocking} optional)` : ''}:\n\n${list}\n\n${summary}`;
   store.transaction(() => {
     store.updatePrReview(row.id, { verdict: 'changes', body: summary, findings_json: JSON.stringify(findings) });
     for (const f of earlier) store.updateFinding(f.id, { resolution: 'superseded' });
     findings.forEach((f, i) => store.addFinding({ ...f, id: ids[i], review_id: row.id, ticket_key: t.key, seat: row.seat }));
     store.updateTicket(t.key, { review_round: round, review_stage: 'responding', reconfirm_from: null, reconfirm_kind: null, reconfirm_base: null }); // next look is a full review
+    store.enqueueOutbox(t.key, `${t.key}:review:${row.id}`, `${text}${footer(t, row.sha, ` · review round ${row.round + 1}`)}`, row.id);
+    store.addComment(t.key, row.seat, text);
   });
-  const blocking = findings.filter((f) => f.blocking).length;
-  const list = findings.map((f, i) => `${i + 1}. ${where(f)} — ${f.problem}${f.why ? `\n   *Why it matters:* ${f.why}` : ''}${f.fix ? `\n   *Suggested fix:* ${f.fix}` : ''}\n   <sub>${ids[i]} · ${f.blocking ? 'must be fixed or answered' : 'suggestion, optional'}</sub>`).join('\n');
-  const text = `${header(t, row)} · ✏️ Changes requested — ${blocking} ${blocking === 1 ? 'thing' : 'things'} to fix${findings.length > blocking ? ` (+${findings.length - blocking} optional)` : ''}:\n\n${list}\n\n${summary}`;
-  store.enqueueOutbox(t.key, `${t.key}:review:${row.id}`, `${text}${footer(t, row.sha, ` · review round ${row.round + 1}`)}`, row.id);
-  store.addComment(t.key, row.seat, text);
   store.logEvent({ run_id: run.id, agent_id: row.seat, ticket_key: t.key, kind: 'action', text: `requested ${blocking} change(s) on ${t.key} (${row.role} reviewer, round ${round})` });
   const cap = Number(config.review.maxRounds ?? 3);
   if (round > cap) {
@@ -275,9 +294,11 @@ export function reviewVerdict(run, t, body) {
       open.length ? `**Still asked for:**\n${open.map((f) => `- ${where(f)} — ${f.problem}`).join('\n')}` : '',
       pushed.length ? `**What ${nameOf(author)} argued earlier:**\n${pushed.map((f) => `- ${f.id}: ${f.response_body}`).join('\n')}` : '',
       `Reply with your decision (e.g. "do what ${nameOf(row.seat)} asks" or "${nameOf(author)} is right, approve as is") — ${nameOf(author)} then answers the review with your guidance; or merge from the PR page with an override reason.`].filter(Boolean).join('\n\n');
-    store.addComment(t.key, 'system', summaryText);
-    store.enqueueOutbox(t.key, `${t.key}:cap:${row.id}`, `${summaryText}${footer(t, row.sha)}`);
-    setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: `Reviewers and ${nameOf(author)} disagree — your call` });
+    store.transaction(() => {
+      store.addComment(t.key, 'system', summaryText);
+      store.enqueueOutbox(t.key, `${t.key}:cap:${row.id}`, `${summaryText}${footer(t, row.sha)}`);
+      setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: `Reviewers and ${nameOf(author)} disagree — your call` });
+    });
   } else {
     store.updateTicket(t.key, { progress_msg: `${nameOf(row.seat)} requested ${blocking} change${blocking === 1 ? '' : 's'} — ${nameOf(author)} is responding` });
   }
@@ -299,10 +320,13 @@ export async function respond(run, t, body) {
     need(f && f.ticket_key === t.key && f.resolution === 'open', `unknown or closed finding id ${body.finding || '(missing --finding)'}`);
     need(!f.response, `you already answered ${f.id}`);
     if (body.action === 'fixed') need(head !== t.head_sha, 'commit the fix first (git add + git commit) — HEAD is still the reviewed commit');
-    store.updateFinding(f.id, { response: body.action, response_body: text, response_sha: body.action === 'fixed' ? head : t.head_sha });
     const reply = `**${nameOf(t.assignee)} — ${roleOf(t.assignee)}** replying to ${nameOf(f.seat)} on ${f.id} (${where(f)}):\n\n${body.action === 'fixed' ? `Fixed in \`${short(head)}\`: ${text}` : `Pushing back: ${text}`}`;
-    store.enqueueOutbox(t.key, `${t.key}:reply:${f.id}`, `${reply}${footer(t, body.action === 'fixed' ? head : t.head_sha)}`);
-    store.addComment(t.key, t.assignee, reply);
+    store.transaction(() => {
+      store.updateFinding(f.id, { response: body.action, response_body: text, response_sha: body.action === 'fixed' ? head : t.head_sha });
+      store.enqueueOutbox(t.key, `${t.key}:reply:${f.id}`, `${reply}${footer(t, body.action === 'fixed' ? head : t.head_sha)}`);
+      store.addComment(t.key, t.assignee, reply);
+      if (body.action === 'fixed') store.addContributor(t.key, t.assignee);
+    });
     const left = openFindings(t.key).filter((x) => x.blocking && !x.response).length;
     return `Recorded your answer to ${f.id}. ${left ? `${left} blocking point(s) still need an answer.` : 'Every blocking point is answered — finish with desk respond done "<summary>".'}`;
   }
@@ -312,26 +336,26 @@ export async function respond(run, t, body) {
   const moved = head !== t.head_sha;
   if (moved) {
     need(await runner.commitsAhead(dir) > 0, 'no commits on your branch');
+    const msg = `🔧 **${nameOf(t.assignee)} answered the review** with new commits (now \`${short(head)}\`): ${text}\n\nQA re-checks the new commit, then both reviewers look again — earlier approvals no longer count because the code changed.`;
     store.transaction(() => {
       store.supersedeReviews(t.key, null); // the code changed: both approvals are void
-      store.updateTicket(t.key, { review_stage: null });
+      store.addContributor(t.key, t.assignee);
+      store.addComment(t.key, t.assignee, msg);
+      store.enqueueOutbox(t.key, `${t.key}:respond:${head}`, `${msg}${footer(t, head)}`);
+      setStatus(t.key, 'qa', { head_sha: head, review_stage: null, progress: 90, progress_msg: 'review fixes committed — QA re-checking' });
     });
-    const msg = `🔧 **${nameOf(t.assignee)} answered the review** with new commits (now \`${short(head)}\`): ${text}\n\nQA re-checks the new commit, then both reviewers look again — earlier approvals no longer count because the code changed.`;
-    store.addComment(t.key, t.assignee, msg);
-    store.enqueueOutbox(t.key, `${t.key}:respond:${head}`, `${msg}${footer(t, head)}`);
-    setStatus(t.key, 'qa', { head_sha: head, progress: 90, progress_msg: 'review fixes committed — QA re-checking' });
     github.flushOutbox();
     return 'Submitted to QA with your fixes. Your run is complete — stop now.';
   }
   need(!open.some((f) => f.response === 'fixed'), 'you reported fixes, but HEAD is back at the reviewed commit — commit them or answer with pushback');
   const askers = [...new Set(open.filter((f) => f.response).map((f) => f.review_id))].map((id) => store.getPrReview(id)).filter(Boolean);
+  const msg = `💬 **${nameOf(t.assignee)} answered the review without code changes**: ${text}\n\n${askers.map((r) => nameOf(r.seat)).join(' and ')} will read the answers and approve or hold.`;
   store.transaction(() => {
     for (const r of askers) store.createPrReview({ ticket_key: t.key, seat: r.seat, role: r.role, sha: t.head_sha, round: t.review_round || 0 });
     store.updateTicket(t.key, { review_stage: 'reviewing', progress_msg: `${nameOf(t.assignee)} pushed back — ${askers.map((r) => nameOf(r.seat)).join(' and ')} re-reviewing` });
+    store.addComment(t.key, t.assignee, msg);
+    store.enqueueOutbox(t.key, `${t.key}:respond:pushback:${askers.map((r) => r.id).join('-')}`, `${msg}${footer(t, t.head_sha)}`);
   });
-  const msg = `💬 **${nameOf(t.assignee)} answered the review without code changes**: ${text}\n\n${askers.map((r) => nameOf(r.seat)).join(' and ')} will read the answers and approve or hold.`;
-  store.addComment(t.key, t.assignee, msg);
-  store.enqueueOutbox(t.key, `${t.key}:respond:pushback:${askers.map((r) => r.id).join('-')}`, `${msg}${footer(t, t.head_sha)}`);
   github.flushOutbox();
   return 'Recorded. The reviewer will reply. Stop now.';
 }
@@ -361,8 +385,8 @@ export async function reconfirmContext(t) {
     let resolution = ''; let incoming = '';
     if (t.reconfirm_kind === 'resolution') {
       resolution = (await pgit(['show', '--no-color', '--remerge-diff', '--format=%h %s', head])).stdout;
-      const files = (await pgit(['diff', '--name-only', oldBase, base])).stdout.split('\n').filter(Boolean);
-      const mine = new Set((await pgit(['diff', '--name-only', oldBase, from])).stdout.split('\n').filter(Boolean));
+      const files = (await pgit(['diff', '--name-only', '-z', oldBase, base])).stdout.split('\0').filter(Boolean);
+      const mine = new Set((await pgit(['diff', '--name-only', '-z', oldBase, from])).stdout.split('\0').filter(Boolean));
       const overlap = files.filter((f) => mine.has(f));
       if (overlap.length) incoming = (await pgit(['diff', '--no-color', oldBase, base, '--', ...overlap.slice(0, 30)])).stdout;
     }

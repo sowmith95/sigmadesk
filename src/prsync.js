@@ -87,8 +87,8 @@ export async function landedElsewhere(t) {
     await git(['rev-parse', '--verify', ref]);
     const { stdout: url } = await pexec('git', ['-C', config.project.repoPath, 'remote', 'get-url', 'origin']);
     await git(['fetch', '-q', '--no-tags', url.trim(), `+refs/heads/${config.project.baseBranch}:refs/sigmadesk/main-now`]);
-    const { stdout: names } = await git(['diff', '--no-ext-diff', '--name-only', `refs/sigmadesk/main-now...${ref}`]);
-    const files = names.split('\n').filter(Boolean);
+    const { stdout: names } = await git(['diff', '--no-ext-diff', '--name-only', '-z', `refs/sigmadesk/main-now...${ref}`]);
+    const files = names.split('\0').filter(Boolean);
     if (!files.length) return true; // nothing left to merge
     await git(['diff', '--no-ext-diff', '--quiet', 'refs/sigmadesk/main-now', ref, '--', ...files]);
     return true; // exit 0: main has identical content for every file this PR touches

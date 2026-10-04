@@ -229,10 +229,11 @@ export async function stageApproved(key, cloneDir, sha) {
     await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', cloneDir, `+${sha}:refs/sigmadesk/${key}`]);
     const { stdout: got } = await git(['-C', pub, 'rev-parse', `refs/sigmadesk/${key}`]);
     if (got.trim() !== sha) throw new Error('fetched commit does not match the approved SHA');
-    const { stdout: names } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--name-only', `refs/sigmadesk/base...${sha}`]);
+    // -z: never let git quote/escape a path (a quoted ".github/…\t.yml" would slip past the risk classifier and guard)
+    const { stdout: names } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--name-only', '-z', `refs/sigmadesk/base...${sha}`]);
     const { stdout: stat } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--shortstat', `refs/sigmadesk/base...${sha}`]);
     const lines = Number(stat.match(/(\d+) insertion/)?.[1] || 0) + Number(stat.match(/(\d+) deletion/)?.[1] || 0);
-    return { files: names.split('\n').filter(Boolean), lines };
+    return { files: names.split('\0').filter(Boolean), lines };
   });
 }
 export function pushBranch(key, branch, sha) {
@@ -626,3 +627,15 @@ export async function syncWorkspace(ticket, sha) {
   return dir;
 }
 export const removeScratch = (name) => { const dir = path.join(config.workspaceRoot, `_${name}`); if (dir.startsWith(config.workspaceRoot)) fs.rmSync(dir, { recursive: true, force: true }); };
+/** The branch head on the owner's remote right now (null if missing), for a last base-freshness check. */
+export async function remoteHead(branch) {
+  const url = await originUrl();
+  if (!url) return null;
+  const { stdout } = await git(['ls-remote', url, `refs/heads/${branch}`], { timeout: 60_000 });
+  return stdout.split('\t')[0].trim() || null;
+}
+/** Does this seat's engine enforce a hard per-run spend cap for a resolve run? (Claude CLI: --max-budget-usd.) */
+export function capsSpend(seat) {
+  if (!seat) return false;
+  try { return buildCommand(seat, 'resolve', path.join(config.workspaceRoot, '_cap-probe')).args.includes('--max-budget-usd'); } catch { return false; }
+}

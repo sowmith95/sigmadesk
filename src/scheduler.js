@@ -353,6 +353,7 @@ async function launchResolve(job, fence) {
   if (!stillWanted(job.key, 'review', seat)) return;
   const t = store.getTicket(job.key);
   const j = store.getConflictJob(job.job.id);
+  if (!mergetrain.cappedSeat(seat)) { idle(); return; } // its engine switched (fallback) to one without a hard spend cap
   if (t.review_stage !== 'resolving' || j.status !== 'pending') { idle(); return; }
   if (prepared.clean) { // git merged it without help after all: no model run needed
     idle();
@@ -834,7 +835,8 @@ export async function deskAction(run, cmd, body = {}) {
       need(await runner.commitsAhead(dir) > 0, 'no commits on your branch yet — git add + git commit your work first');
       const sha = await runner.headSha(dir);
       store.addComment(ticket.key, agentId, `🚀 **Submitted for QA** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
-      setStatus(ticket.key, 'qa', { head_sha: sha, progress: 90, progress_msg: 'waiting for QA', builder: agentId });
+      store.addContributor(ticket.key, agentId);
+      setStatus(ticket.key, 'qa', { head_sha: sha, progress: 90, progress_msg: 'waiting for QA', builder: ticket.builder || agentId });
       ev(`submitted ${ticket.key} for QA (${sha.slice(0, 7)})`);
       github.flushComments();
       return 'Submitted to QA. Your run is complete — stop now.';
@@ -965,8 +967,11 @@ export async function ownerApprovePublish(key) {
 }
 
 export function retryPublications() {
-  for (const t of store.ticketsByStatus('ready_for_human')) if (!t.pr_url && t.head_sha) publishBranch(t.key);
-  for (const t of store.ticketsByStatus('review')) if (t.head_sha && t.review_stage && (!t.pr_url || store.kvGet(`published:${t.key}`) !== t.head_sha)) publishBranch(t.key);
+  // Whenever GitHub may not have the QA-approved commit: no PR yet, or the PR holds an older commit (approved PRs too).
+  for (const t of [...store.ticketsByStatus('ready_for_human'), ...store.ticketsByStatus('review')]) {
+    if (t.status === 'review' && !t.review_stage) continue;
+    if (t.head_sha && (!t.pr_url || store.kvGet(`published:${t.key}`) !== t.head_sha)) publishBranch(t.key);
+  }
 }
 
 async function publishInner(t, key, { ownerApproved = false } = {}) {
@@ -1027,6 +1032,7 @@ export function ownerReply(key, text, mode = 'auto') {
   const discussion = mode === 'discussion' || mode === 'auto' && /\b(discuss|debate|design review|architecture review)\b/i.test(text) && /\b(manager|principal|principals|team)\b/i.test(text);
   if (discussion) need(store.pendingDiscussions().length < 20, 'discussion queue is full');
   store.addComment(key, 'owner', text);
+  store.requeueOutbox(key); // an owner reply retries PR comments that had given up
   let request;
   if (discussion) {
     request = store.createDiscussion(key, String(text).slice(0, 8000));
