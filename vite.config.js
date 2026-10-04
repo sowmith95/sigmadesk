@@ -30,9 +30,10 @@ export default defineConfig({
     reportCompressedSize: false,
     modulePreload: { polyfill: false }, // every browser that runs the desk supports modulepreload
     rolldownOptions: {
-      input: path.join(root, 'ui', 'src', 'main.tsx'),
+      // The desk (main.js) and the Projects home (hub.js) share one stylesheet and the component chunks.
+      input: { main: path.join(root, 'ui', 'src', 'main.tsx'), hub: path.join(root, 'ui', 'src', 'hub', 'main.tsx') },
       output: {
-        entryFileNames: 'main.js',
+        entryFileNames: '[name].js',
         chunkFileNames: 'chunks/[name]-[hash].js',
         assetFileNames: (a) => ((a.names || [a.name]).some((n) => String(n).endsWith('.css')) ? 'main.css' : 'assets/[name]-[hash][extname]'),
       },
