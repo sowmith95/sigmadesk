@@ -837,9 +837,10 @@ export async function learnFromBase(sha) {
   if (!sha) return null;
   const bases = [...kvList('ci:bases').filter((b) => b !== sha), sha].slice(-LEARN_BASES);
   store.kvSet('ci:bases', JSON.stringify(bases));
-  const learned = []; const files = {}; const impossible = new Set(); const possible = new Set();
+  const learned = []; const files = {}; const impossible = new Set(); const possible = new Set(); let unknown = 0;
   for (const b of bases) {
     const seen = await namesOnCommit(b);
+    unknown += seen.unknown;
     learned.push(...seen.learn);
     for (const [name, f] of Object.entries(seen.files)) files[name] = [...new Set([...(files[name] || []), ...f])];
     seen.impossible.forEach((n) => impossible.add(n)); seen.learn.forEach((n) => possible.add(n));
@@ -848,18 +849,20 @@ export async function learnFromBase(sha) {
   store.kvSet('ci:check-files', JSON.stringify({ ...known, ...files }));
   prs.learnChecks(learned);
   prs.pruneImpossibleChecks([...impossible].filter((n) => !possible.has(n)));
+  store.kvSet('ci:discovery', JSON.stringify({ complete: unknown === 0, unknown, at: new Date().toISOString() }));
   return [...new Set(learned)];
 }
 async function namesOnCommit(sha) {
   const [{ runs, statuses }, wfRuns, wfs] = await Promise.all([prs.checksForCommit(sha), prs.runsForCommit(sha), workflowsAtBase().catch(() => null)]);
-  const out = { learn: [], files: {}, impossible: [] };
-  if (!wfs) return out; // the workflow files could not be read this round: learn nothing rather than guess
+  const out = { learn: [], files: {}, impossible: [], unknown: 0 };
+  if (!wfs) return { ...out, unknown: runs.length || 1 }; // the workflow files could not be read: learn nothing, mark incomplete
   const parsed = new Map(wfs.map((w) => [w.file, w.text ? workflows.parseWorkflow(w.text) : null]));
   const suiteFile = new Map(wfRuns.map((r) => [r.suite, r.path]));
   for (const r of runs) {
     const file = suiteFile.get(r.suite);
     const wf = file ? parsed.get(file) : undefined;
-    if (!r.name || !file || !wf) continue; // unknown provenance: never learned
+    if (!r.name) continue;
+    if (!file || !wf) { out.unknown++; continue; } // unknown provenance: never learned, and the round is incomplete
     out.files[r.name] = [...new Set([...(out.files[r.name] || []), file])];
     if (workflows.hasPullRequestTrigger(wf)) out.learn.push(r.name); else out.impossible.push(r.name);
   }

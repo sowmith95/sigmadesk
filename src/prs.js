@@ -208,8 +208,11 @@ export function ciCoverage({ required = [], rollup = [], files = [], workflows: 
   // and nothing reported. "Nothing reported yet" on its own may just mean CI has not started.
   const fires = (wfs || []).filter((w) => workflowsLib.pullRequestTriggers(parsed.get(w.file), base, files)).map((w) => parsed.get(w.file)?.name || w.file);
   const readable = !!wfs && wfs.every((w) => parsed.get(w.file));
-  return { rows, applicable, firing: fires, uncovered: readable && files.length > 0 && !fires.length && !applicable.length && !rollup.length,
-    areas: [...new Set(files.map((f) => f.split('/')[0]))] };
+  const uncovered = readable && files.length > 0 && !fires.length && !applicable.length && !rollup.length;
+  // A validation gap: every required check is known NOT to run for these files (or nothing is required and no workflow
+  // starts). Unrelated green checks (a labeler, an external status) never close it: they did not test these files.
+  const gap = (rows.length > 0 && rows.every((r) => r.state === 'not_run_for_files')) || (uncovered && !required.length);
+  return { rows, applicable, firing: fires, uncovered, gap, areas: [...new Set(files.map((f) => f.split('/')[0]))] };
 }
 const pathsOf = (wf) => {
   const pr = wf?.on?.pull_request ?? wf?.on?.pull_request_target;
@@ -234,7 +237,7 @@ const seatName = (seat) => (seat ? `${agentById[seat]?.name || seat}` : '?');
  * nothing bypasses state, head commit, base branch, conflicts or CI.
  */
 export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, override = '', actor = 'owner', halted = false, gate = null,
-  overrideReason = '', noChecksConfigured = false, baseBranch = config.project.baseBranch, required = [], uncovered = null } = {}) {
+  overrideReason = '', noChecksConfigured = false, baseBranch = config.project.baseBranch, required = [], ciGap = null, ciAckReason = '' } = {}) {
   const blockers = []; const chain = [];
   if (p.state !== 'OPEN') blockers.push(`PR is ${String(p.state).toLowerCase()}`);
   if (!/^[0-9a-f]{7,40}$/.test(String(expectedSha))) blockers.push('the request did not say which commit it approves (expected head SHA)');
@@ -246,10 +249,16 @@ export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, over
   if (ci === 'failing') blockers.push('CI is failing');
   else if (ci === 'pending') blockers.push('CI is still running');
   else if (ci === 'inconclusive') blockers.push('a CI check was skipped or neutral instead of passing (only review.optionalChecks may skip)');
-  // No CI workflow starts for the files this PR changes: nothing can ever report, so waiting would block forever. The owner
-  // may merge with an audited reason (posted on the PR); the desk's own auto-merge never can.
-  else if (ci === 'none' && uncovered) chain.push(`no CI workflow runs for the files this PR changes (${uncovered.areas.join(', ') || 'these paths'}), so nothing tested it`);
-  else if (ci === 'none' && !noChecksConfigured) blockers.push('no CI result has been reported for this commit yet');
+  else if (ci === 'none' && !noChecksConfigured && !ciGap) blockers.push('no CI result has been reported for this commit yet');
+  // No required check runs for the files this PR changes: waiting would block forever. The owner may acknowledge the gap
+  // with its own reason (posted on the PR). It is separate from the review override: it never skips QA or approvals,
+  // and the desk's auto-merge can never acknowledge it.
+  const acknowledged = [];
+  if (ciGap) {
+    const gapMsg = `no required CI check runs for the files this PR changes (${ciGap.areas.join(', ') || 'these paths'}), so nothing tested it automatically`;
+    if (actor === 'owner' && String(ciAckReason || '').trim().length >= MIN_OVERRIDE_REASON) acknowledged.push(gapMsg);
+    else blockers.push(actor === 'owner' ? `${gapMsg} — acknowledge the CI gap with a reason (at least ${MIN_OVERRIDE_REASON} characters)` : gapMsg);
+  }
   const reported = new Map((p.statusCheckRollup || []).map((c) => [checkName(c), c.conclusion || c.state || c.status || '']));
   const missing = required.filter((n) => reported.get(n) !== 'SUCCESS');
   if (missing.length) blockers.push(`required check${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'have' : 'has'} not passed on this commit${missing.some((n) => !reported.has(n)) ? ' (never reported)' : ''}`);
@@ -266,9 +275,9 @@ export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, over
     if (!gate.qaSha || gate.qaSha !== expectedSha) chain.push(gate.qaSha ? `QA passed a different commit (${String(gate.qaSha).slice(0, 7)})` : 'QA has not passed this commit');
   }
   const reason = String(overrideReason || '').trim();
-  if (chain.length && actor === 'owner' && reason.length >= MIN_OVERRIDE_REASON) return { blockers, overridden: chain };
+  if (chain.length && actor === 'owner' && reason.length >= MIN_OVERRIDE_REASON) return { blockers, overridden: chain, acknowledged };
   if (chain.length && actor === 'owner') chain[chain.length - 1] += ` — or give an owner override reason (at least ${MIN_OVERRIDE_REASON} characters)`;
-  return { blockers: [...blockers, ...chain], overridden: [] };
+  return { blockers: [...blockers, ...chain], overridden: [], acknowledged };
 }
 
 // "No checks at all" is a pass only when the repository has no Actions workflows (review.ci = "auto").
@@ -312,15 +321,15 @@ export async function mergeCheck(number, { inBusyWindow = false, halted = false 
   const gate = t && store.inReviewFlow(t.key) ? { approvals: store.approvalsAt(t.key, p.headRefOid), qaSha: t.qa_sha } : null;
   const noWorkflows = await repoHasNoWorkflows();
   const cov = await coverageFor(p);
-  const common = { expectedSha: p.headRefOid, inBusyWindow, actor: 'owner', halted, gate, required: cov.applicable, uncovered: cov.uncovered ? cov : null,
+  const common = { expectedSha: p.headRefOid, inBusyWindow, actor: 'owner', halted, gate, required: cov.applicable, ciGap: cov.gap ? cov : null,
     noChecksConfigured: (p.statusCheckRollup || []).length === 0 && noWorkflows };
   // With a reason and the market-hours phrase supplied, what remains is what nothing can override.
-  const probe = authorizeMerge(p, { ...common, overrideReason: 'x'.repeat(MIN_OVERRIDE_REASON), override: OVERRIDE_PHRASE });
-  return { number: p.number, head: p.headRefOid, blockers: probe.blockers, overridable: probe.overridden, busy_window: inBusyWindow,
-    ready: !probe.blockers.length && !probe.overridden.length,
-    coverage: { rows: cov.rows, uncovered: cov.uncovered, firing: cov.firing, areas: cov.areas, files: cov.files.length } };
+  const probe = authorizeMerge(p, { ...common, overrideReason: 'x'.repeat(MIN_OVERRIDE_REASON), ciAckReason: 'x'.repeat(MIN_OVERRIDE_REASON), override: OVERRIDE_PHRASE });
+  return { number: p.number, head: p.headRefOid, blockers: probe.blockers, overridable: probe.overridden, ci_gap: probe.acknowledged, busy_window: inBusyWindow,
+    ready: !probe.blockers.length && !probe.overridden.length && !probe.acknowledged.length,
+    coverage: { rows: cov.rows, uncovered: cov.uncovered, gap: cov.gap, firing: cov.firing, areas: cov.areas, files: cov.files.length } };
 }
-export async function merge(number, { method = 'squash', override = '', inBusyWindow = false, expectedSha = '', overrideReason = '', actor = 'owner', halted = false, preflight = null } = {}) {
+export async function merge(number, { method = 'squash', override = '', inBusyWindow = false, expectedSha = '', overrideReason = '', ciAckReason = '', actor = 'owner', halted = false, preflight = null } = {}) {
   if (!MERGE_METHODS.includes(method)) fail(`method must be ${MERGE_METHODS.join('|')}`, 400);
   const p = await pr(number);
   const key = keyOfTitle(p.title);
@@ -331,9 +340,12 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   const noChecksConfigured = (p.statusCheckRollup || []).length === 0 && noWorkflows;
   const req = requiredChecks();
   if (actor !== 'owner' && !req.names.length && !noWorkflows) fail('Not merged: nobody has confirmed which CI checks a merge must wait for (review.requiredChecks) — the owner merges until then.');
+  // A partial learning round (a check whose workflow could not be identified) must not let the desk merge on a list that
+  // may be missing a suite: until a complete round, only the owner merges.
+  if (actor !== 'owner') { let disc = {}; try { disc = JSON.parse(store.kvGet('ci:discovery') || '{}'); } catch { disc = {}; } if (disc.complete === false) fail('Not merged: the desk could not identify every CI check on the base branch in its last look; the owner merges until it can.'); }
   const cov = await coverageFor(p);
-  const auth = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, noChecksConfigured, required: cov.applicable, uncovered: cov.uncovered ? cov : null });
-  const { overridden } = auth;
+  const auth = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, ciAckReason, noChecksConfigured, required: cov.applicable, ciGap: cov.gap ? cov : null });
+  const { overridden, acknowledged = [] } = auth;
   const blockers = [...auth.blockers];
   // Product/design feedback and owner-triggered branch refresh gates (main): they add blockers, never remove any.
   if (key) {
@@ -359,7 +371,11 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
     store.logEvent({ kind: 'action', agent_id: 'owner', ticket_key: key, text: `merge override on #${p.number}: ${overridden.join('; ')} — reason: ${String(overrideReason).trim()}`.slice(0, 1000) });
   }
   // The live gate (halt/stop-all fence, Hold, risk, window, deploy lock, base freshness) runs last, right before dispatch.
-  if (preflight) await preflight({ overridden, expectedSha });
+  if (acknowledged.length) {
+    await gh(['pr', 'comment', String(p.number), '-R', repo(), '--body', store.sanitizeForGithub(`⚠️ **The owner is merging without CI on these files**\n\n${acknowledged.join('; ')}.\n**Owner's reason:** ${String(ciAckReason).trim()}`)]);
+    store.logEvent({ kind: 'action', agent_id: 'owner', ticket_key: key, text: `merged #${p.number} without CI coverage: ${acknowledged.join('; ')} — reason: ${String(ciAckReason).trim()}`.slice(0, 1000) });
+  }
+  if (preflight) await preflight({ overridden, expectedSha }); // only review overrides relax the final QA/approval recheck
   // --match-head-commit: GitHub merges exactly the approved commit, or refuses if it moved. From here on a failure is
   // "unknown" (GitHub may have merged before the error/timeout reached us): callers must reconcile, never roll back.
   try { await gh(['pr', 'merge', String(p.number), '-R', repo(), `--${method}`, '--delete-branch', '--match-head-commit', expectedSha]); }
@@ -367,7 +383,7 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   if (actor === 'owner') note(p, `🔀 **Merged #${p.number}** (${method}) from SigmaDesk${inBusyWindow ? ' — market-hours override' : ''}${overridden.length ? ` — review override: ${String(overrideReason).trim()}` : ''}.`);
   else store.logEvent({ kind: 'github', agent_id: 'github', ticket_key: key, text: `auto-merged #${p.number} (${method}) at ${expectedSha.slice(0, 7)}` });
   bust();
-  return { number: p.number, method, overridden };
+  return { number: p.number, method, overridden, acknowledged };
 }
 
 /** {state, mergeCommit:{oid}} of a PR (the merge commit a merged PR produced on the base branch). */

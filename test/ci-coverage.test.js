@@ -65,18 +65,26 @@ test('a UI-only PR: the alpaca check does not apply, no workflow fires, so it is
   assert.equal(unknown.uncovered, false); assert.deepEqual(unknown.applicable, ['Run tests (alpaca_trader)']);
 });
 
-test('the owner can merge an uncovered PR with a reason; the desk itself never can; red or missing applicable CI still blocks', () => {
+test('a CI gap needs its own owner acknowledgement; unrelated green checks never close it; the desk can never merge it', () => {
   const cov = prs.ciCoverage({ required: Object.keys(checkFiles), files: ['ui-trader/x.ts'], workflows: [CI, PREREQ, DEPLOY], checkFiles });
-  const args = { expectedSha: 'a'.repeat(40), required: cov.applicable, uncovered: cov };
+  assert.equal(cov.gap, true);
+  const args = { expectedSha: 'a'.repeat(40), required: cov.applicable, ciGap: cov };
   const blocked = prs.authorizeMerge(PR(), { ...args, actor: 'owner' });
-  assert.match(blocked.blockers.join(' '), /no CI workflow runs for the files this PR changes \(ui-trader\)/);
-  assert.match(blocked.blockers.join(' '), /owner override reason/);
-  const ok = prs.authorizeMerge(PR(), { ...args, actor: 'owner', overrideReason: 'UI-only test file; ui-trader has no PR CI yet' });
-  assert.deepEqual(ok.blockers, []); assert.equal(ok.overridden.length, 1);
-  assert.ok(prs.authorizeMerge(PR(), { ...args, actor: 'desk', overrideReason: 'x'.repeat(40) }).blockers.length, 'auto-merge never overrides');
-  const backend = prs.authorizeMerge(PR(), { expectedSha: 'a'.repeat(40), actor: 'owner', overrideReason: 'x'.repeat(40), required: ['Run tests (alpaca_trader)'], uncovered: null });
+  assert.match(blocked.blockers.join(' '), /no required CI check runs for the files this PR changes \(ui-trader\)/);
+  assert.match(blocked.blockers.join(' '), /acknowledge the CI gap/);
+  const reviewReasonOnly = prs.authorizeMerge(PR(), { ...args, actor: 'owner', overrideReason: 'x'.repeat(40) });
+  assert.ok(reviewReasonOnly.blockers.length, 'a review override reason does not acknowledge a CI gap');
+  const ok = prs.authorizeMerge(PR(), { ...args, actor: 'owner', ciAckReason: 'UI-only test file; ui-trader has no PR CI yet' });
+  assert.deepEqual(ok.blockers, []); assert.equal(ok.acknowledged.length, 1); assert.deepEqual(ok.overridden, [], 'a CI acknowledgement never relaxes QA or approvals');
+  assert.ok(prs.authorizeMerge(PR(), { ...args, actor: 'desk', ciAckReason: 'x'.repeat(40) }).blockers.length, 'auto-merge never acknowledges');
+  // A labeler passing on the PR does not hide the gap.
+  const labeled = PR([{ name: 'label', conclusion: 'SUCCESS' }]);
+  const cov2 = prs.ciCoverage({ required: Object.keys(checkFiles), rollup: labeled.statusCheckRollup, files: ['ui-trader/x.ts'], workflows: [CI, PREREQ, DEPLOY], checkFiles });
+  assert.equal(cov2.gap, true);
+  assert.match(prs.authorizeMerge(labeled, { expectedSha: 'a'.repeat(40), actor: 'owner', required: cov2.applicable, ciGap: cov2 }).blockers.join(' '), /no required CI check runs/);
+  const backend = prs.authorizeMerge(PR(), { expectedSha: 'a'.repeat(40), actor: 'owner', ciAckReason: 'x'.repeat(40), required: ['Run tests (alpaca_trader)'], ciGap: null });
   assert.match(backend.blockers.join(' '), /no CI result has been reported|never reported/);
-  const red = prs.authorizeMerge(PR([{ name: 'Run tests (alpaca_trader)', conclusion: 'FAILURE' }]), { ...args, actor: 'owner', overrideReason: 'x'.repeat(40) });
+  const red = prs.authorizeMerge(PR([{ name: 'Run tests (alpaca_trader)', conclusion: 'FAILURE' }]), { ...args, actor: 'owner', ciAckReason: 'x'.repeat(40) });
   assert.match(red.blockers.join(' '), /CI is failing/);
 });
 

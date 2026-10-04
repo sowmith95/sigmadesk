@@ -77,8 +77,8 @@ export default function PrsPage() {
   );
 }
 
-type MergeCheck = { head: string; ready: boolean; blockers: string[]; overridable: string[]; busy_window: boolean;
-  coverage: { rows: { name: string; state: string; workflows: { file: string; name: string; paths: string[] | null }[] }[]; uncovered: boolean; firing: string[]; areas: string[]; files: number } };
+type MergeCheck = { head: string; ready: boolean; blockers: string[]; overridable: string[]; ci_gap: string[]; busy_window: boolean;
+  coverage: { rows: { name: string; state: string; workflows: { file: string; name: string; paths: string[] | null }[] }[]; uncovered: boolean; gap: boolean; firing: string[]; areas: string[]; files: number } };
 const sentence = (s: string) => { const t = s.replace(/ — or give an owner override reason.*$/, ''); return `${t[0]?.toUpperCase() || ''}${t.slice(1)}${/[.!?]$/.test(t) ? '' : '.'}`; };
 const CHECK_STATE: Record<string, { icon: typeof CheckCircle2; tone: string; word: string }> = {
   passed: { icon: CheckCircle2, tone: 'text-shipped', word: 'Passed on this commit' }, failed: { icon: XCircle, tone: 'text-blocked', word: 'Failed on this commit' },
@@ -93,11 +93,12 @@ function MergeBox({ p, d, field, onMerged }: { p: Pr; d: Record<string, string>;
   useEffect(() => { load(); }, [p.number, p.head_sha, p.checks, p.mergeable]); // eslint-disable-line react-hooks/exhaustive-deps
   const base = P.meta.base || 'main';
   const reasonOk = (d.reason || '').trim().length >= 10;
+  const ackOk = (d.ack || '').trim().length >= 10;
   const phraseOk = !chk?.busy_window || (d.override || '').trim().toLowerCase() === String(P.meta.override_phrase || '').toLowerCase();
-  const can = !!chk && !chk.blockers.length && (!chk.overridable.length || reasonOk) && phraseOk && chk.head === p.head_sha;
+  const can = !!chk && !chk.blockers.length && (!chk.overridable.length || reasonOk) && (!chk.ci_gap.length || ackOk) && phraseOk && chk.head === p.head_sha;
   const status = !chk ? { icon: Loader2, tone: 'text-muted-foreground', text: err || 'Checking whether it can merge…' }
     : chk.blockers.length ? { icon: XCircle, tone: 'text-blocked', text: "Can't merge yet" }
-      : chk.overridable.length ? { icon: AlertTriangle, tone: 'text-needs', text: 'Merging needs your reason' }
+      : chk.overridable.length || chk.ci_gap.length ? { icon: AlertTriangle, tone: 'text-needs', text: chk.ci_gap.length ? 'Nothing tested this change: merging needs your reason' : 'Merging needs your reason' }
         : { icon: CheckCircle2, tone: 'text-shipped', text: chk.busy_window ? 'Ready, but it is market hours' : 'Ready to merge' };
   const S1 = status.icon;
   return (
@@ -112,10 +113,14 @@ function MergeBox({ p, d, field, onMerged }: { p: Pr; d: Record<string, string>;
             <span><b className="font-medium">{r.name}</b> <span className="text-muted-foreground">{st.word}</span>
               {r.state === 'not_run_for_files' && wf && <span className="block text-sm text-muted-foreground">{wf.name} only runs for {wf.paths?.join(', ') || 'other paths'}, and this PR changes {chk.coverage.areas.join(', ')}.</span>}</span></li>); })}</ul>
           : <p className="text-sm text-muted-foreground">No checks are required yet.{chk.coverage.firing.length ? ` These will run: ${chk.coverage.firing.join(', ')}.` : ''}</p>}
-        {chk.coverage.uncovered && <div className="grid gap-1 rounded-md border border-needs/40 bg-needs/10 p-3 text-sm">
-          <b>No CI covers {chk.coverage.areas.join(', ')}.</b>
-          <p>Nothing tested this change automatically, and nothing will: no pull-request workflow runs for these folders. Review the diff on GitHub, then merge with a reason. To fix it for good, add a pull-request workflow for {chk.coverage.areas.filter((a) => a !== 'docs').join(', ') || 'these folders'} in the repository.</p></div>}
+        {chk.coverage.gap && <div className="grid gap-1 rounded-md border border-needs/40 bg-needs/10 p-3 text-sm">
+          <b>No required check runs for {chk.coverage.areas.join(', ')}.</b>
+          <p>Nothing tested this change automatically, and nothing will: the repository's pull-request CI does not cover these folders{chk.coverage.firing.length ? ` (only ${chk.coverage.firing.join(', ')} run, and they are not required checks)` : ''}. Review the diff on GitHub and the desk's QA notes, then merge with a reason. To fix it for good, add a pull-request workflow for {chk.coverage.areas.filter((a) => a !== 'docs').join(', ') || 'these folders'} in the repository.</p></div>}
       </div>}
+      {chk && chk.ci_gap.length > 0 && <div className="grid gap-1.5">
+        <label htmlFor={`ack-${p.number}`} className="text-sm">Why merge without CI? <span className="text-muted-foreground">Posted on the PR. QA and reviewer approvals still apply.</span></label>
+        <Textarea id={`ack-${p.number}`} rows={2} placeholder="For example: UI-only test file; I read the diff and the QA notes." {...field('ack')} />
+        {!ackOk && <span className="text-[13px] text-muted-foreground">At least 10 characters.</span>}</div>}
       {chk && chk.overridable.length > 0 && <div className="grid gap-1.5">
         <label htmlFor={`reason-${p.number}`} className="text-sm">Why merge anyway? <span className="text-muted-foreground">Posted on the PR. It covers: {chk.overridable.map((o) => sentence(o).replace(/\.$/, '').toLowerCase()).join('; ')}.</span></label>
         <Textarea id={`reason-${p.number}`} rows={2} placeholder="For example: UI-only test file; I reviewed the diff." {...field('reason')} />
@@ -127,7 +132,7 @@ function MergeBox({ p, d, field, onMerged }: { p: Pr; d: Record<string, string>;
           options={[{ value: 'squash', label: 'Squash' }, { value: 'merge', label: 'Merge commit' }, { value: 'rebase', label: 'Rebase' }]} />
         <span className="flex-1" />
         <AsyncButton variant="destructive" disabled={!can} confirm={`Merge #${p.number} into ${base} (${d.method || 'squash'})? This deploys production.`}
-          run={async () => { await api('POST', `/api/prs/${p.number}/merge`, { method: d.method || 'squash', override: d.override || '', expected_sha: p.head_sha, override_reason: d.reason || '' }); d.override = ''; d.reason = ''; await onMerged(); }} ok="Merged">Merge and deploy</AsyncButton>
+          run={async () => { await api('POST', `/api/prs/${p.number}/merge`, { method: d.method || 'squash', override: d.override || '', expected_sha: p.head_sha, override_reason: d.reason || '', ci_ack_reason: d.ack || '' }); d.override = ''; d.reason = ''; d.ack = ''; await onMerged(); }} ok="Merged">Merge and deploy</AsyncButton>
       </div>
       <p className="text-[13px] text-muted-foreground">Merging into {base} deploys production. The desk re-checks everything at the moment you merge.</p>
     </section>
@@ -139,7 +144,7 @@ export function PrPanel() {
   const [, force] = useState(0);
   useEffect(() => { loadPrRows(!!P.rows); }, []);
   const p = (P.rows || []).find((x) => x.number === sh.number);
-  const d = drafts[sh.number!] ||= { method: 'squash', override: '', close: '', reviewer: '', tag: '', reason: '' };
+  const d = drafts[sh.number!] ||= { method: 'squash', override: '', close: '', reviewer: '', tag: '', reason: '', ack: '' };
   const field = (k: string) => ({ value: d[k], onChange: (e: { target: { value: string } }) => { d[k] = e.target.value; force((n) => n + 1); } });
   const who = (id?: string) => { const a = S.agents.find((x: { id: string }) => x.id === id); return a ? `${a.name}, ${a.role}` : id || 'unknown'; };
   if (!p) return <Panel title={`Pull request #${sh.number}`} onClose={closeSheet}><p className="text-muted-foreground">{P.loading ? 'Loading…' : P.error || 'This pull request is not among the desk\'s pull requests.'}</p></Panel>;
