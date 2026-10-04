@@ -27,6 +27,11 @@ const USAGE = `usage:
   desk continue-rebase                     (implementer: after editing desk-listed conflict files)
   desk qa pass|fail "<notes>"
   desk accept pass|changes "<notes>"
+  desk review approve --code N --checked "<what you checked>" [--risks "<risks>"] "<summary>"
+  desk review changes --code N --findings '<JSON array>'|@file.json "<summary>"
+  desk respond fixed|pushback --finding ID "<what you changed | why not>"
+  desk respond done "<summary for the reviewers>"
+  desk resolve done "<how you combined both sides>" | desk resolve stuck "<why the owner must decide>"
   desk context-file <path> [--page N]   (Perplexity seats: a desk-built file/diff block to send verbatim on the same thread)
   desk incident file --title T --severity P0-P3 --area A   (analysis on stdin)
   desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>"`;
@@ -65,11 +70,16 @@ switch (cmd) {
   case 'progress': body.pct = Number(pos[0]); body.msg = pos.slice(1).join(' '); break;
   case 'route': takeKey(); body.to = pos.shift(); body.body = pos.join(' '); break;
   case 'consult': body.agent = pos.shift(); body.body = pos.join(' '); break;
-  case 'qa': case 'accept': body.verdict = pos.shift(); body.body = pos.join(' '); break;
+  case 'qa': case 'accept': case 'review': body.verdict = pos.shift(); body.body = pos.join(' '); break;
+  case 'respond': case 'resolve': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'incident': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'context-file': body.path = pos.join(' '); break;
   case 'groom': case 'reject': case 'comment': case 'needs-human': takeKey(); body.body = pos.join(' '); break;
   default: body.body = pos.join(' ');
+}
+// --findings @file.json: read the findings from a file the reviewer wrote (JSON is awkward to quote on a command line).
+if (typeof body.findings === 'string' && body.findings.startsWith('@')) {
+  try { body.findings = fs.readFileSync(path.resolve(body.findings.slice(1)), 'utf8'); } catch (e) { console.error(`desk: cannot read ${body.findings.slice(1)} (${e.message})`); process.exit(2); }
 }
 if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file'].includes(cmd)) body.body = await stdinText();
 else if (['groom', 'propose', 'create-task', 'incident', 'design'].includes(cmd) && !body.body) body.body = await stdinText();

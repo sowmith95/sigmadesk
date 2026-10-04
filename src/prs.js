@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { config } from './config.js';
 import * as store from './db.js';
+import { agentById } from './team.js';
 import * as refresh from './refresh.js';
 
 const pexec = promisify(execFile);
@@ -53,6 +54,7 @@ export async function listPrs({ refresh = false } = {}) {
       checks: checksState(p.statusCheckRollup || []), additions: p.additions, deletions: p.deletions, files: p.changedFiles,
       tags: labels.filter((l) => l.startsWith(TAG_PREFIX)).map((l) => l.slice(TAG_PREFIX.length)),
       labels: labels.filter((l) => !SYSTEM_LABEL(l) && !l.startsWith(TAG_PREFIX)),
+      head_sha: p.headRefOid || null, base: p.baseRefName || null, desk_review: t ? deskReview(t, p.headRefOid) : null,
     };
   });
   cache = { at: Date.now(), rows };
@@ -85,13 +87,13 @@ export async function approve(number, message = '') {
   if (p.state !== 'OPEN') fail(`PR #${p.number} is ${p.state.toLowerCase()}`);
   let mode = 'review';
   try {
-    await gh(['pr', 'review', String(p.number), '-R', repo(), '--approve', '--body', message || 'Approved by the owner via SigmaDesk.']);
+    await gh(['pr', 'review', String(p.number), '-R', repo(), '--approve', '--body', store.sanitizeForGithub(message || 'Approved by the owner via SigmaDesk.')]);
   } catch (err) {
     if (!/own pull request|Can not approve/i.test(String(err.stderr || err.message))) throw err;
     mode = 'label';
     await gh(['label', 'create', 'owner-approved', '--color', '0e8a16', '--description', 'Approved by the owner in SigmaDesk', '--force', '-R', repo()]);
     await gh(['pr', 'edit', String(p.number), '-R', repo(), '--add-label', 'owner-approved']);
-    await gh(['pr', 'comment', String(p.number), '-R', repo(), '--body', `✅ **Approved by the owner** (via SigmaDesk).${message ? `\n\n${message}` : ''}\n\n_GitHub does not allow approving your own PR, so this approval is recorded as a comment and the \`owner-approved\` label._`]);
+    await gh(['pr', 'comment', String(p.number), '-R', repo(), '--body', store.sanitizeForGithub(`✅ **Approved by the owner** (via SigmaDesk).${message ? `\n\n${message}` : ''}\n\n_GitHub does not allow approving your own PR, so this approval is recorded as a comment and the \`owner-approved\` label._`)]);
   }
   note(p, `👍 **Approved on GitHub** (#${p.number}, ${mode === 'review' ? 'review approval' : 'comment + owner-approved label — GitHub blocks self-approval'})`);
   bust();
@@ -124,13 +126,143 @@ export function mergeBlockers(p, { inBusyWindow = false, override = '' } = {}) {
   return out;
 }
 
-export async function merge(number, { method = 'squash', override = '', inBusyWindow = false } = {}) {
+// ---------------- merge authorization (owner UI merges and desk auto-merges share it) ----------------
+const FAILED = ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE'];
+const PENDING = ['PENDING', 'QUEUED', 'IN_PROGRESS', 'EXPECTED', 'WAITING', 'REQUESTED', 'COMPLETED', ''];
+/**
+ * Strict CI verdict: EVERY check must report SUCCESS. Only checks named in review.optionalChecks may be SKIPPED or
+ * NEUTRAL instead. Nothing reported = none.
+ */
+export function ciVerdict(rollup = [], optional = config.review?.optionalChecks || []) {
+  if (!rollup.length) return 'none';
+  const opt = new Set(optional);
+  const rows = rollup.map((c) => ({ name: c.name || c.context || c.workflowName || '', v: c.conclusion || c.state || c.status || '' }));
+  if (rows.some((r) => FAILED.includes(r.v))) return 'failing';
+  if (rows.some((r) => PENDING.includes(r.v))) return 'pending';
+  if (rows.every((r) => r.v === 'SUCCESS' || (opt.has(r.name) && ['SKIPPED', 'NEUTRAL'].includes(r.v)))) return 'passing';
+  return 'inconclusive';
+}
+export const MIN_OVERRIDE_REASON = 10;
+const checkName = (c) => c.name || c.context || c.workflowName || '';
+
+// ---------------- required checks: names that MUST be present and SUCCESS ----------------
+// review.requiredChecks: an explicit list, or "auto": learned from the BASE branch's own commits — the union of
+// pull-request checks that passed on recent main commits (persisted, owner-editable). The learned set only grows;
+// shrinking it needs the owner. Owner merges never teach it (a lint-only merge must not define "required").
+// Reported-only CI is not enough: a suite that never reports would otherwise let lint alone authorize a merge.
+const kvJson = (k, d) => { try { return JSON.parse(store.kvGet(k) || 'null') ?? d; } catch { return d; } };
+export function requiredChecks() {
+  const c = config.review?.requiredChecks;
+  if (Array.isArray(c)) return { names: c.map(String), source: 'config' };
+  return kvJson('ci:required', { names: [], source: 'auto' });
+}
+export function setRequiredChecks(names, source = 'owner') {
+  const clean = [...new Set((names || []).map((n) => String(n).trim()).filter(Boolean))].slice(0, 50);
+  store.kvSet('ci:required', JSON.stringify({ names: clean, source, at: store.now() }));
+  store.logEvent({ kind: 'action', agent_id: source === 'owner' ? 'owner' : 'github', text: `required CI checks set (${source}): ${clean.join(', ') || '(none)'}` });
+  return requiredChecks();
+}
+/** Auto mode: add check names that passed on a base-branch commit. Growth only — never removes a name. */
+export function learnChecks(names = []) {
+  const ok = [...new Set(names.map(String).filter(Boolean))];
+  if (!ok.length) return requiredChecks();
+  store.kvSet('ci:history', JSON.stringify([...kvJson('ci:history', []), ok].slice(-20)));
+  const cur = requiredChecks();
+  if (cur.source !== 'auto') return cur; // explicit (config/owner) lists are never changed automatically
+  const grown = [...new Set([...cur.names, ...ok])];
+  if (grown.length !== cur.names.length) setRequiredChecks(grown, 'auto');
+  return requiredChecks();
+}
+/** Check runs (with their check suite) and commit statuses GitHub recorded for a commit. */
+export async function checksForCommit(sha) {
+  const runs = JSON.parse(await gh(['api', `repos/${repo()}/commits/${encodeURIComponent(String(sha))}/check-runs?per_page=100`,
+    '--jq', '[.check_runs[] | {name, status, conclusion, suite: .check_suite.id}]']) || '[]');
+  const statuses = JSON.parse(await gh(['api', `repos/${repo()}/commits/${encodeURIComponent(String(sha))}/status`,
+    '--jq', '[.statuses[] | {context, state}]']) || '[]');
+  return { runs, statuses };
+}
+export const keyOfTitle = (title) => String(title || '').match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1] || null;
+const seatName = (seat) => (seat ? `${agentById[seat]?.name || seat}` : '?');
+
+/**
+ * Every precondition for merging, pure so it is testable. Returns { blockers, overridden }.
+ * gate (only for tickets that went through two-reviewer review): { approvals: store.approvalsAt(key, expectedSha), qaSha }.
+ * An owner may bypass the review-chain blockers (approvals, their publication, QA commit) with an audited reason;
+ * nothing bypasses state, head commit, base branch, conflicts or CI.
+ */
+export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, override = '', actor = 'owner', halted = false, gate = null,
+  overrideReason = '', noChecksConfigured = false, baseBranch = config.project.baseBranch, required = [] } = {}) {
+  const blockers = []; const chain = [];
+  if (p.state !== 'OPEN') blockers.push(`PR is ${String(p.state).toLowerCase()}`);
+  if (!/^[0-9a-f]{7,40}$/.test(String(expectedSha))) blockers.push('the request did not say which commit it approves (expected head SHA)');
+  else if (p.headRefOid !== expectedSha) blockers.push(`the PR head moved (${String(p.headRefOid).slice(0, 7)} ≠ approved ${String(expectedSha).slice(0, 7)}) — reload and re-check`);
+  if (p.baseRefName !== baseBranch) blockers.push(`the PR targets \`${p.baseRefName || 'unknown'}\`, not \`${baseBranch}\` — merge its base first`);
+  if (p.mergeable === 'CONFLICTING') blockers.push('it conflicts with the base branch — rebase first');
+  else if (p.mergeable !== 'MERGEABLE') blockers.push('GitHub has not finished checking mergeability — try again in a minute');
+  const ci = ciVerdict(p.statusCheckRollup || []);
+  if (ci === 'failing') blockers.push('CI is failing');
+  else if (ci === 'pending') blockers.push('CI is still running');
+  else if (ci === 'inconclusive') blockers.push('a CI check was skipped or neutral instead of passing (only review.optionalChecks may skip)');
+  else if (ci === 'none' && !noChecksConfigured) blockers.push('no CI result has been reported for this commit yet');
+  const reported = new Map((p.statusCheckRollup || []).map((c) => [checkName(c), c.conclusion || c.state || c.status || '']));
+  const missing = required.filter((n) => reported.get(n) !== 'SUCCESS');
+  if (missing.length) blockers.push(`required check${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'have' : 'has'} not passed on this commit${missing.some((n) => !reported.has(n)) ? ' (never reported)' : ''}`);
+  if (inBusyWindow && (actor !== 'owner' || String(override).trim().toLowerCase() !== OVERRIDE_PHRASE)) {
+    blockers.push(actor === 'owner' ? `merging ${baseBranch} deploys production and the desk is inside its busy window (market hours) — type "${OVERRIDE_PHRASE}" to override` : 'inside the busy window (market hours)');
+  }
+  if (actor !== 'owner' && halted) blockers.push('the desk is paused');
+  if (gate) {
+    const a = gate.approvals || {};
+    if (!a.ok) {
+      const have = [a.context && `${seatName(a.context.seat)}: ${a.context.verdict}`, a.independent && `${seatName(a.independent.seat)}: ${a.independent.verdict}`].filter(Boolean).join(', ');
+      chain.push(`it needs two reviewer approvals at this commit (have: ${have || 'none'})`);
+    } else if (a.unpublished) chain.push('the review comments are not on the PR yet');
+    if (!gate.qaSha || gate.qaSha !== expectedSha) chain.push(gate.qaSha ? `QA passed a different commit (${String(gate.qaSha).slice(0, 7)})` : 'QA has not passed this commit');
+  }
+  const reason = String(overrideReason || '').trim();
+  if (chain.length && actor === 'owner' && reason.length >= MIN_OVERRIDE_REASON) return { blockers, overridden: chain };
+  if (chain.length && actor === 'owner') chain[chain.length - 1] += ` — or give an owner override reason (at least ${MIN_OVERRIDE_REASON} characters)`;
+  return { blockers: [...blockers, ...chain], overridden: [] };
+}
+
+// "No checks at all" is a pass only when the repository has no Actions workflows (review.ci = "auto").
+let workflowCache = { at: 0, none: false };
+export async function repoHasNoWorkflows() {
+  if (config.review?.ci === 'required') return false;
+  if (Date.now() - workflowCache.at < 10 * 60_000) return workflowCache.none;
+  try {
+    const n = Number(await gh(['api', `repos/${repo()}/actions/workflows`, '--jq', '.total_count']));
+    workflowCache = { at: Date.now(), none: n === 0 };
+  } catch { workflowCache = { at: Date.now(), none: false }; }
+  return workflowCache.none;
+}
+
+/** Review state for a desk PR row (the DB is authoritative; GitHub only mirrors it). */
+export function deskReview(t, headSha) {
+  if (!store.inReviewFlow(t.key)) return { required: false };
+  const a = store.approvalsAt(t.key, headSha || t.head_sha);
+  const r = (row) => (row ? { seat: row.seat, name: seatName(row.seat), role: row.role, verdict: row.verdict, sha: row.sha, round: row.round } : null);
+  return { required: true, approvals_ok: a.ok, unpublished: a.unpublished, context: r(a.context), independent: r(a.independent),
+    stage: t.review_stage || null, round: t.review_round || 0, risk: t.risk || null, diff_risk: t.diff_risk || null };
+}
+
+export async function merge(number, { method = 'squash', override = '', inBusyWindow = false, expectedSha = '', overrideReason = '', actor = 'owner', halted = false, preflight = null } = {}) {
   if (!MERGE_METHODS.includes(method)) fail(`method must be ${MERGE_METHODS.join('|')}`, 400);
   const p = await pr(number);
-  const blockers = mergeBlockers(p, { inBusyWindow, override });
-  const key = p.title.match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1];
+  const key = keyOfTitle(p.title);
+  const t = key ? store.getTicket(key) : null;
+  const gate = t && store.inReviewFlow(t.key) ? { approvals: store.approvalsAt(t.key, expectedSha), qaSha: t.qa_sha } : null;
+  if (actor !== 'owner' && !gate) fail('Not merged: the desk only merges PRs that passed two-reviewer review.');
+  const noWorkflows = await repoHasNoWorkflows();
+  const noChecksConfigured = (p.statusCheckRollup || []).length === 0 && noWorkflows;
+  const req = requiredChecks();
+  if (actor !== 'owner' && !req.names.length && !noWorkflows) fail('Not merged: nobody has confirmed which CI checks a merge must wait for (review.requiredChecks) — the owner merges until then.');
+  const auth = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, noChecksConfigured, required: req.names });
+  const { overridden } = auth;
+  const blockers = [...auth.blockers];
+  // Product/design feedback and owner-triggered branch refresh gates (main): they add blockers, never remove any.
   if (key) {
-    const ticket = store.getTicket(key);
+    const ticket = t;
     const plan = ticket && productReview.current(ticket.parent_key || key);
     if (plan || productReview.current(key, 'feedback')) {
       const feedback = productReview.current(key, 'feedback');
@@ -146,17 +278,42 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   }
   if (blockers.length) fail(`Not merged: ${blockers.join('; ')}.`);
   if (p.isDraft) await gh(['pr', 'ready', String(p.number), '-R', repo()]);
-  // --match-head-commit: GitHub merges exactly the commit whose checks we just read, or refuses if it moved.
-  await gh(['pr', 'merge', String(p.number), '-R', repo(), `--${method}`, '--delete-branch', '--match-head-commit', p.headRefOid]);
-  note(p, `🔀 **Merged #${p.number}** (${method}) from SigmaDesk${inBusyWindow ? ' — market-hours override' : ''}.`);
+  if (overridden.length) {
+    // Audit first: the reason is on the PR even if the merge call then fails.
+    await gh(['pr', 'comment', String(p.number), '-R', repo(), '--body', store.sanitizeForGithub(`⚠️ **The owner is merging without the full SigmaDesk review**\n\nSkipped: ${overridden.join('; ')}.\n**Owner's reason:** ${String(overrideReason).trim()}`)]);
+    store.logEvent({ kind: 'action', agent_id: 'owner', ticket_key: key, text: `merge override on #${p.number}: ${overridden.join('; ')} — reason: ${String(overrideReason).trim()}`.slice(0, 1000) });
+  }
+  // The live gate (halt/stop-all fence, Hold, risk, window, deploy lock, base freshness) runs last, right before dispatch.
+  if (preflight) await preflight({ overridden, expectedSha });
+  // --match-head-commit: GitHub merges exactly the approved commit, or refuses if it moved. From here on a failure is
+  // "unknown" (GitHub may have merged before the error/timeout reached us): callers must reconcile, never roll back.
+  try { await gh(['pr', 'merge', String(p.number), '-R', repo(), `--${method}`, '--delete-branch', '--match-head-commit', expectedSha]); }
+  catch (err) { throw Object.assign(err, { dispatched: true }); }
+  if (actor === 'owner') note(p, `🔀 **Merged #${p.number}** (${method}) from SigmaDesk${inBusyWindow ? ' — market-hours override' : ''}${overridden.length ? ` — review override: ${String(overrideReason).trim()}` : ''}.`);
+  else store.logEvent({ kind: 'github', agent_id: 'github', ticket_key: key, text: `auto-merged #${p.number} (${method}) at ${expectedSha.slice(0, 7)}` });
   bust();
-  return { number: p.number, method };
+  return { number: p.number, method, overridden };
+}
+
+/** {state, mergeCommit:{oid}} of a PR (the merge commit a merged PR produced on the base branch). */
+export async function mergeInfo(number) {
+  return JSON.parse(await gh(['pr', 'view', String(Number(number)), '-R', repo(), '--json', 'mergeCommit,state']) || '{}');
+}
+/** Workflow runs GitHub started for a commit, identified by workflow FILE path (display names can collide). */
+export async function runsForCommit(sha) {
+  const out = JSON.parse(await gh(['api', `repos/${repo()}/actions/runs?head_sha=${encodeURIComponent(String(sha))}&per_page=100`,
+    '--jq', '[.workflow_runs[] | {path, name, status, conclusion, id, suite: .check_suite_id}]']) || '[]');
+  return out.map((r) => ({ ...r, path: String(r.path || '').replace(/@.*$/, '') }));
+}
+/** Paths a PR changes (for owner merges of PRs the desk did not open). */
+export async function prFiles(number) {
+  return JSON.parse(await gh(['pr', 'view', String(Number(number)), '-R', repo(), '--json', 'files', '--jq', '[.files[].path]']) || '[]');
 }
 
 export async function close(number, comment = '') {
   const p = await pr(number);
   if (p.state !== 'OPEN') fail(`PR #${p.number} is already ${p.state.toLowerCase()}`);
-  await gh(['pr', 'close', String(p.number), '-R', repo(), ...(comment ? ['--comment', comment] : [])]);
+  await gh(['pr', 'close', String(p.number), '-R', repo(), ...(comment ? ['--comment', store.sanitizeForGithub(comment)] : [])]);
   note(p, `🚫 Closed #${p.number} from SigmaDesk${comment ? `: ${comment}` : ''}.`);
   bust();
   return { number: p.number };

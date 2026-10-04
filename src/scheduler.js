@@ -12,23 +12,16 @@ import * as watch from './watch.js';
 import { notify } from './notify.js';
 import * as prsync from './prsync.js';
 import * as prs from './prs.js';
+import * as reviews from './reviews.js';
+import * as mergetrain from './mergetrain.js';
 import * as refresh from './refresh.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 import { selectionFor } from './dispatch.js';
 
 // ---------------- publish guard ----------------
-export function globToRegExp(glob) {
-  let re = '';
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
-    if (c === '*' && glob[i + 1] === '*') { re += glob[i + 2] === '/' ? '(?:.*/)?' : '.*'; i += glob[i + 2] === '/' ? 2 : 1; }
-    else if (c === '*') re += '[^/]*';
-    else if (c === '?') re += '[^/]';
-    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-  }
-  return new RegExp(`^${re}$`);
-}
+import { globToRegExp } from './reviews.js';
+export { globToRegExp };
 export function guardReasons(files, lines, complexity) {
   const pats = config.project.protectedPaths.map(globToRegExp);
   const hit = files.filter((f) => pats.some((r) => r.test(f)));
@@ -83,13 +76,14 @@ export function requesterOf(t) {
 
 const agentIdle = (id) => agentById[id]?.enabled !== false && store.getAgentState(id)?.status !== 'working';
 
-function setStatus(key, status, extra = {}) {
+export function setStatus(key, status, extra = {}) {
   const before = store.getTicket(key)?.status;
   const t = store.updateTicket(key, { status, ...extra });
   github.syncIssueState(key);
   if (status !== before && status === 'needs_human') notify('needs_human', t, 'needs you');
   if (status !== before && status === 'ready_for_human') notify('ready_for_human', t, 'ready for your review');
   if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key); // clones are full copies now; free the disk
+  if (['done', 'wontdo'].includes(status)) store.clearReservation(key);
   if (t.parent_key) rollupParent(t.parent_key);
   return t;
 }
@@ -128,9 +122,9 @@ function stall(ticket, reason) {
 }
 
 // ---------------- job launchers ----------------
-async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [], nonce = null, fence = runner.currentEpoch() }) {
+async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [], nonce = null, fence = runner.currentEpoch(), onStart = null, outcome = null }) {
   const before = ticket?.status;
-  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs, nonce, fence });
+  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs, nonce, fence, onStart });
   if (ticket) store.updateTicket(ticket.key, { active_run: store.getAgentState(agentId).current_run });
   const { run, aborted, failure } = await p;
   if (aborted) {
@@ -143,7 +137,8 @@ async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork 
   const after = store.getTicket(ticket.key);
   if (after.active_run === run.id) store.updateTicket(ticket.key, { active_run: null });
   // Did the seat actually move the ticket forward? (An implement run must end with `desk submit`.)
-  const moved = kind === 'implement' ? after.status !== 'in_progress' : after.status !== before;
+  // `outcome` lets a job say what "done" means (a first code-review approval leaves the ticket in review).
+  const moved = outcome ? outcome(after) : kind === 'implement' ? after.status !== 'in_progress' : after.status !== before;
   if (!moved && failure) {
     store.updateTicket(ticket.key, { active_run: null, status: after.status === 'in_progress' ? 'todo' : after.status,
       progress_msg: 'Provider unavailable — waiting for an available engine' });
@@ -227,6 +222,7 @@ async function launchImplement(ticket, agentId, fence) {
   store.updateAgent(agentId, { status: 'working', current_ticket: ticket.key, last_action: 'cloning workspace', last_action_at: store.now() });
   store.logEvent({ agent_id: agentId, ticket_key: ticket.key, kind: 'pickup', text: `${agentById[agentId].role} picked up ${ticket.key}` });
   setStatus(ticket.key, 'in_progress', { assignee: agentId, active_run: -1, progress: Math.max(2, ticket.progress || 0), progress_msg: 'cloning workspace' });
+  store.addContributor(ticket.key, agentId); // recorded at pickup: even an interrupted author never reviews this ticket
   let ws;
   try {
     ws = await runner.ensureWorkspace(store.getTicket(ticket.key));
@@ -314,6 +310,91 @@ async function launchReview(ticket, seat, fence) {
   }
   const code = nonce();
   await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: ws.dir, nonce: code, prompt: promptFor('review', { ticket, comments, extra: code }) });
+}
+
+// Two-reviewer PRs: a reviewer runs read-only on a fresh snapshot of exactly the reviewed commit.
+async function launchPrReview(job, fence) {
+  const { seat } = job;
+  const idle = () => { store.updateAgent(seat, { status: 'idle', current_ticket: null }); store.updateTicket(job.key, { active_run: null }); };
+  store.updateAgent(seat, { status: 'working', current_ticket: job.key, last_action: 'checking out the commit under review', last_action_at: store.now() });
+  store.updateTicket(job.key, { active_run: -1 });
+  let cwd;
+  try { cwd = await reviews.prepareSnapshot(store.getTicket(job.key), seat); } catch (err) { idle(); throw err; }
+  if (!stillWanted(job.key, 'review', seat)) return;
+  const t = store.getTicket(job.key);
+  const row = store.getPrReview(job.review.id);
+  if (row.verdict !== 'pending' || row.state !== 'active' || row.sha !== t.head_sha || t.review_stage !== 'reviewing') { idle(); return; }
+  store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is reviewing ${t.key} at ${row.sha.slice(0, 7)} (${row.role} reviewer)` });
+  const code = nonce();
+  const reconfirm = await reviews.reconfirmContext(t); // light re-confirm after a desk update or a conflict resolution
+  await launch({ fence, agentId: seat, kind: 'pr_review', ticket: t, cwd, nonce: code, prompt: reviews.reviewPrompt(t, row, code, reconfirm),
+    onStart: (run) => store.updatePrReview(row.id, { nonce: code, run_id: run.id, round: t.review_round || 0 }),
+    outcome: (after) => after.status !== 'review' || store.getPrReview(row.id).verdict !== 'pending' });
+  runner.removeReviewSnapshot(t.key, seat); // every review starts from a fresh snapshot; free the disk
+}
+
+// The author answers review findings in their own clone: fix + commit, or push back with reasons.
+async function launchRespond(job, fence) {
+  const { seat } = job;
+  store.updateAgent(seat, { status: 'working', current_ticket: job.key, last_action: 'reading the review', last_action_at: store.now() });
+  store.addContributor(job.key, seat);
+  store.updateTicket(job.key, { active_run: -1 });
+  let ws;
+  try { ws = await runner.ensureWorkspace(store.getTicket(job.key)); } catch (err) {
+    store.updateAgent(seat, { status: 'idle', current_ticket: null }); store.updateTicket(job.key, { active_run: null }); throw err;
+  }
+  if (!stillWanted(job.key, 'review', seat)) return;
+  const t = store.getTicket(job.key);
+  if (t.review_stage !== 'responding') { store.updateAgent(seat, { status: 'idle', current_ticket: null }); store.updateTicket(t.key, { active_run: null }); return; }
+  store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is answering the code review on ${t.key}` });
+  await launch({ fence, agentId: seat, kind: 'respond', ticket: t, cwd: ws.dir, prompt: reviews.respondPrompt(t),
+    outcome: (after) => after.status !== 'review' || after.review_stage !== 'responding' });
+}
+
+// Merge train (#3): the builder resolves a real conflict in a fresh desk-built clone with a compact conflict pack.
+async function launchResolve(job, fence) {
+  const { seat } = job;
+  const idle = () => { store.updateAgent(seat, { status: 'idle', current_ticket: null }); store.updateTicket(job.key, { active_run: null }); };
+  store.updateAgent(seat, { status: 'working', current_ticket: job.key, last_action: 'preparing the conflict', last_action_at: store.now() });
+  store.updateTicket(job.key, { active_run: -1 });
+  let prepared;
+  try { prepared = await mergetrain.prepareResolve(job.job); } catch (err) { idle(); throw err; }
+  if (!stillWanted(job.key, 'review', seat)) return;
+  const t = store.getTicket(job.key);
+  const j = store.getConflictJob(job.job.id);
+  if (t.review_stage !== 'resolving' || j.status !== 'pending') { idle(); return; }
+  if (prepared.clean) { // git merged it without help after all: no model run needed
+    idle();
+    const head = (await runner.scratchGit(prepared.dir, ['rev-parse', 'HEAD'])).stdout.trim();
+    store.updateConflictJob(j.id, { status: 'running' });
+    await mergetrain.finishResolution(t, j, head, prepared.dir, 'git merged it cleanly this time; no manual changes were needed.');
+    return;
+  }
+  const attempts = (j.attempts || 0) + 1;
+  if (attempts > (Number(config.resolve?.maxAttempts) || 2)) {
+    idle();
+    store.updateConflictJob(j.id, { status: 'needs_owner', note: 'resolution attempts exhausted' });
+    store.addComment(t.key, 'system', `🧭 ${agentById[seat].name} tried to resolve the conflict ${attempts - 1} times without finishing. Reply to let them try again, or resolve it yourself.`);
+    setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: 'conflict needs your call' });
+    return;
+  }
+  const pack = await mergetrain.conflictPack(j, t, prepared.dir);
+  const prev = store.lastRunFor(t.key, seat, 'implement');
+  if (mergetrain.shouldResume(prev, pack)) store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'system', text: 'resume estimated cheaper, but sessions are tied to the builder clone; using a fresh run in the isolated clone' });
+  store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is resolving a merge conflict on ${t.key}` });
+  // Synchronous from this check to the run start (launch → startRun selects the provider without awaiting): the seat's
+  // engine must enforce the hard spend cap right now; onStart re-verifies the engine the run actually got.
+  if (!mergetrain.cappedSeat(seat)) { idle(); return; }
+  store.addContributor(t.key, seat);
+  await launch({ fence, agentId: seat, kind: 'resolve', ticket: t, cwd: prepared.dir, prompt: mergetrain.resolvePrompt(t, j, pack),
+    onStart: (run) => {
+      const [engine, ...m] = String(run.model || '').split(':');
+      if (!runner.capsSpend({ ...agentById[seat], engine, model: m.join(':') })) { runner.killRun(run.id, 'resolve needs an engine with a hard spend cap'); return; }
+      store.updateConflictJob(j.id, { status: 'running', run_id: run.id, attempts });
+    },
+    outcome: () => store.getConflictJob(j.id).status !== 'running' });
+  const after = store.getConflictJob(j.id);
+  if (after.status === 'running') store.updateConflictJob(j.id, { status: 'pending', run_id: null }); // no outcome: retried (attempts counted)
 }
 
 // ---------------- watch desk ----------------
@@ -412,7 +493,8 @@ export function health() {
     queued: queued.length, discussions: store.pendingDiscussions().length, waiting: queued.filter((t) => !t.active_run).map((t) => {
       const review = productReview.current(t.key) || (t.parent_key && productReview.current(t.parent_key));
       if (review && (review.stale || review.status !== 'approved')) return { key: t.key, code: review.status === 'reviewing' && !review.stale ? 'product_review' : 'review_decision', reason: review.stale ? 'Product/design review is stale' : `Product/design review: ${review.status}` };
-      const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa' : t.status === 'review' ? requesterOf(t) : t.assignee || routeTicket(t);
+      const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa'
+        : t.status === 'review' ? (t.review_stage === 'resolving' ? store.conflictJobsFor(t.key).at(-1)?.seat : reviews.enabled() ? reviews.jobFor(t)?.seat : requesterOf(t)) : t.assignee || routeTicket(t);
       const chosen = selectionFor(seat);
       // `code` is the structured reason the UI classifies on; `reason` stays human-readable.
       const [code, why] = settings.paused === 'true' ? ['paused', 'Desk paused'] : t.after_key && store.getTicket(t.after_key)?.status !== 'done' ? ['dependency', `Waiting for ${t.after_key} to merge`]
@@ -494,12 +576,25 @@ export async function tick() {
     if (qa && slots > 0 && agentIdle('qa')) go('qa', (f) => launchQa(qa, f));
     const discussion = store.pendingDiscussions().find((d) => d.status === 'queued');
     if (discussion && slots > 0 && agentIdle('manager')) go('manager', (f) => launchDiscussion(discussion, f));
-    // 2b. Requesters confirm QA-passed work matches what they asked for.
-    for (const t of store.ticketsByStatus('review')) {
-      if (slots <= 0) break;
-      const seat = requesterOf(t);
-      if (t.active_run || !seat || !agentIdle(seat)) continue;
-      go(seat, (f) => launchReview(t, seat, f));
+    // 2b. Two-reviewer code review (context, then independent) and the author's answers; legacy: requester acceptance.
+    if (reviews.enabled()) {
+      for (const job of reviews.nextJobs()) {
+        if (slots <= 0) break;
+        if (!agentIdle(job.seat)) continue;
+        go(job.seat, (f) => (job.kind === 'pr_review' ? launchPrReview(job, f) : launchRespond(job, f)));
+      }
+      for (const job of mergetrain.enabled() ? mergetrain.nextResolveJobs() : []) {
+        if (slots <= 0) break;
+        if (!agentIdle(job.seat)) continue;
+        go(job.seat, (f) => launchResolve(job, f));
+      }
+    } else {
+      for (const t of store.ticketsByStatus('review')) {
+        if (slots <= 0) break;
+        const seat = requesterOf(t);
+        if (t.active_run || !seat || !agentIdle(seat)) continue;
+        go(seat, (f) => launchReview(t, seat, f));
+      }
     }
     productReview.refreshChangedPlans();
     // Bounded independent product/design reviews; preserve capacity for QA/SRE.
@@ -556,6 +651,7 @@ export function recoverOrphans() {
       cost_usd: run.cost_usd || runner.reservationFor(run), cost_estimated: run.cost_usd ? 0 : 1 });
     store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: 'run interrupted by a desk restart' });
   }
+  mergetrain.recover(); // interrupted conflict resolutions go back to pending (durable, keyed by PR/base/head)
   for (const a of store.listAgentStates()) store.updateAgent(a.id, { status: 'idle', current_ticket: null, current_run: null, current_kind: null, meeting: null });
   for (const t of store.listTickets()) {
     if (t.active_run) store.updateTicket(t.key, { active_run: null, ...(t.status === 'in_progress' ? { status: 'todo' } : {}) });
@@ -569,6 +665,7 @@ const PERMS = {
   design: PRINCIPALS, delegate: PRINCIPALS, 'peer-review': ['manager', ...PRINCIPALS], council: ['manager', ...PRINCIPALS],
   route: ['support'], submit: ENGINEERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
+  review: ['manager', ...ENGINEERS], respond: ENGINEERS, resolve: ENGINEERS,
   'continue-rebase': BUILDERS,
 };
 const PRIORITY = /^P[0-3]$/;
@@ -683,7 +780,7 @@ export async function deskAction(run, cmd, body = {}) {
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
       const description = body.body ? `${ticket.description}\n\n## Groomed spec (Engineering Manager)\n${body.body}` : ticket.description;
       setStatus(ticket.key, 'todo', { complexity: body.complexity, area: body.area, priority: PRIORITY.test(body.priority) ? body.priority : ticket.priority,
-        assignee, description, ...(body.title ? { title: body.title } : {}) });
+        assignee, description, risk: ['high', 'low'].includes(body.risk) ? body.risk : null, ...(body.title ? { title: body.title } : {}) });
       ev(`groomed ${ticket.key} → ${body.complexity}/${body.area}${body.risk === 'high' ? '/high-risk' : ''}, staffed ${agentById[assignee].role}`);
       github.createIssue(ticket.key);
       return `groomed; assigned to ${assignee}`;
@@ -701,7 +798,8 @@ export async function deskAction(run, cmd, body = {}) {
         const parent = store.getTicket(run.ticket_key);
         const slice = store.createTicket({ title: body.title, description: body.body, type: parent.type === 'bug' ? 'bug' : 'task', status: 'todo', area: body.area,
           complexity: body.complexity, priority: parent.priority, assignee: body.assign || routeSlice(body), reporter: agentId, source: 'agent', parent_key: run.ticket_key });
-        if (body.after) store.updateTicket(slice.key, { after_key: body.after });
+        // The slicer is the context reviewer later; slices inherit the parent's risk.
+        store.updateTicket(slice.key, { designer: agentId, risk: parent.risk || null, ...(body.after ? { after_key: body.after } : {}) });
         ev(`sliced ${slice.key} (${body.complexity}) for ${agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
         github.createIssue(slice.key);
         return `created ${slice.key} → ${slice.assignee}`;
@@ -709,7 +807,8 @@ export async function deskAction(run, cmd, body = {}) {
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
       const t = store.createTicket({ title: body.title, description: body.body, type: body.type || 'task', status: 'todo', area: body.area,
         complexity: body.complexity, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', assignee, reporter: agentId, source: 'agent', parent_key: body.parent || key });
-      store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null });
+      const parentRisk = store.getTicket(body.parent || key)?.risk;
+      store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null });
       ev(`created task ${t.key} for ${agentById[assignee].role}`, t.key);
       github.createIssue(t.key);
       return `created ${t.key} assigned to ${assignee}`;
@@ -789,7 +888,8 @@ export async function deskAction(run, cmd, body = {}) {
       need(await runner.commitsAhead(dir) > 0, 'no commits on your branch yet — git add + git commit your work first');
       const sha = await runner.headSha(dir);
       store.addComment(ticket.key, agentId, `🚀 **Submitted for QA** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
-      setStatus(ticket.key, 'qa', { head_sha: sha, progress: 90, progress_msg: 'waiting for QA' });
+      store.addContributor(ticket.key, agentId);
+      setStatus(ticket.key, 'qa', { head_sha: sha, progress: 90, progress_msg: 'waiting for QA', builder: ticket.builder || agentId });
       ev(`submitted ${ticket.key} for QA (${sha.slice(0, 7)})`);
       github.flushComments();
       return 'Submitted to QA. Your run is complete — stop now.';
@@ -821,7 +921,11 @@ export async function deskAction(run, cmd, body = {}) {
       store.addComment(ticket.key, agentId, `✅ **QA passed** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
       ev(`QA passed ${ticket.key}`);
       const seat = requesterOf(ticket);
-      if (seat) {
+      if (reviews.enabled()) {
+        // Publish the draft PR now (guard unchanged), then two sequential code reviews on this exact commit.
+        await reviews.afterQaPass(ticket, sha);
+        publishBranch(ticket.key);
+      } else if (seat) {
         setStatus(ticket.key, 'review', { progress: 95, progress_msg: `QA passed — ${agentById[seat].name} confirming intent` });
       } else {
         setStatus(ticket.key, 'ready_for_human', { progress: 100, progress_msg: 'QA passed — awaiting owner review' });
@@ -859,6 +963,12 @@ export async function deskAction(run, cmd, body = {}) {
       publishBranch(ticket.key);
       return 'Recorded. Stop now.';
     }
+    case 'review':
+      return reviews.reviewVerdict(run, ticket, body);
+    case 'respond':
+      return reviews.respond(run, ticket, body);
+    case 'resolve':
+      return mergetrain.resolveCommand(run, ticket, body);
     case 'incident': {
       need(run.kind === 'investigate' && run.incident_id, 'incident commands only work inside an investigation');
       const inc = store.getIncident(run.incident_id);
@@ -897,7 +1007,8 @@ const publishing = new Set();
 async function publishBranch(key) {
   const t = store.getTicket(key);
   if (store.getSettings().open_draft_prs !== 'true' || store.getSettings().github_sync !== 'true') return;
-  if (publishing.has(key) || t.pr_url && refresh.current(key)?.status !== 'rebased') return;
+  // A PR that exists is updated when the QA-approved commit changed (review fixes, desk updates, branch refresh).
+  if (publishing.has(key) || (t.pr_url && store.kvGet(`published:${key}`) === t.head_sha && refresh.current(key)?.status !== 'rebased')) return;
   publishing.add(key);
   try { await publishInner(t, key); } finally { publishing.delete(key); }
 }
@@ -908,14 +1019,20 @@ export async function ownerApprovePublish(key) {
   need(t && t.head_sha && store.kvGet(`guard:${key}`) === t.head_sha, 'nothing awaiting publish approval for this commit');
   store.kvSet(`guard:${key}`, ''); // one approval per parked commit
   store.addComment(key, 'owner', `✅ Publish approved for \`${t.head_sha.slice(0, 10)}\` despite the guard.`);
-  setStatus(key, 'ready_for_human', { resume_status: null, progress_msg: 'owner approved publish' });
+  const inReview = reviews.enabled() && t.review_stage === 'reviewing';
+  setStatus(key, inReview ? 'review' : 'ready_for_human', { resume_status: null, progress_msg: inReview ? 'owner approved publish — code review continues' : 'owner approved publish' });
   if (publishing.has(key)) return;
   publishing.add(key);
   try { await publishInner(store.getTicket(key), key, { ownerApproved: true }); } finally { publishing.delete(key); }
 }
 
 export function retryPublications() {
-  for (const t of store.ticketsByStatus('ready_for_human')) if (t.head_sha && (!t.pr_url || refresh.current(t.key)?.status === 'rebased')) publishBranch(t.key);
+  // Whenever GitHub may not have the QA-approved commit: no PR yet, the PR holds an older commit (approved PRs too),
+  // or an owner-triggered branch refresh passed QA and still has to be pushed.
+  for (const t of [...store.ticketsByStatus('ready_for_human'), ...store.ticketsByStatus('review')]) {
+    if (t.status === 'review' && !t.review_stage) continue;
+    if (t.head_sha && (!t.pr_url || store.kvGet(`published:${t.key}`) !== t.head_sha || refresh.current(t.key)?.status === 'rebased')) publishBranch(t.key);
+  }
 }
 
 async function publishInner(t, key, { ownerApproved = false } = {}) {
@@ -938,7 +1055,7 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     const reasons = guardReasons(files, lines, t.complexity);
     if (reasons.length) {
       store.addComment(key, 'system', `🛑 **Publish guard** — not pushed: ${reasons.join('; ')}.\nReview the branch locally (${runner.workspaceDir(key)}) and press "Approve publish" if it is safe.`);
-      setStatus(key, 'needs_human', { resume_status: 'ready_for_human', progress_msg: 'publish guard: needs owner approval' });
+      setStatus(key, 'needs_human', { resume_status: reviews.enabled() && t.review_stage === 'reviewing' ? 'review' : 'ready_for_human', progress_msg: 'publish guard: needs owner approval' });
       store.kvSet(`guard:${key}`, t.head_sha);
       return;
     }
@@ -953,8 +1070,9 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     if (!t.issue_number) await github.createIssue(key);
     await runner.pushBranch(key, t.branch, t.head_sha, { lease: refresh.current(key)?.remote_head });
     if (refresh.current(key)) refresh.published(key, t.head_sha);
-    store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch}` });
-    if (t.pr_url) return; // Update the existing PR; retain its discussion and review history.
+    store.kvSet(`published:${key}`, t.head_sha);
+    store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch} at ${t.head_sha.slice(0, 7)}` });
+    if (t.pr_url) { github.flushOutbox(); return; } // existing PR: the push updated it; its discussion and reviews stay
     const cs = store.listComments(key);
     const last = (prefix) => cs.filter((c) => c.body.startsWith(prefix)).pop()?.body.replace(/^[^\n]*\n*/, '') || '';
     const stack = await prsync.stackBaseFor(store.getTicket(key));
@@ -987,17 +1105,33 @@ export async function ownerRefreshBase(key, { expected_updated_at } = {}) {
   need(t?.head_sha && t.pr_url && ['needs_human', 'ready_for_human', 'todo'].includes(t.status), 'Refresh needs a submitted PR awaiting work or owner review');
   if (expected_updated_at && expected_updated_at !== t.updated_at) throw Object.assign(new Error('The ticket changed. Read it before refreshing.'), { status: 409 });
   if (t.active_run || store.unfinishedRuns().some((r) => r.ticket_key === key)) throw Object.assign(new Error('Wait for this ticket’s workers to finish before refreshing.'), { status: 409 });
+  need(!['merging', 'merge_unknown'].includes(t.review_stage) && !mergetrain.activeIntentFor(key), 'A merge of this PR is in progress or being confirmed with GitHub; wait for it to settle');
+  need(!store.conflictJobsFor(key).some((j) => ['pending', 'running'].includes(j.status)), 'The builder is resolving a merge conflict on this branch; wait for it to finish');
+  // The ticket reservation is taken before anything else (and before any await): no merge can start meanwhile.
+  const res = store.reserve(key, 'refresh', 'owner branch refresh');
+  if (!res.ok) throw Object.assign(new Error(`This PR is busy (${res.holder.note || res.holder.kind}); wait for it to finish.`), { status: 409 });
   store.updateTicket(key, { active_run: -1, status: 'needs_human', progress_msg: 'desk refreshing remote base' });
   try {
     if (store.getSettings().github_sync === 'true') await prs.assertRefreshable(prNumberOf(t.pr_url), t);
-    const r = await refresh.prepare(t);
+    const r = await refresh.prepare(t, { reservation: res.token });
     store.kvSet(`guard:${key}`, '');
     store.addComment(key, 'owner', `Approved desk-owned branch refresh. Original commit \`${r.original_head}\` preserved; remote lease \`${r.remote_head}\`; refreshed base \`${r.base}\`. Previous QA is historical. Final merge still requires owner review.`);
     store.addComment(key, 'system', refresh.instructions(r));
-    setStatus(key, 'todo', { active_run: null, head_sha: null, resume_status: null, stalls: 0, progress: 50, progress_msg: r.status === 'conflicts' ? 'refreshed — engineer resolving conflicts' : 'rebased — waiting for fresh tests and QA' });
+    // Same rule as the merge train: a rewritten branch voids QA and both reviewer approvals; the queue spot is kept.
+    store.transaction(() => {
+      store.supersedeReviews(key, null);
+      setStatus(key, 'todo', { active_run: null, head_sha: null, resume_status: null, stalls: 0, review_stage: null, merge_after: null,
+        reconfirm_from: null, reconfirm_kind: null, reconfirm_base: null, qa_sha: null,
+        progress: 50, progress_msg: r.status === 'conflicts' ? 'refreshed — engineer resolving conflicts' : 'rebased — waiting for fresh tests and QA' });
+    });
+    if (t.pr_url) {
+      store.enqueueOutbox(key, `${key}:refresh:${r.base}:${r.original_head}`, `🔄 **The owner refreshed this branch onto \`${config.project.baseBranch}\`** (\`${String(r.base).slice(0, 7)}\`). Earlier QA and both reviewer approvals no longer count: the engineer re-runs the tests, QA checks the new commit, and the reviewers look again before it can merge.\n\n<sub>SigmaDesk ${key}</sub>`);
+      github.flushOutbox();
+    }
     github.flushComments();
     return { ticket: store.getTicket(key), refresh: refresh.publicState(key) };
   } catch (err) {
+    if (refresh.current(key)?.reservation !== res.token) store.releaseReservation(key, res.token); // nothing to keep
     store.updateTicket(key, { active_run: null, status: t.status, progress_msg: `Branch refresh held: ${store.redact(err.message).slice(0, 160)}` });
     throw err;
   }
@@ -1015,6 +1149,7 @@ export function ownerReply(key, text, mode = 'auto', { expected_updated_at } = {
   if (!discussion && mode !== 'comment' && expected_updated_at && expected_updated_at !== t.updated_at)
     throw Object.assign(new Error('The question changed. Read the latest ticket before answering.'), { status: 409 });
   store.addComment(key, 'owner', text);
+  store.requeueOutbox(key); // an owner reply retries PR comments that had given up
   let request;
   if (discussion) {
     request = store.createDiscussion(key, String(text).slice(0, 8000));

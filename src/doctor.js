@@ -24,6 +24,16 @@ try { run('git', ['--version']); ok('git'); } catch { bad('git missing'); }
 
 if (config.github.sync) {
   try { run(config.bins.gh, ['auth', 'status']); ok(`gh authenticated · repo ${config.project.githubRepo || '(unknown)'}`); } catch { bad('gh not authenticated (gh auth login) — or set github.sync=false'); }
+  // The desk re-checks the base right before every merge, but only GitHub can make "CI ran on exactly what lands"
+  // atomic: branch protection with required status checks + "require branches to be up to date" (or a merge queue).
+  try {
+    const p = JSON.parse(run(config.bins.gh, ['api', `repos/${config.project.githubRepo}/branches/${config.project.baseBranch}/protection`]));
+    const rsc = p.required_status_checks;
+    if (!rsc) warn(`${config.project.baseBranch}: branch protection has no required status checks — merges are only as safe as the desk's own checks`);
+    else if (!rsc.strict) warn(`${config.project.baseBranch}: enable "Require branches to be up to date before merging" (or a merge queue) so a base move between the desk's check and the merge cannot slip in`);
+    else if (!(rsc.contexts?.length || rsc.checks?.length)) warn(`${config.project.baseBranch}: no required checks are listed in branch protection`);
+    else ok(`${config.project.baseBranch}: branch protection requires up-to-date branches and ${(rsc.checks || rsc.contexts).length} status check(s)`);
+  } catch { warn(`${config.project.baseBranch}: no branch protection (or no permission to read it) — enable required status checks + "require branches to be up to date"`); }
 } else warn('GitHub sync disabled');
 
 if (config.sandbox.enabled) {

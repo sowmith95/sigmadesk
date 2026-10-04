@@ -19,7 +19,7 @@ const mark = (k) => store.kvSet(`prsync:${k}`, '1');
 const prNumber = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 const trusted = (login) => (config.github.trustedAuthors || []).includes(login);
 // Comments the desk itself wrote (issue mirrors, PR bodies) must never loop back in as owner input.
-const isDeskText = (body) => /SigmaDesk|<!-- sigmadesk:/.test(String(body || ''));
+const isDeskText = (body) => /SigmaDesk|<!-- sigmadesk[:-]/.test(String(body || ''));
 
 export function trackedTickets() {
   return store.listTickets().filter((t) => t.pr_url && !TERMINAL.has(t.status) && prNumber(t.pr_url));
@@ -87,8 +87,8 @@ export async function landedElsewhere(t) {
     await git(['rev-parse', '--verify', ref]);
     const { stdout: url } = await pexec('git', ['-C', config.project.repoPath, 'remote', 'get-url', 'origin']);
     await git(['fetch', '-q', '--no-tags', url.trim(), `+refs/heads/${config.project.baseBranch}:refs/sigmadesk/main-now`]);
-    const { stdout: names } = await git(['diff', '--no-ext-diff', '--name-only', `refs/sigmadesk/main-now...${ref}`]);
-    const files = names.split('\n').filter(Boolean);
+    const { stdout: names } = await git(['diff', '--no-ext-diff', '--name-only', '-z', `refs/sigmadesk/main-now...${ref}`]);
+    const files = names.split('\0').filter(Boolean);
     if (!files.length) return true; // nothing left to merge
     await git(['diff', '--no-ext-diff', '--quiet', 'refs/sigmadesk/main-now', ref, '--', ...files]);
     return true; // exit 0: main has identical content for every file this PR touches

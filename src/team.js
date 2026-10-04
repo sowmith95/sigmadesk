@@ -103,8 +103,8 @@ export function permissionsFor(kind, cwd = '/nonexistent') {
   // With the OS sandbox on, it is the boundary: allow any shell command (deny rules still win). Without this,
   // dontAsk silently denies harmless commands Claude Code wants to confirm, e.g. anything with $(...).
   const extra = [...(config.project.extraAllowedBash || []), ...(config.sandbox.enabled && kind !== 'triage' ? ['Bash(*)'] : [])];
-  if (kind === 'implement') return { tools: TOOLSET.write, allow: [...READ_RULES, ...TEST_RULES, ...WRITE_RULES, ...writeRules(cwd), ...extra] };
-  if (kind === 'qa' || kind === 'review' || kind === 'investigate') return { tools: TOOLSET.read, allow: [...READ_RULES, ...TEST_RULES, ...extra] };
+  if (kind === 'implement' || kind === 'respond' || kind === 'resolve') return { tools: TOOLSET.write, allow: [...READ_RULES, ...TEST_RULES, ...WRITE_RULES, ...writeRules(cwd), ...extra] };
+  if (kind === 'qa' || kind === 'review' || kind === 'pr_review' || kind === 'investigate') return { tools: TOOLSET.read, allow: [...READ_RULES, ...TEST_RULES, ...extra] };
   if (kind === 'triage') return { tools: TOOLSET.triage, allow: ['Read', 'Grep', 'Glob', 'Bash(desk *)'] };
   if (kind === 'design') return { tools: TOOLSET.read, allow: [...READ_RULES, ...extra] };
   if (kind === 'research') return { tools: TOOLSET.research, allow: [...READ_RULES, 'WebSearch', 'WebFetch', ...extra] };
@@ -165,14 +165,16 @@ For consequential architecture, release policy, migration or repeated QA failure
   desk council --profile architecture|data|ux|security|delivery --reviewer MODEL --challenger MODEL "<precise decision>"
 Choose different model families and explain the task fit in the question. The principal/domain chair synthesizes; the deterministic coordinator enforces quota, capacity and budget. Do not change global seat preferences or request councils for routine S/M work. Councils never replace QA or owner merge approval.
 Then exactly one outcome:
-  desk groom <KEY> --complexity <S|M|L|XL> --area <backend|frontend|db|fullstack|infra> --priority <P0-P3> [--risk high] [--assign <seat>] <<'EOF'
+  desk groom <KEY> --complexity <S|M|L|XL> --area <backend|frontend|db|fullstack|infra> --priority <P0-P3> --risk <high|low> [--assign <seat>] <<'EOF'
   <refined spec: scope, files likely touched, acceptance criteria, test plan>
   EOF
   desk create-task --parent <KEY> --title "..." --complexity .. --area .. <<'EOF' ... EOF   (split; then reject the parent "split into ...")
   desk reject <KEY> "<reason>"   (duplicates, low value, ideas the playbook marks as dead)
 Routing when you don't --assign: db→dba; S→junior; M→senior (backend/frontend by area); L/XL or --risk high→principal,
 who designs it and slices it into S/M tasks for seniors and juniors (principals do not write code).
-Use --risk high for anything touching money, orders, auth, migrations or data deletion, whatever its size.
+Use --risk high for anything touching money, orders, auth, migrations, deploys or data deletion, whatever its size; --risk low
+only when it cannot. Always pass --risk: a ticket without a recorded risk is treated as high (never auto-merged).
+After QA, you review PRs as the context reviewer when no principal designed the work (desk review, see the prompt).
 Seats: principal-be, senior-be, principal-fe, senior-fe, dba, junior. Prefer S/M slices; XL usually means split.
 Tasks you create come back to you for acceptance review after QA: \`desk accept pass|changes "<notes>"\`.`,
   'principal-be': () => `You are Rowan, Principal Backend Engineer. You ARCHITECT and DELEGATE; you never write production code.
@@ -296,6 +298,63 @@ It was built by the team and passed QA. Inspect it with:
 Ticket thread (consults, QA notes):\n${fmtComments(comments)}\n
 Judge it against the intent you had when you asked for it. Do not modify code. Verdict, exactly one:
   desk accept pass --code ${t.nonce} "<why>"   |   desk accept changes --code ${t.nonce} "<numbered gaps>"`;
+    case 'pr_review': {
+      const x = extra; // { code, role, why, sha, author, thread, reconfirm }
+      if (x.reconfirm) {
+        const r = x.reconfirm;
+        return `${head}\nLIGHT RE-CONFIRM (${x.role} reviewer: ${x.why}). This change was already approved at ${r.from.slice(0, 10)}.
+Since then ${r.kind === 'rebase' ? `the desk brought it up to date with ${config.project.baseBranch} (git applied it cleanly)` : `${x.author} resolved a merge conflict with ${config.project.baseBranch}`}; QA re-ran on the new commit ${x.sha}.
+Only check that the approved change survived intact${r.kind === 'resolution' ? ' and that the conflict resolution keeps BOTH sides\' intent' : ''}. Do not re-review unchanged code.
+Range-diff (approved commits → current commits):
+${r.rangeDiff}
+${r.resolution ? `\nHow the conflicts were resolved (remerge-diff of the merge commit):\n${r.resolution}\n` : ''}${r.incoming ? `\nWhat came in from ${config.project.baseBranch} in the overlapping files:\n${r.incoming}\n` : ''}
+Your cwd is a read-only snapshot of ${x.sha}. Write for the owner, in plain language. Verdict, exactly one (never write the --code to a file):
+  desk review approve --code ${x.code} --checked "<what you compared>" --risks "<risks, or none>" "<1-2 sentences>"
+  desk review changes --code ${x.code} --findings '<JSON array>' "<1-2 sentences>"
+Findings JSON: [{"file":"path","line":1,"problem":"...","why_it_matters":"...","suggested_fix":"...","blocking":true}]`;
+      }
+      return `${head}\nCode review. ${x.author} built this change; it passed QA. You are the ${x.role === 'context' ? `CONTEXT reviewer (${x.why}): judge it against the design and intent you know` : `INDEPENDENT reviewer (${x.why}): you did not design or build it — look at it with fresh eyes`}.
+Your cwd is a read-only snapshot of exactly commit ${x.sha} (detached). Inspect it with:
+  git log --oneline origin/${config.project.baseBranch}..HEAD
+  git diff origin/${config.project.baseBranch}...HEAD
+Check correctness, edge cases, failure modes, tests, scope creep, and anything risky (money, orders, auth, data, deploys).
+Run tests if it helps. Do not edit, commit or push — nothing you change here is ever used.
+${x.thread ? `\nEarlier review conversation on this ticket (finding ids in brackets):\n${x.thread}\nIf the author pushed back and convinced you, approve and say so. A point you still hold must be raised again as a new finding.\n` : ''}
+Write for the owner, who will read your words on the GitHub PR: plain language, short, concrete. No jargon dumps.
+Verdict, exactly one (the --code proves it is your verdict — never write it to a file):
+  desk review approve --code ${x.code} --checked "<what you actually checked, concretely>" --risks "<risks you still see, or none>" "<2-4 sentence summary>"
+  desk review changes --code ${x.code} --findings '<JSON array>' "<2-4 sentence summary>"
+Findings JSON (or --findings @file.json): [{"file":"path/to/file.py","line":120,"problem":"what is wrong","why_it_matters":"the consequence","suggested_fix":"what would fix it","blocking":true}]
+Use blocking:false for suggestions that should not hold the merge. Request changes only for real problems.`;
+    }
+    case 'respond': {
+      const x = extra; // { findings, reviewer }
+      return `${head}\nCode review feedback on your change from ${x.reviewer}. You are on your branch ${t.branch} in your own clone.
+Open points (answer every blocking one; optional ones too if useful):
+${x.findings}
+
+For each point, exactly one:
+  - Agree: fix it, run the relevant tests, git commit, then  desk respond fixed --finding <ID> "<what you changed>"
+  - Disagree: desk respond pushback --finding <ID> "<why not, with evidence (file:line, test, ticket scope)>"
+Push back when the reviewer is wrong or the change is out of scope; do not fix things just to end the conversation.
+Do not push, rebase or amend. When every blocking point has an answer, finish with:
+  desk respond done "<one-paragraph summary for the reviewers>"
+If you committed fixes, QA re-checks them and both reviewers look again; if you only pushed back, the reviewer replies.`;
+    }
+    case 'resolve': {
+      const x = extra; // { pack, base }
+      return `${head}\nMerge conflict on your PR. Your cwd is a fresh clone of your PR branch where the desk has started
+merging the latest ${x.base}; git stopped on conflicts (see git status, the <<<<<<< markers, git diff).
+Context (keep it short; read more code only where you need it):
+
+${x.pack}
+
+Resolve every conflict so that BOTH your change and what landed on ${x.base} keep working. Keep the scope: do not
+refactor or add features. Run the relevant tests (the playbook says how). Then: git add <files> && git commit --no-edit
+(do not rebase, reset or push). Finish with exactly one:
+  desk resolve done "<plain-language summary: what conflicted and how you combined both sides>"
+  desk resolve stuck "<why only the owner can decide>"`;
+    }
     case 'rework':
       return `Your work on ${t.key} came back. Latest review notes:\n\n${extra}\n\nYou are in the same clone and branch as before.
 Fix every numbered item, re-run the relevant tests, commit, and finish with: desk submit "<what you changed for each note>".`;

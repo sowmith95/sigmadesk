@@ -58,7 +58,7 @@ export function createIssue(ticketKey) {
       .find((i) => (i.body || '').includes(`<!-- sigmadesk:${t.key} -->`));
     if (existing) { store.updateTicket(t.key, { issue_number: existing.number }); return existing.number; }
     const labels = [LABEL, STATUS_LABELS[t.status], ROLE_LABEL(t.assignee)].filter(Boolean);
-    const url = await gh(['issue', 'create', '-R', config.project.githubRepo, '--title', `[${t.key}] ${t.title}`, '--body', issueBody(t), ...labels.flatMap((l) => ['--label', l])]);
+    const url = await gh(['issue', 'create', '-R', config.project.githubRepo, '--title', `[${t.key}] ${t.title}`, '--body', store.sanitizeForGithub(issueBody(t)), ...labels.flatMap((l) => ['--label', l])]);
     const num = Number(url.match(/\/issues\/(\d+)/)?.[1]);
     if (num) {
       store.updateTicket(t.key, { issue_number: num });
@@ -88,8 +88,58 @@ export function flushComments() {
     for (const c of store.unsyncedComments()) {
       const who = agentById[c.author] ? `${agentById[c.author].name} · ${agentById[c.author].role}` : c.author;
       store.markCommentSynced(c.id); // at-most-once: a crash mid-post loses one mirror comment instead of duplicating it
-      await gh(['issue', 'comment', String(c.issue_number), '-R', config.project.githubRepo, '--body', `**${who}** · SigmaDesk ${c.ticket_key}\n\n${c.body}`]);
+      await gh(['issue', 'comment', String(c.issue_number), '-R', config.project.githubRepo, '--body', store.sanitizeForGithub(`**${who}** · SigmaDesk ${c.ticket_key}\n\n${c.body}`)]);
     }
+  });
+}
+
+// Two-reviewer PR conversation: a durable outbox. A row is marked sent only after GitHub returned the comment id.
+// Each body carries a hidden marker, so a retry after a crash between "posted" and "recorded" adopts the existing
+// comment instead of posting a duplicate.
+export const OUTBOX_MAX_ATTEMPTS = 8;
+export const outboxMarker = (marker) => `<!-- sigmadesk-review:${marker} -->`;
+export function flushOutbox() {
+  if (!enabled()) return Promise.resolve(0);
+  return enqueue('PR review comments', async () => {
+    let sent = 0;
+    for (const o of store.pendingOutbox()) {
+      const n = Number(String(o.pr_url).match(/\/pull\/(\d+)/)?.[1]);
+      if (!n) continue;
+      const marker = outboxMarker(o.marker);
+      const path = `repos/${config.project.githubRepo}/issues/${n}/comments`;
+      try {
+        let id = '';
+        if (o.attempts > 0) {
+          const found = await gh(['api', path, '--paginate', '--jq', `.[] | select(.body | contains(${JSON.stringify(marker)})) | .id`]);
+          id = found.split('\n').map((x) => x.trim()).filter(Boolean)[0] || '';
+        }
+        if (!id) {
+          store.updateOutbox(o.id, { attempts: o.attempts + 1 });
+          id = (await gh(['api', '-X', 'POST', path, '-f', `body=${store.sanitizeForGithub(o.body)}\n\n${marker}`, '--jq', '.id'])).trim();
+        }
+        if (!id) throw new Error('GitHub returned no comment id');
+        store.transaction(() => {
+          store.updateOutbox(o.id, { status: 'sent', gh_comment_id: id, sent_at: store.now(), last_error: null, next_attempt_at: null });
+          if (o.review_id) store.updatePrReview(o.review_id, { published_comment_id: id });
+        });
+        sent += 1;
+      } catch (err) {
+        const why = String(err.stderr || err.message).slice(0, 300);
+        // Every failed try counts, including the duplicate-lookup step, so a broken lookup also backs off and escalates.
+        const tries = Math.max(store.listOutbox(o.ticket_key).find((x) => x.id === o.id)?.attempts || 0, o.attempts + 1);
+        store.updateOutbox(o.id, { attempts: tries });
+        if (tries >= OUTBOX_MAX_ATTEMPTS) {
+          store.updateOutbox(o.id, { status: 'dead', last_error: why });
+          store.addComment(o.ticket_key, 'system', `🚨 A review comment could not be posted to the PR after ${tries} tries (${why.slice(0, 160)}). Merging stays blocked until it is on the PR; reply here to retry, or merge with an override reason.`);
+          store.logEvent({ kind: 'error', ticket_key: o.ticket_key, agent_id: 'github', text: `PR comment gave up after ${tries} tries: ${why.slice(0, 200)}` });
+        } else {
+          const waitMin = Math.min(60, 2 ** Math.max(0, tries - 1));
+          store.updateOutbox(o.id, { status: 'failed', last_error: why, next_attempt_at: new Date(Date.now() + waitMin * 60_000).toISOString() });
+          store.logEvent({ kind: 'github', ticket_key: o.ticket_key, agent_id: 'github', text: `PR comment not posted yet (retry in ${waitMin} min): ${why.slice(0, 200)}` });
+        }
+      }
+    }
+    return sent;
   });
 }
 
@@ -99,10 +149,11 @@ export function openDraftPr(ticketKey, summary, { base = config.project.baseBran
     if (!t?.branch || t.pr_url) return t?.pr_url;
     const open = JSON.parse(await gh(['pr', 'list', '-R', config.project.githubRepo, '--head', t.branch, '--state', 'all', '--json', 'url', '--limit', '1']));
     if (open[0]?.url) { store.updateTicket(t.key, { pr_url: open[0].url }); return open[0].url; }
-    const body = `${summary}\n\n${t.issue_number ? `Closes #${t.issue_number}\n\n` : ''}---\nBuilt by **${agentById[t.assignee]?.name || 'SigmaDesk'} (${agentById[t.assignee]?.role || 'engineer'})**, independently checked by QA at \`${String(t.head_sha || '').slice(0, 10)}\`. Draft — needs human review before merge.\n\n_Opened by [SigmaDesk](https://github.com/${config.project.githubOwner})._`;
-    const url = await gh(['pr', 'create', '-R', config.project.githubRepo, '--draft', '--base', base, '--head', t.branch, '--title', `[${t.key}] ${t.title}`, '--body', body]);
+    const body = `${summary}\n\n${t.issue_number ? `Closes #${t.issue_number}\n\n` : ''}---\nBuilt by **${agentById[t.assignee]?.name || 'SigmaDesk'} (${agentById[t.assignee]?.role || 'engineer'})**, independently checked by QA at \`${String(t.head_sha || '').slice(0, 10)}\`. ${Number(config.review.required) > 0 ? 'Two desk reviewers review it next; their comments appear below.' : 'Needs human review before merge.'}\n\n_Opened by [SigmaDesk](https://github.com/${config.project.githubOwner})._`;
+    const draft = store.getSettings().draft_prs === 'true';
+    const url = await gh(['pr', 'create', '-R', config.project.githubRepo, ...(draft ? ['--draft'] : []), '--base', base, '--head', t.branch, '--title', `[${t.key}] ${t.title}`, '--body', store.sanitizeForGithub(body)]);
     store.updateTicket(t.key, { pr_url: url.split('\n').pop() });
-    store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: `opened draft PR ${url}` });
+    store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: `opened ${draft ? 'draft ' : ''}PR ${url}` });
     return url;
   }, ticketKey);
 }

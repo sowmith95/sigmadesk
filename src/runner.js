@@ -250,11 +250,12 @@ export async function stageApproved(key, cloneDir, sha) {
     await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', cloneDir, `+${sha}:refs/sigmadesk/${key}`]);
     const { stdout: got } = await git(['-C', pub, 'rev-parse', `refs/sigmadesk/${key}`]);
     if (got.trim() !== sha) throw new Error('fetched commit does not match the approved SHA');
-    const { stdout: names } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--name-only', `refs/sigmadesk/base...${sha}`]);
+    // -z: never let git quote/escape a path (a quoted ".github/…\t.yml" would slip past the risk classifier and guard)
+    const { stdout: names } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--name-only', '-z', `refs/sigmadesk/base...${sha}`]);
     const { stdout: stat } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--shortstat', `refs/sigmadesk/base...${sha}`]);
     const lines = Number(stat.match(/(\d+) insertion/)?.[1] || 0) + Number(stat.match(/(\d+) deletion/)?.[1] || 0);
     const { stdout: baseSha } = await git(['-C', pub, 'rev-parse', 'refs/sigmadesk/base']);
-    return { files: names.split('\n').filter(Boolean), lines, baseSha: baseSha.trim() };
+    return { files: names.split('\0').filter(Boolean), lines, baseSha: baseSha.trim() };
   });
 }
 export function pushBranch(key, branch, sha, { lease } = {}) {
@@ -330,10 +331,14 @@ function childEnv(token, engine) {
 export const engineOf = (seat) => ENGINES[seat?.engine || 'claude'] || ENGINES.claude;
 
 export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath } = {}) {
-  return engineOf(agent).command({
+  const cmd = engineOf(agent).command({
     seat: agent, kind, cwd, resume, fork, extraDirs,
     perms: permissionsFor(kind, cwd), denyRules: DENY_RULES, charter: kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.' : kind==='product_review'?productReviewCharter(agent.id):charterFor(agent.id), settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
   });
+  // Conflict resolutions get their own hard spend cap (merge train, #3).
+  const capAt = kind === 'resolve' ? cmd.args.indexOf('--max-budget-usd') : -1;
+  if (capAt >= 0) cmd.args[capAt + 1] = String(Math.min(Number(cmd.args[capAt + 1]) || Infinity, Number(config.resolve?.budgetUsd) || 1.5));
+  return cmd;
 }
 
 // Provenance: which charter/playbook/engine/model produced this run, so scorecards can be split by version.
@@ -622,4 +627,110 @@ async function consultInner({ agentId, ticketKey, question }) {
     store.updateAgent(agentId, { meeting: null });
     if (!store.getAgentState(agentId)?.current_run) store.updateAgent(agentId, { status: 'idle', current_ticket: null });
   }
+}
+
+// ---------------- review snapshots (two-reviewer PRs) ----------------
+// A reviewer never works in the author's writable clone: it gets a fresh checkout of exactly the reviewed commit,
+// built from the desk-owned publisher repo (stageApproved must have fetched that commit first).
+export const reviewSnapshotDir = (key, seat) => path.join(config.workspaceRoot, `_review-${key}-${seat}`);
+export function reviewSnapshot(key, seat, sha) {
+  if (!/^[0-9a-f]{40}$/.test(String(sha))) return Promise.reject(new Error('review snapshot needs a full commit SHA'));
+  if (!/^[A-Za-z0-9-]+$/.test(`${key}${seat}`)) return Promise.reject(new Error('invalid review snapshot name'));
+  return withGitLock(async () => {
+    const pub = await publisher();
+    const dir = reviewSnapshotDir(key, seat);
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    const base = config.project.baseBranch;
+    await git(['init', '-q', dir]);
+    await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', dir, 'fetch', '-q', '--no-tags', pub,
+      `+refs/sigmadesk/${key}:refs/heads/sigmadesk-review`, `+refs/sigmadesk/base:refs/remotes/origin/${base}`]);
+    const { stdout: got } = await git(['-C', dir, 'rev-parse', 'refs/heads/sigmadesk-review']);
+    if (got.trim() !== sha) throw new Error(`review snapshot is at ${got.trim().slice(0, 7)}, expected ${sha.slice(0, 7)}`);
+    await git([...SAFE, '-C', dir, 'checkout', '-q', '--detach', sha]);
+    return dir;
+  });
+}
+export function removeReviewSnapshot(key, seat) {
+  const dir = reviewSnapshotDir(key, seat);
+  if (dir.startsWith(config.workspaceRoot) && fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// ---------------- merge train helpers (#3): desk-owned git only ----------------
+export const originUrl = async () => (await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }))).stdout.trim();
+/** Run git commands in the desk-owned publisher repo under the git lock. pgit resolves {code, stdout, stderr}. */
+export function withPublisher(fn) {
+  return withGitLock(async () => {
+    const pub = await publisher();
+    const pgit = (args, opts = {}) => git([...SAFE, '-c', 'protocol.file.allow=always', '-C', pub, ...args], { timeout: 120_000, ...opts })
+      .then((r) => ({ code: 0, stdout: r.stdout, stderr: r.stderr }), (e) => ({ code: typeof e.code === 'number' ? e.code : 128, stdout: e.stdout || '', stderr: e.stderr || e.message }));
+    return fn(pgit, pub);
+  });
+}
+const DESK_ID = ['-c', 'user.name=SigmaDesk', '-c', 'user.email=sigmadesk@localhost', '-c', 'commit.gpgsign=false'];
+/** A fresh desk-built clone at workspaces/_<name>, holding the given publisher refs; copyPaths cloned in for tests. */
+export function scratchClone(name, refspecs) {
+  if (!/^[A-Za-z0-9-]+$/.test(name)) return Promise.reject(new Error('invalid scratch name'));
+  return withGitLock(async () => {
+    const pub = await publisher();
+    const dir = path.join(config.workspaceRoot, `_${name}`);
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    await git(['init', '-q', dir]);
+    await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', dir, 'fetch', '-q', '--no-tags', pub, ...refspecs]);
+    return dir;
+  }).then(async (dir) => { await copyPathsInto(dir); return dir; });
+}
+async function copyPathsInto(dir) {
+  for (const p of config.project.copyPaths) {
+    const src = path.join(config.project.repoPath, p); const dst = path.join(dir, p);
+    if (!fs.existsSync(src) || fs.existsSync(dst)) continue;
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    await pexec('cp', os.platform() === 'darwin' ? ['-cR', src, dst] : ['-R', '--reflink=auto', src, dst], { timeout: 600_000 }).catch(() => pexec('cp', ['-R', src, dst], { timeout: 600_000 }));
+  }
+}
+/** git in a desk scratch clone (desk identity, no hooks); resolves {code, stdout, stderr}. */
+export const scratchGit = (dir, args, opts = {}) => git([...SAFE, ...DESK_ID, '-C', dir, ...args], { timeout: 300_000, ...opts })
+  .then((r) => ({ code: 0, stdout: r.stdout, stderr: r.stderr }), (e) => ({ code: typeof e.code === 'number' ? e.code : 128, stdout: e.stdout || '', stderr: e.stderr || e.message }));
+/** Fetch a commit out of a clone into the publisher (refs/sigmadesk/<key>) without trusting the clone's config. */
+export async function fetchIntoPublisher(key, dir, sha) {
+  return withGitLock(async () => {
+    const pub = await publisher();
+    await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', dir, `+${sha}:refs/sigmadesk/${key}`]);
+  });
+}
+/** Point the ticket's own clone at `sha` (after a desk rebase or a resolution) so QA tests exactly that commit. */
+export async function syncWorkspace(ticket, sha) {
+  // Never discard a seat's uncommitted edits: a dirty clone is moved aside (kept) and a fresh one is made.
+  const existing = workspaceDir(ticket.key);
+  if (fs.existsSync(path.join(existing, '.git'))) {
+    const dirty = await git([...SAFE, '-C', existing, 'status', '--porcelain', '--untracked-files=no']).then((r) => r.stdout.trim(), () => 'unknown');
+    if (dirty) {
+      const backup = `${existing}-backup-${Date.now()}`;
+      fs.renameSync(existing, backup);
+      store.logEvent({ kind: 'system', ticket_key: ticket.key, text: `uncommitted edits preserved in ${backup} before the desk updated the clone` });
+    }
+  }
+  const { dir, branch } = await ensureWorkspace(ticket);
+  await withGitLock(async () => {
+    const pub = await publisher();
+    await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', dir, 'fetch', '-q', '--no-tags', pub, `+refs/sigmadesk/${ticket.key}:refs/sigmadesk/synced`]);
+    await git([...SAFE, '-C', dir, 'checkout', '-q', '-B', branch, sha]);
+    await git([...SAFE, '-C', dir, 'reset', '-q', '--hard', sha]);
+    await git([...SAFE, '-C', dir, 'clean', '-qfd']);
+  });
+  return dir;
+}
+export const removeScratch = (name) => { const dir = path.join(config.workspaceRoot, `_${name}`); if (dir.startsWith(config.workspaceRoot)) fs.rmSync(dir, { recursive: true, force: true }); };
+/** The branch head on the owner's remote right now (null if missing), for a last base-freshness check. */
+export async function remoteHead(branch) {
+  const url = await originUrl();
+  if (!url) return null;
+  const { stdout } = await git(['ls-remote', url, `refs/heads/${branch}`], { timeout: 60_000 });
+  return stdout.split('\t')[0].trim() || null;
+}
+/** Does this seat's engine enforce a hard per-run spend cap for a resolve run? (Claude CLI: --max-budget-usd.) */
+export function capsSpend(seat) {
+  if (!seat) return false;
+  try { return buildCommand(seat, 'resolve', path.join(config.workspaceRoot, '_cap-probe')).args.includes('--max-budget-usd'); } catch { return false; }
 }

@@ -48,9 +48,31 @@ without you.
   models spend tokens on decisions, cheaper models on typing.
 - **Planning meetings are real.** The manager calls `desk consult principal-be "…"`, which runs the principal on the
   spot; the answer lands in the ticket thread for every later seat to read.
-- **Requesters review their own asks.** After QA (correctness), the PM / manager / SRE who asked for the work does an
-  acceptance review (intent). Rework resumes the engineer's own Claude session in the same clone, so it remembers what
-  it tried.
+- **Two independent reviewers on every PR.** After QA passes, the draft PR is published and reviewed twice, in order, on
+  the exact QA-passed commit: first by the principal who designed/sliced the work (else the Engineering Manager), then
+  by an independent senior or principal who neither built nor designed it (preferably on another engine). Each
+  approval says what was checked; change requests are numbered findings (file:line, why it matters, suggested fix).
+  The author fixes (new commit → QA again → both approvals void) or pushes back with reasons (the same reviewer
+  re-reviews). Every verdict and reply is posted on the PR in plain language. After two approvals the desk merges
+  low-risk work itself (outside the busy window, CI green); anything high-risk or unclassified waits for you. After
+  `review.maxRounds` change requests the owner gets a summary of the disagreement. Set `review.required: 0` for the
+  older requester acceptance review instead.
+- **A merge train, not a merge button.** PRs open as normal (non-draft) PRs (`github.draftPrs: false`). Approved PRs
+  merge one at a time, oldest approval first, slices after their predecessor. Only high-risk work waits for you. A PR
+  whose files trigger a deploying workflow (`deploy.workflows`: `"auto"` reads every workflow's `on.push`
+  branches/paths filters, `!` exclusions included; or list the files that deploy — unreadable counts as deploying) is
+  scheduled for the end of the busy window instead of merging during market hours ("Merges automatically at 4:15 PM
+  ET"; Hold / Merge now from the PR page), and the next deploying merge waits until that merge's deploy run finished
+  (failure or `deploy.waitMinutes` → you). Every minute the desk fetches the base and every open PR head and runs a free
+  `git merge-tree`: only the queue front is rebased (desk-side, `--force-with-lease`, then QA plus a light reviewer
+  re-confirm with a range-diff); a real conflict becomes a durable resolve job for the engineer who built the PR — a
+  fresh, budget-capped run (`resolve.budgetUsd`, session resume off by default) in an isolated clone with a compact
+  conflict pack — followed by QA and both reviewers re-confirming the resolution. Each step is posted on the PR.
+  Merges fail closed: every merge (desk or owner) takes the deploy lock first when it redeploys, persists its intent
+  before calling GitHub, and re-checks halt / stop-all / Hold / risk / window / lock / base freshness immediately before
+  the merge call. The desk can only narrow the gap between "CI read" and "merged"; to make it atomic, protect the base
+  branch with required status checks and "Require branches to be up to date before merging" (or a merge queue) —
+  `npm run doctor` warns when that is missing.
 - **On-call SRE.** A deterministic watcher (no LLM) tails Loki / docker / files, fingerprints errors, and wakes the SRE
   only for new or chronic signatures. The SRE files a root-caused bug, mutes noise, or pages you. Error storms become
   one page, not fifty tickets. A fixed signature that comes back reopens as a regression.
@@ -270,7 +292,8 @@ Everything lives in `sigmadesk.config.json` (gitignored). See `sigmadesk.config.
 | `team.<seat>` | Override `name`, `model`, `enabled`, `charter` per seat. |
 | `limits.*` | Concurrency, busy window, daily budget, per-run budgets, timeouts. |
 | `engines.perplexity.*` | Context-pack cap (`contextMaxChars`), remote wait for pending threads, follow-up rounds. |
-| `review.*` | Acceptance reviews, requester session resume (opt-in), rework session resume. |
+| `review.*` | Two-reviewer PRs (`required`, `independentSeats`, `maxRounds`, `autoMerge`, `riskPaths`, `ci`), legacy acceptance reviews, session resume. `ci: "auto"` lets a PR with no checks merge only when the repo has no Actions workflows; skipped/neutral-only checks never count as a pass. Every merge (yours or the desk's) needs the exact head SHA, green CI, known mergeability, the configured base branch, and two approvals at that commit — you can override the approvals with a reason that is posted on the PR. |
+| `deploy.*`, `mergeTrain.*`, `resolve.*` | Which workflows deploy, how long to wait for a deploy, the lazy update of the queue front, the conflict-resolution budget and resume policy. |
 | `watch.*` | Log sources (`loki` / `docker` / `file`), thresholds, storm and regression handling. |
 | `pm.*` | PM persona, competitors to study, cadence. |
 | `sandbox.*` | Extra allowed domains (e.g. a package registry) and paths to keep unreadable. |
