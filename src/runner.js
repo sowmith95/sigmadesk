@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { config } from './config.js';
+import { config, publisherPath } from './config.js';
 import { agentById, charterFor, permissionsFor, promptFor, DENY_RULES } from './team.js';
 import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
@@ -214,7 +214,7 @@ export async function commitsAhead(dir) {
 // FETCHES objects out of a clone into a bare repo the desk owns, computes the guard diff there against the OWNER's
 // base commit, and pushes from there. No git command ever runs with a clone's config.
 const SAFE = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'diff.external=', '-c', 'core.sshCommand=ssh'];
-const publisherDir = () => path.join(config.dataDir, 'publisher.git');
+const publisherDir = () => publisherPath();
 async function publisher() {
   const dir = publisherDir();
   if (!fs.existsSync(path.join(dir, 'HEAD'))) await git(['init', '-q', '--bare', dir]);
@@ -388,7 +388,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const pplx = engine.id === 'perplexity' && engine.supports?.(kind);
   const px = context.packSettings();
   // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
-  const timeoutMin = Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.remoteWaitMinutes * (1 + px.followupRounds) + 10 : 0);
+  // Covers the first answer, follow-ups and every permitted page round (bounded by engines.perplexity.maxRunMinutes).
+  const timeoutMin = Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0);
   const deadlineAt = Date.now() + timeoutMin * 60_000;
   if (!pplx) return spawnChild();
 

@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { config } from './config.js';
+import { config, publisherPath } from './config.js';
 import * as store from './db.js';
 
 const pexec = promisify(execFile);
@@ -80,7 +80,7 @@ export function planActions(t, pr) {
 // Checked in the desk-owned publisher repo; never in an agent clone.
 const SAFE = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'diff.external='];
 export async function landedElsewhere(t) {
-  const pub = path.join(config.root, 'data', 'publisher.git');
+  const pub = publisherPath();
   const ref = `refs/sigmadesk/${t.key}`;
   const git = (args) => pexec('git', [...SAFE, '-C', pub, ...args], { timeout: 120_000, maxBuffer: 16 << 20 });
   try {
@@ -197,7 +197,7 @@ export async function closePr(pr, comment) {
 // that PR's branch (so it shows only its own changes) instead of duplicating them against the base branch.
 export async function stackBaseFor(t) {
   if (!t?.head_sha) return null;
-  const pub = path.join(config.root, 'data', 'publisher.git');
+  const pub = publisherPath();
   const git = (args) => pexec('git', [...SAFE, '-C', pub, ...args], { timeout: 60_000 });
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).then(() => true, () => false);
   const candidates = store.listTickets().filter((u) => u.key !== t.key && u.head_sha && u.branch && u.pr_url && !TERMINAL.has(u.status));

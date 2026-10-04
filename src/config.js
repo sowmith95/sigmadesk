@@ -126,6 +126,7 @@ const DEFAULTS = {
       prepareDeadlineSeconds: 45, // total time to build a pack (git work is cancelled after this; the run is refused)
       pageChars: 0, // max size of one `desk context-file` page; 0 = contextMaxChars - relayReserveChars
       pageRounds: 6, // follow-ups that only carry requested file pages
+      maxRunMinutes: 90, // cap on a Perplexity run's timeout; fewer page rounds are allowed if the cap is lower
       secretPatterns: [], // extra high-confidence secret formats (regex strings) that stop a run, e.g. a broker's key shape
     },
   },
@@ -210,6 +211,9 @@ export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT
 
 export const config = loadConfig();
 
+// The desk-owned bare repo (publishing, PR reconciliation, context packs). Always under dataDir.
+export const publisherPath = (c = config) => path.join(c.dataDir, 'publisher.git');
+
 // A shell wrapper that injects --dangerously-skip-permissions / --add-dir / would silently void the sandbox.
 export function wrapperProblem(bin) {
   try {
@@ -240,6 +244,7 @@ export function validateConfig(c = config) {
   if (!(Number.isInteger(px.pageRounds) && px.pageRounds >= 1 && px.pageRounds <= 20)) problems.push('engines.perplexity.pageRounds must be 1-20');
   if (!(px.pageChars === 0 || (px.pageChars >= 2000 && px.pageChars <= px.contextMaxChars))) problems.push('engines.perplexity.pageChars must be 0 or between 2000 and contextMaxChars');
   for (const src of px.secretPatterns || []) { try { new RegExp(src); } catch { problems.push(`engines.perplexity.secretPatterns: invalid regex ${src}`); } }
+  if (!(px.maxRunMinutes >= 15 && px.maxRunMinutes <= 240)) problems.push('engines.perplexity.maxRunMinutes must be between 15 and 240');
   if (!(px.prepareDeadlineSeconds >= 5 && px.prepareDeadlineSeconds <= 300)) problems.push('engines.perplexity.prepareDeadlineSeconds must be between 5 and 300');
   if (!(Number.isInteger(px.followupRounds) && px.followupRounds >= 0 && px.followupRounds <= 3)) problems.push('engines.perplexity.followupRounds must be 0-3');
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');
