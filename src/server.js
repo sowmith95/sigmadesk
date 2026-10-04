@@ -154,6 +154,8 @@ async function ownerRoute(req, res) {
 
   if (req.method === 'POST' && p === '/api/tickets') return send(res, 201, sched.ownerCreate(await readBody(req)));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/merge-hold$'))) { const b = await readBody(req); return send(res, 200, mergetrain.setHold(mm[1], b.hold !== false, b.reason)); }
+  if (req.method === 'GET' && p === '/api/ci/required-checks') return send(res, 200, { ...prs.requiredChecks(), history: JSON.parse(store.kvGet('ci:history') || '[]') });
+  if (req.method === 'POST' && p === '/api/ci/required-checks') return send(res, 200, prs.setRequiredChecks((await readBody(req)).names || [], 'owner'));
   if (req.method === 'POST' && p === '/api/merge-train/clear-deploy') return send(res, 200, { cleared: mergetrain.clearDeployLock('owner') });
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/approve-publish$'))) { await sched.ownerApprovePublish(mm[1]); return send(res, 200, { ok: true }); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/name$'))) {

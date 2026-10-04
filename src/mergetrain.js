@@ -20,6 +20,7 @@ import * as github from './github.js';
 import * as prs from './prs.js';
 import * as workflows from './workflows.js';
 import * as reviews from './reviews.js';
+import crypto from 'node:crypto';
 import { notify } from './notify.js';
 // Circular on purpose: only used at call time.
 import { setStatus, inBusyWindow, guardReasons } from './scheduler.js';
@@ -83,45 +84,73 @@ export async function deployInfo(t) {
 }
 
 // ---------------- deploy lock: one deploying merge at a time ----------------
+// A lock names the merge commit and the deploying workflow FILES expected to run for it. Deploying merges observed
+// while a lock is held are queued (never forgotten) and take the lock in order.
 const lockGet = () => { try { return JSON.parse(store.kvGet('train:deploy') || 'null'); } catch { return null; } };
 const lockSet = (v) => store.kvSet('train:deploy', v ? JSON.stringify(v) : 'null');
+const kvList = (k) => { try { return JSON.parse(store.kvGet(k) || '[]') || []; } catch { return []; } };
+export const pendingDeploys = () => kvList('train:deploy-pending');
+/** Take the lock now, or queue behind the current one. */
+export function queueDeploy(entry) {
+  const l = lockGet();
+  if (!l) { lockSet(entry); return 'locked'; }
+  const pending = pendingDeploys();
+  if (entry.merge_sha && (l.merge_sha === entry.merge_sha || pending.some((p) => p.merge_sha === entry.merge_sha))) return 'known';
+  store.kvSet('train:deploy-pending', JSON.stringify([...pending, entry].slice(-50)));
+  return 'queued';
+}
+function releaseLock() {
+  const l = lockGet();
+  if (l?.merge_sha) store.kvSet('train:deploy-released', JSON.stringify([...kvList('train:deploy-released'), l.merge_sha].slice(-30)));
+  const released = new Set(kvList('train:deploy-released'));
+  const pending = pendingDeploys().filter((p) => !released.has(p.merge_sha));
+  const next = pending.shift() || null;
+  store.kvSet('train:deploy-pending', JSON.stringify(pending));
+  lockSet(next);
+  return next;
+}
 export function clearDeployLock(by = 'owner') {
   const l = lockGet();
-  lockSet(null);
-  store.logEvent({ kind: 'action', agent_id: by, ticket_key: l?.key || null, text: `deploy lock cleared${l ? ` (was ${l.state} for ${l.key})` : ''}` });
+  releaseLock();
+  store.logEvent({ kind: 'action', agent_id: by, ticket_key: l?.key || null, text: `deploy lock cleared${l ? ` (was ${l.state} for ${l.key || l.merge_sha})` : ''}` });
   return l;
 }
 /**
- * null when no deploy is in flight; otherwise the lock (refreshed from GitHub's workflow runs). The lock is released
- * ONLY when every expected deploy workflow for the merge commit completed successfully. A missing, failed or unknown
- * deploy keeps it locked; after deploy.waitMinutes the owner is asked (state "escalated" / "failed").
+ * null when no deploy is in flight; otherwise the lock (refreshed from GitHub's workflow runs). Released ONLY when
+ * every expected deploy workflow file has a run for the merge commit that completed successfully. Unknown expected
+ * workflows, a missing run, a failure or an unreadable GitHub keep it locked; after deploy.waitMinutes the owner is
+ * asked (state "escalated" / "failed").
  */
-export async function deployLock(now = new Date()) {
+export async function deployLock(now = new Date(), depth = 0) {
   const l = lockGet();
   if (!l) return null;
   if (l.state !== 'running') return l; // merging (intent in flight), failed, escalated: only reconcile / the owner clears
   const age = (now.getTime() - Date.parse(l.at)) / 60_000;
   let runs = null;
   if (l.merge_sha) { try { runs = await prs.runsForCommit(l.merge_sha); } catch { runs = null; } }
-  const expected = (l.workflows || []).length ? l.workflows : [...new Set((runs || []).map((r) => r.workflowName))];
-  const latest = (name) => (runs || []).filter((r) => r.workflowName === name).sort((a, b) => (b.databaseId || 0) - (a.databaseId || 0))[0];
-  const states = expected.map((name) => ({ name, run: latest(name) }));
+  const expected = l.workflows || [];
+  const latest = (file) => (runs || []).filter((r) => r.path === file).sort((a, b) => (b.id || 0) - (a.id || 0))[0];
+  const states = expected.map((file) => ({ file, run: latest(file) }));
   const failed = states.filter((x) => x.run?.status === 'completed' && String(x.run.conclusion).toLowerCase() !== 'success');
   const t = l.key ? store.getTicket(l.key) : null;
+  const label = (file) => file.split('/').pop();
   const tell = (marker, text) => {
-    if (t) say(t, marker, text, l.merge_sha); else store.logEvent({ kind: 'error', agent_id: 'github', text: text.replace(/\*\*/g, '') });
-    if (t) notify('needs_human', t, 'deploy needs you');
+    if (t) { say(t, marker, text, l.merge_sha); notify('needs_human', t, 'deploy needs you'); }
+    else store.logEvent({ kind: 'error', agent_id: 'github', text: text.replace(/\*\*/g, '') });
   };
   if (failed.length) {
-    const next = { ...l, state: 'failed', note: failed.map((x) => `${x.name}: ${x.run.conclusion}`).join(', ') };
+    const next = { ...l, state: 'failed', note: failed.map((x) => `${label(x.file)}: ${x.run.conclusion}`).join(', ') };
     lockSet(next);
     tell(`deploy-failed:${l.merge_sha}`, `🚨 **The deploy after this merge failed** (${next.note}). SigmaDesk will not merge anything else that redeploys until you check it and clear the deploy hold.`);
     return next;
   }
-  if (runs && expected.length && states.every((x) => x.run?.status === 'completed')) { lockSet(null); return null; }
+  if (runs && expected.length && states.every((x) => x.run?.status === 'completed')) {
+    releaseLock();
+    return depth < 5 ? deployLock(now, depth + 1) : lockGet();
+  }
   if (age > (Number(config.deploy?.waitMinutes) || 45)) {
     const missing = !l.merge_sha ? ['the merge commit is unknown'] : runs == null ? ['GitHub runs could not be read']
-      : !expected.length ? ['no deploy run appeared'] : states.filter((x) => x.run?.status !== 'completed').map((x) => `${x.name} ${x.run ? x.run.status : 'never started'}`);
+      : !expected.length ? ['which workflows deploy is unknown'] : states.filter((x) => x.run?.status !== 'completed').map((x) => `${label(x.file)} ${x.run ? x.run.status : 'never started'}`);
     const next = { ...l, state: 'escalated', note: missing.join(', ') };
     lockSet(next);
     tell(`deploy-timeout:${l.merge_sha || l.at}`, `⏳ **The deploy after this merge has not finished in ${Math.round(age)} minutes** (${next.note}). SigmaDesk is holding further deploying merges until you check it and clear the deploy hold.`);
@@ -350,13 +379,16 @@ export async function resolveCommand(run, t, body) {
 export async function finishResolution(t, job, head, dir, how) {
   await runner.fetchIntoPublisher(t.key, dir, head);
   await runner.syncWorkspace(store.getTicket(t.key), head);
-  store.updateConflictJob(job.id, { status: 'resolved', result_sha: head, note: how });
-  store.addContributor(t.key, job.seat); // the resolver wrote code: they can never review this ticket
-  store.supersedeReviews(t.key, null);
   const incoming = JSON.parse(job.incoming_json || '[]');
-  say(t, `resolved:${job.id}`, `✅ **${nameOf(job.seat)} resolved the conflict** with ${describeIncoming(incoming)} (now \`${short(head)}\`): ${how}\n\nQA re-checks it next, then both reviewers re-confirm the resolution.`, head, job.seat);
-  setStatus(t.key, 'qa', { head_sha: head, review_stage: null, reconfirm_from: job.head_sha, reconfirm_kind: 'resolution', reconfirm_base: job.base_sha,
-    progress: 90, progress_msg: 'conflict resolved — QA re-checking' });
+  // One transaction: the job is never "resolved" without the ticket moving on to QA (no orphaned state after a crash).
+  store.transaction(() => {
+    store.updateConflictJob(job.id, { status: 'resolved', result_sha: head, note: how });
+    store.addContributor(t.key, job.seat); // the resolver wrote code: they can never review this ticket
+    store.supersedeReviews(t.key, null);
+    say(t, `resolved:${job.id}`, `✅ **${nameOf(job.seat)} resolved the conflict** with ${describeIncoming(incoming)} (now \`${short(head)}\`): ${how}\n\nQA re-checks it next, then both reviewers re-confirm the resolution.`, head, job.seat);
+    setStatus(t.key, 'qa', { head_sha: head, review_stage: null, reconfirm_from: job.head_sha, reconfirm_kind: 'resolution', reconfirm_base: job.base_sha,
+      progress: 90, progress_msg: 'conflict resolved — QA re-checking' });
+  });
   runner.removeScratch(`resolve-${t.key}`);
   github.flushOutbox();
 }
@@ -455,14 +487,19 @@ function waitMsg(t, names, text) {
 // ---------------- merge intents: persisted BEFORE the merge, reconciled after a crash ----------------
 const intentGet = () => { try { return JSON.parse(store.kvGet('train:intent') || 'null'); } catch { return null; } };
 const intentSet = (v) => store.kvSet('train:intent', v ? JSON.stringify(v) : 'null');
+const inFlight = new Map(); // intent.at → started (this process): reconciliation never touches a merge still running
 
 /**
- * The single live gate, called by prs.merge immediately before it dispatches `gh pr merge`. Everything is re-read:
- * the stop-all fence, halt, ticket status, Hold, stored + diff risk, approvals and their publication, the busy window
- * and deploy lock for deploying changes, and that the base branch is still the one whose integration evidence we read.
+ * The single live gate, called by prs.merge immediately before it dispatches `gh pr merge`. The only await (the
+ * remote base lookup) comes FIRST; every other condition is then re-read synchronously, so nothing can change between
+ * the last check and the dispatch: stop-all fence, halt, ticket status, Hold, stored + diff risk, published approvals,
+ * the busy window and deploy-lock ownership for deploying changes.
  */
-export async function authorizeMerge(key, intent, now = new Date()) {
+export async function authorizeMerge(key, intent, now = null) {
   const fail = (why) => { throw Object.assign(new Error(`Not merged: ${why}.`), { status: 409 }); };
+  const live = intent.base ? await runner.remoteHead(config.project.baseBranch).catch(() => null) : null;
+  // ---- synchronous from here to the dispatch ----
+  if (intent.base && live !== intent.base) fail(`${config.project.baseBranch} moved since its CI was read (${short(intent.base)} → ${short(live) || '?'}); re-checking next cycle`);
   if (intent.epoch !== runner.currentEpoch()) fail('the desk was stopped (circuit breaker)');
   const t = store.getTicket(key);
   if (intent.by === 'desk') {
@@ -474,64 +511,97 @@ export async function authorizeMerge(key, intent, now = new Date()) {
     if (!policy.eligible) fail(policy.reason);
     const ap = store.approvalsAt(key, intent.head);
     if (!ap.ok || ap.unpublished) fail('the two approvals are not complete and published at this commit');
-    if (intent.deploys && inBusyWindow(now)) fail('it redeploys and the busy window has started');
   }
+  if (intent.deploys && intent.by === 'desk' && inBusyWindow(now || new Date())) fail('it redeploys and the busy window has started');
   if (intent.deploys) {
     const l = lockGet();
     if (!l || l.key !== key || l.state !== 'merging' || l.intent_at !== intent.at) fail('the deploy lock is not held for this merge');
   }
-  if (intent.base) {
-    const live = await runner.remoteHead(config.project.baseBranch).catch(() => null);
-    if (live !== intent.base) fail(`${config.project.baseBranch} moved since its CI was read (${short(intent.base)} → ${short(live) || '?'}); re-checking next cycle`);
-  }
 }
 
-/** Persist the intent and (for deploying changes) take the deploy lock, atomically, before any merge call. */
-function beginMerge(t, n, dep, by, base) {
+/** Persist the intent, the ticket's "merging" stage and (for deploying changes) the deploy lock in ONE transaction. */
+function beginMerge(key, n, head, dep, by, base, epoch = runner.currentEpoch()) {
   const at = new Date().toISOString();
-  const intent = { key: t.key, pr: n, head: t.head_sha, base, deploys: !!dep?.deploys, by, at, epoch: runner.currentEpoch(), workflows: (dep?.workflows || []).map((w) => w.name) };
+  const intent = { key, pr: n, head, base, deploys: !!dep?.deploys, by, at, epoch, token: crypto.randomBytes(6).toString('hex'),
+    workflows: (dep?.workflows || []).map((w) => w.file) };
   store.transaction(() => {
+    if (intentGet()) throw Object.assign(new Error('Not merged: another merge is still being confirmed with GitHub.'), { status: 409 });
     if (intent.deploys) {
       const l = lockGet();
-      if (l) throw Object.assign(new Error(`Not merged: the deploy of ${l.key} is ${l.state === 'running' ? 'still running' : `${l.state} — clear the deploy hold after checking it`}.`), { status: 409 });
-      lockSet({ key: t.key, pr: n, head: t.head_sha, at, intent_at: at, state: 'merging', by, workflows: intent.workflows, merge_sha: null });
+      if (l) throw Object.assign(new Error(`Not merged: the deploy of ${l.key || short(l.merge_sha)} is ${['running', 'merging'].includes(l.state) ? 'still running' : `${l.state} — clear the deploy hold after checking it`}.`), { status: 409 });
+      lockSet({ key, pr: n, head, at, intent_at: at, state: 'merging', by, workflows: intent.workflows, merge_sha: null });
     }
+    if (by === 'desk') store.updateTicket(key, { review_stage: 'merging' });
     intentSet(intent);
   });
   return intent;
 }
 function abortMerge(intent) {
-  const l = lockGet();
-  if (l && l.key === intent.key && l.state === 'merging' && l.intent_at === intent.at) lockSet(null);
-  intentSet(null);
-}
-async function mergedOk(intent, mergeSha) {
-  if (intent.deploys) {
+  store.transaction(() => {
     const l = lockGet();
-    lockSet({ ...(l || {}), key: intent.key, pr: intent.pr, head: intent.head, at: new Date().toISOString(), state: 'running', merge_sha: mergeSha, workflows: intent.workflows, by: intent.by });
-  }
-  intentSet(null);
+    if (l && l.key === intent.key && l.state === 'merging' && l.intent_at === intent.at) lockSet(null);
+    intentSet(null);
+    const t = store.getTicket(intent.key);
+    if (t && ['merging', 'merge_unknown'].includes(t.review_stage)) store.updateTicket(t.key, { review_stage: 'approved' });
+  });
+}
+function mergedOk(intent, mergeSha) {
+  store.transaction(() => {
+    if (intent.deploys) {
+      const l = lockGet();
+      lockSet({ ...(l || {}), key: intent.key, pr: intent.pr, head: intent.head, at: new Date().toISOString(), state: 'running', merge_sha: mergeSha, workflows: intent.workflows, by: intent.by });
+    }
+    intentSet(null);
+  });
+}
+/** The merge call failed AFTER dispatch: GitHub may have merged. Keep the lock, mark unknown, reconcile later. */
+function mergeUnknown(intent, err) {
+  store.transaction(() => {
+    intentSet({ ...intent, state: 'unknown', failed_at: new Date().toISOString(), error: String(err.message).slice(0, 200) });
+    const t = store.getTicket(intent.key);
+    if (t?.review_stage === 'merging') store.updateTicket(t.key, { review_stage: 'merge_unknown', progress_msg: 'GitHub did not confirm the merge — checking' });
+  });
+}
+async function dispatch(intent, fn) {
+  inFlight.set(intent.at, Date.now());
+  try { return await fn(); } finally { inFlight.delete(intent.at); }
 }
 
-/** After a restart (or each cycle): finish or roll back an intent whose merge call never reported back. */
-export async function reconcileIntent() {
+/** Each cycle (and after a restart): finish an intent GitHub merged, or roll back one GitHub shows open past a grace. */
+export async function reconcileIntent(now = new Date()) {
+  // A ticket left "merging" without an intent (crash between steps of an older version) goes back to the queue.
   const intent = intentGet();
+  for (const t of store.listTickets().filter((x) => ['merging', 'merge_unknown'].includes(x.review_stage) && x.key !== intent?.key)) {
+    if (t.status === 'ready_for_human') store.updateTicket(t.key, { review_stage: 'approved' });
+  }
   if (!intent) return null;
+  if (inFlight.has(intent.at)) return { reconciled: 'in_flight' };
   let pr;
-  try { pr = await prs.mergeInfo(intent.pr); } catch { return intent; } // GitHub unreachable: keep everything locked
+  try { pr = await prs.mergeInfo(intent.pr); } catch { return { reconciled: 'unreachable' }; } // keep everything locked
   if (pr.state === 'MERGED') {
-    await mergedOk(intent, pr.mergeCommit?.oid || null);
+    mergedOk(intent, pr.mergeCommit?.oid || null);
     const t = store.getTicket(intent.key);
     if (t && intent.by === 'desk') {
-      say(t, `merged:${intent.head}`, `🔀 **Merged by SigmaDesk** at \`${short(intent.head)}\` after two approvals (recorded after a desk restart).`, intent.head);
+      say(t, `merged:${intent.head}`, `🔀 **Merged by SigmaDesk** at \`${short(intent.head)}\` after two approvals (confirmed with GitHub after the merge call did not report back).`, intent.head);
       store.updateTicket(t.key, { review_stage: 'merged' });
     }
     return { reconciled: 'merged' };
   }
+  const since = Date.parse(intent.failed_at || intent.at);
+  const grace = (Number(config.mergeTrain?.unknownGraceMinutes) || 5) * 60_000;
+  if (pr.mergeCommit?.oid || now.getTime() - since < grace) return { reconciled: 'waiting' };
   abortMerge(intent);
-  const t = store.getTicket(intent.key);
-  if (t?.review_stage === 'merging') store.updateTicket(t.key, { review_stage: 'approved' });
   return { reconciled: 'rolled_back' };
+}
+
+let askedChecks = false;
+function askOwnerForChecks() {
+  if (askedChecks || store.kvGet('ci:asked') === '1') return;
+  askedChecks = true; store.kvSet('ci:asked', '1');
+  const hist = kvList('ci:history');
+  const t = store.createTicket({ title: 'Confirm which CI checks auto-merge must wait for', type: 'task', status: 'needs_human', priority: 'P1', reporter: 'system', source: 'agent',
+    description: `SigmaDesk only auto-merges when every required CI check has reported SUCCESS on the exact commit. It does not know yet which checks are required in this repository, so auto-merge is off.\n\n${hist.length ? `Checks seen on recent merges: ${[...new Set(hist.flat())].join(', ')}.` : 'No merges have been observed yet; merging one PR yourself lets the desk propose the list.'}\n\nSet them with POST /api/ci/required-checks {"names": [...]} or in sigmadesk.config.json → review.requiredChecks.` });
+  store.updateTicket(t.key, { resume_status: 'done' });
 }
 
 /** Decide one approved ticket. allowMerge=false once this sweep already merged/updated something (serialized train). */
@@ -570,28 +640,24 @@ export async function consider(t, { now = new Date(), snap = null, allowMerge = 
   if (u.action !== 'current') return u.action === 'updated' ? { action: 'updated' } : wait(`auto-merge waiting: ${u.reason || u.action}`, u.action);
   const mt = await mergeTree(snap.base, t.head_sha);
   store.kvSet(`train:evidence:${t.key}`, JSON.stringify({ head: t.head_sha, base: snap.base, tree: mt.tree || null, at: now.toISOString() }));
+  const req = prs.requiredChecks();
+  if (!req.names.length && !(await prs.repoHasNoWorkflows())) { askOwnerForChecks(); return wait('auto-merge is off until you confirm which CI checks it must wait for', 'owner'); }
   const n = prNumber(t.pr_url);
   let intent;
-  try {
-    store.updateTicket(t.key, { review_stage: 'merging' });
-    intent = beginMerge(store.getTicket(t.key), n, dep, 'desk', snap.base);
-  } catch (err) {
-    store.updateTicket(t.key, { review_stage: 'approved' });
-    return wait(`auto-merge waiting: ${String(err.message).replace(/^Not merged: /, '').replace(/\.$/, '')}`, 'queued');
-  }
-  intent.epoch = epoch; intentSet(intent);
+  try { intent = beginMerge(t.key, n, t.head_sha, dep, 'desk', snap.base, epoch); }
+  catch (err) { return wait(`auto-merge waiting: ${String(err.message).replace(/^Not merged: /, '').replace(/\.$/, '')}`, 'queued'); }
   const am = config.review.autoMerge || {};
   try {
-    await prs.merge(n, { actor: 'desk', method: am.method || 'squash', expectedSha: t.head_sha, inBusyWindow: dep.deploys && inBusyWindow(now),
-      halted: store.getSettings().paused === 'true', preflight: () => authorizeMerge(t.key, intent) });
+    await dispatch(intent, () => prs.merge(n, { actor: 'desk', method: am.method || 'squash', expectedSha: t.head_sha, inBusyWindow: dep.deploys && inBusyWindow(now),
+      halted: store.getSettings().paused === 'true', preflight: () => authorizeMerge(t.key, intent, now) }));
   } catch (err) {
+    if (err.dispatched) { mergeUnknown(intent, err); return wait('GitHub did not confirm the merge — checking its state before anything else merges', 'unknown'); }
     abortMerge(intent);
-    if (store.getTicket(t.key)?.review_stage === 'merging') store.updateTicket(t.key, { review_stage: 'approved' });
     return wait(`auto-merge waiting: ${String(err.message).replace(/^Not merged: /, '').replace(/\.$/, '')}`, 'queued');
   }
   let mergeSha = null;
   try { mergeSha = (await prs.mergeInfo(n)).mergeCommit?.oid || null; } catch { /* unknown: the lock escalates after deploy.waitMinutes */ }
-  await mergedOk(intent, mergeSha);
+  mergedOk(intent, mergeSha);
   const text = `🔀 **Merged by SigmaDesk** after approvals from ${nameOf(ap.context.seat)} (${roleOf(ap.context.seat)}) and ${nameOf(ap.independent.seat)} (${roleOf(ap.independent.seat)}) at \`${short(t.head_sha)}\`, on top of \`${config.project.baseBranch}\` \`${short(snap.base)}\`. Low risk, CI green${dep.deploys ? `; ${dep.reason}, so the next deploying merge waits for that deploy to finish` : '; nothing redeploys'}.`;
   say(t, `merged:${t.head_sha}`, text);
   store.updateTicket(t.key, { review_stage: 'merged', progress_msg: `Merged by SigmaDesk after approvals from ${names}` });
@@ -599,33 +665,52 @@ export async function consider(t, { now = new Date(), snap = null, allowMerge = 
   return { action: 'merged', merge_sha: mergeSha };
 }
 
-/** Owner merges from the UI share the deploy lock (and the restart reconciliation) with desk merges. */
-export async function ownerMerge(number, opts) {
-  const t = store.listTickets().find((x) => prNumber(x.pr_url) === Number(number) && !TERMINAL.has(x.status));
-  const dep = t ? await deployInfo(t) : null;
-  if (!dep?.deploys) return prs.merge(number, { ...opts, actor: 'owner' });
-  await deployLock();
-  const intent = beginMerge(t, Number(number), dep, 'owner', null);
+/**
+ * Owner merges from the UI (desk tickets and PRs the desk did not open) share the deploy lock, the intent journal and
+ * reconciliation with desk merges. Non-deploying changes need no market-hours override; deploying ones still do.
+ */
+export async function ownerMerge(number, opts, now = new Date()) {
+  const n = Number(number);
+  const t = store.listTickets().find((x) => prNumber(x.pr_url) === n && !TERMINAL.has(x.status));
+  let dep;
+  if (t) dep = await deployInfo(t);
+  else {
+    const files = await prs.prFiles(n).catch(() => null);
+    const wfs = await workflowsAtBase().catch(() => null);
+    dep = files?.length && wfs ? workflows.deploysFor({ files, branch: config.project.baseBranch, workflows: wfs, registered: config.deploy?.workflows ?? 'auto' })
+      : { deploys: true, workflows: [] };
+  }
+  const busy = !!dep.deploys && inBusyWindow(now);
+  const key = t?.key || `PR#${n}`;
+  if (dep.deploys) await deployLock();
+  const intent = beginMerge(key, n, t?.head_sha || null, dep, 'owner', null);
   try {
-    const out = await prs.merge(number, { ...opts, actor: 'owner', preflight: () => authorizeMerge(t.key, intent) });
+    const out = await dispatch(intent, () => prs.merge(n, { ...opts, inBusyWindow: busy, actor: 'owner', preflight: () => authorizeMerge(key, intent) }));
     let mergeSha = null;
-    try { mergeSha = (await prs.mergeInfo(number)).mergeCommit?.oid || null; } catch { /* escalates later */ }
-    await mergedOk(intent, mergeSha);
+    try { mergeSha = (await prs.mergeInfo(n)).mergeCommit?.oid || null; } catch { /* the lock escalates later */ }
+    mergedOk(intent, mergeSha);
     return out;
-  } catch (err) { abortMerge(intent); throw err; }
+  } catch (err) {
+    if (err.dispatched) { mergeUnknown(intent, err); throw Object.assign(new Error('GitHub did not confirm the merge; SigmaDesk is checking the PR state before anything else merges.'), { status: 502 }); }
+    abortMerge(intent);
+    throw err;
+  }
 }
 
-/** Base moved by something the desk did not merge (owner on GitHub, another tool): if it redeploys, take the lock. */
+/** Base moved by something the desk did not merge (owner on GitHub, another tool): if it redeploys, lock or queue it. */
 async function observeExternal(prev, next) {
-  if (!prev || prev === next || lockGet() || intentGet()) return;
+  if (!prev || prev === next) return;
   const r = await pub(['diff', '--name-only', '-z', prev, next]);
   if (r.code) return;
   const files = r.stdout.split('\0').filter(Boolean);
   const wfs = await workflowsAtBase().catch(() => null);
   const d = wfs ? workflows.deploysFor({ files, branch: config.project.baseBranch, workflows: wfs, registered: config.deploy?.workflows ?? 'auto' }) : { deploys: true, workflows: [] };
   if (!d.deploys) return;
-  lockSet({ key: null, by: 'external', merge_sha: next, at: new Date().toISOString(), state: 'running', workflows: d.workflows.map((w) => w.name) });
-  store.logEvent({ kind: 'github', agent_id: 'github', text: `${config.project.baseBranch} moved to ${short(next)} outside the desk and it redeploys — deploying merges wait for that deploy` });
+  // Our own merge commit is deduplicated (current lock or recently released); everything else is locked or queued.
+  if (lockGet()?.merge_sha === next || kvList('train:deploy-released').includes(next)) return;
+  const entry = { key: null, by: 'external', merge_sha: next, at: new Date().toISOString(), state: 'running', workflows: d.workflows.map((w) => w.file) };
+  const how = queueDeploy(entry);
+  if (how !== 'known') store.logEvent({ kind: 'github', agent_id: 'github', text: `${config.project.baseBranch} moved to ${short(next)} outside the desk and it redeploys — ${how === 'locked' ? 'deploying merges wait for that deploy' : 'queued behind the deploy in flight'}` });
 }
 
 let sweeping = null;

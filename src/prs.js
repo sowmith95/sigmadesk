@@ -136,6 +136,37 @@ export function ciVerdict(rollup = [], optional = config.review?.optionalChecks 
   return 'inconclusive';
 }
 export const MIN_OVERRIDE_REASON = 10;
+const checkName = (c) => c.name || c.context || c.workflowName || '';
+
+// ---------------- required checks: names that MUST be present and SUCCESS ----------------
+// review.requiredChecks: an explicit list, or "auto": the checks that reported SUCCESS on every one of the last few
+// merges (persisted in kv, editable by the owner). Reported-only CI is not enough: a suite that never reports would
+// otherwise let lint alone authorize a merge.
+const HISTORY = 5;
+const kvJson = (k, d) => { try { return JSON.parse(store.kvGet(k) || 'null') ?? d; } catch { return d; } };
+export function requiredChecks() {
+  const c = config.review?.requiredChecks;
+  if (Array.isArray(c)) return { names: c.map(String), source: 'config' };
+  return kvJson('ci:required', { names: [], source: 'auto' });
+}
+export function setRequiredChecks(names, source = 'owner') {
+  const clean = [...new Set((names || []).map((n) => String(n).trim()).filter(Boolean))].slice(0, 50);
+  store.kvSet('ci:required', JSON.stringify({ names: clean, source, at: store.now() }));
+  store.logEvent({ kind: 'action', agent_id: source === 'owner' ? 'owner' : 'github', text: `required CI checks set (${source}): ${clean.join(', ') || '(none)'}` });
+  return requiredChecks();
+}
+/** Learn from a merge that passed: auto mode = checks that succeeded on every recent merge. */
+export function learnChecks(rollup = []) {
+  const ok = [...new Set(rollup.filter((c) => (c.conclusion || c.state) === 'SUCCESS').map(checkName).filter(Boolean))];
+  if (!ok.length) return requiredChecks();
+  const hist = [...kvJson('ci:history', []), ok].slice(-HISTORY);
+  store.kvSet('ci:history', JSON.stringify(hist));
+  const cur = requiredChecks();
+  if (cur.source !== 'auto') return cur;
+  const names = hist.reduce((acc, set) => acc.filter((n) => set.includes(n)), hist[0]);
+  if (names.join('|') !== cur.names.join('|')) setRequiredChecks(names, 'auto');
+  return requiredChecks();
+}
 export const keyOfTitle = (title) => String(title || '').match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1] || null;
 const seatName = (seat) => (seat ? `${agentById[seat]?.name || seat}` : '?');
 
@@ -146,7 +177,7 @@ const seatName = (seat) => (seat ? `${agentById[seat]?.name || seat}` : '?');
  * nothing bypasses state, head commit, base branch, conflicts or CI.
  */
 export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, override = '', actor = 'owner', halted = false, gate = null,
-  overrideReason = '', noChecksConfigured = false, baseBranch = config.project.baseBranch } = {}) {
+  overrideReason = '', noChecksConfigured = false, baseBranch = config.project.baseBranch, required = [] } = {}) {
   const blockers = []; const chain = [];
   if (p.state !== 'OPEN') blockers.push(`PR is ${String(p.state).toLowerCase()}`);
   if (!/^[0-9a-f]{7,40}$/.test(String(expectedSha))) blockers.push('the request did not say which commit it approves (expected head SHA)');
@@ -159,6 +190,9 @@ export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, over
   else if (ci === 'pending') blockers.push('CI is still running');
   else if (ci === 'inconclusive') blockers.push('a CI check was skipped or neutral instead of passing (only review.optionalChecks may skip)');
   else if (ci === 'none' && !noChecksConfigured) blockers.push('no CI result has been reported for this commit yet');
+  const reported = new Map((p.statusCheckRollup || []).map((c) => [checkName(c), c.conclusion || c.state || c.status || '']));
+  const missing = required.filter((n) => reported.get(n) !== 'SUCCESS');
+  if (missing.length) blockers.push(`required check${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'have' : 'has'} not passed on this commit${missing.some((n) => !reported.has(n)) ? ' (never reported)' : ''}`);
   if (inBusyWindow && (actor !== 'owner' || String(override).trim().toLowerCase() !== OVERRIDE_PHRASE)) {
     blockers.push(actor === 'owner' ? `merging ${baseBranch} deploys production and the desk is inside its busy window (market hours) — type "${OVERRIDE_PHRASE}" to override` : 'inside the busy window (market hours)');
   }
@@ -205,8 +239,11 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   const t = key ? store.getTicket(key) : null;
   const gate = t && store.inReviewFlow(t.key) ? { approvals: store.approvalsAt(t.key, expectedSha), qaSha: t.qa_sha } : null;
   if (actor !== 'owner' && !gate) fail('Not merged: the desk only merges PRs that passed two-reviewer review.');
-  const noChecksConfigured = (p.statusCheckRollup || []).length === 0 ? await repoHasNoWorkflows() : false;
-  const { blockers, overridden } = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, noChecksConfigured });
+  const noWorkflows = await repoHasNoWorkflows();
+  const noChecksConfigured = (p.statusCheckRollup || []).length === 0 && noWorkflows;
+  const req = requiredChecks();
+  if (actor !== 'owner' && !req.names.length && !noWorkflows) fail('Not merged: nobody has confirmed which CI checks a merge must wait for (review.requiredChecks) — the owner merges until then.');
+  const { blockers, overridden } = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, noChecksConfigured, required: req.names });
   if (blockers.length) fail(`Not merged: ${blockers.join('; ')}.`);
   if (p.isDraft) await gh(['pr', 'ready', String(p.number), '-R', repo()]);
   if (overridden.length) {
@@ -216,8 +253,11 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   }
   // The live gate (halt/stop-all fence, Hold, risk, window, deploy lock, base freshness) runs last, right before dispatch.
   if (preflight) await preflight();
-  // --match-head-commit: GitHub merges exactly the approved commit, or refuses if it moved.
-  await gh(['pr', 'merge', String(p.number), '-R', repo(), `--${method}`, '--delete-branch', '--match-head-commit', expectedSha]);
+  // --match-head-commit: GitHub merges exactly the approved commit, or refuses if it moved. From here on a failure is
+  // "unknown" (GitHub may have merged before the error/timeout reached us): callers must reconcile, never roll back.
+  try { await gh(['pr', 'merge', String(p.number), '-R', repo(), `--${method}`, '--delete-branch', '--match-head-commit', expectedSha]); }
+  catch (err) { throw Object.assign(err, { dispatched: true }); }
+  learnChecks(p.statusCheckRollup || []);
   if (actor === 'owner') note(p, `🔀 **Merged #${p.number}** (${method}) from SigmaDesk${inBusyWindow ? ' — market-hours override' : ''}${overridden.length ? ` — review override: ${String(overrideReason).trim()}` : ''}.`);
   else store.logEvent({ kind: 'github', agent_id: 'github', ticket_key: key, text: `auto-merged #${p.number} (${method}) at ${expectedSha.slice(0, 7)}` });
   bust();
@@ -228,9 +268,15 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
 export async function mergeInfo(number) {
   return JSON.parse(await gh(['pr', 'view', String(Number(number)), '-R', repo(), '--json', 'mergeCommit,state']) || '{}');
 }
-/** Workflow runs GitHub started for a commit (used to wait for a deploy before the next deploying merge). */
+/** Workflow runs GitHub started for a commit, identified by workflow FILE path (display names can collide). */
 export async function runsForCommit(sha) {
-  return JSON.parse(await gh(['run', 'list', '-R', repo(), '--commit', String(sha), '--json', 'workflowName,status,conclusion,databaseId', '-L', '50']) || '[]');
+  const out = JSON.parse(await gh(['api', `repos/${repo()}/actions/runs?head_sha=${encodeURIComponent(String(sha))}&per_page=100`,
+    '--jq', '[.workflow_runs[] | {path, name, status, conclusion, id}]']) || '[]');
+  return out.map((r) => ({ ...r, path: String(r.path || '').replace(/@.*$/, '') }));
+}
+/** Paths a PR changes (for owner merges of PRs the desk did not open). */
+export async function prFiles(number) {
+  return JSON.parse(await gh(['pr', 'view', String(Number(number)), '-R', repo(), '--json', 'files', '--jq', '[.files[].path]']) || '[]');
 }
 
 export async function close(number, comment = '') {

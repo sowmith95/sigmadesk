@@ -45,10 +45,15 @@ const a = process.argv.slice(2); const d = ${JSON.stringify(ghDir)};
 fs.appendFileSync(${JSON.stringify(ghLog)}, JSON.stringify(a) + '\\n');
 const read = (f, def) => { try { return JSON.parse(fs.readFileSync(d + '/' + f, 'utf8')); } catch { return def; } };
 const out = (x) => { process.stdout.write(typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
+if (a[0] === 'pr' && a[1] === 'view' && a.includes('files')) out(read('files.json', []));
+if (a[0] === 'pr' && a[1] === 'merge') {
+  if (fs.existsSync(d + '/slow-merge')) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 800);
+  if (fs.existsSync(d + '/fail-merge')) { process.stderr.write('HTTP 502 (timeout)'); process.exit(1); }
+}
 if (a[0] === 'pr' && a[1] === 'view') out(a.join(' ').includes('mergeCommit') ? read('merge.json', {}) : read('pr.json', {}));
 if (a[0] === 'pr' && a[1] === 'list') out('[]');
 if (a[0] === 'pr' && a[1] === 'create') out('https://github.com/owner/demo/pull/55');
-if (a[0] === 'run' && a[1] === 'list') out(read('runs.json', []));
+if (a[0] === 'api' && /actions\\/runs/.test(a[1])) out(read('runs.json', []));
 if (a[0] === 'api' && /actions\\/workflows/.test(a[1])) out('2');
 if (a[0] === 'api' && a[1] === '-X') { const c = read('comments.json', []); c.push({ id: 1000 + c.length, body: a[a.indexOf('-f') + 1].slice(5) }); fs.writeFileSync(d + '/comments.json', JSON.stringify(c)); out(String(999 + c.length)); }
 if (a[0] === 'api') out('');
@@ -79,6 +84,7 @@ before(async () => {
   reviews = await import('../src/reviews.js');
   train = await import('../src/mergetrain.js');
   store.setSetting('paused', 'false');
+  (await import('../src/prs.js')).setRequiredChecks(['tests']);
 });
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -119,7 +125,7 @@ async function approvedPr(file, text = `change ${++seq}\n`, { risk = 'low' } = {
   return store.getTicket(t0.key);
 }
 const prFor = (t, o = {}) => setGh('pr.json', { number: 7, title: `[${t.key}] x`, state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', headRefOid: t.head_sha,
-  baseRefName: 'main', body: 'Opened by SigmaDesk', statusCheckRollup: [{ conclusion: 'SUCCESS' }], ...o });
+  baseRefName: 'main', body: 'Opened by SigmaDesk', statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }], ...o });
 
 test('glob + workflow filters: negation, ** and ? semantics, branches, paths-ignore, tags-only, unknown = deploys', () => {
   assert.ok(wf.matchesFilters('app/x/y.py', ['app/**']));
@@ -207,26 +213,26 @@ test('deploying PR inside the window is scheduled, then merges after the window;
 test('one deploying merge at a time: wait for the deploy run, owner on failure or timeout', async () => {
   const next = await approvedPr('app/second.py');
   prFor(next);
-  setGh('runs.json', [{ workflowName: 'Deploy', status: 'in_progress', conclusion: '' }]);
+  setGh('runs.json', [{ path: '.github/workflows/deploy.yml', status: 'in_progress', conclusion: '' }]);
   let r = await train.consider(next, { now: WED_AFTER, snap: await train.watchBase() });
   assert.equal(r.action, 'queued', JSON.stringify(r)); assert.match(r.reason, /deploy of M-\d+ is still running/);
-  setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'failure' }]);
+  setGh('runs.json', [{ path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'failure' }]);
   r = await train.consider(store.getTicket(next.key), { now: WED_AFTER, snap: await train.watchBase() });
   assert.match(r.reason, /last deploy failed/);
   assert.equal(train.deployState().state, 'failed');
   train.clearDeployLock('owner');
   // timeout: a run that never finishes
-  store.kvSet('train:deploy', JSON.stringify({ key: 'M-1', merge_sha: 'e'.repeat(40), at: new Date(WED_AFTER - 50 * 60_000).toISOString(), workflows: ['Deploy'], state: 'running' }));
-  setGh('runs.json', [{ workflowName: 'Deploy', status: 'queued', conclusion: '' }]);
+  store.kvSet('train:deploy', JSON.stringify({ key: 'M-1', merge_sha: 'e'.repeat(40), at: new Date(WED_AFTER - 50 * 60_000).toISOString(), workflows: ['.github/workflows/deploy.yml'], state: 'running' }));
+  setGh('runs.json', [{ path: '.github/workflows/deploy.yml', status: 'queued', conclusion: '' }]);
   r = await train.consider(store.getTicket(next.key), { now: WED_AFTER, snap: await train.watchBase() });
   assert.match(r.reason, /did not finish/);
   assert.equal(train.deployState().state, 'escalated');
   train.clearDeployLock('owner');
-  setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success' }]);
+  setGh('runs.json', [{ path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success' }]);
   setGh('merge.json', { mergeCommit: { oid: 'f'.repeat(40) } });
   r = await train.consider(store.getTicket(next.key), { now: WED_AFTER, snap: await train.watchBase() });
   assert.equal(r.action, 'merged');
-  setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success' }]);
+  setGh('runs.json', [{ path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success' }]);
   assert.equal(await train.deployLock(WED_AFTER), null, 'a finished, green deploy releases the lock');
 });
 
@@ -399,16 +405,16 @@ test('merge intent + deploy lock are persisted before merging and reconciled aft
   resetTrain();
   const t = await approvedPr('app/intent.py');
   // crash after GitHub merged but before the desk recorded it
-  store.kvSet('train:intent', JSON.stringify({ key: t.key, pr: 7, head: t.head_sha, deploys: true, by: 'desk', at: 'a1', workflows: ['Deploy'] }));
-  store.kvSet('train:deploy', JSON.stringify({ key: t.key, state: 'merging', intent_at: 'a1', workflows: ['Deploy'] }));
+  store.kvSet('train:intent', JSON.stringify({ key: t.key, pr: 7, head: t.head_sha, deploys: true, by: 'desk', at: 'a1', workflows: ['.github/workflows/deploy.yml'] }));
+  store.kvSet('train:deploy', JSON.stringify({ key: t.key, state: 'merging', intent_at: 'a1', workflows: ['.github/workflows/deploy.yml'] }));
   setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '1'.repeat(40) } });
   assert.deepEqual(await train.reconcileIntent(), { reconciled: 'merged' });
   assert.equal(lockNow().state, 'running'); assert.equal(lockNow().merge_sha, '1'.repeat(40));
   assert.equal(store.kvGet('train:intent'), 'null');
   // crash before GitHub merged: rolled back, lock released
   resetTrain();
-  store.kvSet('train:intent', JSON.stringify({ key: t.key, pr: 7, head: t.head_sha, deploys: true, by: 'desk', at: 'a2', workflows: ['Deploy'] }));
-  store.kvSet('train:deploy', JSON.stringify({ key: t.key, state: 'merging', intent_at: 'a2', workflows: ['Deploy'] }));
+  store.kvSet('train:intent', JSON.stringify({ key: t.key, pr: 7, head: t.head_sha, deploys: true, by: 'desk', at: 'a2', workflows: ['.github/workflows/deploy.yml'] }));
+  store.kvSet('train:deploy', JSON.stringify({ key: t.key, state: 'merging', intent_at: 'a2', workflows: ['.github/workflows/deploy.yml'] }));
   setGh('merge.json', { state: 'OPEN', mergeCommit: null });
   assert.deepEqual(await train.reconcileIntent(), { reconciled: 'rolled_back' });
   assert.equal(lockNow(), null);
@@ -422,21 +428,21 @@ test('merge intent + deploy lock are persisted before merging and reconciled aft
 test('deploy lock: every expected workflow must succeed; missing or failed stays locked and escalates', async () => {
   resetTrain();
   const at = new Date(SAT.getTime() - 10 * 60_000).toISOString();
-  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at, workflows: ['Deploy', 'Publish UI'], state: 'running' }));
-  setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success', databaseId: 1 }]);
+  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at, workflows: ['.github/workflows/deploy.yml', '.github/workflows/ui.yml'], state: 'running' }));
+  setGh('runs.json', [{ path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success', id: 1 }]);
   assert.ok(await train.deployLock(SAT), 'one of two expected deploys is not enough');
   setGh('runs.json', []);
   assert.ok(await train.deployLock(SAT), 'no runs at all is not a release');
-  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at: new Date(SAT.getTime() - 60 * 60_000).toISOString(), workflows: ['Deploy', 'Publish UI'], state: 'running' }));
+  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at: new Date(SAT.getTime() - 60 * 60_000).toISOString(), workflows: ['.github/workflows/deploy.yml', '.github/workflows/ui.yml'], state: 'running' }));
   assert.equal((await train.deployLock(SAT)).state, 'escalated');
-  assert.match(lockNow().note, /Deploy never started|Publish UI never started/);
+  assert.match(lockNow().note, /deploy.yml never started|ui.yml never started/);
   resetTrain();
-  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at, workflows: ['Deploy', 'Publish UI'], state: 'running' }));
-  setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success', databaseId: 1 }, { workflowName: 'Publish UI', status: 'completed', conclusion: 'skipped', databaseId: 2 }]);
+  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at, workflows: ['.github/workflows/deploy.yml', '.github/workflows/ui.yml'], state: 'running' }));
+  setGh('runs.json', [{ path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success', id: 1 }, { path: '.github/workflows/ui.yml', status: 'completed', conclusion: 'skipped', id: 2 }]);
   assert.equal((await train.deployLock(SAT)).state, 'failed', 'skipped is not a successful deploy');
   resetTrain();
-  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at, workflows: ['Deploy', 'Publish UI'], state: 'running' }));
-  setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success', databaseId: 1 }, { workflowName: 'Publish UI', status: 'completed', conclusion: 'success', databaseId: 2 }]);
+  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at, workflows: ['.github/workflows/deploy.yml', '.github/workflows/ui.yml'], state: 'running' }));
+  setGh('runs.json', [{ path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success', id: 1 }, { path: '.github/workflows/ui.yml', status: 'completed', conclusion: 'success', id: 2 }]);
   assert.equal(await train.deployLock(SAT), null);
 });
 
@@ -455,7 +461,7 @@ test('owner merges of deploying changes and external deploying commits on main t
   await train.sweep({ now: SAT });
   store.setSetting('paused', 'false');
   assert.equal(lockNow().by, 'external');
-  assert.deepEqual(lockNow().workflows, ['Deploy']);
+  assert.deepEqual(lockNow().workflows, ['.github/workflows/deploy.yml']);
   resetTrain();
 });
 
@@ -499,4 +505,125 @@ test('resolve jobs only run on engines that enforce the spend cap', async () => 
   team.applyTeamOverrides({});
   const args = runner.buildCommand({ ...team.agentById.junior, model: 'opus' }, 'resolve', '/tmp/x').args;
   assert.equal(args[args.indexOf('--max-budget-usd') + 1], '1.5');
+});
+
+// ---------------- second verification round ----------------
+const prsMod = () => import('../src/prs.js');
+const flag = (name, on) => (on ? fs.writeFileSync(path.join(ghDir, name), '1') : fs.rmSync(path.join(ghDir, name), { force: true }));
+
+test('the live gate re-checks halt AFTER its only await, right before dispatch', async () => {
+  resetTrain();
+  const t = await approvedPr('docs/late-halt.md');
+  const snap = await train.watchBase();
+  store.updateTicket(t.key, { review_stage: 'merging' });
+  const intent = { key: t.key, head: t.head_sha, by: 'desk', deploys: false, epoch: runner.currentEpoch(), at: 'y', base: snap.base };
+  const pending = train.authorizeMerge(t.key, intent); // now awaiting the remote base lookup
+  store.setSetting('paused', 'true'); // halt lands during that await
+  await assert.rejects(pending, /paused/);
+  store.setSetting('paused', 'false');
+  const again = train.authorizeMerge(t.key, intent);
+  store.updateTicket(t.key, { merge_hold: 'late hold' });
+  await assert.rejects(again, /on hold/);
+  store.updateTicket(t.key, { merge_hold: null, review_stage: 'approved' });
+});
+
+test('required checks: a missing suite blocks; auto list = checks that passed on every recent merge; none ⇒ owner asked', async () => {
+  const prs = await prsMod();
+  const sha = 'a'.repeat(40);
+  const p = { state: 'OPEN', headRefOid: sha, baseRefName: 'main', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'lint', conclusion: 'SUCCESS' }] };
+  assert.match(prs.authorizeMerge(p, { expectedSha: sha, required: ['tests', 'lint'] }).blockers[0], /required check tests has not passed.*never reported/);
+  assert.deepEqual(prs.authorizeMerge({ ...p, statusCheckRollup: [{ name: 'lint', conclusion: 'SUCCESS' }, { name: 'tests', conclusion: 'SUCCESS' }] }, { expectedSha: sha, required: ['tests', 'lint'] }).blockers, []);
+  store.kvSet('ci:history', '[]'); prs.setRequiredChecks([], 'auto');
+  prs.learnChecks([{ name: 'tests', conclusion: 'SUCCESS' }, { name: 'lint', conclusion: 'SUCCESS' }, { name: 'docs-only', conclusion: 'SUCCESS' }]);
+  prs.learnChecks([{ name: 'tests', conclusion: 'SUCCESS' }, { name: 'lint', conclusion: 'SUCCESS' }]);
+  assert.deepEqual(prs.requiredChecks(), { ...prs.requiredChecks(), names: ['tests', 'lint'], source: 'auto' });
+  // nothing learned and the repo has workflows: the desk does not auto-merge and asks the owner once
+  store.kvSet('ci:history', '[]'); prs.setRequiredChecks([], 'auto'); store.kvSet('ci:asked', '0');
+  resetTrain();
+  const t = await approvedPr('docs/needs-checks.md'); prFor(t);
+  const r = await train.consider(t, { now: SAT, snap: await train.watchBase() });
+  assert.equal(r.action, 'owner'); assert.match(r.reason, /confirm which CI checks/);
+  assert.ok(store.listTickets().some((x) => /Confirm which CI checks/.test(x.title) && x.status === 'needs_human'));
+  prs.setRequiredChecks(['tests'], 'owner');
+  assert.equal(prs.requiredChecks().source, 'owner');
+});
+
+test('a merge call that errors after dispatch is "unknown": lock kept, reconciled from GitHub, never blindly cleared', async () => {
+  resetTrain();
+  const t = await approvedPr('app/unknown.py'); prFor(t);
+  flag('fail-merge', true);
+  const r = await train.consider(t, { now: SAT, snap: await train.watchBase() });
+  flag('fail-merge', false);
+  assert.equal(r.action, 'unknown');
+  assert.equal(lockNow().state, 'merging', 'the deploy lock is kept');
+  assert.equal(store.getTicket(t.key).review_stage, 'merge_unknown');
+  assert.equal(JSON.parse(store.kvGet('train:intent')).state, 'unknown');
+  setGh('merge.json', { state: 'OPEN', mergeCommit: null });
+  assert.equal((await train.reconcileIntent(SAT)).reconciled, 'waiting', 'OPEN inside the grace period: wait');
+  const later = new Date(Date.now() + 10 * 60_000);
+  setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '5'.repeat(40) } });
+  assert.equal((await train.reconcileIntent(later)).reconciled, 'merged', 'GitHub had merged it after all');
+  assert.equal(lockNow().state, 'running'); assert.equal(lockNow().merge_sha, '5'.repeat(40));
+  // and a confirmed OPEN past the grace period rolls back
+  resetTrain();
+  store.kvSet('train:intent', JSON.stringify({ key: t.key, pr: 7, head: t.head_sha, deploys: true, by: 'desk', at: new Date(Date.now() - 600_000).toISOString(), state: 'unknown', failed_at: new Date(Date.now() - 600_000).toISOString(), workflows: [] }));
+  setGh('merge.json', { state: 'OPEN', mergeCommit: null });
+  assert.equal((await train.reconcileIntent()).reconciled, 'rolled_back');
+});
+
+test('reconciliation never clears an owner merge whose call is still in flight', async () => {
+  resetTrain();
+  const t = await approvedPr('app/slow.py', 'x\n', { risk: 'high' });
+  store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
+  prFor(t); setGh('merge.json', { state: 'OPEN', mergeCommit: null });
+  flag('slow-merge', true);
+  const p = train.ownerMerge(7, { expectedSha: t.head_sha }, SAT);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal((await train.reconcileIntent(new Date(Date.now() + 3600_000))).reconciled, 'in_flight');
+  assert.equal(lockNow().state, 'merging');
+  setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '6'.repeat(40) } });
+  await p; flag('slow-merge', false);
+  assert.equal(lockNow().merge_sha, '6'.repeat(40));
+  resetTrain();
+});
+
+test('detached owner PRs take the lock; non-deploying owner merges need no market-hours phrase', async () => {
+  resetTrain();
+  setGh('pr.json', { number: 77, title: 'hand-written PR', state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', headRefOid: 'c'.repeat(40), baseRefName: 'main', body: 'SigmaDesk', statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }] });
+  setGh('files.json', ['app/handmade.py']); setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '7'.repeat(40) } });
+  await train.ownerMerge(77, { expectedSha: 'c'.repeat(40) }, SAT);
+  assert.equal(lockNow().key, 'PR#77'); assert.deepEqual(lockNow().workflows, ['.github/workflows/deploy.yml']);
+  resetTrain();
+  setGh('files.json', ['docs/readme.md']);
+  await train.ownerMerge(77, { expectedSha: 'c'.repeat(40) }, WED_11_ET); // no override phrase given
+  assert.equal(lockNow(), null);
+  setGh('files.json', ['app/handmade.py']);
+  await assert.rejects(train.ownerMerge(77, { expectedSha: 'c'.repeat(40) }, WED_11_ET), /type "merge during market hours"/);
+});
+
+test('deploys observed while a lock is held are queued, and expected workflows are tracked by file, never a visible subset', async () => {
+  resetTrain();
+  store.kvSet('train:deploy-pending', '[]');
+  const at = new Date(SAT.getTime() - 5 * 60_000).toISOString();
+  train.queueDeploy({ key: 'A', merge_sha: '8'.repeat(40), at, state: 'running', workflows: ['.github/workflows/deploy.yml'] });
+  assert.equal(train.queueDeploy({ key: null, by: 'external', merge_sha: '9'.repeat(40), at, state: 'running', workflows: ['.github/workflows/deploy.yml'] }), 'queued');
+  assert.equal(train.pendingDeploys().length, 1);
+  // a run of a DIFFERENT workflow file with the same display name does not release it
+  setGh('runs.json', [{ path: '.github/workflows/other.yml', name: 'Deploy', status: 'completed', conclusion: 'success', id: 3 }]);
+  assert.equal((await train.deployLock(SAT)).merge_sha, '8'.repeat(40));
+  setGh('runs.json', [{ path: '.github/workflows/deploy.yml', name: 'Deploy', status: 'completed', conclusion: 'success', id: 4 }]);
+  const next = await train.deployLock(SAT); // first released; the queued external deploy takes the lock and is green too
+  assert.equal(next, null); assert.equal(train.pendingDeploys().length, 0);
+  // unknown expected workflows: a green run is not enough
+  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '1'.repeat(40), at, state: 'running', workflows: [] }));
+  assert.ok(await train.deployLock(SAT), 'unknown expected deploys keep the lock');
+  resetTrain();
+});
+
+test('a ticket left "merging" without an intent goes back to the queue', async () => {
+  resetTrain();
+  const t = await approvedPr('docs/orphan.md');
+  store.updateTicket(t.key, { review_stage: 'merging' });
+  await train.reconcileIntent();
+  assert.equal(store.getTicket(t.key).review_stage, 'approved');
 });

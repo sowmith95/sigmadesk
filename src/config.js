@@ -73,6 +73,9 @@ const DEFAULTS = {
     // "auto": a PR with no checks at all may merge only if the repo has no GitHub Actions workflows.
     // "required": no checks reported = not mergeable. Skipped/neutral-only checks never count as a pass.
     ci: 'auto',
+    // "auto": the checks that succeeded on every one of the last 5 merges (owner-editable). Or list the names.
+    // With no list and a repo that has workflows, the desk does not auto-merge (the owner is asked to confirm).
+    requiredChecks: 'auto',
     optionalChecks: [], // check names allowed to be SKIPPED/NEUTRAL; every other check must be SUCCESS
     // Diff paths that make a change high-risk (trading, broker, risk, schema, deploy). Globs, like protectedPaths.
     riskPaths: ['**/oms/**', '**/*order_execution*', '**/*order_execution*/**', '**/*position_manager*', '**/clients/alpaca*',
@@ -89,7 +92,8 @@ const DEFAULTS = {
   // Merge train: serialized merges, a free conflict check after every base move, real conflicts to the builder.
   mergeTrain: {
     enabled: true,
-    updateWhenBehind: true, // the queue front is brought up to date with the base (lazy rebase) before merging
+    updateWhenBehind: true,
+    unknownGraceMinutes: 5, // a merge call that errored: only rolled back once GitHub shows it OPEN this long after // the queue front is brought up to date with the base (lazy rebase) before merging
   },
   resolve: {
     budgetUsd: 1.5, // per conflict-resolution run (Claude CLI hard cap)
