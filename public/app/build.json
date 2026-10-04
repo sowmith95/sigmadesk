@@ -1,5 +1,5 @@
 {
-  "source": "e5c4b517886b5453aba6019d55924a2e3ce71ac0305d7b3f2b7e08f3de67bb11",
+  "source": "179639d64a80d214127e18208704850b06d37c1419d0c9ef59d4a9d591828df3",
   "outputs": {
     "public/app/chunks/Bits-D_O2g6L4.js": "783ecf54d09f52d63c9c8a6d72c621f20c651fd4d490f8c275b794f3224e8d51",
     "public/app/chunks/check-0I0azLJq.js": "8b9a83e8ecfbaa6b859e974bd0b77143f852cceb3917ccfafd2eea92063857ca",
@@ -10,10 +10,10 @@
     "public/app/chunks/Features-B4slILpv.js": "95dae23a1abdba6fe6505f4369b4b1ca9b62490b29ce23c756fcecccc8f442aa",
     "public/app/chunks/Panels-BoAzkkE8.js": "1dccfc93acb05135d6905b2e573e17496c92c4acdb8edb47d604aea46fa9bc34",
     "public/app/chunks/Prs-B07EgLEV.js": "4bd4f1685d4055966bd674c92ac06bd97e202254e4a923325eb53b9e62d21916",
-    "public/app/chunks/Research-BUMMoW03.js": "2608eee76941a9d01e7e9121597b8b4b98f35007a245efdad4b685bb4fee00f8",
+    "public/app/chunks/Research-BLEuAO0d.js": "45d2ec6cab5f3e861e497987c05ebd4f432a73abe8c365c5966f2a26d7afb034",
     "public/app/chunks/Settings-Dpa2ONes.js": "61a174e22ddeb4a568b78ac1a8619e9a3fb4ff3ddd185f833e00d8323868cae1",
     "public/app/chunks/x-Y5ZyaGPP.js": "2e4c4c2f927335596d1d01a072a55fd0762dea9ffeddf03e64dd4e350dd3330c",
     "public/app/main.css": "54e520b4fe185386a25ab41884956e94b438c0cd59699ed2198cdc9fa3ea3ed6",
-    "public/app/main.js": "d788f9450be60082068e4e400027461c359e4c0906c5f9a896c5b11c707ee565"
+    "public/app/main.js": "99d2bfbb7d9e3af8c027376eaab824ee3e1dfbd7640a9ee24cdea169bda0a5b6"
   }
 }

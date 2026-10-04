@@ -34,7 +34,7 @@ export default function ResearchPage() {
       </Section>
       {!editing?.draft && <Section title="Add a program">
         <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-          {TEMPLATES.map((t: { id: string; label: string; blurb: string }) => <button key={t.id} type="button" onClick={() => setEditing({ draft: fromTemplate(t, opts) })}
+          {TEMPLATES.filter((t: { seat: string }) => S.agents.some((a: { id: string }) => a.id === t.seat)).map((t: { id: string; label: string; blurb: string }) => <button key={t.id} type="button" onClick={() => setEditing({ draft: fromTemplate(t, opts) })}
             className="grid gap-1 rounded-lg border border-dashed px-4 py-3 text-left hover:border-solid hover:bg-card"><b>{t.label}</b><span className="text-sm text-muted-foreground">{t.blurb}</span></button>)}
           <button type="button" onClick={() => setEditing({ draft: blankDraft(opts) })} className="grid gap-1 rounded-lg border border-dashed px-4 py-3 text-left hover:border-solid hover:bg-card"><b>Start blank</b><span className="text-sm text-muted-foreground">Pick every setting yourself</span></button>
         </div>

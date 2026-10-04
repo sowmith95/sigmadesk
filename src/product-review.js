@@ -2,7 +2,8 @@
 import crypto from 'node:crypto';
 import * as store from './db.js';
 import * as runner from './runner.js';
-import { agentById } from './team.js';
+import { agentById, advisorSeats } from './team.js';
+import { advisorMatches } from './team-catalog.js';
 const phases = ['plan', 'feedback'];
 const fail = message => { throw Object.assign(new Error(message), { status: 409 }); };
 const keyOf = (key, phase) => `product-review:${key}:${phase}`;
@@ -15,15 +16,21 @@ export function current(key, phase = 'plan') {
 export function fingerprint(t, phase = 'plan') {
   return crypto.createHash('sha256').update(JSON.stringify([t.title, t.description, t.area, t.type, t.parent_key, t.after_key, phase === 'feedback' ? t.head_sha : null, store.listComments(t.key).filter(c=>c.body.startsWith('📐 **Design**')).map(c=>[c.id,c.body])])).digest('hex');
 }
+// Reviewers: the PM, the principal(s) for the area (plan phase), and every advisor whose triggers match. Switched-off
+// seats never join (a principal falls back to the other one). Advisors chosen per project report; only the legacy
+// desk's advisors gate the review (see team-catalog.js).
 export function reviewersFor(t, phase = 'plan') {
-  const text = `${t.title} ${t.description}`;
-  const ids = ['pm'];
-  if (phase === 'plan') ids.push(...(t.area === 'frontend' ? ['principal-fe'] : t.area === 'fullstack' ? ['principal-be','principal-fe'] : ['principal-be']));
-  if (['frontend','fullstack'].includes(t.area) || /dashboard|interface|\bUX\b|mobile/i.test(text)) ids.push('product-design');
-  if (/trad|dashboard|portfolio|position|order|liquidat|risk|P&L|market/i.test(text)) ids.push('trading-advisor');
-  if (/\balpha\b|backtest|predict|forecast|signal|strategy|statistical|machine learning/i.test(text)) ids.push('quant-research');
+  const on = (id) => agentById[id] && agentById[id].enabled !== false;
+  const ids = on('pm') ? ['pm'] : [];
+  if (phase === 'plan') {
+    const want = t.area === 'frontend' ? ['principal-fe'] : t.area === 'fullstack' ? ['principal-be', 'principal-fe'] : ['principal-be'];
+    const have = want.filter(on);
+    ids.push(...(have.length ? have : ['principal-be', 'principal-fe'].filter(on).slice(0, 1)));
+  }
+  for (const a of advisorSeats()) if (a.enabled !== false && advisorMatches(a.advisor, t)) ids.push(a.id);
   return [...new Set(ids)];
 }
+const isAdvisory = (id) => !!agentById[id]?.advisor && !agentById[id].advisor.gate;
 function save(r) {
   const value = { ...r, updated_at: store.now() }; delete value.stale;
   store.kvSet(keyOf(r.ticket_key, r.phase), JSON.stringify(value));
@@ -41,7 +48,7 @@ export function start(key, { phase = 'plan', message = '', expected_revision } =
   const r = { ticket_key:key, phase, revision:(old?.revision || 0)+1, input_hash:fingerprint(t,phase), status:'reviewing', created_at:store.now(),
     brief:store.redact(JSON.stringify({ title:t.title, description:t.description, area:t.area, head_sha:phase==='feedback'?t.head_sha:null,
       evidence:store.listComments(key).filter(c=>phase==='feedback' || /design|architecture/i.test(c.body)).slice(-8).map(c=>({author:c.author,body:c.body.slice(0,3500)})), direction:String(message).slice(0,4000) })),
-    members:[...reviewersFor(t,phase).map(agent_id=>({agent_id,stage:'review',status:'pending',attempts:0})),{agent_id:'manager',stage:'synthesis',status:'pending',attempts:0}] };
+    members:[...reviewersFor(t,phase).map(agent_id=>({agent_id,stage:'review',status:'pending',attempts:0,...(isAdvisory(agent_id)?{advisory:true}:{})})),{agent_id:'manager',stage:'synthesis',status:'pending',attempts:0}] };
   save(r);
   store.logEvent({ticket_key:key,agent_id:'manager',kind:'system',text:`${phase === 'plan' ? 'Product & design' : 'User feedback'} review #${r.revision} queued: independent perspectives, then EM synthesis.`});
   return current(key,phase);
@@ -94,13 +101,15 @@ export function complete(key,phase,revision,agentId,{report,error,run_id,model,p
   const peers=r.members.filter(x=>x.stage!=='synthesis');
   if(!r.stale&&!r.challenge_started&&peers.every(x=>x.status==='complete')) {
     r.challenge_started=true;
-    for(const peer of peers.filter(x=>x.report.verdict!=='support').slice(0,2)) {
+    for(const peer of peers.filter(x=>!x.advisory&&x.report.verdict!=='support').slice(0,2)) {
       Object.assign(peer,{initial_report:peer.report,report:null,stage:'challenge',status:'pending',attempts:0});
     }
   }
   if(r.stale) r.status='stale';
-  else if(r.members.some(x=>x.status==='failed')) r.status='failed';
-  else if(r.members.every(x=>x.status==='complete')) r.status=r.members.every(x=>x.report.verdict==='support')?'approved':'changes';
+  // Advisory members report (their concerns reach the synthesis and the owner) but neither a failure nor a concern of
+  // theirs blocks the review; required members gate it as before.
+  else if(r.members.some(x=>!x.advisory&&x.status==='failed')) r.status='failed';
+  else if(r.members.every(x=>x.status==='complete'||(x.advisory&&x.status==='failed'))) r.status=r.members.filter(x=>!x.advisory).every(x=>x.report.verdict==='support')?'approved':'changes';
   save(r);
   if(report) store.addComment(key,agentId,`**${r.phase==='plan'?'Product & design':'User feedback'} review · ${report.verdict}**\n\n${report.recommendation}\n\nUsers: ${report.users.join('; ')}\nBenefits: ${report.benefits.join('; ')}\nDrawbacks: ${report.drawbacks.join('; ')}\nAlternatives: ${report.alternatives.join('; ')}\nConditions: ${report.conditions.join('; ')||'None'}\nEvidence: ${report.evidence.join('; ')}\n\nArchitecture: ${report.architecture}\nRollout: ${report.rollout}\nSuccess metric: ${report.success_metric}`);
 }
@@ -118,7 +127,7 @@ export async function launch(r,m,fence) {
   finally { if(!store.getAgentState(m.agent_id)?.current_run) store.updateAgent(m.agent_id,{status:'idle',current_ticket:null,current_kind:null}); }
 }
 export function pending() {
-  return summaries().filter(r=>r.status==='reviewing'&&!r.stale).flatMap(r=>r.members.filter(m=>m.status==='pending'&&(m.stage!=='synthesis'||r.members.filter(x=>x.stage!=='synthesis').every(x=>x.status==='complete'))).map(m=>({r,m})));
+  return summaries().filter(r=>r.status==='reviewing'&&!r.stale).flatMap(r=>r.members.filter(m=>m.status==='pending'&&(m.stage!=='synthesis'||r.members.filter(x=>x.stage!=='synthesis').every(x=>x.status==='complete'||(x.advisory&&x.status==='failed')))).map(m=>({r,m})));
 }
 export function refreshChangedPlans() {
   for (const r of summaries()) {

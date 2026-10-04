@@ -138,3 +138,15 @@ test('feedback reviewers inspect an isolated clone pinned to the submitted commi
  assert.equal(fs.readFileSync(path.join(clone,'submitted.txt'),'utf8'),'Exact submitted feedback evidence');
  assert.equal(fs.existsSync(path.join(repo,'submitted.txt')),false);
 });
+
+test('an advisory reviewer reports but never blocks: its concern or failure leaves the required verdicts in charge',()=>{
+  const t=ticket(); const r=review.start(t.key);
+  // Make the trading advisor advisory, as a project's catalog advisors are (the legacy desk keeps it required).
+  const raw=JSON.parse(store.kvGet(`product-review:${t.key}:plan`)); raw.members.find(m=>m.agent_id==='trading-advisor').advisory=true; store.kvSet(`product-review:${t.key}:plan`,JSON.stringify(raw));
+  for(const m of r.members.filter(m=>m.stage==='review')) finish(r,m.agent_id,m.agent_id==='trading-advisor'?'concern':'support');
+  assert.ok(!review.pending().some(x=>x.r.ticket_key===t.key&&x.m.stage==='challenge'),'no challenge round is forced by an advisory concern');
+  assert.ok(review.pending().some(x=>x.r.ticket_key===t.key&&x.m.agent_id==='manager'),'synthesis follows');
+  finish(r,'manager');
+  assert.equal(review.current(t.key).status,'approved');
+  assert.match(store.listComments(t.key).map(c=>c.body).join('\n'),/concern/,'the advisory concern is still on the record');
+});

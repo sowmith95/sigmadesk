@@ -9,6 +9,7 @@
 import fs from 'node:fs';
 import { config } from './config.js';
 import * as store from './db.js';
+import { LEGACY_TEAM, advisorSeats } from './team.js';
 
 export const STATUSES = ['proposed', 'assessing', 'assessed', 'approved', 'rejected', 'retired'];
 export const CASE_SECTIONS = ['Purpose', 'Benefit to the application', 'How it is used', 'SDLC stage improved', 'Cost', 'Time', 'Data leaving the machine', 'Risks and fallback', 'Success measure'];
@@ -100,8 +101,15 @@ export function updateCase(name, { purpose, case_md }) {
 // Assessment: one read-only run by a seat other than the proposer, chosen by domain. The verdict is structured JSON.
 export function assessorFor(c, enabled = (id) => true) {
   const text = `${c.purpose} ${c.case_md}`;
-  const domain = /market|price|quote|broker|option|trade|paper|arxiv|research|academic|dataset|econom/i.test(text) ? ['quant-research', 'trading-advisor', 'principal-be'] : ['principal-be', 'quant-research', 'trading-advisor'];
-  return domain.find((id) => id !== c.proposed_by && enabled(id)) || null;
+  if (LEGACY_TEAM) { // today's desk: today's order
+    const domain = /market|price|quote|broker|option|trade|paper|arxiv|research|academic|dataset|econom/i.test(text) ? ['quant-research', 'trading-advisor', 'principal-be'] : ['principal-be', 'quant-research', 'trading-advisor'];
+    return domain.find((id) => id !== c.proposed_by && enabled(id)) || null;
+  }
+  // A project's research advisors whose domain the connector touches go first, then the principal backend engineer.
+  const research = advisorSeats().filter((a) => a.advisor.research);
+  const fits = research.filter((a) => (a.advisor.assess || a.advisor.triggers?.pattern) && new RegExp(a.advisor.assess || a.advisor.triggers.pattern, 'i').test(text)).map((a) => a.id);
+  const order = [...fits, 'principal-be', 'principal-fe', ...research.map((a) => a.id)];
+  return [...new Set(order)].find((id) => id !== c.proposed_by && enabled(id)) || null;
 }
 export function requestAssessment(name) {
   const c = store.getConnector(name) || fail('connector not found', 404);
