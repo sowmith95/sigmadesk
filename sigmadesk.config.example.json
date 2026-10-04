@@ -99,7 +99,10 @@
       "relayReserveChars": 8000,
       "remoteWaitMinutes": 8,
       "followupRounds": 1,
-      "prepareDeadlineSeconds": 45
+      "prepareDeadlineSeconds": 45,
+      "pageChars": 0,
+      "pageRounds": 6,
+      "secretPatterns": []
     }
   },
   "advisors": {

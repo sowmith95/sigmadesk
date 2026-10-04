@@ -36,6 +36,9 @@ w('.env.prod', `DB_URL=postgres://app:prodpass@db/x\n`);
 w('src/big.js', `${Array.from({ length: 400 }, (_, i) => `export const v${i} = ${i};`).join('\n')}\n`);
 w('src/giant.js', `${Array.from({ length: 1500 }, (_, i) => `export const g${i} = ${i};`).join('\n')}\n`);
 w('config/app.json', '{"name":"demo"}\n');
+w('constructor', 'a file named like an Object.prototype property\n');
+w('__proto__', 'another one\n');
+w('src/minified.js', `// head\n${'x'.repeat(10)}\nconst blob = "${'q'.repeat(120000)}END";\n// tail\n`);
 fs.symlinkSync('../outside/secret.txt', path.join(owner, 'link.js'));
 go('add', '-A');
 go('commit', '-qm', 'init');
@@ -131,7 +134,11 @@ function read(live, thread, text) {
 test('groom pack: base frozen from the owner, ticket, acceptance, excerpts, search references; escapes rejected', async () => {
   const t = ticketFor();
   store.addComment(t.key, 'manager', '🗣 **Asked Ada (Principal):** is src/caller.js affected?');
+  // The 3000-char comment clip lands inside a JSON password: scrubbing must happen before clipping.
+  store.addComment(t.key, 'owner', `${'x'.repeat(2980)}{"password":"clipsecretvalue123"}`);
   const { pack } = await packFor('groom', t);
+  assert.match(pack.text, /x{100}\{"password":"\[reda[\s\S]{0,20}\[comment cut here/, 'the clip lands inside the redacted value');
+  assert.ok(!pack.text.includes('clipsec'), 'clipped credential not leaked');
   const x = pack.text;
   assert.match(x, /^<sigmadesk-context kind="groom" sha256="[0-9a-f]{64}">/);
   assert.match(x, new RegExp(`base branch: main @ ${mainSha} \\(frozen from the owner's repository\\)`));
@@ -230,9 +237,24 @@ test('scrub: quoted JSON/YAML credentials, PEM blocks, bearer tokens, URL creden
     const out = ctx.scrub(input);
     assert.ok(!out.includes(secret), `${input} → ${out}`);
     assert.equal(ctx.scrub(out), out, `idempotent: ${out}`);
-    assert.ok(ctx.hasSecret(input));
   }
-  assert.ok(!ctx.hasSecret('export function computeEdge(iv, rv) { return iv - rv; }'));
+  // Kill rule: exact run secrets and high-confidence formats only; generic assignments are redaction-only.
+  for (const benign of ['token = getToken()', 'const password = req.body.password;', 'Authorization: Bearer abcdefghijklmnop.qrstu',
+    'password: "hunter2hunter"', 'pk_live_1234567890abcdefghijklmnop', 'export function computeEdge(iv, rv) { return iv - rv; }'])
+    assert.equal(ctx.killReason(benign), null, benign);
+  const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun\nVTLw7onLRnrq0/IzW7yWR7QkrmBL7jTKEn5u+qKhbwKfBstIs+bMY2Zkp18gnTxK\n-----END RSA PRIVATE KEY-----';
+  for (const bad of [pem, `x ghp_${'a'.repeat(36)} y`, 'AKIAABCDEFGHIJKLMNOP', `sk_live_${'b'.repeat(24)}`, `sk-ant-api03-${'c'.repeat(30)}`])
+    assert.match(ctx.killReason(bad), /private key or provider secret/, bad.slice(0, 30));
+  assert.match(ctx.killReason('use nonce-123456 here', ['nonce-123456']), /token or verdict code/);
+  assert.equal(ctx.killReason('-----BEGIN RSA PRIVATE KEY----- (redacted in docs)'), null, 'an unvalidated header alone is not a key');
+  config.engines.perplexity.secretPatterns = ['\\bBRK[A-Z0-9]{20}\\b'];
+  process.env.DESK_TEST_BROKER_SECRET = 'live-secret-value-0123456789';
+  ctx.resetSecretCache();
+  try {
+    assert.match(ctx.killReason('key BRKABCDEFGHIJ0123456789'), /provider secret/);
+    assert.match(ctx.killReason('value live-secret-value-0123456789'), /secret environment/);
+    assert.ok(!ctx.scrub('BRKABCDEFGHIJ0123456789 live-secret-value-0123456789').match(/BRKA|live-secret/));
+  } finally { config.engines.perplexity.secretPatterns = []; delete process.env.DESK_TEST_BROKER_SECRET; ctx.resetSecretCache(); }
 });
 
 test('context-file: secret renames and secret paths are withheld; extras capped; pack omissions always servable', async () => {
@@ -280,24 +302,42 @@ test('delivery counts only on a successful, correlated result; pages count only 
   assert.ok(!live.meta.fetched.includes('src/big.js'), 'a failed follow-up does not count');
   call(live, { message: `Here:\n${block}`, thread_id: 'thread-A-0001' });
   assert.deepEqual(live.meta.fetched, ['src/big.js']);
+  const DONE = '{"thread_status":"idle","web_state":{"thread_status":"idle","entries":[{"status":"WORKFLOW_COMPLETED"},{"status":"WORKFLOW_COMPLETED","steps":[{"status":"WORKFLOW_COMPLETED"}]}]}}';
+  const RUNNING = '{"thread_status":"running","web_state":{"thread_status":"running","entries":[{"status":"WORKFLOW_COMPLETED"},{"status":"RUNNING"}]}}';
+  const FAILED = '{"thread_status":"idle","web_state":{"entries":[{"status":"WORKFLOW_COMPLETED"},{"status":"WORKFLOW_ERROR"}]}}';
   assert.match(ctx.acceptBlockers(live.meta), /No completed Perplexity answer/);
-  read(live, 'thread-B-0002', '{"web_state":{"steps":[{"status":"WORKFLOW_COMPLETED"}]}}');
+  read(live, 'thread-B-0002', DONE);
   assert.match(ctx.acceptBlockers(live.meta), /No completed Perplexity answer/, 'another thread finishing does not count');
-  read(live, 'thread-A-0001', '{"thread_status":"running"}');
-  assert.equal(live.meta.remote.status, 'pending');
-  read(live, 'thread-A-0001', '{"web_state":{"steps":[{"status":"WORKFLOW_COMPLETED"}]}}');
+  read(live, 'thread-A-0001', 'The answer mentions WORKFLOW_COMPLETED in prose');
+  assert.match(ctx.acceptBlockers(live.meta), /No completed Perplexity answer/, 'a text mention is not a state');
+  read(live, 'thread-A-0001', RUNNING);
+  assert.equal(live.meta.remote.status, 'pending', 'an earlier completed entry does not finish the latest one');
+  read(live, 'thread-A-0001', DONE);
   assert.equal(ctx.acceptBlockers(live.meta), null);
-  assert.equal(live.meta.remote.status, 'completed');
+  read(live, 'thread-A-0001', FAILED);
+  assert.match(ctx.acceptBlockers(live.meta), /failed or was cancelled/, 'a later error invalidates the completion');
+  read(live, 'thread-A-0001', DONE);
+  assert.equal(ctx.acceptBlockers(live.meta), null);
+  const pendingId = id();
+  ctx.recordSend(live, pendingId, 'call', { message: 'One more question', thread_id: 'thread-A-0001' });
+  assert.match(ctx.acceptBlockers(live.meta), /still in flight/);
+  ctx.recordResult(live, pendingId, { text: '{"thread_id":"thread-A-0001"}' });
+  assert.match(ctx.acceptBlockers(live.meta), /No completed Perplexity answer/, 'the follow-up needs its own completion');
+  read(live, 'thread-A-0001', DONE);
+  assert.equal(ctx.acceptBlockers(live.meta), null);
+  assert.equal(ctx.remoteState('{"thread_status":"idle","web_state":{"entries":[]}}'), 'pending', 'idle with no entries is not completion');
   ctx.release(run.id);
 });
 
-test('violations fail closed: token/nonce, secrets or an oversized message kill the run and invalidate it', async () => {
+test('violations fail closed: token/nonce, provider secrets or an oversized message kill the run; generic code does not', async () => {
   const t = ticketFor();
   const { run, pack, live } = await packFor('groom', t, { secrets: ['nonce99999'] });
   let ev = ctx.recordSend(live, id(), 'call', { message: `${pack.text}\n--code nonce99999` });
   assert.ok(ev.some((e) => e.kill && /token or verdict code/.test(e.kill)));
-  ev = ctx.recordSend(live, id(), 'call', { message: `${pack.text}\n## Relay additions\npassword: "hunter2hunter"` });
-  assert.ok(ev.some((e) => e.kill && /secret-looking/.test(e.kill)));
+  ev = ctx.recordSend(live, id(), 'call', { message: `${pack.text}\n## Relay additions\ntoken = getToken()\npassword: "hunter2hunter"` });
+  assert.ok(!ev.some((e) => e.kill), 'generic credential-looking code does not kill');
+  ev = ctx.recordSend(live, id(), 'call', { message: `${pack.text}\n## Relay additions\nGITHUB=ghp_${'z'.repeat(36)}` });
+  assert.ok(ev.some((e) => e.kill && /provider secret/.test(e.kill)));
   ev = ctx.recordSend(live, id(), 'call', { message: `${pack.text}\n${'x'.repeat(70000)}` });
   assert.ok(ev.some((e) => e.kill && /over the 60000-char cap/.test(e.kill)));
   assert.equal(ctx.recordSend(live, id(), 'call', { message: `Groom this.\n${pack.text}` }).filter((e) => e.kill).length, 0, 'the pack itself is clean');
@@ -323,7 +363,7 @@ test('giant single hunk: paginated, every page within the cap, full coverage onl
   const blocks = [first];
   for (let p = 2; p <= pages; p++) blocks.push(await ctx.serveFile(run.id, 'src/giant.js', p, settings));
   await assert.rejects(ctx.serveFile(run.id, 'src/giant.js', pages + 1, settings), /has \d+ page/);
-  for (const b of blocks) assert.ok(b.length <= settings.pageChars + 400, `page ${b.length} chars`);
+  for (const b of blocks) assert.ok(b.length <= settings.pageChars, `page ${b.length} chars > ${settings.pageChars}`);
   const all = blocks.join('\n');
   for (const n of [1, 700, 1499]) assert.ok(all.includes(`+export const g${n} = ${n * 7};`), `line ${n} present`);
   assert.match(first, /\[hunk part 1 of \d+\]/);
@@ -408,5 +448,56 @@ test('runner: a pack that cannot be built refuses the run before spawning; a kil
     const stopped = await p;
     assert.equal(stopped.run.status, 'killed');
     assert.equal(stopped.run.pid, null);
+  } finally { Object.assign(seat, saved); }
+});
+
+test('pagination: a giant line is chunked, every block within the page cap, coverage across several follow-ups', async () => {
+  const { live, run, pack } = await packFor('groom', ticketFor());
+  call(live, { message: pack.text });
+  const settings = ctx.packSettings();
+  const first = await ctx.serveFile(run.id, 'src/minified.js', 1, settings);
+  const n = Number(first.match(/pages="(\d+)"/)[1]);
+  const blocks = [first];
+  for (let p = 2; p <= n; p++) blocks.push(await ctx.serveFile(run.id, 'src/minified.js', p, settings));
+  for (const b of blocks) assert.ok(b.length <= settings.pageChars && b.length <= settings.maxChars, `${b.length}`);
+  const joined = blocks.join('').replace(/ \[line continues\]|\n|<[^>]+>|\(\d+ more page[^)]*\)/g, '');
+  assert.equal((joined.match(/q/g) || []).length, 120000, 'every character of the giant line is served');
+  assert.match(joined, /END/);
+  for (const b of blocks) call(live, { message: b, thread_id: 'thread-A-0001' }); // one follow-up per page
+  assert.deepEqual(live.meta.fetched, ['src/minified.js']);
+  assert.equal(live.meta.pageRounds, n);
+  ctx.release(run.id);
+});
+
+test('files named constructor and __proto__ are ordinary keys', async () => {
+  const { live, run, pack } = await packFor('groom', ticketFor());
+  call(live, { message: pack.text });
+  for (const name of ['constructor', '__proto__']) {
+    const block = await ctx.serveFile(run.id, name);
+    assert.match(block, new RegExp(`<sigmadesk-file path="${name}" page="1" pages="1"`));
+    call(live, { message: block, thread_id: 'thread-A-0001' });
+  }
+  assert.deepEqual(live.meta.fetched, ['constructor', '__proto__']);
+  assert.equal(Object.getPrototypeOf(live.meta.servedPages), null);
+  assert.deepEqual(Object.keys(live.meta.servedPages), ['constructor', '__proto__']);
+  const revived = ctx.reviveMeta(JSON.parse(JSON.stringify(live.meta)));
+  assert.deepEqual(revived.fetchedPages.__proto__, [1]);
+  assert.equal(revived.servedPages.constructor, 1);
+  ctx.release(run.id);
+});
+
+test('stop-all aborts a run that is still building its pack', async () => {
+  const dispatch = await import('../src/dispatch.js');
+  const team = await import('../src/team.js');
+  dispatch.setAvailability([{ id: 'perplexity', available: true }, { id: 'claude', available: true }, { id: 'codex', available: false }]);
+  const seat = team.agentById.pm;
+  const saved = { engine: seat.engine, model: seat.model };
+  Object.assign(seat, { engine: 'perplexity', model: 'pplx_asi_kimi_k3' });
+  try {
+    const p = runner.startRun({ agentId: 'pm', kind: 'groom', ticketKey: ticketFor().key, prompt: 'groom it', cwd: clone, track: false, fence: runner.currentEpoch() });
+    runner.killAll('circuit breaker');
+    const out = await p;
+    assert.equal(out.run.status, 'killed');
+    assert.equal(out.run.pid, null, 'never spawned');
   } finally { Object.assign(seat, saved); }
 });

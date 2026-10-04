@@ -94,14 +94,22 @@ private-key blocks, bearer tokens, URL credentials, known key formats); secret p
 are withheld. Packs are stored in `data/context/` (0600). If a pack cannot be built within `prepareDeadlineSeconds`,
 the run is refused.
 
-The relay must send the pack verbatim. The desk inspects every outgoing call: a run token, verdict code, secret-looking
-content or a message over `contextMaxChars` stops the run immediately and invalidates it. The pack counts as delivered
-only when that call's tool result succeeds; requested files (`desk context-file <path> [--page N]`, paginated, never
-truncated) count only once every page reaches the pack's own thread. `desk accept pass` is refused until the pack was
-delivered, every omitted changed file was fully sent, and the thread shows `WORKFLOW_COMPLETED` after the last message.
-A retry of the same job (same task, seat contract and pack) resumes polling the recorded thread; anything else asks
-afresh. Knobs under `engines.perplexity`: `contextMaxChars` (60000), `relayReserveChars` (8000), `remoteWaitMinutes`
-(8; idle watchdog and run timeouts are raised above it), `followupRounds` (1), `prepareDeadlineSeconds` (45).
+The relay must send the pack verbatim. The desk inspects every outgoing call. It stops the run immediately and
+invalidates it only for this run's exact token or verdict code, a validated private-key block, a recognised provider
+secret (Anthropic/OpenAI/GitHub/AWS/Slack/Google/Stripe secret keys…, never public `pk_*` keys), a format listed in
+`engines.perplexity.secretPatterns`, the value of a secret-named desk environment variable, or a message over
+`contextMaxChars`. Generic credential-looking code (`token = getToken()`) is redacted from packs but never stops a run.
+This is observation of the relay's stream, not a proxy: a violating message may already be in flight when the run is
+stopped. The pack counts as delivered only when that call's tool result succeeds. Requested files
+(`desk context-file <path> [--page N]`) are paginated without truncation; every page fits `pageChars` and pages may go
+in several follow-ups, but they count only on the pack's own thread. `desk accept pass` is refused until the pack was
+delivered, every omitted changed file was fully sent, no message to the thread is in flight, and `read_thread`'s
+structured state shows the latest entry as `WORKFLOW_COMPLETED` after the last message (a later error or follow-up
+undoes it). Stop-all also aborts runs that are still building their pack. A retry of the same job (same task, seat
+contract and pack) resumes polling the recorded thread; anything else asks afresh. Knobs under `engines.perplexity`:
+`contextMaxChars` (60000), `relayReserveChars` (8000), `remoteWaitMinutes` (8; idle watchdog and run timeouts are
+raised above it), `followupRounds` (1), `pageRounds` (6), `pageChars` (0 = the pack budget), `secretPatterns` ([]),
+`prepareDeadlineSeconds` (45).
 
 ## Owner decisions and discussions
 
