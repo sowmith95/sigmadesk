@@ -3,6 +3,9 @@
 // and runs the desk commands the model decides. Only "thinking" seats can use it: Perplexity cannot edit local files,
 // so implementation and QA always run on a local engine.
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { config } from '../config.js';
 import { claude } from './claude.js';
 import * as context from '../context.js';
@@ -13,11 +16,10 @@ const T = (name) => `mcp__${SERVER}__${name}`;
 const ALLOW = [T('call_perplexity_computer'), T('read_thread'), T('answer_question'), T('confirm_action_deny'), T('models_list')];
 // Computer can act in the world (connected apps, files): the desk never lets a seat approve those actions.
 const BLOCK = [T('confirm_action_approve'), T('create_attachment_upload'), T('create_asset_download'), T('projects_list'), T('notify_connected')];
-// owner_discussion is the manager's design discussion (scheduler.launchDiscussion); without it here, a manager seat on
-// Perplexity silently ran those on local Claude.
-export const THINK_KINDS = ['research', 'groom', 'design', 'consult', 'review', 'triage', 'investigate', 'owner_discussion', 'product_review'];
+// owner_discussion is the manager's design discussion (scheduler.launchDiscussion); council_review and product_review are read-only review passes.
+export const THINK_KINDS = ['research', 'groom', 'design', 'consult', 'review', 'triage', 'investigate', 'owner_discussion', 'product_review', 'council_review'];
 
-// From models.list on the owner's account (2026-10-03). Ids are passed straight to call_perplexity_computer.
+// From models.list on the owner's account. Ids are passed straight to call_perplexity_computer.
 export const MODELS = [
   { id: 'pplx_asi_kimi_k3', label: 'Kimi K3', tier: 'frontier', note: 'architecture & independent design reasoning' },
   { id: 'pplx_asi_grok', label: 'Grok 4.7', tier: 'frontier', note: 'reliability, adversarial review' },
@@ -31,6 +33,7 @@ export const MODELS = [
   { id: 'pplx_asi_opus_fast', label: 'Claude Opus 5.5 fast', tier: 'strong', note: 'faster' },
   { id: 'pplx_asi_sonnet', label: 'Claude Sonnet 5.5', tier: 'fast', note: 'fewer credits' },
   { id: 'pplx_asi_fable_5', label: 'Claude Fable 5.1', tier: 'frontier', note: 'most powerful; extra credits' },
+  { id: 'pplx_model_council', label: 'Model Council', tier: 'frontier', note: 'multi-model consensus and synthesis in Computer' },
 ];
 const labelOf = (id) => MODELS.find((m) => m.id === id)?.label || id || 'Perplexity default';
 
@@ -54,9 +57,9 @@ function relayCharter(seat, kind) {
 Your judgment comes from ${labelOf(model)}, reached with ${T('call_perplexity_computer')}. You do not decide yourself.
 1. Read your task. The desk has already gathered the context (the context pack at the end of your instructions); read
    more files only if something specific is missing, and add those excerpts after the pack, never inside it.
-2. Call ${T('call_perplexity_computer')} ONCE with model="${model}", effort="${seat.effort || 'medium'}" (do not pass mode — Computer rejects mode+model together).
+2. Call ${T('call_perplexity_computer')} ONCE with model="${model === 'pplx_model_council' ? 'pplx_asi_kimi_k3' : model}", effort="${seat.effort || 'medium'}"${model === 'pplx_model_council' ? ', mode="council"' : ''} (do not pass mode when passing model unless invoking Model Council).
    Tell it to answer read-only: no connected apps, no files, no accounts, nothing outside this conversation.
-3. ${kind==='product_review'?'Return its structured review JSON as your final answer. Do not run desk mutations.':'Act on its answer by running the desk commands it decides, quoting its reasoning where useful.'} For a follow-up, call
+3. ${['product_review', 'council_review'].includes(kind) ? 'Return its structured review as your final answer. Do not run desk mutations.' : 'Act on its answer by running the desk commands it decides, quoting its reasoning where useful.'} For a follow-up, call
    again with the same thread_id.
 4. Never approve a Computer action (only ${T('confirm_action_deny')}). If Perplexity fails or times out, say so with
    \`desk comment\` and stop — do not substitute your own judgment.
@@ -73,7 +76,28 @@ export const perplexity = {
   canFork: false,
   usesSocket: true,
   supports: (kind) => THINK_KINDS.includes(kind),
-  models: () => MODELS.map((m) => ({ id: m.id, tier: m.tier, note: `${m.label} — ${m.note}` })),
+  models: () => {
+    let cache = {};
+    try {
+      const cacheFile = path.join(process.env.PERPLEXITY_HOME || path.join(os.homedir(), '.perplexity'), 'models_cache.json');
+      cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    } catch { /* use base catalog */ }
+    const choices = (cache.models || []).map((x) => ({
+      id: x.slug || x.id,
+      label: x.display_name || x.label || x.name || x.id,
+      tier: x.tier || 'frontier',
+      efforts: x.supported_reasoning_levels || x.efforts,
+      note: `Perplexity catalog${cache.fetched_at ? ` · ${cache.fetched_at}` : ''}; access checked on use`,
+    }));
+    const combined = [...MODELS];
+    for (const m of choices) {
+      if (!combined.some((x) => x.id === m.id)) combined.push(m);
+    }
+    for (const id of config.engines?.perplexity?.models || []) {
+      if (!combined.some((x) => x.id === id)) combined.push({ id, label: id, tier: 'frontier', note: 'Configured model; access checked on use' });
+    }
+    return combined.map((m) => ({ id: m.id, tier: m.tier, note: `${m.label || m.id} — ${m.note || ''}` }));
+  },
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
   suggest(tier) {
     return { frontier: { model: 'pplx_asi_kimi_k3', effort: 'high' }, strong: { model: 'pplx_asi_kimi_k3', effort: 'medium' },
@@ -93,7 +117,7 @@ export const perplexity = {
     const cmd = claude.command({
       ...args,
       seat: { ...args.seat, engine: 'claude', model: hands, effort: 'low' },
-      charter: `${args.charter}${relayCharter(args.seat,args.kind)}`,
+      charter: `${args.charter}${relayCharter(args.seat, args.kind)}`,
       perms: { ...args.perms, allow: [...args.perms.allow, ...ALLOW] },
       denyRules: [...args.denyRules, ...BLOCK],
     });
@@ -111,7 +135,7 @@ export const perplexity = {
     const base = claude.parse(line, cwd, state).map((e) => {
       if (e.type !== 'tool' || !e.text.startsWith(T(''))) return e;
       if (e.text.startsWith(T('call_perplexity_computer'))) {
-        const model = e.text.match(/"model":"([^"]+)"/)?.[1];
+        const model = e.text.match(/\"model\":\"([^\"]+)\"/)?.[1];
         return { ...e, text: `🔭 Asked ${labelOf(model)} on Perplexity` };
       }
       return { ...e, text: e.text.replace(`mcp__${SERVER}__`, 'Perplexity · ').slice(0, 120) };
