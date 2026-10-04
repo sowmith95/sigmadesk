@@ -344,6 +344,33 @@ seats resume their own sessions anyway, but an idle restart charges nothing).
 Add your Tailscale (or LAN) IP to `server.hosts` and set `server.ownerToken`, then open
 `http://<ip>:8790/?token=<ownerToken>` once on the phone (it sets a cookie). Add it to your home screen: it's a PWA.
 
+## Projects: one desk per repository
+
+SigmaDesk can run a desk for any number of projects. The code (this checkout) holds no project data. Each project
+lives in the per-user application folder:
+
+| What | macOS | Linux |
+|---|---|---|
+| Project home: config, team, playbook, database, run files | `~/Library/Application Support/SigmaDesk/projects/<id>/` | `~/.local/share/sigmadesk/projects/<id>/` |
+| Agent workspaces (clones), outside every project home | `…/SigmaDesk/workspaces/<id>/` | `…/sigmadesk/workspaces/<id>/` |
+| Logs | `~/Library/Logs/SigmaDesk/<id>/` | `~/.local/state/sigmadesk/<id>/` |
+| Registry | `…/SigmaDesk/projects.json` | `…/sigmadesk/projects.json` |
+
+```bash
+npm run project -- create ~/code/shop --name "Shop"   # creates the project home with a neutral profile
+npm run project -- list
+npm run project -- install shop                       # background service on its own port
+npm run project -- uninstall shop                     # stops it; the data stays
+```
+
+Each desk is isolated:
+- its own database, sockets, workspaces, port and login cookie;
+- a lock refuses a second copy of the same project before it can touch the database;
+- agents can read their own clones, but never any project's database or another project's clones.
+
+A desk without `SIGMADESK_HOME` uses the original in-checkout layout, so an existing desk keeps working unchanged.
+The setup wizard (describe the project, approve a recommended team) is next.
+
 ## Configuration
 
 Everything lives in `sigmadesk.config.json` (gitignored). See `sigmadesk.config.example.json`. Highlights:

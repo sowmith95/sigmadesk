@@ -290,10 +290,17 @@ export function canResume(run, maxAgeHours) {
   return Date.now() - ended < maxAgeHours * 3600_000 && transcript && fs.existsSync(run.cwd);
 }
 
+// Other projects' workspaces under the application folder (agents of one project never read another's clones).
+function siblingWorkspaces() {
+  const dir = path.join(config.appRoot, 'workspaces');
+  try { return fs.readdirSync(dir).filter((d) => d !== config.projectId).map((d) => path.join(dir, d)); } catch { return []; }
+}
 export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketPath = config.socketPath) {
   const deny = [...config.sandbox.denyRead,
     // desk state: run tokens, verdict codes, config, private notes, and every seat's session transcript
-    path.join(config.root, 'data'), config.dataDir, config.configFile, path.join(config.root, 'local'), '~/.claude', '~/.codex'];
+    path.join(config.root, 'data'), config.dataDir, config.configFile, path.join(config.root, 'local'), '~/.claude', '~/.codex',
+    // project homes: every project's config, db and sockets (this one's too), the registry, and sibling projects' clones
+    ...(config.appRoot ? [path.join(config.appRoot, 'projects'), path.join(config.appRoot, 'projects.json'), ...siblingWorkspaces()] : [])];
   if (config.advisors.keyFile) deny.push(config.advisors.keyFile);
   if (config.project.repoPath) deny.push(path.join(config.project.repoPath, '.env'));
   const asRule = (p) => (p.startsWith('~') ? p : `/${p}`);
