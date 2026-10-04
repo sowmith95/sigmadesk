@@ -30,6 +30,15 @@ const unit = (seed) => parseInt(crypto.createHash('sha256').update(seed).digest(
 /** Exploration is decided once per ticket (its key), only for fresh, unpinned, small or explicitly low-risk work. */
 export const explores = (t) => !t.assign_pinned && t.risk !== 'high' && (t.complexity === 'S' || t.risk === 'low') && unit(`explore:${t.key}`) < EXPLORE_SHARE;
 
+/** Why nobody in `ids` can start: no provider (or switched off), a setup retry, or simply busy. */
+function blocked(ids, ctx, busyText) {
+  const name = (id) => ctx.names?.[id] || id;
+  const who = ids.map(name).join(' or ');
+  if (ids.every((id) => ctx.off?.has(id))) return { code: 'provider_hold', reason: `No provider can run ${who} right now (or the seat is switched off)` };
+  if (ids.every((id) => ctx.off?.has(id) || ctx.held?.has(id))) return { code: 'setup_retry', reason: `${who}: workspace setup failed; retrying shortly` };
+  return { code: 'seat_busy', reason: busyText(who) };
+}
+
 /**
  * ctx: { candidates: [fit order], launchable: Set, stats: team-stats seats, team: team-stats team, quota: {seat: 0..1},
  *        siblings: Set (seats that built other tasks of the same epic), author, names: {seat: name}, recent: {seat: builds} }
@@ -39,14 +48,18 @@ export function pick(t, ctx) {
   const name = (id) => ctx.names?.[id] || id;
   const { candidates = [], launchable = new Set() } = ctx;
   if (t.assign_pinned && t.assignee) {
-    return launchable.has(t.assignee) ? { order: [t.assignee], reason: `${name(t.assignee)}: assigned to this task` } : { order: [], reason: `Waiting for ${name(t.assignee)} (assigned to this task)` };
+    if (launchable.has(t.assignee)) return { order: [t.assignee], reason: `${name(t.assignee)}: assigned to this task` };
+    // A pin to a seat that cannot work at all is the owner's to fix, not a wait.
+    if (ctx.off?.has(t.assignee)) return { order: [], code: 'seat_off', reason: `Assigned to ${name(t.assignee)}, who is switched off or has no provider: choose another seat or let the desk choose` };
+    return { order: [], code: 'seat_busy', reason: `Waiting for ${name(t.assignee)} (assigned to this task)` };
   }
   if (ctx.author) {
-    return launchable.has(ctx.author) ? { order: [ctx.author], reason: `${name(ctx.author)}: their own work coming back` } : { order: [], reason: `Waiting for ${name(ctx.author)}, who built it` };
+    if (launchable.has(ctx.author)) return { order: [ctx.author], reason: `${name(ctx.author)}: their own work coming back` };
+    return { order: [], ...blocked([ctx.author], ctx, (who) => `Waiting for ${who}, who built it`) };
   }
-  if (!candidates.length) return { order: [], reason: 'No enabled seat can build this task' };
+  if (!candidates.length) return { order: [], code: 'no_seat', reason: 'No enabled seat can build this task: switch one on in Team' };
   const free = candidates.filter((id) => launchable.has(id));
-  if (!free.length) return { order: [], reason: `Waiting for ${candidates.map(name).join(' or ')}` };
+  if (!free.length) return { order: [], ...blocked(candidates, ctx, (who) => `Waiting for ${who}`) };
   const cohort = cohortOf(t);
   const scores = free.map((id) => {
     const c = ctx.stats?.[id]?.[cohort];
@@ -57,7 +70,7 @@ export function pick(t, ctx) {
   let order = scores.map((s) => s.id);
   if (free.length > 1 && explores(t)) {
     const least = [...free].sort((a, b) => (ctx.recent?.[a] || 0) - (ctx.recent?.[b] || 0) || candidates.indexOf(a) - candidates.indexOf(b))[0];
-    if (least !== order[0]) return { order: [least, ...order.filter((id) => id !== least)], scores, explored: true, reason: `${name(least)}: rotated in to keep their record current (fits this task, fewer recent tasks)` };
+    if (least !== order[0] && quotaFactor(ctx.quota?.[least] || 0) === 1) return { order: [least, ...order.filter((id) => id !== least)], scores, explored: true, reason: `${name(least)}: rotated in to keep their record current (fits this task, fewer recent tasks)` };
   }
   const best = scores[0], c = ctx.stats?.[best.id]?.[cohort];
   const lead = candidates[0] === best.id ? 'best fit' : !launchable.has(candidates[0]) ? `${name(candidates[0])} busy` : `scored above ${name(candidates[0])}`;

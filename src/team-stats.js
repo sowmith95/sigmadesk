@@ -20,15 +20,15 @@ export function compute(facts, now = Date.now()) {
   for (const r of facts.runs) if (r.ticket_key) (byTicket.get(r.ticket_key) || byTicket.set(r.ticket_key, []).get(r.ticket_key)).push(r);
   const merged = new Map((facts.merged || []).map((m) => [m.ticket_key, m.ts]));
   const firstQa = new Map((facts.qa || []).map((q) => [q.ticket_key, /^QA passed/.test(q.text)]));
-  const parents = new Set(facts.tickets.map((t) => t.parent_key).filter(Boolean));
   const seats = {};
   const seat = (id) => (seats[id] ||= { all: blank(), S: blank(), 'M+': blank(), builds_14d: 0, busy_ms_7d: 0 });
   for (const r of facts.runs) {
+    if (!r.ended_at && r.status !== 'running') continue; // an orphaned row is not a busy seat
     const start = Date.parse(r.started_at), end = r.ended_at ? Date.parse(r.ended_at) : now;
     if (Number.isFinite(start) && end > now - 7 * DAY) seat(r.agent_id).busy_ms_7d += Math.max(0, end - Math.max(start, now - 7 * DAY));
   }
   for (const t of facts.tickets) {
-    if (t.owner_task || parents.has(t.key)) continue;
+    if (t.owner_task) continue; // an epic has no implement runs of its own, so it never counts; a built parent does
     const runs = (byTicket.get(t.key) || []).filter((r) => r.kind === 'implement').sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
     if (!runs.length) continue;
     const author = t.builder || runs[0].agent_id;
@@ -63,7 +63,7 @@ export function compute(facts, now = Date.now()) {
 }
 
 let cache = null;
-/** Cached for five minutes; a merge or QA verdict invalidates it. */
+/** Cached for five minutes; a QA verdict or a merge on GitHub invalidates it. */
 export function current(now = Date.now()) {
   if (cache && now - cache.ms < 5 * 60_000) return cache.value;
   cache = { ms: now, value: compute(store.assignmentFacts(new Date(now - 90 * DAY).toISOString()), now) };

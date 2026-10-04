@@ -61,7 +61,7 @@ export function TeamStats() {
             <dt className="text-muted-foreground">Busy, 7 days</dt><dd>{s.busy_hours_7d.toFixed(1)} h</dd>
           </dl>
         </li>); })}</ul>
-      <p className="text-[13px] text-muted-foreground">First-try QA is the first QA verdict on each task the seat built, by task size. Shipped means merged. Cycle time runs from the first build to the merge. Cost counts only runs with a measured cost.</p>
+      <p className="text-[13px] text-muted-foreground">First-try QA is the first QA verdict on each task the seat built, by task size. Shipped means merged. Cycle time runs from the first build to the merge. Cost is the average per merged task, counting only runs with a measured cost.</p>
     </section>
   );
 }

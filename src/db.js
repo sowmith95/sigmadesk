@@ -336,11 +336,20 @@ export const now = () => new Date().toISOString();
 /** Raw facts for team stats (src/team-stats.js): build runs since a date, every ticket's outcome, first merge per ticket. */
 export function assignmentFacts(since) {
   return {
-    runs: db.prepare(`SELECT agent_id, ticket_key, kind, status, cost_usd, cost_estimated, started_at, ended_at FROM runs WHERE started_at >= ? AND agent_id IS NOT NULL`).all(since),
+    // Every run of each task touched in the window (a task's early runs count toward its cost and cycle time), plus
+    // the window's own runs for busy time.
+    runs: db.prepare(`SELECT agent_id, ticket_key, kind, status, cost_usd, cost_estimated, started_at, ended_at FROM runs WHERE agent_id IS NOT NULL
+      AND (started_at >= ? OR ticket_key IN (SELECT DISTINCT ticket_key FROM runs WHERE started_at >= ? AND ticket_key IS NOT NULL))`).all(since, since),
     tickets: db.prepare(`SELECT key, status, builder, assignee, parent_key, area, complexity, risk, owner_task FROM tickets`).all(),
     // The first QA verdict per ticket, as recorded by the QA seat ("QA passed KEY" / "QA failed KEY").
-    qa: db.prepare(`SELECT ticket_key, text, MIN(id) id FROM events WHERE kind = 'action' AND agent_id = 'qa' AND (text LIKE 'QA passed %' OR text LIKE 'QA failed %') AND ticket_key IS NOT NULL GROUP BY ticket_key`).all(),
-    merged: db.prepare(`SELECT ticket_key, MIN(ts) ts FROM events WHERE ticket_key IS NOT NULL AND kind = 'github' AND (text LIKE 'PR merged%' OR text LIKE '%Merged #%') GROUP BY ticket_key`).all(),
+    qa: db.prepare(`SELECT e.ticket_key, e.text FROM events e JOIN (SELECT ticket_key, MIN(id) id FROM events WHERE kind = 'action' AND agent_id = 'qa'
+      AND (text LIKE 'QA passed %' OR text LIKE 'QA failed %') AND ticket_key IS NOT NULL GROUP BY ticket_key) f ON e.id = f.id`).all(),
+    // A merge: on GitHub (PR sync), from the PR console, or by the merge train. A done ticket with a PR and no merge
+    // event (older history) counts as shipped when it last changed.
+    merged: db.prepare(`SELECT ticket_key, MIN(ts) ts FROM events WHERE ticket_key IS NOT NULL AND kind = 'github'
+      AND (text LIKE 'PR merged%' OR text LIKE '🔀 Merged #%' OR text LIKE 'auto-merged #%') GROUP BY ticket_key
+      UNION ALL SELECT key, updated_at FROM tickets t WHERE status = 'done' AND pr_url IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM events e WHERE e.ticket_key = t.key AND e.kind = 'github' AND (e.text LIKE 'PR merged%' OR e.text LIKE '🔀 Merged #%' OR e.text LIKE 'auto-merged #%'))`).all(),
   };
 }
 const q = (sql) => db.prepare(sql);

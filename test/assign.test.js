@@ -74,7 +74,7 @@ test('team stats count the first QA verdict, merges, measured cost, and keep siz
   const run = (agent_id, ticket_key, kind, extra = {}) => ({ agent_id, ticket_key, kind, status: 'success', cost_usd: 1, cost_estimated: 0, started_at: '2026-10-03T10:00:00Z', ended_at: '2026-10-03T10:10:00Z', ...extra });
   const s = stats.compute({
     runs: [run('junior', 'T-1', 'implement'), run('junior', 'T-2', 'implement'), run('junior', 'T-3', 'implement', { cost_estimated: 1, cost_usd: 5 }),
-      run('senior-be', 'T-4', 'implement'), run('senior-be', 'T-4', 'respond'), run('junior', 'T-9', 'implement'), run('junior', 'E-1', 'implement')],
+      run('senior-be', 'T-4', 'implement'), run('senior-be', 'T-4', 'respond'), run('junior', 'T-9', 'implement'), run('manager', 'E-1', 'groom')],
     tickets: [{ key: 'T-1', status: 'done', complexity: 'S' }, { key: 'T-2', status: 'wontdo', complexity: 'S' }, { key: 'T-3', status: 'done', complexity: 'S' },
       { key: 'T-4', status: 'done', complexity: 'M', builder: 'senior-be' }, { key: 'T-9', status: 'done', complexity: 'S', owner_task: 1 },
       { key: 'E-1', status: 'in_progress', complexity: 'S' }, { key: 'E-2', status: 'todo', complexity: 'S', parent_key: 'E-1' }],
@@ -83,7 +83,7 @@ test('team stats count the first QA verdict, merges, measured cost, and keep siz
   }, now);
   const j = s.seats.junior;
   assert.equal(j.S.qa_first, 3, 'an abandoned task\'s failed first QA still counts'); assert.equal(j.S.qa_first_pass, 2);
-  assert.equal(j.all.built, 3, 'owner tasks and epics are not counted');
+  assert.equal(j.all.built, 3, 'owner tasks and epics (no implement run of their own) are not counted');
   assert.equal(j.S.shipped, 2); assert.equal(j.S.cost_n, 1, 'a run with an estimated cost is left out of cost'); assert.equal(j.S.cost_per_shipped, 1);
   assert.equal(j['M+'].built, 0);
   assert.equal(s.seats['senior-be']['M+'].review_rounds, 1); assert.equal(s.seats['senior-be']['M+'].cost_per_shipped, 2);
@@ -151,4 +151,81 @@ test('explicit seats pin the task, a principal named for small work is routed to
   store.updateTicket(r, { active_run: 7 });
   assert.throws(() => sched.ownerPatch(r, { assignee: 'senior-fe' }), /being worked on/);
   store.updateTicket(r, { active_run: null });
+});
+
+test('the facts come from the real records: a GitHub merge counts as shipped, the first QA verdict wins', () => {
+  const t = store.createTicket({ title: 'Merged on GitHub', type: 'bug', status: 'qa', area: 'backend', complexity: 'S', assignee: 'junior' });
+  const run = store.createRun({ agent_id: 'junior', ticket_key: t.key, kind: 'implement', token: 'facts', model: 'claude:fixture' });
+  store.updateRun(run.id, { status: 'success', cost_usd: 1.5, ended_at: store.now() });
+  store.logEvent({ kind: 'action', agent_id: 'qa', ticket_key: t.key, text: `QA failed ${t.key}` });
+  store.logEvent({ kind: 'action', agent_id: 'qa', ticket_key: t.key, text: `QA passed ${t.key}` });
+  store.updateTicket(t.key, { pr_url: 'https://github.com/x/y/pull/9' });
+  sched.prActions.merged(store.getTicket(t.key), { at: '2026-10-04T12:00:00Z' });
+  const facts = store.assignmentFacts('2000-01-01');
+  assert.equal(facts.qa.find((q) => q.ticket_key === t.key).text, `QA failed ${t.key}`, 'the first verdict, not the latest');
+  assert.equal(facts.merged.filter((m) => m.ticket_key === t.key).length, 1, 'one merge per ticket');
+  const s = stats.current();
+  assert.ok(s.seats.junior.S.shipped >= 1);
+});
+
+test('a pin to a switched-off seat says so, a principal reroute never lands on a principal, and taken seats are not reused', async () => {
+  const t = { key: 'P-1', complexity: 'S', assign_pinned: 1, assignee: 'dba' };
+  const off = assign.pick(t, { candidates: ['dba'], launchable: new Set(), off: new Set(['dba']), names: { dba: 'Casey' } });
+  assert.equal(off.code, 'seat_off'); assert.match(off.reason, /switched off/);
+  team.agentById.dba.enabled = false;
+  const parent = store.createTicket({ title: 'Epic 2', status: 'in_progress', type: 'feature' });
+  const run = store.createRun({ agent_id: 'manager', ticket_key: parent.key, kind: 'groom', token: 'reroute', model: 'claude:fixture' });
+  const made = (s) => s.match(/created (\S+)/)[1];
+  const k = made(await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Small db fix', complexity: 'S', area: 'db', body: 'x', assign: 'principal-be' }));
+  assert.equal(store.getTicket(k).assignee, 'senior-be', 'with the DBA off, a builder still gets it');
+  team.agentById.dba.enabled = true;
+  // Two builders free, two small tasks: each seat gets one, never both.
+  idle();
+  const ctx = sched.assignContext();
+  const taken = new Set();
+  const first = sched.buildDecision({ key: 'Q-1', complexity: 'S', area: 'backend' }, { ctx, taken });
+  taken.add(first.order[0]);
+  const second = sched.buildDecision({ key: 'Q-2', complexity: 'S', area: 'backend' }, { ctx, taken });
+  assert.notEqual(second.order[0], first.order[0]);
+  assert.ok(!second.order.includes(first.order[0]));
+});
+
+test('exploration rotates in the least-used fitting seat, but not onto an engine near its limit', () => {
+  const key = Array.from({ length: 500 }, (_, i) => `X-${i}`).find((k) => assign.explores({ key: k, complexity: 'S' }));
+  const t = { key, complexity: 'S' };
+  const ctx = { candidates: ['junior', 'senior-be'], launchable: new Set(['junior', 'senior-be']), recent: { junior: 9, 'senior-be': 0 }, team: {}, stats: {} };
+  const r = assign.pick(t, ctx);
+  assert.equal(r.explored, true); assert.deepEqual(r.order, ['senior-be', 'junior']);
+  assert.notEqual(assign.pick(t, { ...ctx, quota: { 'senior-be': 0.9 } }).explored, true);
+});
+
+test('Codex review regressions: a pin to a switched-off builder never becomes a design, grooming keeps a pin, inherited high risk is not rerouted, provider outages are not "busy", stale quota is ignored', async () => {
+  idle();
+  team.agentById.dba.enabled = false;
+  const db = store.createTicket({ title: 'Pinned db fix', type: 'bug', status: 'todo', area: 'db', complexity: 'S', assignee: 'dba' });
+  store.updateTicket(db.key, { assign_pinned: 1 });
+  await tickOnce();
+  assert.equal(store.getTicket(db.key).status, 'todo', 'no principal design run starts for a builder pin');
+  assert.equal(sched.health().waiting.find((w) => w.key === db.key)?.code, 'seat_off');
+  team.agentById.dba.enabled = true;
+  store.updateTicket(db.key, { status: 'wontdo' });
+
+  const prop = store.createTicket({ title: 'Owner pinned before grooming', type: 'bug', status: 'proposed', assignee: 'senior-be' });
+  store.updateTicket(prop.key, { assign_pinned: 1 });
+  const g = store.createRun({ agent_id: 'manager', ticket_key: prop.key, kind: 'groom', token: 'keep-pin', model: 'claude:fixture' });
+  await sched.deskAction(g, 'groom', { complexity: 'S', area: 'backend', body: 'spec' });
+  assert.equal(store.getTicket(prop.key).assignee, 'senior-be'); assert.equal(store.getTicket(prop.key).assign_pinned, 1);
+  store.updateTicket(prop.key, { status: 'wontdo' });
+
+  const risky = store.createTicket({ title: 'Risky epic', status: 'in_progress', type: 'feature' });
+  store.updateTicket(risky.key, { risk: 'high' });
+  const r = store.createRun({ agent_id: 'manager', ticket_key: risky.key, kind: 'groom', token: 'inherit', model: 'claude:fixture' });
+  const k = (await sched.deskAction(r, 'create-task', { parent: risky.key, title: 'Needs design', complexity: 'M', area: 'backend', body: 'x', assign: 'principal-be' })).match(/created (\S+)/)[1];
+  assert.equal(store.getTicket(k).assignee, 'principal-be', 'inherited high risk keeps the principal');
+  store.updateTicket(k, { status: 'wontdo' });
+
+  const out = assign.pick({ key: 'O-1', complexity: 'S' }, { candidates: ['junior', 'senior-be'], launchable: new Set(), off: new Set(['junior', 'senior-be']), names: {} });
+  assert.equal(out.code, 'provider_hold');
+  assert.equal(sched.liveUsage({ five_hour: 0.95, five_hour_resets_at: '2000-01-01T00:00:00Z' }), 0, 'a window that already reset is empty');
+  assert.equal(sched.liveUsage({ five_hour: 0.95, five_hour_resets_at: '2999-01-01T00:00:00Z' }), 0.95);
 });
