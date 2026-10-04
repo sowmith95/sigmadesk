@@ -10,22 +10,14 @@ import * as watch from './watch.js';
 import { notify } from './notify.js';
 import * as prsync from './prsync.js';
 import * as prs from './prs.js';
+import * as reviews from './reviews.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 import { selectionFor } from './dispatch.js';
 
 // ---------------- publish guard ----------------
-export function globToRegExp(glob) {
-  let re = '';
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
-    if (c === '*' && glob[i + 1] === '*') { re += glob[i + 2] === '/' ? '(?:.*/)?' : '.*'; i += glob[i + 2] === '/' ? 2 : 1; }
-    else if (c === '*') re += '[^/]*';
-    else if (c === '?') re += '[^/]';
-    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-  }
-  return new RegExp(`^${re}$`);
-}
+import { globToRegExp } from './reviews.js';
+export { globToRegExp };
 export function guardReasons(files, lines, complexity) {
   const pats = config.project.protectedPaths.map(globToRegExp);
   const hit = files.filter((f) => pats.some((r) => r.test(f)));
@@ -80,7 +72,7 @@ export function requesterOf(t) {
 
 const agentIdle = (id) => agentById[id]?.enabled !== false && store.getAgentState(id)?.status !== 'working';
 
-function setStatus(key, status, extra = {}) {
+export function setStatus(key, status, extra = {}) {
   const before = store.getTicket(key)?.status;
   const t = store.updateTicket(key, { status, ...extra });
   github.syncIssueState(key);
@@ -125,9 +117,9 @@ function stall(ticket, reason) {
 }
 
 // ---------------- job launchers ----------------
-async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [], nonce = null, fence = runner.currentEpoch() }) {
+async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [], nonce = null, fence = runner.currentEpoch(), onStart = null, outcome = null }) {
   const before = ticket?.status;
-  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs, nonce, fence });
+  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs, nonce, fence, onStart });
   if (ticket) store.updateTicket(ticket.key, { active_run: store.getAgentState(agentId).current_run });
   const { run, aborted, failure } = await p;
   if (aborted) {
@@ -140,7 +132,8 @@ async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork 
   const after = store.getTicket(ticket.key);
   if (after.active_run === run.id) store.updateTicket(ticket.key, { active_run: null });
   // Did the seat actually move the ticket forward? (An implement run must end with `desk submit`.)
-  const moved = kind === 'implement' ? after.status !== 'in_progress' : after.status !== before;
+  // `outcome` lets a job say what "done" means (a first code-review approval leaves the ticket in review).
+  const moved = outcome ? outcome(after) : kind === 'implement' ? after.status !== 'in_progress' : after.status !== before;
   if (!moved && failure) {
     store.updateTicket(ticket.key, { active_run: null, status: after.status === 'in_progress' ? 'todo' : after.status,
       progress_msg: 'Provider unavailable — waiting for an available engine' });
@@ -310,6 +303,43 @@ async function launchReview(ticket, seat, fence) {
   await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: ws.dir, nonce: code, prompt: promptFor('review', { ticket, comments, extra: code }) });
 }
 
+// Two-reviewer PRs: a reviewer runs read-only on a fresh snapshot of exactly the reviewed commit.
+async function launchPrReview(job, fence) {
+  const { seat } = job;
+  const idle = () => { store.updateAgent(seat, { status: 'idle', current_ticket: null }); store.updateTicket(job.key, { active_run: null }); };
+  store.updateAgent(seat, { status: 'working', current_ticket: job.key, last_action: 'checking out the commit under review', last_action_at: store.now() });
+  store.updateTicket(job.key, { active_run: -1 });
+  let cwd;
+  try { cwd = await reviews.prepareSnapshot(store.getTicket(job.key), seat); } catch (err) { idle(); throw err; }
+  if (!stillWanted(job.key, 'review', seat)) return;
+  const t = store.getTicket(job.key);
+  const row = store.getPrReview(job.review.id);
+  if (row.verdict !== 'pending' || row.state !== 'active' || row.sha !== t.head_sha || t.review_stage !== 'reviewing') { idle(); return; }
+  store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is reviewing ${t.key} at ${row.sha.slice(0, 7)} (${row.role} reviewer)` });
+  const code = nonce();
+  await launch({ fence, agentId: seat, kind: 'pr_review', ticket: t, cwd, nonce: code, prompt: reviews.reviewPrompt(t, row, code),
+    onStart: (run) => store.updatePrReview(row.id, { nonce: code, run_id: run.id, round: t.review_round || 0 }),
+    outcome: (after) => after.status !== 'review' || store.getPrReview(row.id).verdict !== 'pending' });
+  runner.removeReviewSnapshot(t.key, seat); // every review starts from a fresh snapshot; free the disk
+}
+
+// The author answers review findings in their own clone: fix + commit, or push back with reasons.
+async function launchRespond(job, fence) {
+  const { seat } = job;
+  store.updateAgent(seat, { status: 'working', current_ticket: job.key, last_action: 'reading the review', last_action_at: store.now() });
+  store.updateTicket(job.key, { active_run: -1 });
+  let ws;
+  try { ws = await runner.ensureWorkspace(store.getTicket(job.key)); } catch (err) {
+    store.updateAgent(seat, { status: 'idle', current_ticket: null }); store.updateTicket(job.key, { active_run: null }); throw err;
+  }
+  if (!stillWanted(job.key, 'review', seat)) return;
+  const t = store.getTicket(job.key);
+  if (t.review_stage !== 'responding') { store.updateAgent(seat, { status: 'idle', current_ticket: null }); store.updateTicket(t.key, { active_run: null }); return; }
+  store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is answering the code review on ${t.key}` });
+  await launch({ fence, agentId: seat, kind: 'respond', ticket: t, cwd: ws.dir, prompt: reviews.respondPrompt(t),
+    outcome: (after) => after.status !== 'review' || after.review_stage !== 'responding' });
+}
+
 // ---------------- watch desk ----------------
 function incidentEvidence(inc, context = []) {
   const samples = JSON.parse(inc.samples || '[]');
@@ -404,7 +434,7 @@ export function health() {
   const queued = store.listTickets().filter((t) => ['triage', 'proposed', 'todo', 'qa', 'review'].includes(t.status));
   return { last_tick: lastTick, last_error: lastError, paused: settings.paused === 'true', budget_headroom: budgetHeadroom(settings),
     queued: queued.length, discussions: store.pendingDiscussions().length, waiting: queued.filter((t) => !t.active_run).map((t) => {
-      const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa' : t.status === 'review' ? requesterOf(t) : t.assignee || routeTicket(t);
+      const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa' : t.status === 'review' ? (reviews.enabled() ? reviews.jobFor(t)?.seat : requesterOf(t)) : t.assignee || routeTicket(t);
       const chosen = selectionFor(seat);
       const why = settings.paused === 'true' ? 'Desk paused' : t.after_key && store.getTicket(t.after_key)?.status !== 'done' ? `Waiting for ${t.after_key} to merge`
         : !chosen.seat ? chosen.reason : setupHold(seat) ? `Setup retry after ${setupHold(seat).until}` : !agentIdle(seat) ? 'Seat busy' : budgetHeadroom(settings) < runner.runBudget(seat) ? 'Daily budget reached' : 'Ready for next scheduler tick';
@@ -484,12 +514,20 @@ export async function tick() {
     if (qa && slots > 0 && agentIdle('qa')) go('qa', (f) => launchQa(qa, f));
     const discussion = store.pendingDiscussions().find((d) => d.status === 'queued');
     if (discussion && slots > 0 && agentIdle('manager')) go('manager', (f) => launchDiscussion(discussion, f));
-    // 2b. Requesters confirm QA-passed work matches what they asked for.
-    for (const t of store.ticketsByStatus('review')) {
-      if (slots <= 0) break;
-      const seat = requesterOf(t);
-      if (t.active_run || !seat || !agentIdle(seat)) continue;
-      go(seat, (f) => launchReview(t, seat, f));
+    // 2b. Two-reviewer code review (context, then independent) and the author's answers; legacy: requester acceptance.
+    if (reviews.enabled()) {
+      for (const job of reviews.nextJobs()) {
+        if (slots <= 0) break;
+        if (!agentIdle(job.seat)) continue;
+        go(job.seat, (f) => (job.kind === 'pr_review' ? launchPrReview(job, f) : launchRespond(job, f)));
+      }
+    } else {
+      for (const t of store.ticketsByStatus('review')) {
+        if (slots <= 0) break;
+        const seat = requesterOf(t);
+        if (t.active_run || !seat || !agentIdle(seat)) continue;
+        go(seat, (f) => launchReview(t, seat, f));
+      }
     }
     // 3. Engineers pick up groomed work by routing (area × complexity × risk).
     council.pump();
@@ -543,6 +581,7 @@ const PERMS = {
   design: PRINCIPALS, delegate: PRINCIPALS, 'peer-review': ['manager', ...PRINCIPALS], council: ['manager', ...PRINCIPALS],
   route: ['support'], submit: ENGINEERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
+  review: ['manager', ...ENGINEERS], respond: ENGINEERS,
 };
 const PRIORITY = /^P[0-3]$/;
 const consultsByRun = new Map();
@@ -641,7 +680,7 @@ export async function deskAction(run, cmd, body = {}) {
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
       const description = body.body ? `${ticket.description}\n\n## Groomed spec (Engineering Manager)\n${body.body}` : ticket.description;
       setStatus(ticket.key, 'todo', { complexity: body.complexity, area: body.area, priority: PRIORITY.test(body.priority) ? body.priority : ticket.priority,
-        assignee, description, ...(body.title ? { title: body.title } : {}) });
+        assignee, description, risk: ['high', 'low'].includes(body.risk) ? body.risk : null, ...(body.title ? { title: body.title } : {}) });
       ev(`groomed ${ticket.key} → ${body.complexity}/${body.area}${body.risk === 'high' ? '/high-risk' : ''}, staffed ${agentById[assignee].role}`);
       github.createIssue(ticket.key);
       return `groomed; assigned to ${assignee}`;
@@ -659,7 +698,8 @@ export async function deskAction(run, cmd, body = {}) {
         const parent = store.getTicket(run.ticket_key);
         const slice = store.createTicket({ title: body.title, description: body.body, type: parent.type === 'bug' ? 'bug' : 'task', status: 'todo', area: body.area,
           complexity: body.complexity, priority: parent.priority, assignee: body.assign || routeSlice(body), reporter: agentId, source: 'agent', parent_key: run.ticket_key });
-        if (body.after) store.updateTicket(slice.key, { after_key: body.after });
+        // The slicer is the context reviewer later; slices inherit the parent's risk.
+        store.updateTicket(slice.key, { designer: agentId, risk: parent.risk || null, ...(body.after ? { after_key: body.after } : {}) });
         ev(`sliced ${slice.key} (${body.complexity}) for ${agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
         github.createIssue(slice.key);
         return `created ${slice.key} → ${slice.assignee}`;
@@ -667,7 +707,8 @@ export async function deskAction(run, cmd, body = {}) {
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
       const t = store.createTicket({ title: body.title, description: body.body, type: body.type || 'task', status: 'todo', area: body.area,
         complexity: body.complexity, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', assignee, reporter: agentId, source: 'agent', parent_key: body.parent || key });
-      store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null });
+      const parentRisk = store.getTicket(body.parent || key)?.risk;
+      store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null });
       ev(`created task ${t.key} for ${agentById[assignee].role}`, t.key);
       github.createIssue(t.key);
       return `created ${t.key} assigned to ${assignee}`;
@@ -777,7 +818,11 @@ export async function deskAction(run, cmd, body = {}) {
       store.addComment(ticket.key, agentId, `✅ **QA passed** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
       ev(`QA passed ${ticket.key}`);
       const seat = requesterOf(ticket);
-      if (seat) {
+      if (reviews.enabled()) {
+        // Publish the draft PR now (guard unchanged), then two sequential code reviews on this exact commit.
+        await reviews.afterQaPass(ticket, sha);
+        publishBranch(ticket.key);
+      } else if (seat) {
         setStatus(ticket.key, 'review', { progress: 95, progress_msg: `QA passed — ${agentById[seat].name} confirming intent` });
       } else {
         setStatus(ticket.key, 'ready_for_human', { progress: 100, progress_msg: 'QA passed — awaiting owner review' });
@@ -809,6 +854,10 @@ export async function deskAction(run, cmd, body = {}) {
       publishBranch(ticket.key);
       return 'Recorded. Stop now.';
     }
+    case 'review':
+      return reviews.reviewVerdict(run, ticket, body);
+    case 'respond':
+      return reviews.respond(run, ticket, body);
     case 'incident': {
       need(run.kind === 'investigate' && run.incident_id, 'incident commands only work inside an investigation');
       const inc = store.getIncident(run.incident_id);
@@ -847,7 +896,8 @@ const publishing = new Set();
 async function publishBranch(key) {
   const t = store.getTicket(key);
   if (store.getSettings().open_draft_prs !== 'true' || store.getSettings().github_sync !== 'true') return;
-  if (publishing.has(key) || t.pr_url) return;
+  // A PR that exists is updated when the QA-approved commit changed (review fixes push to the same PR).
+  if (publishing.has(key) || (t.pr_url && store.kvGet(`published:${key}`) === t.head_sha)) return;
   publishing.add(key);
   try { await publishInner(t, key); } finally { publishing.delete(key); }
 }
@@ -858,7 +908,8 @@ export async function ownerApprovePublish(key) {
   need(t && t.head_sha && store.kvGet(`guard:${key}`) === t.head_sha, 'nothing awaiting publish approval for this commit');
   store.kvSet(`guard:${key}`, ''); // one approval per parked commit
   store.addComment(key, 'owner', `✅ Publish approved for \`${t.head_sha.slice(0, 10)}\` despite the guard.`);
-  setStatus(key, 'ready_for_human', { resume_status: null, progress_msg: 'owner approved publish' });
+  const inReview = reviews.enabled() && t.review_stage === 'reviewing';
+  setStatus(key, inReview ? 'review' : 'ready_for_human', { resume_status: null, progress_msg: inReview ? 'owner approved publish — code review continues' : 'owner approved publish' });
   if (publishing.has(key)) return;
   publishing.add(key);
   try { await publishInner(store.getTicket(key), key, { ownerApproved: true }); } finally { publishing.delete(key); }
@@ -866,6 +917,7 @@ export async function ownerApprovePublish(key) {
 
 export function retryPublications() {
   for (const t of store.ticketsByStatus('ready_for_human')) if (!t.pr_url && t.head_sha) publishBranch(t.key);
+  for (const t of store.ticketsByStatus('review')) if (t.head_sha && t.review_stage && (!t.pr_url || store.kvGet(`published:${t.key}`) !== t.head_sha)) publishBranch(t.key);
 }
 
 async function publishInner(t, key, { ownerApproved = false } = {}) {
@@ -881,7 +933,7 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     const reasons = guardReasons(files, lines, t.complexity);
     if (reasons.length) {
       store.addComment(key, 'system', `🛑 **Publish guard** — not pushed: ${reasons.join('; ')}.\nReview the branch locally (${runner.workspaceDir(key)}) and press "Approve publish" if it is safe.`);
-      setStatus(key, 'needs_human', { resume_status: 'ready_for_human', progress_msg: 'publish guard: needs owner approval' });
+      setStatus(key, 'needs_human', { resume_status: reviews.enabled() && t.review_stage === 'reviewing' ? 'review' : 'ready_for_human', progress_msg: 'publish guard: needs owner approval' });
       store.kvSet(`guard:${key}`, t.head_sha);
       return;
     }
@@ -889,7 +941,9 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
   try {
     if (!t.issue_number) await github.createIssue(key);
     await runner.pushBranch(key, t.branch, t.head_sha);
-    store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch}` });
+    store.kvSet(`published:${key}`, t.head_sha);
+    store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch} at ${t.head_sha.slice(0, 7)}` });
+    if (t.pr_url) { github.flushOutbox(); return; } // existing PR: the push updated it
     const cs = store.listComments(key);
     const last = (prefix) => cs.filter((c) => c.body.startsWith(prefix)).pop()?.body.replace(/^[^\n]*\n*/, '') || '';
     const stack = await prsync.stackBaseFor(store.getTicket(key));

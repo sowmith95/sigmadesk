@@ -12,6 +12,7 @@ import * as sched from './scheduler.js';
 import * as watch from './watch.js';
 import * as prsync from './prsync.js';
 import * as prs from './prs.js';
+import * as reviews from './reviews.js';
 import { nameOf } from '../public/names.js';
 import * as dispatch from './dispatch.js';
 import * as advisors from './advisors.js';
@@ -142,7 +143,7 @@ async function ownerRoute(req, res) {
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
-    return send(res, 200, { ticket: t, comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
+    return send(res, 200, { ticket: t, comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)/events$'))) return send(res, 200, store.recentEvents({ agent_id: mm[1], limit: 300 }));
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)$'))) {
@@ -174,7 +175,8 @@ async function ownerRoute(req, res) {
     const n = Number(mm[1]);
     const out = mm[2] === 'approve' ? await prs.approve(n, String(b.message || '').slice(0, 4000))
       : mm[2] === 'ready' ? await prs.ready(n)
-        : mm[2] === 'merge' ? await prs.merge(n, { method: b.method || 'squash', override: b.override || '', inBusyWindow: sched.inBusyWindow() })
+        : mm[2] === 'merge' ? await prs.merge(n, { method: b.method || 'squash', override: b.override || '', inBusyWindow: sched.inBusyWindow(),
+          expectedSha: String(b.expected_sha || ''), overrideReason: String(b.override_reason || '').slice(0, 2000), actor: 'owner' })
           : mm[2] === 'close' ? await prs.close(n, String(b.comment || '').slice(0, 2000))
             : mm[2] === 'reviewer' ? await prs.addReviewer(n, b.login)
               : await prs.setTags(n, { add: b.add || [], remove: b.remove || [] });
@@ -423,6 +425,7 @@ export async function main() {
   setTimeout(syncPrs, 15_000);
   prsync.startWebhook((event) => { store.logEvent({ kind: 'github', agent_id: 'github', text: `webhook: ${event} → syncing PRs` }); syncPrs(); });
   setInterval(() => github.flushComments(), 60_000);
+  setInterval(() => reviews.sweep().catch((err) => console.error('reviews:', err.message)), 60_000); // PR review comments + auto-merge
   setInterval(() => sched.retryPublications(), 5 * 60_000);
   const shutdown = () => { council.cancelAll(); advisors.cancelAll(); runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
   process.on('SIGTERM', shutdown);

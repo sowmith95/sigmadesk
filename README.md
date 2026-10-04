@@ -48,9 +48,15 @@ without you.
   models spend tokens on decisions, cheaper models on typing.
 - **Planning meetings are real.** The manager calls `desk consult principal-be "…"`, which runs the principal on the
   spot; the answer lands in the ticket thread for every later seat to read.
-- **Requesters review their own asks.** After QA (correctness), the PM / manager / SRE who asked for the work does an
-  acceptance review (intent). Rework resumes the engineer's own Claude session in the same clone, so it remembers what
-  it tried.
+- **Two independent reviewers on every PR.** After QA passes, the draft PR is published and reviewed twice, in order, on
+  the exact QA-passed commit: first by the principal who designed/sliced the work (else the Engineering Manager), then
+  by an independent senior or principal who neither built nor designed it (preferably on another engine). Each
+  approval says what was checked; change requests are numbered findings (file:line, why it matters, suggested fix).
+  The author fixes (new commit → QA again → both approvals void) or pushes back with reasons (the same reviewer
+  re-reviews). Every verdict and reply is posted on the PR in plain language. After two approvals the desk merges
+  low-risk work itself (outside the busy window, CI green); anything high-risk or unclassified waits for you. After
+  `review.maxRounds` change requests the owner gets a summary of the disagreement. Set `review.required: 0` for the
+  older requester acceptance review instead.
 - **On-call SRE.** A deterministic watcher (no LLM) tails Loki / docker / files, fingerprints errors, and wakes the SRE
   only for new or chronic signatures. The SRE files a root-caused bug, mutes noise, or pages you. Error storms become
   one page, not fifty tickets. A fixed signature that comes back reopens as a regression.
@@ -236,7 +242,7 @@ Everything lives in `sigmadesk.config.json` (gitignored). See `sigmadesk.config.
 | `project.extraAllowedBash`, `readOnlyPaths` | E.g. a shared virtualenv the seats may use. |
 | `team.<seat>` | Override `name`, `model`, `enabled`, `charter` per seat. |
 | `limits.*` | Concurrency, busy window, daily budget, per-run budgets, timeouts. |
-| `review.*` | Acceptance reviews, requester session resume (opt-in), rework session resume. |
+| `review.*` | Two-reviewer PRs (`required`, `independentSeats`, `maxRounds`, `autoMerge`, `riskPaths`, `ci`), legacy acceptance reviews, session resume. `ci: "auto"` lets a PR with no checks merge only when the repo has no Actions workflows; skipped/neutral-only checks never count as a pass. Every merge (yours or the desk's) needs the exact head SHA, green CI, known mergeability, the configured base branch, and two approvals at that commit — you can override the approvals with a reason that is posted on the PR. |
 | `watch.*` | Log sources (`loki` / `docker` / `file`), thresholds, storm and regression handling. |
 | `pm.*` | PM persona, competitors to study, cadence. |
 | `sandbox.*` | Extra allowed domains (e.g. a package registry) and paths to keep unreadable. |

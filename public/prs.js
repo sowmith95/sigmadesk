@@ -116,6 +116,11 @@ export function renderSheet(ctx) {
   const closeNote = h('input', { type: 'text', placeholder: 'Why close? (posted on the PR)', 'aria-label': 'Close comment' });
   const reviewer = h('input', { type: 'text', placeholder: 'GitHub login or org/team', 'aria-label': 'Reviewer' });
   const tagIn = h('input', { type: 'text', placeholder: 'add tag…', 'aria-label': 'Add tag' });
+  const dr = p.desk_review || {};
+  const needsOverride = dr.required && !(dr.approvals_ok && !dr.unpublished);
+  const overrideReason = needsOverride ? h('input', { type: 'text', placeholder: 'Merge without both reviewer approvals? Say why (audited on the PR)', 'aria-label': 'Review override reason' }) : null;
+  const verdictIcon = { approve: '✅ approved', changes: '✏️ changes requested', pending: '… reviewing' };
+  const deskReviews = dr.required ? [dr.context, dr.independent].filter(Boolean).map((r) => `${r.name} (${r.role}): ${verdictIcon[r.verdict] || r.verdict}`).join(' · ') || 'not started' : null;
   const blockers = [p.mergeable === 'CONFLICTING' && 'conflicts with base', p.checks === 'failing' && 'CI failing', p.checks === 'pending' && 'CI running'].filter(Boolean);
   const body = [
     sh.banner ? h('div', { class: 'ask' }, h('b', {}, sh.banner.error ? `Approved on the desk, but GitHub said: ${sh.banner.error}` : '👍 Approved'),
@@ -129,6 +134,7 @@ export function renderSheet(ctx) {
       h('div', {}, h('span', {}, 'Built by'), p.seat ? h('span', { class: 'pr-who' }, avatar(p.seat), ` ${nameOf(p.seat)}`) : '—'),
       h('div', {}, h('span', {}, 'Requested by'), nameOf(p.requester)),
       h('div', {}, h('span', {}, 'Ticket'), p.key ? h('button', { class: 'linkish', type: 'button', title: p.key, onclick: () => openTicket(p.key) }, `${ctx.nameOf ? ctx.nameOf(p.key) : p.key} · ${p.key}`) : '—'),
+      deskReviews ? h('div', {}, h('span', {}, 'Desk review'), deskReviews) : null,
       h('div', {}, h('span', {}, 'Reviews'), [...p.reviews.map((r) => `${r.who}: ${r.state.toLowerCase()}`), ...p.reviewers.map((r) => `${r}: requested`)].join(', ') || '—')),
     h('div', { class: 'row-actions' }, h('a', { class: 'btn small', href: p.url, target: '_blank', rel: 'noopener' }, 'Open on GitHub ↗')),
     h('div', { class: 'section-title' }, 'Tags'),
@@ -141,10 +147,11 @@ export function renderSheet(ctx) {
         p.draft ? h('button', { class: 'btn', type: 'button', onclick: run('ready', {}, 'marked ready') }, 'Mark ready for review') : null),
       h('div', { class: 'pr-merge' },
         h('div', { class: 'warn' }, `⚠ Merging into ${st.meta.base || 'main'} deploys production.${blockers.length ? ` Blocked: ${blockers.join(', ')}.` : ''}`),
-        h('div', { class: 'row-actions' }, method, override,
+        needsOverride ? h('div', { class: 'warn' }, '⚠ Not approved by both desk reviewers at this commit. The merge is refused unless you give a reason, which is posted on the PR.') : null,
+        h('div', { class: 'row-actions' }, method, override, overrideReason,
           h('button', { class: 'btn danger', type: 'button', disabled: blockers.length > 0, onclick: act(async () => {
             if (!confirm(`Merge #${p.number} into ${st.meta.base || 'main'} (${method.value})? This deploys production.`)) return;
-            await api('POST', `/api/prs/${p.number}/merge`, { method: method.value, override: override?.value || '' });
+            await api('POST', `/api/prs/${p.number}/merge`, { method: method.value, override: override?.value || '', expected_sha: p.head_sha, override_reason: overrideReason?.value || '' });
             await load(ctx, true);
           }, 'merged') }, '🔀 Merge'))),
       h('div', { class: 'row-actions' }, reviewer, h('button', { class: 'btn', type: 'button', onclick: act(async () => { if (!reviewer.value.trim()) return; await api('POST', `/api/prs/${p.number}/reviewer`, { login: reviewer.value.trim() }); await load(ctx, true); }, 'review requested') }, '👥 Add reviewer')),
