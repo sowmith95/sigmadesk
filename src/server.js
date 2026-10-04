@@ -276,7 +276,12 @@ async function ownerRoute(req, res) {
   };
   if (req.method === 'POST' && p === '/api/control/research') return startProgram(research.DEFAULT_PROGRAM, (await readBody(req)).focus);
   if (req.method === 'GET' && p === '/api/research') return send(res, 200, { ...research.status(), reviews: researchReview.summaries() });
-  if (req.method === 'PUT' && p === '/api/research/programs') { const b = await readBody(req); const saved = research.save(b.programs); sched.tick(); return send(res, 200, { programs: saved, status: research.status() }); }
+  if (req.method === 'PUT' && p === '/api/research/programs') {
+    const b = await readBody(req);
+    // Conditional save: the editor sends the revision it loaded; another save since then is a conflict, not an overwrite.
+    if (b.expected_revision !== undefined && b.expected_revision !== research.revision()) return send(res, 409, { error: 'Research programs changed since you opened them. Your edit is kept; review the latest list and save again.' });
+    const saved = research.save(b.programs); sched.tick(); return send(res, 200, { programs: saved, status: research.status() });
+  }
   if (req.method === 'POST' && p === '/api/research/programs/reset') return send(res, 200, { programs: research.reset(), status: research.status() });
   if (req.method === 'POST' && (mm = m('^/api/research/programs/([a-z0-9-]+)/run$'))) return startProgram(mm[1], (await readBody(req)).focus);
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/research-review/waive$'))) { const b = await readBody(req); const t = researchReview.waive(mm[1], String(b.note || '').slice(0, 2000)); sched.tick(); return send(res, 200, t); }
@@ -306,6 +311,8 @@ async function ownerRoute(req, res) {
   if (req.method === 'GET' && !isApi) {
     const rel = p === '/' ? 'index.html' : decodeURIComponent(p.slice(1));
     const file = path.normalize(path.join(PUBLIC, rel));
+    // Bundle assets never fall back to the page: a stale tab asking for a replaced chunk must see a 404, not HTML.
+    if (rel.startsWith('app/') && !(file.startsWith(PUBLIC) && fs.existsSync(file) && fs.statSync(file).isFile())) return send(res, 404, 'not found', 'text/plain');
     const target = file.startsWith(PUBLIC) && fs.existsSync(file) && fs.statSync(file).isFile() ? file : path.join(PUBLIC, 'index.html');
     return send(res, 200, fs.readFileSync(target), MIME[path.extname(target)] || 'application/octet-stream',
       target.endsWith('.html') ? { 'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'" } : {});

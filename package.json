@@ -4,14 +4,38 @@
   "description": "An AI engineering desk run like a quant firm: real Claude Code agents per seat, a live Jira-style board, sandboxed execution, GitHub sync, and an on-call SRE that turns production errors into fixes.",
   "license": "MIT",
   "type": "module",
-  "bin": { "sigmadesk": "src/server.js" },
+  "bin": {
+    "sigmadesk": "src/server.js"
+  },
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/server.js",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
     "doctor": "node --disable-warning=ExperimentalWarning src/doctor.js",
     "models:refresh": "node --disable-warning=ExperimentalWarning scripts/refresh-perplexity-models.mjs",
-    "preview": "node --disable-warning=ExperimentalWarning scripts/local-preview.mjs"
+    "preview": "node --disable-warning=ExperimentalWarning scripts/local-preview.mjs",
+    "build:ui": "vite build --config vite.config.js && node scripts/ui-stamp.mjs",
+    "dev:ui": "vite --config vite.config.js",
+    "check:ui": "node scripts/ui-stamp.mjs --check",
+    "ui:shots": "node --disable-warning=ExperimentalWarning scripts/ui-shots.mjs"
   },
-  "engines": { "node": ">=22.13" },
-  "keywords": ["ai-agents", "claude-code", "multi-agent", "kanban", "jira", "devops", "sre", "github"]
+  "engines": {
+    "node": ">=22.13"
+  },
+  "keywords": [
+    "ai-agents",
+    "claude-code",
+    "multi-agent",
+    "kanban",
+    "jira",
+    "devops",
+    "sre",
+    "github"
+  ],
+  "devDependencies": {
+    "@vitejs/plugin-react": "6.1.1",
+    "playwright-core": "1.63.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "vite": "8.3.2"
+  }
 }

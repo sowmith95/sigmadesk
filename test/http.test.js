@@ -28,7 +28,12 @@ test('isolated HTTP desk: UI, live events, settings, ticket decisions and deskto
   assert.equal(observed.meta.usage.perplexity_desktop.credits_remaining, 44985);
   assert.equal((await fetch(`${url}/api/settings`, { method: 'POST', body: '{}' })).status, 415);
   assert.equal((await request('POST', '/api/settings', { key: 'max_concurrent', value: '0' })).status, 400);
-  const html = await fetch(url); assert.match(html.headers.get('content-security-policy'), /default-src 'self'/); assert.match(await html.text(), /\/v2\.js/);
+  const html = await fetch(url); assert.match(html.headers.get('content-security-policy'), /default-src 'self'/); assert.match(await html.text(), /\/app\/main\.js/);
+  for (const [asset, type] of [['/app/main.js', /javascript/], ['/app/main.css', /text\/css/]]) {
+    const r = await fetch(url + asset); assert.equal(r.status, 200, asset); assert.match(r.headers.get('content-type'), type); assert.equal(r.headers.get('cache-control'), 'no-store');
+  }
+  assert.equal((await fetch(`${url}/app/chunks/gone-123.js`)).status, 404, 'a replaced chunk is a 404, never the page');
+  assert.equal((await fetch(`${url}/some/client/route`)).status, 200, 'other unknown paths still serve the page');
   assert.match(await (await fetch(`${url}/classic.html`)).text(), /Reliability/);
   assert.equal((await fetch(`${url}/fonts/ibm-plex-sans-latin-400-normal.woff2`)).headers.get('content-type'), 'font/woff2');
   const engineCatalog = await (await request('GET','/api/engines')).json();

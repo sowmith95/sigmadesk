@@ -1,24 +1,16 @@
 // PR console: every PR the desk opened, live GitHub state, filters, tags, and owner actions.
 // Receives the app's helpers (h, api, sheetShell, …) so it renders exactly like the rest of the UI.
 
+import { safeGithubUrl, STATE_LABEL, stateOf, filterRows } from './prs-model.js';
+export { safeGithubUrl, stateOf, filterRows };
+
 const st = {
   rows: null, meta: {}, loading: false, error: '', loadedAt: 0,
   f: JSON.parse((typeof globalThis.localStorage?.getItem === 'function' && localStorage.getItem('sd.prs.filters')) || '{"q":"","state":"active","seat":"","requester":"","tag":""}'),
 };
-/** Only https links to github.com are rendered as PR links. */
-export function safeGithubUrl(u) {
-  try { const x = new URL(String(u)); return x.protocol === 'https:' && x.hostname === 'github.com' ? x.href : null; } catch { return null; }
-}
 const drafts = {}; // per-PR field drafts survive the live refreshes that rebuild the sheet
 const saveFilters = () => typeof globalThis.localStorage?.setItem === 'function' && localStorage.setItem('sd.prs.filters', JSON.stringify(st.f));
 
-const STATE_LABEL = { draft: 'Draft', open: 'Open', approved: 'Approved', merged: 'Merged', closed: 'Closed' };
-export function stateOf(p) {
-  if (p.state === 'MERGED') return 'merged';
-  if (p.state === 'CLOSED') return 'closed';
-  if (p.owner_approved || p.review === 'APPROVED') return 'approved';
-  return p.draft ? 'draft' : 'open';
-}
 const ago = (iso) => {
   if (!iso) return '';
   const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
@@ -38,20 +30,6 @@ async function load(ctx, refresh = false) {
   st.loading = false;
   ctx.render();
   if (ctx.S.sheet?.type === 'pr') renderSheet(ctx);
-}
-
-export function filterRows(rows, f) {
-  const q = (f.q || '').toLowerCase();
-  return rows.filter((p) => {
-    const s = stateOf(p);
-    if (f.state === 'active' && !['draft', 'open', 'approved'].includes(s)) return false;
-    if (f.state && f.state !== 'active' && f.state !== 'all' && s !== f.state) return false;
-    if (f.seat && p.seat !== f.seat) return false;
-    if (f.requester && p.requester !== f.requester) return false;
-    if (f.tag && !p.tags.includes(f.tag)) return false;
-    if (q && !`${p.number} ${p.key || ''} ${p.title} ${p.branch} ${p.tags.join(' ')}`.toLowerCase().includes(q)) return false;
-    return true;
-  });
 }
 
 export function renderPage(ctx) {
