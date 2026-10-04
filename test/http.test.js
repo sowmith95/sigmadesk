@@ -72,3 +72,42 @@ test('isolated HTTP desk: UI, live events, settings, ticket decisions and deskto
   await new Promise((resolve) => setTimeout(resolve, 3100));
   const health = await (await request('GET', '/api/health')).json(); assert.equal(health.scheduler.paused, true); assert.ok(health.scheduler.last_tick); assert.equal(health.watch.sources[0].ok, true);
 });
+
+test('isolated HTTP desk: research programs, connector governance and the review gate are owner-only, validated endpoints', async (t) => {
+  const socket = net.createServer(); await new Promise((resolve) => socket.listen(0, '127.0.0.1', resolve));
+  const port = socket.address().port; await new Promise((resolve) => socket.close(resolve));
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'scripts/local-preview.mjs'], { env: { ...process.env, SIGMADESK_PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = ''; child.stdout.on('data', (s) => { output += s; }); child.stderr.on('data', (s) => { output += s; });
+  t.after(async () => { child.kill('SIGTERM'); if (child.exitCode === null) await new Promise((resolve) => child.once('exit', resolve)); });
+  const url = `http://127.0.0.1:${port}`;
+  let ready = false;
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(`${url}/api/state`)).ok) { ready = true; break; } } catch { /* booting */ }
+    if (child.exitCode !== null) throw new Error(`Preview failed: ${output}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(ready, output);
+  const request = (method, p, b) => fetch(url + p, { method, headers: { 'Content-Type': 'application/json' }, body: b === undefined ? undefined : JSON.stringify(b) });
+  const research = await (await request('GET', '/api/research')).json();
+  assert.ok(research.programs.some((p) => p.id === 'product-discovery')); assert.equal(research.configured, false); assert.equal(research.market_hours.timezone, 'America/New_York');
+  assert.equal((await request('POST', '/api/settings', { key: 'research_programs', value: '[]' })).status, 400, 'generic settings cannot bypass program validation');
+  const bad = await request('PUT', '/api/research/programs', { programs: [{ ...research.programs[0], review: { minReviewers: 1, reviewers: ['pm'] } }] });
+  assert.equal(bad.status, 400); assert.match((await bad.json()).error, /cannot review its own/);
+  const saved = await request('PUT', '/api/research/programs', { programs: [{ ...research.programs[0], window: 'off-market', intervalMinutes: 90 }] });
+  assert.equal(saved.status, 200); assert.equal((await saved.json()).status.configured, true);
+  const state = await (await request('GET', '/api/state')).json();
+  assert.equal(state.settings.pm_interval_min, '90'); assert.equal(state.meta.research.programs[0].window, 'off-market'); assert.ok(Array.isArray(state.meta.research_reviews));
+  assert.equal((await request('POST', '/api/research/programs/nope/run', {})).status, 404);
+  assert.equal((await request('POST', '/api/research/programs/product-discovery/run', {})).status, 409, 'halted desk refuses a run');
+  assert.equal((await request('POST', '/api/research/programs/reset', {})).status, 200);
+  const CASE = '## Purpose\nx\n## Benefit to the application\nx\n## How it is used\nx\n## SDLC stage improved\ndiscovery\n## Cost\nx\n## Time\nx\n## Data leaving the machine\nx\n## Risks and fallback\nx\n## Success measure\nx';
+  assert.equal((await request('POST', '/api/connectors', { name: 'sec-filings', case_md: '## Purpose\nonly' })).status, 400);
+  assert.equal((await request('POST', '/api/connectors', { name: 'sec-filings', purpose: 'EDGAR filings', case_md: CASE })).status, 201);
+  assert.equal((await request('POST', `/api/connectors/sec-filings/approve`, { binding: { type: 'http', url: 'https://x.example/mcp' }, tools: ['search'] })).status, 400, 'no approval without an assessment');
+  assert.equal((await request('POST', `/api/connectors/sec-filings/assess`, {})).status, 200);
+  const list = await (await request('GET', '/api/connectors')).json();
+  assert.equal(list.connectors.find((c) => c.name === 'sec-filings').status, 'assessing'); assert.equal(list.case_sections.length, 9);
+  assert.equal((await request('POST', `/api/connectors/sec-filings/reject`, { reason: 'not now' })).status, 200);
+  const created = await (await request('POST', '/api/tickets', { title: 'Owner ticket', description: 'd', type: 'task', priority: 'P2' })).json();
+  assert.equal((await request('POST', `/api/tickets/${created.key}/research-review/waive`, { note: 'x' })).status, 400, 'only research proposals carry the gate');
+});

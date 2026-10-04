@@ -11,7 +11,9 @@ const USAGE = `usage:
   desk progress <0-100> "<msg>"
   desk comment [--key KEY] "<text>"            (or text on stdin)
   desk needs-human "<question>"
-  desk propose --title T [--area A] [--priority P] [--type T]   (body on stdin)
+  desk propose --title T [--area A] [--priority P] [--type T]   (body on stdin; research runs only)
+  desk revise KEY [--title T]   (revised proposal body on stdin; the author's research revision run only)
+  desk connector-propose --name N   (connector case on stdin; thinking seats; owner approval required)
   desk groom KEY --complexity S|M|L|XL --area A [--priority P] [--risk high] [--assign SEAT] [--title T]   (spec on stdin)
   desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT]   (body on stdin)
   desk design   (design doc on stdin; principals)
@@ -74,7 +76,7 @@ switch (cmd) {
   case 'respond': case 'resolve': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'incident': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'context-file': body.path = pos.join(' '); break;
-  case 'groom': case 'reject': case 'comment': case 'needs-human': takeKey(); body.body = pos.join(' '); break;
+  case 'groom': case 'reject': case 'comment': case 'needs-human': case 'revise': takeKey(); body.body = pos.join(' '); break;
   default: body.body = pos.join(' ');
 }
 // --findings @file.json: read the findings from a file the reviewer wrote (JSON is awkward to quote on a command line).
@@ -82,7 +84,7 @@ if (typeof body.findings === 'string' && body.findings.startsWith('@')) {
   try { body.findings = fs.readFileSync(path.resolve(body.findings.slice(1)), 'utf8'); } catch (e) { console.error(`desk: cannot read ${body.findings.slice(1)} (${e.message})`); process.exit(2); }
 }
 if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file'].includes(cmd)) body.body = await stdinText();
-else if (['groom', 'propose', 'create-task', 'incident', 'design'].includes(cmd) && !body.body) body.body = await stdinText();
+else if (['groom', 'propose', 'create-task', 'incident', 'design', 'revise', 'connector-propose'].includes(cmd) && !body.body) body.body = await stdinText();
 
 const token = process.env.DESK_RUN_TOKEN;
 const mailbox = process.env.DESK_MAILBOX;

@@ -184,6 +184,27 @@ Perplexity's Agent API routes the other model families. “Configured” means a
 Provider IDs and request formats were checked against [Perplexity](https://docs.perplexity.ai/docs/agent-api/models),
 [Gemini](https://ai.google.dev/gemini-api/docs/models), and [xAI](https://docs.x.ai/developers/grok-4-7).
 
+## Research programs and the second-person review
+
+Research is configured as **programs** (Settings → Research): which seat researches, how often, whether only during or
+only outside market hours (`research.marketHours`, New York regular hours by default), which approved sources it must
+cite, whether it may use the web, which approved connectors it may call, how many proposals a session may file, and
+which seats must review a proposal. The default `product-discovery` program is the PM's competitor research and is
+derived from `pm.*` and the legacy cadence settings until you save programs. Due programs run oldest-first while the
+funnel is thin; "Run now" skips cadence and window but never budget, capacity, engine fit or the proposal allowance.
+
+Every proposal filed by a research run waits for an **independent second review** by a different seat (preferring a
+different model family) before the manager may groom it: `pass` unblocks it, `changes` gives the author one bounded
+revision, `reject` or a second `changes` holds it for you (approve, send back with notes, or reject). Reviewers run
+read-only and answer with a structured verdict; you can waive the review, and that is recorded.
+
+**Connectors** (MCP servers for research seats) are governed: a written case (benefit, how it is used, SDLC stage,
+cost, time, data leaving the machine, risks, success measure), an independent assessment by a seat other than the
+proposer, then your approval with the exact binding and tool list and a re-evaluation date. Usage, cost and the review
+outcome of the proposals they helped produce are shown per connector. A `stdio` connector runs outside the OS sandbox
+with your user's file access; the desk strips its own credentials from that process and allows only the listed tools,
+but cannot confine it, so prefer `https` bindings. See [docs/research-programs.md](docs/research-programs.md).
+
 ## On-demand engineering councils
 
 Open **Architecture review** → **Model council**. Choose two or three reviewers from different model families,

@@ -20,7 +20,7 @@ const ALLOW = [T('call_perplexity_computer'), T('read_thread'), T('answer_questi
 const BLOCK = [T('confirm_action_approve'), T('create_attachment_upload'), T('create_asset_download'), T('projects_list'), T('notify_connected')];
 // owner_discussion is the manager's design discussion (scheduler.launchDiscussion); without it here, a manager seat on
 // Perplexity silently ran those on local Claude.
-export const THINK_KINDS = ['research', 'groom', 'design', 'consult', 'review', 'triage', 'investigate', 'owner_discussion', 'product_review'];
+export const THINK_KINDS = ['research', 'research_revision', 'research_review', 'connector_assessment', 'groom', 'design', 'consult', 'review', 'triage', 'investigate', 'owner_discussion', 'product_review'];
 // council_review (a frozen, read-only engineering council brief) is opt-in: a Computer task bills account credits and
 // cannot be cancelled from here, so docs/perplexity-connection.md must be verified before engines.perplexity.councilEnabled.
 const councilEnabled = () => config.engines?.perplexity?.councilEnabled === true;
@@ -95,7 +95,7 @@ function relayCharter(seat, kind) {
   const model = seat.model || 'pplx_asi_kimi_k3';
   const efforts = effortsOf(model);
   const effort = Array.isArray(efforts) && efforts.length === 0 ? '' : `, effort="${seat.effort || 'medium'}"`;
-  const review = ['product_review', 'council_review'].includes(kind);
+  const review = ['product_review', 'council_review', 'research_review', 'connector_assessment'].includes(kind);
   return `
 
 # You are the hands of ${labelOf(model)} (Perplexity)

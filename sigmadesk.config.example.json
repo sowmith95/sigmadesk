@@ -108,6 +108,12 @@
       "councilEnabled": false
     }
   },
+  "research": {
+    "marketHours": { "timezone": "America/New_York", "days": [1, 2, 3, 4, 5], "start": "09:30", "end": "16:00" },
+    "connectors": {},
+    "programs": [],
+    "review": { "minReviewers": 1, "reviewers": ["trading-advisor", "quant-research", "principal-be"] }
+  },
   "advisors": {
     "keyFile": "~/projects/sigmadesk/local/advisor-keys.json",
     "reserveUsd": 1,

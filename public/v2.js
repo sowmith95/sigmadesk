@@ -10,7 +10,7 @@ import { conversationItems, nearLatest } from './conversation.js';
 const VIEWS = ['inbox', 'work', 'team'];
 const STAGE_LABEL = { triage: 'Intake', proposed: 'Proposed', todo: 'To do', in_progress: 'Building', qa: 'QA', review: 'Acceptance', needs_human: 'Needs you', ready_for_human: 'Ready for review', done: 'Shipped', wontdo: 'Closed' };
 const BUCKET_LABEL = { needs_you: 'Needs you', blocked: 'Blocked', working: 'Working', queued: 'Queued', shipped: 'Shipped', closed: 'Closed' };
-const KIND_LABEL = { product: 'Product review', question: 'Question', guard: 'Publish guard', merge: 'Ready to merge', publish: 'Ready to publish', design: 'Design decision', council: 'Council verdict', page: 'Production errors' };
+const KIND_LABEL = { product: 'Product review', question: 'Question', guard: 'Publish guard', merge: 'Ready to merge', publish: 'Ready to publish', design: 'Design decision', council: 'Council verdict', page: 'Production errors', research: 'Research proposal' };
 
 const S = {
   agents: [], tickets: [], events: [], runs: [], settings: {}, meta: {}, incidents: [],
@@ -171,6 +171,8 @@ function apply(m) {
     case 'discussion': into('discussions', m.data); refreshMeta(); break;
     case 'branch-refresh': if (mine(m.data.ticket_key) && sh.detail) sh.detail.refresh = m.data; break;
     case 'product-review': if (mine(m.data.ticket_key) && sh.detail) upsert(sh.detail.product_reviews ||= [], m.data, 'phase'); refreshMeta(); break;
+    case 'research-review': if (mine(m.data.ticket_key) && sh.detail) upsert(sh.detail.research_reviews ||= [], m.data); refreshMeta(); break;
+    case 'connector': refreshMeta(); if (sh?.type === 'research') reloadResearch(sh).catch(() => {}); break;
     case 'council': delete S.councils[m.data.id]; refreshMeta(); break;
     case 'event':
       if (!S.events.some((e) => e.id === m.data.id)) S.events.push(m.data);
@@ -597,6 +599,7 @@ function renderSheet() {
   if (sh.type === 'desk') return renderDeskSheet();
   if (sh.type === 'money') return renderMoneySheet();
   if (sh.type === 'settings') return renderSettingsSheet();
+  if (sh.type === 'research') return renderResearchSheet();
   if (sh.type === 'prs') return sheetShell([h('div', { class: 'row' }, h('h2', {}, 'Pull requests'), closeBtn())], prsUi.renderPage(prsCtx()));
   if (sh.type === 'pr') return prsUi.renderSheet(prsCtx());
 }
@@ -728,6 +731,7 @@ function briefView(dec, t, d, card) {
   const strip = (x) => String(x).replace(new RegExp(`^\\s*${t.key}[a-z]?\\s*[:—-]\\s*`), '');
   const changed = dec.kind === 'question' ? outcome(card?.result?.summary || 'The engineer stopped to ask before going further.')
     : dec.kind === 'design' ? 'The manager finished a design recommendation for this ticket.'
+      : dec.kind === 'research' ? 'The independent second reviewer did not pass this research proposal; the author\'s revision allowance is used up or the reviewer rejected it.'
       : dec.kind === 'council' ? 'The architecture council finished its review.'
         : outcome(strip(submit ? submit.body.split('\n').slice(1).join(' ').trim() || submit.body : card?.result?.summary || t.progress_msg || 'No change summary posted.'));
   const pr = prFor(t);
@@ -738,6 +742,7 @@ function briefView(dec, t, d, card) {
     question: [`${firstName(t.assignee)} is paused until you answer.`],
     design: ['Approving records the design. Implementation, QA and merge keep their own gates.'],
     council: ['A council verdict records a design decision; implementation, QA and merge keep their own gates.'],
+    research: ['Approving waives the second review (recorded as your verdict) and lets the manager groom it. Send back gives the author one more revision with your notes. Reject closes the proposal.'],
   }[dec.kind] || [];
   const row = (k, ...v) => h('div', { class: 'brief-row' }, h('span', { class: 'rc-k' }, k), h('div', { class: 'rc-v' }, v));
   return h('section', { class: 'brief', id: 'brief', 'aria-label': 'Decision brief' },
@@ -880,24 +885,25 @@ function ticketFooter(t, dec, sh) {
   }
   if (dec && dec.kind !== 'page') {
     const target = dec.kind === 'design' ? ` #${dec.proposal_id}` : dec.kind === 'council' ? ` #${dec.council_id}` : '';
-    const primaryLabel = dec.kind === 'merge' ? 'Review merge' : dec.kind === 'design' ? `Approve design${target}` : dec.kind === 'council' ? `Approve council${target}` : 'Approve publication';
+    const primaryLabel = dec.kind === 'merge' ? 'Review merge' : dec.kind === 'design' ? `Approve design${target}` : dec.kind === 'council' ? `Approve council${target}` : dec.kind === 'research' ? 'Approve for grooming' : 'Approve publication';
     const cantApprove = running || (dec.kind === 'design' && !proposal) || (dec.kind === 'council' && (!council || council.stale || council.status === 'partial'));
     const primary = dec.kind === 'merge'
       ? h('button', { class: 'btn primary big', type: 'button', onclick: () => { const n = prNumber(t.pr_url); if (n) prsUi.openActions(prsCtx(), n); } }, primaryLabel)
       : h('button', { class: 'btn primary big', type: 'button', disabled: cantApprove, onclick: decide('approve',
         dec.kind === 'design' ? `Design #${dec.proposal_id} approved — recorded for planning` : dec.kind === 'council' ? 'Council decision recorded'
+          : dec.kind === 'research' ? 'Second review waived — the manager can groom it'
           : dec.kind === 'guard' ? 'Guard lifted — pushing the branch and opening a draft PR' : 'Approved — opening a draft PR') }, primaryLabel);
     const changes = sh.mode === 'changes';
     const blockedAll = running || (dec.kind === 'council' && (!council || council.stale));
     return [changes ? replyBox('What should change? (required)', 'Requested changes') : null,
       h('div', { class: 'f-actions' },
         overflow([h('button', { class: 'menu-i danger', type: 'button', disabled: blockedAll, onclick: decide('reject', ['design', 'council'].includes(dec.kind) ? 'Recommendation rejected' : 'Rejected — ticket closed, local work kept') },
-          dec.kind === 'design' ? `Reject design${target}…` : dec.kind === 'council' ? `Reject council${target}…` : 'Reject ticket…')]),
+          dec.kind === 'design' ? `Reject design${target}…` : dec.kind === 'council' ? `Reject council${target}…` : dec.kind === 'research' ? 'Reject proposal…' : 'Reject ticket…')]),
         h('span', { class: 'spacer' }),
         changes ? h('button', { class: 'btn ghost', type: 'button', onclick: () => { sh.mode = null; renderSheet(); } }, 'Cancel')
           : h('button', { class: 'btn', type: 'button', disabled: blockedAll, onclick: () => { sh.mode = 'changes'; renderSheet(); requestAnimationFrame(() => $('reply')?.focus()); } }, 'Request changes'),
         changes ? h('button', { id: 'send-changes', class: 'btn primary big', type: 'button', disabled: blockedAll || !draft(), onclick: decide('correction',
-          ['design', 'council'].includes(dec.kind) ? 'Corrections sent to the manager' : `Changes requested — ${who} picks it back up`) }, 'Send changes') : primary), note];
+          ['design', 'council'].includes(dec.kind) ? 'Corrections sent to the manager' : dec.kind === 'research' ? 'Sent back to the author with your notes' : `Changes requested — ${who} picks it back up`) }, dec.kind === 'research' ? 'Send back' : 'Send changes') : primary), note];
   }
   // No decision: the composer is collapsed behind the header's Message button.
   if (!sh.compose) return null;
@@ -944,6 +950,7 @@ function renderTicketSheet() {
     d ? threadView(d, card) : h('p', { class: 'muted' }, sh.error || 'Loading conversation…'),
     hist,
     dec.kind === 'product' ? null : productReviewView(t,d),
+    researchReviewView(t, d),
     moreView(t, d),
   ] : [
     gone ? h('p', { class: 'status-line blocked' }, 'That decision was resolved or changed while you were reading. Nothing was submitted.') : null,
@@ -953,6 +960,7 @@ function renderTicketSheet() {
     prSummary(t, null),
     reviewsView(prReviewsOf(t, d)),
     productReviewView(t,d),
+    researchReviewView(t, d),
     moreView(t, d),
   ];
   const sig = `${dec?.id || 'none'}|${sh.mode || ''}|${!!t.active_run}|${sh.compose}|${dec?.kind === 'design' ? !!(d?.discussions || []).find((x) => x.id === dec.proposal_id) : ''}|${dec?.kind === 'council' ? `${councilFor(dec.council_id)?.status}${councilFor(dec.council_id)?.stale}` : ''}`;
@@ -1077,7 +1085,8 @@ function renderSettingsSheet() {
     num('max_concurrent', 'Seats at once', 'A market-hours window in the config can lower this.'),
     bool('auto_fallback', 'Provider fallback', 'When one provider is low or down, seats use the other. Limits and gates still apply.'),
     h('h3', {}, 'Research and GitHub'),
-    bool('pm_enabled', 'PM research', 'The product manager proposes features while the funnel is thin.'),
+    h('div', { class: 'set' }, h('span', { class: 'set-l' }, h('b', {}, 'Research programs'), h('span', { class: 'muted small' }, `${(S.meta.research?.programs || []).length} program(s) · every research proposal gets an independent second review · connectors need a case, an assessment and your approval`)),
+      h('button', { class: 'btn', type: 'button', onclick: openResearch }, 'Open')),
     bool('github_sync', 'Sync GitHub issues', `Mirror tickets and comments to ${S.meta.repo || 'GitHub'}.`),
     bool('open_draft_prs', 'Open draft PRs', 'After QA, push the branch and open a draft PR. Nothing merges automatically.'),
     h('p', { class: 'muted small' }, 'Halt, resume and the breaker live under the Desk instrument in the header.'),
@@ -1231,3 +1240,135 @@ connect();
 const openFromHash = () => { const k = decodeURIComponent(location.hash.slice(1)); if (/^[A-Z][A-Z0-9]*-\d+$/.test(k) && !(S.sheet?.type === 'ticket' && S.sheet.key === k)) openTicket(k); };
 window.addEventListener('hashchange', openFromHash);
 openFromHash();
+
+
+// ---- research programs, second-person review and governed connectors ----
+function researchReviewView(t, d) {
+  if (t.source !== 'research' || !t.research_review) return null;
+  const sum = (S.meta.research_reviews || []).find((r) => r.ticket_key === t.key);
+  const rows = (d?.research_reviews || []).slice().sort((a, b) => a.id - b.id);
+  const label = { pending: 'Awaiting second review', passed: 'Passed', changes: 'Changes requested', held: 'Held for you', waived: 'Waived by you' }[t.research_review] || t.research_review;
+  const tone = { passed: 'green', waived: 'green', held: 'amber', changes: 'amber' }[t.research_review] || '';
+  const blocks = ['pending', 'changes', 'held'].includes(t.research_review);
+  return h('section', { class: 'product-review', 'aria-label': 'Independent research review' }, h('h3', {}, 'Independent research review'),
+    h('p', {}, chip(label, tone), ` · program ${t.research_program || '—'} · generation ${t.research_generation || 1}${sum && t.research_review === 'pending' ? ` · ${sum.needed} more pass${sum.needed === 1 ? '' : 'es'} needed` : ''}`),
+    sum?.reason ? h('p', { class: 'muted small' }, sum.reason) : null,
+    rows.length ? h('ul', { class: 'slices' }, rows.map((r) => h('li', {}, `${r.reviewer === 'owner' ? 'You' : agentMap()[r.reviewer]?.name || r.reviewer} · generation ${r.generation} · ${r.verdict || r.status}${r.report?.summary ? ` — ${r.report.summary}` : ''}${r.report?.conditions?.length ? ` Conditions: ${r.report.conditions.join('; ')}` : ''}${r.error ? ` — ${r.error}` : ''}`)))
+      : h('p', { class: 'muted small' }, 'No reviewer has reported yet.'),
+    blocks && t.status !== 'needs_human' ? h('div', { class: 'row-actions' }, h('button', { class: 'btn', type: 'button', onclick: act(async () => {
+      const note = prompt('Waive the independent second review? This is recorded as your verdict. Optional note:', '');
+      if (note == null) return false;
+      await api('POST', `/api/tickets/${t.key}/research-review/waive`, { note });
+      await loadSnapshot(); if (S.sheet?.type === 'ticket' && S.sheet.key === t.key) loadDetail(S.sheet);
+    }, 'Review waived — the manager can groom it') }, 'Waive review')) : null);
+}
+
+const programDraft = (p) => ({ id: p.id, label: p.label, seat: p.seat, enabled: p.enabled, intervalMinutes: p.intervalMinutes, window: p.window, focus: p.focus || '', sources: [...(p.sources || [])],
+  tools: { web: !!p.tools?.web, connectors: [...(p.tools?.connectors || [])] }, maxProposals: p.maxProposals, review: { minReviewers: p.review?.minReviewers || 1, reviewers: [...(p.review?.reviewers || [])] } });
+async function reloadResearch(sh) {
+  const [data, conns] = await Promise.all([api('GET', '/api/research'), api('GET', '/api/connectors')]);
+  data.connectors = conns.connectors;
+  sh.data = data; sh.draft = data.programs.map(programDraft); sh.error = null;
+  if (S.sheet === sh) renderSheet();
+}
+async function openResearch() {
+  const sh = { type: 'research', data: null, draft: null, error: null, connForm: null, approve: {} };
+  S.sheet = sh; renderSheet();
+  try { await reloadResearch(sh); } catch (e) { sh.error = e.message; if (S.sheet === sh) renderSheet(); }
+}
+function renderResearchSheet() {
+  const sh = S.sheet, data = sh.data;
+  if (!data) return sheetShell([h('div', { class: 'row' }, h('h2', {}, sh.error || 'Loading research…'), h('span', { class: 'spacer' }), closeBtn())], null);
+  const approved = (data.connectors || []).filter((c) => c.status === 'approved').map((c) => c.name);
+  const field = (label, input) => h('label', { class: 'field' }, h('span', {}, label), input);
+  const num = (obj, k, min, max) => h('input', { type: 'number', min: String(min), max: String(max), value: String(obj[k]), onchange: (e) => { obj[k] = Number(e.target.value); } });
+  const text = (obj, k, placeholder) => h('input', { type: 'text', value: obj[k] || '', placeholder, onchange: (e) => { obj[k] = e.target.value; } });
+  const check = (obj, k, label) => h('label', { class: 'council-check' }, h('input', { type: 'checkbox', checked: !!obj[k], onchange: (e) => { obj[k] = e.target.checked; } }), label);
+  const toggleIn = (arr, v, on) => (on ? [...new Set([...arr, v])] : arr.filter((x) => x !== v));
+  const programCard = (p, i) => {
+    const live = data.programs.find((x) => x.id === p.id);
+    return h('article', { class: 'prov' },
+      h('div', { class: 'dcard-top' }, h('b', {}, p.label || p.id), h('span', { class: 'spacer' }),
+        live ? chip(live.ok ? 'Due' : live.code === 'cadence' ? 'Scheduled' : live.code === 'disabled' ? 'Off' : live.code, live.ok ? 'green' : live.code === 'disabled' ? '' : 'amber') : chip('Unsaved')),
+      live ? h('p', { class: 'muted small' }, `${live.reason}${live.last_run_at ? ` · last session ${ago(live.last_run_at)}` : ' · never run'}`) : null,
+      h('div', { class: 'kv' },
+        field('Id', text(p, 'id', 'kebab-case')), field('Label', text(p, 'label', 'Name')),
+        field('Seat', h('select', { onchange: (e) => { p.seat = e.target.value; p.review.reviewers = p.review.reviewers.filter((x) => x !== p.seat); renderSheet(); } }, S.agents.map((a) => h('option', { value: a.id, selected: a.id === p.seat }, `${a.name} · ${a.role}`)))),
+        field('Every (minutes)', num(p, 'intervalMinutes', 15, 525600)),
+        field('Window', h('select', { onchange: (e) => { p.window = e.target.value; } }, (data.windows || ['any', 'market', 'off-market']).map((w) => h('option', { value: w, selected: w === p.window }, w === 'market' ? 'market hours only' : w === 'off-market' ? 'outside market hours' : 'any time')))),
+        field('Proposals per session', num(p, 'maxProposals', 1, 10)),
+        field('Reviewers needed', num(p.review, 'minReviewers', 1, 3)),
+        field('Standing focus', text(p, 'focus', 'e.g. alerts that matter to 0DTE traders')),
+        field('Approved sources (comma separated)', h('input', { type: 'text', value: p.sources.join(', '), placeholder: 'arxiv.org, ssrn.com, docs.alpaca.markets', onchange: (e) => { p.sources = e.target.value.split(',').map((x) => x.trim()).filter(Boolean); } }))),
+      h('div', { class: 'row-actions' }, check(p, 'enabled', 'Enabled'), check(p.tools, 'web', 'Web search / fetch (runs outside the sandbox)')),
+      h('p', { class: 'small' }, h('b', {}, 'Reviewer pool (never the researching seat): '), ...S.agents.filter((a) => a.id !== p.seat).map((a) => h('label', { class: 'council-check' },
+        h('input', { type: 'checkbox', checked: p.review.reviewers.includes(a.id), onchange: (e) => { p.review.reviewers = toggleIn(p.review.reviewers, a.id, e.target.checked); } }), a.name))),
+      h('p', { class: 'small' }, h('b', {}, 'Approved connectors: '), approved.length ? approved.map((c) => h('label', { class: 'council-check' },
+        h('input', { type: 'checkbox', checked: p.tools.connectors.includes(c), onchange: (e) => { p.tools.connectors = toggleIn(p.tools.connectors, c, e.target.checked); } }), c)) : 'none approved yet (see Connectors below)'),
+      h('div', { class: 'row-actions' },
+        live ? h('button', { class: 'btn', type: 'button', onclick: act(async () => { const focus = prompt(`One-off focus for "${p.label}" (optional):`, ''); if (focus == null) return false; await api('POST', `/api/research/programs/${p.id}/run`, { focus }); }, `${p.label} started`) }, 'Run now') : null,
+        h('span', { class: 'spacer' }),
+        h('button', { class: 'btn ghost', type: 'button', onclick: () => { sh.draft.splice(i, 1); renderSheet(); } }, 'Remove')));
+  };
+  const mh = data.market_hours || {};
+  return sheetShell([h('div', { class: 'row' }, h('h2', {}, 'Research'), h('span', { class: 'spacer' }), closeBtn())], [
+    h('p', { class: 'muted small' }, `Market hours: ${mh.timezone} ${mh.start}–${mh.end} (${mh.open_now ? 'open now' : 'closed now'}). ${data.configured ? 'Saved programs are in effect.' : 'Programs derive from the config and the legacy PM settings until you save.'} Every proposal filed by a program is reviewed by another seat before the manager grooms it.`),
+    data.problems?.length ? h('p', { class: 'amber-t' }, data.problems.join(' · ')) : null,
+    h('h3', {}, 'Programs'),
+    ...sh.draft.map(programCard),
+    h('div', { class: 'row-actions' },
+      h('button', { class: 'btn', type: 'button', onclick: () => { const dr = data.default_review || { minReviewers: 1, reviewers: [] }; sh.draft.push({ id: `program-${sh.draft.length + 1}`, label: 'New program', seat: 'pm', enabled: false, intervalMinutes: 1440, window: 'any', focus: '', sources: [], tools: { web: true, connectors: [] }, maxProposals: 2, review: { minReviewers: dr.minReviewers, reviewers: [...dr.reviewers] } }); renderSheet(); } }, 'Add program'),
+      h('button', { class: 'btn ghost', type: 'button', onclick: act(async () => { if (!confirm('Discard saved programs and return to the configuration defaults?')) return false; await api('POST', '/api/research/programs/reset', {}); await reloadResearch(sh); await loadSnapshot(); }, 'Programs reset to config') }, 'Reset to config'),
+      h('span', { class: 'spacer' }),
+      h('button', { class: 'btn primary', type: 'button', onclick: act(async () => { await api('PUT', '/api/research/programs', { programs: sh.draft }); await reloadResearch(sh); await loadSnapshot(); }, 'Programs saved (all or nothing)') }, 'Save programs')),
+    h('h3', {}, 'Connectors'),
+    ...renderConnectors(sh, data),
+  ]);
+}
+function renderConnectors(sh, data) {
+  const list = data.connectors || [];
+  const tone = { approved: 'green', assessed: 'amber', assessing: 'amber', proposed: '', rejected: 'red', retired: '' };
+  const refresh = async () => { await reloadResearch(sh); await loadSnapshot(); };
+  const approveForm = (c) => {
+    const d = sh.approve[c.name] ||= { type: c.binding?.type || 'http', url: c.binding?.url || '', command: c.binding?.command || '', args: (c.binding?.args || []).join(' '), tools: (c.tools || []).join(', '), days: 30, note: '' };
+    return h('div', { class: 'kv' },
+      h('label', { class: 'field' }, h('span', {}, 'Binding type'), h('select', { onchange: (e) => { d.type = e.target.value; renderSheet(); } }, ['http', 'stdio'].map((v) => h('option', { value: v, selected: v === d.type }, v)))),
+      d.type === 'http' ? h('label', { class: 'field' }, h('span', {}, 'https URL'), h('input', { type: 'text', value: d.url, onchange: (e) => { d.url = e.target.value; } }))
+        : [h('label', { class: 'field' }, h('span', {}, 'Command (absolute path on this machine)'), h('input', { type: 'text', value: d.command, onchange: (e) => { d.command = e.target.value; } })),
+          h('label', { class: 'field' }, h('span', {}, 'Arguments (space separated)'), h('input', { type: 'text', value: d.args, onchange: (e) => { d.args = e.target.value; } }))],
+      h('label', { class: 'field' }, h('span', {}, 'Allowed tools (comma separated, exact names)'), h('input', { type: 'text', value: d.tools, onchange: (e) => { d.tools = e.target.value; } })),
+      h('label', { class: 'field' }, h('span', {}, 'Re-evaluate after (days)'), h('input', { type: 'number', min: '7', max: '365', value: String(d.days), onchange: (e) => { d.days = Number(e.target.value); } })),
+      h('label', { class: 'field' }, h('span', {}, 'Approval note'), h('input', { type: 'text', value: d.note, onchange: (e) => { d.note = e.target.value; } })),
+      d.type === 'stdio' ? h('p', { class: 'amber-t' }, 'A stdio connector runs outside the OS sandbox with your user\'s file access. The desk strips its own credentials and allows only the listed tools; it cannot confine the process. Bindings carry no credentials.') : null,
+      h('div', { class: 'row-actions' }, h('button', { class: 'btn primary', type: 'button', onclick: act(async () => {
+        const binding = d.type === 'http' ? { type: 'http', url: d.url.trim() } : { type: 'stdio', command: d.command.trim(), args: d.args.trim() ? d.args.trim().split(/\s+/) : [] };
+        await api('POST', `/api/connectors/${c.name}/approve`, { binding, tools: d.tools.split(',').map((x) => x.trim()).filter(Boolean), review_after_days: d.days, note: d.note });
+        await refresh();
+      }, `${c.name} approved`) }, 'Approve with this binding')));
+  };
+  const card = (c) => h('article', { class: 'prov' },
+    h('div', { class: 'dcard-top' }, h('b', {}, c.name), h('span', { class: 'spacer' }), chip(c.status, tone[c.status] || ''), c.due_for_review ? chip('re-evaluate', 'amber') : null),
+    h('p', { class: 'small' }, c.purpose || 'No purpose recorded'),
+    h('p', { class: 'muted small' }, `proposed by ${c.proposed_by === 'owner' ? 'you' : agentMap()[c.proposed_by]?.name || c.proposed_by}${c.assessed_by ? ` · assessed by ${agentMap()[c.assessed_by]?.name || c.assessed_by}` : ''}${c.approved_at ? ` · approved ${ago(c.approved_at)} · re-evaluate ${String(c.review_after).slice(0, 10)}` : ''}${c.binding ? ` · ${c.binding.type}` : ''}${c.tools?.length ? ` · tools: ${c.tools.join(', ')}` : ''}`),
+    c.assessment ? h('p', { class: 'small' }, h('b', {}, `Assessment: ${c.assessment.verdict}`), ` · benefit ${c.assessment.benefit_score}/5 · ${c.assessment.sdlc_stage} · risk ${c.assessment.risk} · cost ${c.assessment.cost_estimate} · time ${c.assessment.time_estimate} · data leaving: ${c.assessment.data_leaving}. ${c.assessment.rationale}${c.assessment.conditions?.length ? ` Conditions: ${c.assessment.conditions.join('; ')}` : ''}`) : null,
+    c.usage?.runs ? h('p', { class: 'muted small' }, `${c.usage.runs} run(s) · $${c.usage.cost_usd} · ${c.usage.proposals} proposal(s), ${c.usage.passed_review} passed the second review · last used ${ago(c.usage.last_used_at)}`) : null,
+    c.decision_note ? h('p', { class: 'muted small' }, c.decision_note) : null,
+    c.case_md ? disclose(`case-${c.name}`, 'Case', h('pre', { class: 'prose wrap' }, c.case_md)) : h('p', { class: 'amber-t' }, 'No case written yet; write one before requesting an assessment.'),
+    c.status === 'assessed' ? approveForm(c) : null,
+    h('div', { class: 'row-actions' },
+      ['proposed', 'assessed', 'rejected'].includes(c.status) && c.case_md ? h('button', { class: 'btn', type: 'button', onclick: act(async () => { await api('POST', `/api/connectors/${c.name}/assess`, {}); await refresh(); }, 'Assessment requested — a seat other than the proposer reviews the case') }, c.status === 'proposed' ? 'Request assessment' : 'Assess again') : null,
+      c.status === 'assessing' ? h('span', { class: 'muted small' }, 'Assessment in progress…') : null,
+      ['proposed', 'assessing', 'assessed'].includes(c.status) ? h('button', { class: 'btn ghost', type: 'button', onclick: act(async () => { const reason = prompt(`Reject ${c.name}? Reason for the record:`, ''); if (reason == null) return false; await api('POST', `/api/connectors/${c.name}/reject`, { reason }); await refresh(); }, `${c.name} rejected`) }, 'Reject') : null,
+      c.status === 'approved' ? h('button', { class: 'btn danger', type: 'button', onclick: act(async () => { const reason = prompt(`Retire ${c.name}? Programs that use it must drop it before they can be saved again. Reason:`, ''); if (reason == null) return false; await api('POST', `/api/connectors/${c.name}/retire`, { reason }); await refresh(); }, `${c.name} retired`) }, 'Retire') : null));
+  const f = sh.connForm ||= { name: '', purpose: '', case_md: (data.case_sections || []).map((x) => `## ${x}\n\n`).join('') };
+  const caseBox = h('textarea', { rows: '16', 'aria-label': 'Connector case', oninput: (e) => { f.case_md = e.target.value; } }); caseBox.value = f.case_md;
+  return [
+    h('p', { class: 'muted small' }, 'Adding a connector is a decision, not a config edit: a written case (benefit, how it is used, SDLC stage, cost, time, data leaving the machine, risks, success measure), an independent assessment by another seat, then your approval with the exact binding and tools. Only approved connectors can be selected by a program; usage and review outcomes are tracked for the re-evaluation.'),
+    ...(list.length ? list.map(card) : [h('p', { class: 'muted' }, 'No connectors proposed yet.')]),
+    disclose('propose-connector', 'Propose a connector', h('div', { class: 'kv' },
+      h('label', { class: 'field' }, h('span', {}, 'Name (kebab-case)'), h('input', { type: 'text', value: f.name, placeholder: 'paper-search', onchange: (e) => { f.name = e.target.value; } })),
+      h('label', { class: 'field' }, h('span', {}, 'Purpose (one line)'), h('input', { type: 'text', value: f.purpose, onchange: (e) => { f.purpose = e.target.value; } })),
+      h('label', { class: 'field' }, h('span', {}, 'Case (keep every section)'), caseBox),
+      h('div', { class: 'row-actions' }, h('button', { class: 'btn primary', type: 'button', onclick: act(async () => { await api('POST', '/api/connectors', { name: f.name.trim(), purpose: f.purpose, case_md: f.case_md }); sh.connForm = null; await refresh(); }, 'Connector proposed — request its assessment next') }, 'Propose')))),
+  ];
+}
