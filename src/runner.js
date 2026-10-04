@@ -424,7 +424,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const token = crypto.randomBytes(18).toString('hex');
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job });
   // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
-  if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id });
+  if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
   store.updateRun(run.id, { reserve_usd: engineOf(agent).budgetUsd(agent) });
   onStart?.(run);
   const ctx = { run, cwd, result: null, state: {}, presence: track };
@@ -492,6 +492,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const child = spawn(cmd.bin, cmd.args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
   children.set(run.id, child);
   store.updateRun(run.id, { pid: child.pid });
+  if (child.pid) lessons.delivered(run.id, ticketKey); // lessons count as given only once the prompt reaches a process
   child.stdin.on('error', () => {});
   child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt);
 

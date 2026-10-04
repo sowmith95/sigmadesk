@@ -494,11 +494,13 @@ Resolve every conflict so that BOTH your change and what landed on ${x.base} kee
 refactor or add features. Run the relevant tests (the playbook says how). Then: git add <files> && git commit --no-edit
 (do not rebase, reset or push). Finish with exactly one:
   desk resolve done "<plain-language summary: what conflicted and how you combined both sides>"
-  desk resolve stuck "<why only the owner can decide>"`;
+  desk resolve stuck "<why only the owner can decide>"
+If a fix you made is a mistake the team should not repeat, propose one sentence: desk lesson "<lesson>".`;
     }
     case 'rework':
       return `Your work on ${t.key} came back. Latest review notes:\n\n${extra}\n\nYou are in the same clone and branch as before.
-Fix every numbered item, re-run the relevant tests, commit, and finish with: desk submit "<what you changed for each note>".`;
+Fix every numbered item, re-run the relevant tests, commit, and finish with: desk submit "<what you changed for each note>".
+If a fix you made is a mistake the team should not repeat, propose one sentence: desk lesson "<lesson>".`;
     case 'investigate':
       return `Incident investigation. A NEW recurring error signature crossed the watch threshold.\n\n${extra}\n
 The repo is checked out read-only in your cwd at the base branch. Investigate and finish with exactly one desk incident

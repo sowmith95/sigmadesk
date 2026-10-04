@@ -340,17 +340,25 @@ export function openDb(file = config.dbPath) {
 }
 
 // QA verdicts before the qa_verdicts table existed: rebuilt once from the QA seat's events, reason unknown.
+// Also after a rollback to a version without the table: events newer than the last recorded verdict (with a minute of
+// slack, since the live path logs its event a moment after the row) are rebuilt; older ones are never touched twice.
 export function backfillQaVerdicts() {
-  if (db.prepare('SELECT 1 FROM qa_verdicts LIMIT 1').get()) return;
+  const last = db.prepare('SELECT MAX(ts) ts FROM qa_verdicts').get()?.ts;
+  const after = last ? new Date(Date.parse(last) + 60_000).toISOString() : '';
   const rows = db.prepare(`SELECT e.ticket_key, e.text, e.run_id, e.ts, t.builder, t.complexity, t.area FROM events e LEFT JOIN tickets t ON t.key = e.ticket_key
-    WHERE e.kind = 'action' AND e.agent_id = 'qa' AND (e.text LIKE 'QA passed %' OR e.text LIKE 'QA failed %') AND e.ticket_key IS NOT NULL ORDER BY e.id`).all();
-  const firstBuild = db.prepare("SELECT agent_id, model FROM runs WHERE ticket_key = ? AND kind = 'implement' AND started_at <= ? ORDER BY id DESC LIMIT 1");
+    WHERE e.kind = 'action' AND e.agent_id = 'qa' AND (e.text LIKE 'QA passed %' OR e.text LIKE 'QA failed %') AND e.ticket_key IS NOT NULL AND e.ts > ? ORDER BY e.id`).all(after);
+  const firstBuild = db.prepare("SELECT agent_id, model FROM runs WHERE ticket_key = ? AND kind IN ('implement','respond','resolve') AND started_at <= ? ORDER BY id DESC LIMIT 1");
   const ins = db.prepare('INSERT INTO qa_verdicts(ticket_key, run_id, verdict, reason, builder, model, complexity, area, ts) VALUES (?,?,?,?,?,?,?,?,?)');
+  if (!rows.length) return;
+  db.exec('BEGIN IMMEDIATE'); // all or nothing: a half-done rebuild would hide the rest of the history for good
+  try {
   for (const r of rows) {
     const b = firstBuild.get(r.ticket_key, r.ts);
     const pass = /^QA passed/.test(r.text);
     ins.run(r.ticket_key, r.run_id ?? null, pass ? 'pass' : 'fail', pass ? null : 'unknown', r.builder || b?.agent_id || null, b?.model || null, r.complexity ?? null, r.area ?? null, r.ts);
   }
+  db.exec('COMMIT');
+  } catch (err) { db.exec('ROLLBACK'); throw err; }
 }
 
 // Additive migrations for databases created by older versions.
@@ -396,7 +404,9 @@ export const lastBuildRun = (ticketKey, agentId) => db.prepare("SELECT * FROM ru
 export const qaVerdicts = (ticketKey) => db.prepare('SELECT * FROM qa_verdicts WHERE ticket_key = ? ORDER BY id').all(ticketKey);
 export const getLesson = (id) => db.prepare('SELECT * FROM lessons WHERE id = ?').get(id) || null;
 export function listLessons() {
-  return db.prepare(`SELECT l.*, (SELECT COUNT(*) FROM qa_verdicts v WHERE v.lesson_id = l.id) repeats,
+  // A repeat counts only on a task whose build actually carried the lesson.
+  return db.prepare(`SELECT l.*, (SELECT COUNT(*) FROM qa_verdicts v WHERE v.lesson_id = l.id
+      AND EXISTS (SELECT 1 FROM lesson_exposures x WHERE x.lesson_id = l.id AND x.ticket_key = v.ticket_key)) repeats,
     (SELECT COUNT(DISTINCT ticket_key) FROM lesson_exposures x WHERE x.lesson_id = l.id) tasks FROM lessons l ORDER BY l.id DESC`).all();
 }
 export function insertLesson(l) {
@@ -408,6 +418,7 @@ export function updateLesson(id, patch) {
   if (cols.length) db.prepare(`UPDATE lessons SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = ? WHERE id = ?`).run(...cols.map((c) => patch[c]), now(), id);
   return getLesson(id);
 }
+export const exposedLessons = (ticketKey) => new Set(db.prepare('SELECT DISTINCT lesson_id FROM lesson_exposures WHERE ticket_key = ?').all(ticketKey).map((r) => r.lesson_id));
 export function recordExposures(runId, ticketKey, ids) {
   const ins = db.prepare('INSERT OR IGNORE INTO lesson_exposures(run_id, lesson_id, ticket_key) VALUES (?,?,?)');
   for (const id of ids) ins.run(runId, id, ticketKey ?? null);

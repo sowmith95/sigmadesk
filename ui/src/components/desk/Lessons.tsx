@@ -14,7 +14,10 @@ type Lesson = { id: number; area: string | null; text: string; source_ticket: st
 function Row({ l }: { l: Lesson }) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(l.text);
-  const act = (action: string, extra: Record<string, unknown> = {}) => async () => { await api('POST', `/api/lessons/${l.id}`, { action, expected_updated_at: l.updated_at, ...extra }); setEditing(false); await loadSnapshot(); };
+  // An edit is checked against the version it started from: a newer change elsewhere refuses the save (409).
+  const [base, setBase] = useState(l.updated_at);
+  const startEdit = () => { setText(l.text); setBase(l.updated_at); setEditing(true); };
+  const act = (action: string, extra: Record<string, unknown> = {}) => async () => { await api('POST', `/api/lessons/${l.id}`, { action, expected_updated_at: editing ? base : l.updated_at, ...extra }); setEditing(false); await loadSnapshot(); };
   const who = agentMap()[l.proposed_by || '']?.name || l.proposed_by || 'the team';
   return (
     <li data-lesson={l.id} className="grid gap-2 rounded-md bg-secondary/50 p-3">
@@ -30,10 +33,10 @@ function Row({ l }: { l: Lesson }) {
           <Button size="sm" variant="ghost" onClick={() => { setText(l.text); setEditing(false); }}>Cancel</Button>
         </> : l.status === 'proposed' ? <>
           <AsyncButton size="sm" run={act('approve')} ok="Approved; builds in this area now read it">Approve</AsyncButton>
-          <Button size="sm" variant="secondary" onClick={() => setEditing(true)}>Edit</Button>
+          <Button size="sm" variant="secondary" onClick={startEdit}>Edit</Button>
           <AsyncButton size="sm" variant="ghost" run={act('reject')} ok="Rejected">Reject</AsyncButton>
         </> : <>
-          <Button size="sm" variant="secondary" onClick={() => setEditing(true)}>Edit</Button>
+          <Button size="sm" variant="secondary" onClick={startEdit}>Edit</Button>
           <AsyncButton size="sm" variant="ghost" confirm="Retire this lesson? Builds stop reading it." run={act('retire')} ok="Retired">Retire</AsyncButton>
         </>}
       </div>

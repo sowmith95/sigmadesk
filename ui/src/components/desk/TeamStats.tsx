@@ -15,7 +15,7 @@ const dur = (m: number | null) => (m == null ? '—' : m < 90 ? `${Math.round(m)
 
 // First-try QA per size: small and medium work are different jobs, so they are never blended into one figure. The band
 // compares the seat with the rest of the team on the same size; with few verdicts it says so instead of guessing.
-const BAND: Record<string, string> = { too_early: 'too early to tell', inconclusive: 'no clear difference', above: 'above the team', below: 'below the team' };
+const BAND: Record<string, string> = { too_early: 'too early to tell', inconclusive: 'no clear difference', above: 'above the team', below: 'below the team', no_comparison: 'nobody else to compare with' };
 const BAND_TONE: Record<string, string> = { above: 'text-shipped', below: 'text-blocked' };
 const range = (c: Cohort) => (c.interval ? `likely ${pct(c.interval[0])}–${pct(c.interval[1])}` : '');
 function Qa({ c, label }: { c: Cohort; label: string }) {

@@ -70,6 +70,8 @@ test('lessons: proposed from the fixing run, approved by the owner, carried in b
   const t = ticketInQa();
   store.updateTicket(t.key, { status: 'in_progress' });
   const fix = store.createRun({ agent_id: 'junior', ticket_key: t.key, kind: 'implement', token: `fix-${t.key}`, model: 'claude:sonnet' });
+  await assert.rejects(sched.deskAction(fix, 'lesson', { body: 'Nothing went wrong yet on this task.' }), /sent back/, 'a first build has no setback to learn from');
+  store.updateTicket(t.key, { qa_loops: 1 });
   await assert.rejects(sched.deskAction(fix, 'lesson', { body: 'short' }), /10 to 300/);
   const out = await sched.deskAction(fix, 'lesson', { body: 'Add a test for the empty input before submitting a parser change.' });
   const id = Number(out.match(/#(\d+)/)[1]);
@@ -86,15 +88,54 @@ test('lessons: proposed from the fixing run, approved by the owner, carried in b
   assert.equal(lessons.decorate({ kind: 'implement', ticket: { ...store.getTicket(t.key), area: 'frontend', key: t.key }, prompt: 'X', runId: fix.id }), 'X', 'another area does not carry it');
   assert.match(lessons.decorate({ kind: 'qa', ticket: store.getTicket(t.key), prompt: 'QA', runId: 0 }), new RegExp(`#${id}: Add a test`));
   const t2 = ticketInQa();
+  await assert.rejects(sched.deskAction(qaRun(t2), 'qa', { verdict: 'fail', code: 'N1', reason: 'tests', lesson: String(id), body: 'x' }), /not in this task's instructions/, 'a repeat needs the lesson to have been given');
+  const b2 = store.createRun({ agent_id: 'junior', ticket_key: t2.key, kind: 'implement', token: `b2-${t2.key}`, model: 'claude:sonnet' });
+  lessons.decorate({ kind: 'implement', ticket: store.getTicket(t2.key), prompt: 'BUILD', runId: b2.id });
+  lessons.delivered(b2.id, t2.key); // the process started: the lesson was given
   await sched.deskAction(qaRun(t2), 'qa', { verdict: 'fail', code: 'N1', reason: 'tests', lesson: String(id), body: 'again no empty-input test' });
   const row = store.listLessons().find((x) => x.id === id);
-  assert.equal(row.repeats, 1); assert.equal(row.tasks, 1);
-  lessons.decide(id, { action: 'retire' });
+  assert.equal(row.repeats, 1); assert.equal(row.tasks, 1, 'only builds whose process started count as having seen it');
+  assert.equal(lessons.decorate({ kind: 'implement', ticket: store.getTicket(t2.key), prompt: 'RESUME', runId: b2.id, resumed: true }), 'RESUME', 'a resumed session is not told again');
+  assert.throws(() => lessons.decide(id, { action: 'edit', expected_updated_at: store.getLesson(id).updated_at }), /nothing to change/);
+  assert.throws(() => lessons.decide(id, { action: 'retire' }), /expected_updated_at is required/);
+  // New words are a new lesson: the old one is retired with its record; the replacement starts at zero.
+  const replaced = lessons.decide(id, { action: 'edit', text: 'Write a test for empty and whitespace-only input first.', expected_updated_at: store.getLesson(id).updated_at });
+  assert.notEqual(replaced.id, id); assert.equal(store.getLesson(id).status, 'retired');
+  assert.equal(store.listLessons().find((x) => x.id === replaced.id).repeats, 0);
+  // A resumed session that was told the old words hears that they are retired, and gets the new ones.
+  const resumed = lessons.decorate({ kind: 'implement', ticket: store.getTicket(t2.key), prompt: 'RESUME', runId: 999, resumed: true });
+  assert.match(resumed, /retired since you were told them[\s\S]*empty-input|retired since you were told them[\s\S]*empty input/);
+  assert.match(resumed, /whitespace-only/);
+  lessons.decide(replaced.id, { action: 'retire', expected_updated_at: store.getLesson(replaced.id).updated_at });
   assert.equal(lessons.decorate({ kind: 'implement', ticket: store.getTicket(t.key), prompt: 'BUILD', runId: fix.id }), 'BUILD');
 });
 
+test('lessons for a build: its area first, the most repeated first, at most five', () => {
+  const ids = [];
+  for (let i = 0; i < 7; i++) { const l = store.insertLesson({ area: i < 2 ? null : 'frontend', text: `Frontend or general lesson number ${i} for ordering.`, proposed_by: 'senior-fe' }); store.updateLesson(l.id, { status: 'active' }); ids.push(l.id); }
+  const got = lessons.activeFor('frontend');
+  assert.equal(got.length, 5);
+  assert.ok(got.every((l) => l.area === 'frontend'), 'area lessons before general ones');
+  assert.deepEqual(lessons.activeFor('db').map((l) => l.id).filter((x) => ids.includes(x)), ids.slice(0, 2), 'another area gets only the general lessons');
+  assert.equal(stats.band(20, 20, 0, 0), 'no_comparison');
+  for (const id of ids) lessons.decide(id, { action: 'retire', expected_updated_at: store.getLesson(id).updated_at });
+});
+
+test('duplicates are judged within the areas a build reads; a verdict keeps the size it was judged at', async () => {
+  const be = ticketInQa({ qa_loops: 1 });
+  const fe = ticketInQa({ qa_loops: 1 }); store.updateTicket(fe.key, { area: 'frontend' });
+  const runOf = (t) => store.createRun({ agent_id: 'junior', ticket_key: t.key, kind: 'implement', token: `d-${t.key}`, model: 'claude:sonnet' });
+  const text = 'Run the linter before you submit any change at all.';
+  assert.match(await sched.deskAction(runOf(be), 'lesson', { body: text }), /proposed/);
+  assert.match(await sched.deskAction(runOf(fe), 'lesson', { body: text }), /proposed/, 'a backend lesson does not block the same frontend one');
+  const s = stats.compute({ runs: [{ agent_id: 'junior', ticket_key: 'Z', kind: 'implement', status: 'success', model: 'm', cost_usd: 0, started_at: '2026-10-03T00:00:00Z', ended_at: '2026-10-03T00:01:00Z' }],
+    tickets: [{ key: 'Z', status: 'qa', complexity: 'M' }], qa: [{ ticket_key: 'Z', verdict: 'fail', reason: 'bug', builder: 'junior', complexity: 'S' }], merged: [] });
+  assert.equal(s.seats.junior.S.qa_first, 1, 'judged as small'); assert.equal(s.seats.junior['M+'].qa_first, 0);
+  assert.equal(s.seats.junior['M+'].built, 1, 'built and shipped follow the task as it is now');
+});
+
 test('history: QA verdicts recorded only as events are rebuilt once, reason unknown, attributed to the builder', () => {
-  store.openDb(path.join(tmp, 'history.db')); // a fresh database: the backfill ran at open, on no history
+  store.openDb(path.join(tmp, 'history.db')); // a fresh database (this test must stay last: it replaces the module's db)
   const t = store.createTicket({ title: 'Old work', type: 'bug', status: 'done', area: 'db', complexity: 'M', assignee: 'dba' });
   store.createRun({ agent_id: 'dba', ticket_key: t.key, kind: 'implement', token: 'old', model: 'claude:opus' });
   store.logEvent({ kind: 'action', agent_id: 'qa', ticket_key: t.key, text: `QA failed ${t.key}` });

@@ -36,6 +36,7 @@ export function diffInterval(k1, n1, k2, n2, z = Z80) {
 }
 export function band(k, n, restK, restN) {
   if (n < MIN_N) return 'too_early';
+  if (!restN) return 'no_comparison'; // nobody else did this size of work
   const d = diffInterval(k, n, restK, restN);
   if (!d) return 'inconclusive';
   return d[0] > 0 ? 'above' : d[1] < 0 ? 'below' : 'inconclusive';
@@ -50,7 +51,7 @@ export function compute(facts, now = Date.now()) {
   const firstQa = new Map((facts.qa || []).map((q) => {
     const verdict = q.verdict || (/^QA passed/.test(q.text || '') ? 'pass' : 'fail');
     const pass = verdict === 'pass' ? true : EXCLUDED_REASONS.has(q.reason) ? null : false;
-    return [q.ticket_key, { pass, reason: q.reason || null, builder: q.builder || null, model: q.model || null }];
+    return [q.ticket_key, { pass, reason: q.reason || null, builder: q.builder || null, model: q.model || null, complexity: q.complexity ?? null }];
   }));
   const seats = {};
   const seat = (id) => (seats[id] ||= { all: blank(), S: blank(), 'M+': blank(), builds_14d: 0, busy_ms_7d: 0 });
@@ -66,15 +67,19 @@ export function compute(facts, now = Date.now()) {
     const author = t.builder || firstQa.get(t.key)?.builder || runs[0].agent_id;
     const s = seat(author);
     if (Date.parse(runs[0].started_at) > now - 14 * DAY) s.builds_14d++;
-    for (const c of [s.all, s[cohortOf(t)]]) {
-      c.built++;
-      const q = firstQa.get(t.key);
+    const q = firstQa.get(t.key);
+    // The verdict counts in the size the task had when it was judged (a later re-size does not move history).
+    const qaCohort = q?.complexity ? cohortOf({ complexity: q.complexity }) : cohortOf(t);
+    for (const c of [s.all, s[qaCohort]]) {
       if (q && q.pass === null) c.excluded[q.reason] = (c.excluded[q.reason] || 0) + 1;
       else if (q) {
         c.qa_first++; if (q.pass) c.qa_first_pass++;
         const m = (c.models[q.model || runs[0].model || 'unknown'] ||= { qa_first: 0, qa_first_pass: 0 });
         m.qa_first++; if (q.pass) m.qa_first_pass++;
       }
+    }
+    for (const c of [s.all, s[cohortOf(t)]]) {
+      c.built++;
       const at = merged.get(t.key);
       if (!at) continue;
       c.shipped++;
