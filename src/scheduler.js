@@ -133,6 +133,47 @@ export function rollupParent(parentKey) {
   }
 }
 
+// One-time repair: before `desk split` existed, the manager split a ticket and then closed it as "won't do", so live
+// tasks hung under a closed parent. Those parents become epics again (or done, when every task already settled). Only
+// parents the manager closed with a split note are touched; an owner's rejection is never reopened.
+export function repairSplitEpics() {
+  if (store.kvGet('migration:split-epics:v1')) return [];
+  const leaves = (key, seen = new Set()) => store.childrenOf(key).flatMap((k) => {
+    if (seen.has(k.key)) return []; seen.add(k.key);
+    const kids = store.childrenOf(k.key);
+    return kids.length ? leaves(k.key, seen) : [k];
+  });
+  const depth = (t) => { let d = 0; for (let p = t; p?.parent_key && d < 20; p = store.getTicket(p.parent_key)) d++; return d; };
+  const candidates = store.listTickets().filter((p) => {
+    if (p.status !== 'wontdo' || !store.childrenOf(p.key).length) return false;
+    const comments = store.listComments(p.key);
+    const closed = comments.filter((c) => c.body.startsWith('Closed:')).at(-1);
+    if (closed?.author !== 'manager' || !/\bsplit\b/i.test(closed.body)) return false;
+    // Anything the owner did after that closure (a rejection, a status edit, a reply) is their decision: keep it.
+    if (comments.some((c) => c.author === 'owner' && c.id > closed.id)) return false;
+    return !store.recentEvents({ ticket_key: p.key, limit: 200 }).some((e) => e.agent_id === 'owner' && e.ts >= closed.ts);
+  });
+  const fixed = [];
+  store.transaction(() => {
+    // Phase 1: decide every candidate from its real work (leaf tasks), before any rollup can settle an ancestor early.
+    for (const p of candidates) {
+      const work = leaves(p.key);
+      const open = work.some((k) => !['done', 'wontdo'].includes(k.status));
+      const next = open ? 'in_progress' : work.some((k) => k.status === 'done') ? 'done' : null;
+      if (!next) continue;
+      store.updateTicket(p.key, { status: next, ...(open ? {} : { progress: 100 }) });
+      store.addComment(p.key, 'system', `Reopened as an epic. It was closed as "won't do" when the manager split it into tasks; a split parent now stays open${open ? ' and closes itself when its tasks are done' : ', and every task has settled, so it is done'}.`);
+      fixed.push(p);
+    }
+    // Phase 2: roll up deepest first, so each ancestor sees its sub-epics' final state.
+    for (const p of [...fixed].sort((x, y) => depth(y) - depth(x))) rollupParent(p.key);
+    store.kvSet('migration:split-epics:v1', JSON.stringify({ at: store.now(), fixed: fixed.map((p) => p.key) }));
+  });
+  for (const p of fixed) github.syncIssueState(p.key);
+  if (fixed.length) store.logEvent({ kind: 'system', agent_id: 'system', text: `Repaired ${fixed.length} split parent${fixed.length === 1 ? '' : 's'} closed by the old split rule: ${fixed.map((p) => p.key).join(', ')}.` });
+  return fixed.map((p) => p.key);
+}
+
 function stall(ticket, reason) {
   const stalls = (ticket.stalls || 0) + 1;
   const resume = ticket.status === 'in_progress' ? 'todo' : ticket.status;
@@ -345,7 +386,7 @@ async function launchReview(ticket, seat, fence) {
     const run = await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: origin.cwd, resume: origin.session_id, fork: true, extraDirs: [ws.dir], nonce: code,
       prompt: promptFor('review-resumed', { ticket: { ...ticket, nonce: code }, comments, extra: ws.dir }) });
     if (!(run && run.status === 'error' && !run.num_turns)) return;
-    if (budgetHeadroom() < runner.runBudget(seat)) { stall(store.getTicket(ticket.key), 'daily risk limit reached'); return; }
+    if (budgetHeadroom() < runner.runBudget(seat, 'pr_review')) { stall(store.getTicket(ticket.key), 'daily risk limit reached'); return; }
   }
   const code = nonce();
   await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: ws.dir, nonce: code, prompt: promptFor('review', { ticket, comments, extra: code }) });
@@ -569,7 +610,7 @@ export function health() {
 
 export function budgetHeadroom(settings = store.getSettings()) {
   // Reserve each running seat's full per-run cap so concurrent runs can't jointly blow the daily limit.
-  const preparing = store.listAgentStates().filter((a) => a.status === 'working' && !a.current_run).reduce((sum, a) => sum + runner.runBudget(a.id), 0);
+  const preparing = store.listAgentStates().filter((a) => a.status === 'working' && !a.current_run).reduce((sum, a) => sum + runner.runBudget(a.id, a.current_kind || null), 0);
   return Number(settings.daily_budget_usd) - store.spendSince(startOfToday()) - preparing - runner.runningBudget() - council.reservations();
 }
 export function workCount() {
@@ -588,10 +629,11 @@ export async function tick() {
     // Seats are flipped to "working" synchronously when a job starts, so this counts jobs still in setup too.
     let slots = capacity(s) - workCount();
     const fence = runner.currentEpoch();
-    const go = (agentId, fn, pin = null, pinKind = 'groom') => {
-      if (!(pin ? pinnedSelection(agentId, pin, pinKind) : selectionFor(agentId)).seat) return false;
+    // `kind` is the job's kind: admission checks the same engine capability the run will (see selectionFor).
+    const go = (agentId, fn, pin = null, kind = null) => {
+      if (!(pin ? pinnedSelection(agentId, pin, kind || 'groom') : selectionFor(agentId, Date.now(), null, kind)).seat) return false;
       if (setupHold(agentId)) return false;
-      const need = pin ? runner.engineOf({ engine: pin }).budgetUsd({}) : runner.runBudget(agentId); // a pinned job reserves its own engine's cap
+      const need = pin ? runner.engineOf({ engine: pin }).budgetUsd({}) : runner.runBudget(agentId, kind); // reserve the cap of the engine that will run it
       if (headroom < need) {
         const day = startOfToday();
         if (budgetWarned !== day) {
@@ -626,19 +668,19 @@ export async function tick() {
 
     // 1. Support triages owner/GitHub tickets (cheap, fast).
     const triage = store.ticketsByStatus('triage').find((t) => !t.active_run && !features.holds(t));
-    if (triage && slots > 0 && agentIdle('support')) go('support', (f) => launchTriage(triage, f));
+    if (triage && slots > 0 && agentIdle('support')) go('support', (f) => launchTriage(triage, f), null, 'triage');
     // 1b. On-call SRE investigates new recurring error signatures (rate-limited).
     if (config.watch.enabled && slots > 0 && agentIdle('sre')) {
       const recentCount = store.investigationsSince(new Date(Date.now() - 3600_000).toISOString());
       const next = recentCount < config.watch.maxInvestigationsPerHour
         ? (watch.triageIncidents().investigate || []).sort((a, b) => watch.windowCount(b.signature) - watch.windowCount(a.signature))[0] : null;
-      if (next) go('sre', (f) => launchInvestigation(next, f));
+      if (next) go('sre', (f) => launchInvestigation(next, f), null, 'investigate');
     }
     // 2. QA before new implementation: settle work in flight first.
     const qa = store.ticketsByStatus('qa').find((t) => !t.active_run);
-    if (qa && slots > 0 && agentIdle('qa')) go('qa', (f) => launchQa(qa, f));
+    if (qa && slots > 0 && agentIdle('qa')) go('qa', (f) => launchQa(qa, f), null, 'qa');
     const discussion = store.pendingDiscussions().find((d) => d.status === 'queued');
-    if (discussion && slots > 0 && agentIdle('manager')) go('manager', (f) => launchDiscussion(discussion, f));
+    if (discussion && slots > 0 && agentIdle('manager')) go('manager', (f) => launchDiscussion(discussion, f), null, 'owner_discussion');
     // Owner-requested feature grooming (Codex) runs before ordinary grooming: the owner is waiting on it.
     const plan = features.next();
     if (plan && slots > 0 && agentIdle('manager')) go('manager', (f) => features.launch(plan, f), features.ENGINE, 'feature_groom');
@@ -647,19 +689,19 @@ export async function tick() {
       for (const job of reviews.nextJobs()) {
         if (slots <= 0) break;
         if (!agentIdle(job.seat)) continue;
-        go(job.seat, (f) => (job.kind === 'pr_review' ? launchPrReview(job, f) : launchRespond(job, f)));
+        go(job.seat, (f) => (job.kind === 'pr_review' ? launchPrReview(job, f) : launchRespond(job, f)), null, job.kind === 'pr_review' ? 'pr_review' : 'respond');
       }
       for (const job of mergetrain.enabled() ? mergetrain.nextResolveJobs() : []) {
         if (slots <= 0) break;
         if (!agentIdle(job.seat)) continue;
-        go(job.seat, (f) => launchResolve(job, f));
+        go(job.seat, (f) => launchResolve(job, f), null, 'resolve');
       }
     } else {
       for (const t of store.ticketsByStatus('review')) {
         if (slots <= 0) break;
         const seat = requesterOf(t);
         if (t.active_run || !seat || !agentIdle(seat)) continue;
-        go(seat, (f) => launchReview(t, seat, f));
+        go(seat, (f) => launchReview(t, seat, f), null, 'review');
       }
     }
     productReview.refreshChangedPlans();
@@ -670,23 +712,23 @@ export async function tick() {
     const reviewRoom = () => slots > (capacity(s) > 1 ? 1 : 0) && reviewSlots > 0;
     for (const { r, m } of productReview.pending()) {
       if (!reviewRoom()) break;
-      if (agentIdle(m.agent_id) && go(m.agent_id, f => productReview.launch(r, m, f))) reviewSlots--;
+      if (agentIdle(m.agent_id) && go(m.agent_id, f => productReview.launch(r, m, f), null, 'product_review')) reviewSlots--;
     }
     for (const { t, reviewer } of researchReview.nextAssignments()) {
       if (!reviewRoom()) break;
       if (!agentIdle(reviewer)) continue;
       const a = researchReview.assign(t, reviewer);
-      if (go(reviewer, (f) => researchReview.launch(a, f))) reviewSlots--; else researchReview.cancel(a.id, 'not admitted this tick');
+      if (go(reviewer, (f) => researchReview.launch(a, f), null, 'research_review')) reviewSlots--; else researchReview.cancel(a.id, 'not admitted this tick');
     }
     for (const t of researchReview.nextRevisions()) {
       if (!reviewRoom()) break;
-      if (agentIdle(t.reporter) && go(t.reporter, (f) => researchReview.launchRevision(t, f))) reviewSlots--;
+      if (agentIdle(t.reporter) && go(t.reporter, (f) => researchReview.launchRevision(t, f), null, 'research_revision')) reviewSlots--;
     }
     for (const c of connectors.pendingAssessments()) {
       if (!reviewRoom()) break;
       const seat = connectors.assessorFor(c, (id) => agentById[id]?.enabled !== false);
       if (!seat) { connectors.completeAssessment(c.name, { error: 'no eligible assessor seat is enabled' }); continue; }
-      if (agentIdle(seat) && go(seat, (f) => launchConnectorAssessment(c, seat, f))) reviewSlots--;
+      if (agentIdle(seat) && go(seat, (f) => launchConnectorAssessment(c, seat, f), null, 'connector_assessment')) reviewSlots--;
     }
     // 3. Engineers pick up groomed work by routing (area × complexity × risk).
     council.pump();
@@ -707,12 +749,12 @@ export async function tick() {
       if (researchReview.blocks(t) || (parent && researchReview.blocks(parent))) continue; // a research proposal needs its second review first
       const who = t.assignee && ENGINEERS.includes(t.assignee) && agentById[t.assignee].enabled !== false ? t.assignee : routeTicket(t);
       if (!agentIdle(who)) continue;
-      if (PRINCIPALS.includes(who)) go(who, (f) => launchDesign(t, who, f));
-      else go(who, (f) => launchImplement(t, who, f));
+      if (PRINCIPALS.includes(who)) go(who, (f) => launchDesign(t, who, f), null, 'design');
+      else go(who, (f) => launchImplement(t, who, f), null, 'implement');
     }
     // 4. Manager grooms proposals (consulting principals inside the run); research proposals wait for their second review.
     const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run && !researchReview.blocks(t) && !features.holds(t));
-    if (proposed && slots > 0 && agentIdle('manager')) go('manager', (f) => launchGroom(proposed, f), groomEngine());
+    if (proposed && slots > 0 && agentIdle('manager')) go('manager', (f) => launchGroom(proposed, f), groomEngine(), 'groom');
     // 5. Research programs on their own cadence and market window while the funnel is thin (oldest last run first).
     for (const p of research.due(s)) {
       if (slots <= 0 || researchAllowance(s) <= 0) break;
@@ -729,6 +771,7 @@ export function recoverOrphans() {
   productReview.recover();
   researchReview.recover();
   features.recover();
+  repairSplitEpics();
   connectors.recover();
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
   for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });

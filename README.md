@@ -220,6 +220,14 @@ splits a ticket, `desk split` keeps the parent open as an epic that closes when 
 the order between tasks. You can change a task's order in its Details tab, and reopen a parent that was closed while its
 tasks were open.
 
+**Epics and tasks are linked both ways.**
+- **Every task names its epic.** Inbox cards, Work cards, pull requests and the ticket panel show "Part of: Feature ›
+  Sub-epic" crumbs, and each crumb opens that epic.
+- **Every epic shows its tasks.** An epic's panel opens on a Tasks tab with the full tree, what each task waits for,
+  and progress counted over the real work.
+- **Work can be grouped by epic.** Work → By epic shows each top-level epic with its whole tree, then anything not in an
+  epic.
+
 ## Research programs and the second-person review
 
 Research is configured as **programs** (Settings → Research): which seat researches, how often, whether only during or

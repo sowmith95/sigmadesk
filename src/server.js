@@ -185,8 +185,8 @@ async function ownerRoute(req, res) {
     return send(res, 200, out);
   }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/merge-hold$'))) { const b = await readBody(req); return send(res, 200, mergetrain.setHold(mm[1], b.hold !== false, b.reason)); }
-  if (req.method === 'GET' && p === '/api/ci/required-checks') return send(res, 200, { ...prs.requiredChecks(), history: JSON.parse(store.kvGet('ci:history') || '[]') });
-  if (req.method === 'POST' && p === '/api/ci/required-checks') return send(res, 200, prs.setRequiredChecks((await readBody(req)).names || [], 'owner'));
+  if (req.method === 'GET' && p === '/api/ci/required-checks') return send(res, 200, { ...prs.requiredChecks(), history: JSON.parse(store.kvGet('ci:history') || '[]'), workflows: JSON.parse(store.kvGet('ci:check-files') || '{}') });
+  if (req.method === 'POST' && p === '/api/ci/required-checks') { const b = await readBody(req); return send(res, 200, prs.setRequiredChecks(b.names || [], b.learn === true ? 'auto' : 'owner')); }
   if (req.method === 'POST' && p === '/api/merge-train/clear-deploy') return send(res, 200, { cleared: mergetrain.clearDeployLock('owner') });
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/approve-publish$'))) { await sched.ownerApprovePublish(mm[1]); return send(res, 200, { ok: true }); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/name$'))) {
@@ -209,13 +209,14 @@ async function ownerRoute(req, res) {
     return send(res, 200, { prs: rows, deploy_lock: mergetrain.deployState(), busy_window: sched.inBusyWindow(),
       override_phrase: prs.OVERRIDE_PHRASE, base: config.project.baseBranch, repo: config.project.githubRepo, last_sync: store.kvGet('prsync:last_ok') });
   }
+  if (req.method === 'GET' && (mm = m('^/api/prs/(\\d+)/merge-check$'))) return send(res, 200, await prs.mergeCheck(Number(mm[1]), { inBusyWindow: sched.inBusyWindow(), halted: store.getSettings().paused === 'true' }));
   if (req.method === 'POST' && (mm = m('^/api/prs/(\\d+)/(approve|ready|merge|close|reviewer|tags)$'))) {
     const b = await readBody(req);
     const n = Number(mm[1]);
     const out = mm[2] === 'approve' ? await prs.approve(n, String(b.message || '').slice(0, 4000))
       : mm[2] === 'ready' ? await prs.ready(n)
         : mm[2] === 'merge' ? await mergetrain.ownerMerge(n, { method: b.method || 'squash', override: b.override || '', inBusyWindow: sched.inBusyWindow(),
-          expectedSha: String(b.expected_sha || ''), overrideReason: String(b.override_reason || '').slice(0, 2000), actor: 'owner' })
+          expectedSha: String(b.expected_sha || ''), overrideReason: String(b.override_reason || '').slice(0, 2000), ciAckReason: String(b.ci_ack_reason || '').slice(0, 2000), actor: 'owner' })
           : mm[2] === 'close' ? await prs.close(n, String(b.comment || '').slice(0, 2000))
             : mm[2] === 'reviewer' ? await prs.addReviewer(n, b.login)
               : await prs.setTags(n, { add: b.add || [], remove: b.remove || [] });

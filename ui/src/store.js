@@ -166,10 +166,13 @@ export function closeSheet() {
   emit();
 }
 export async function openTicket(key, opts = {}) {
-  S.sheet = { type: 'ticket', key, decision: opts.decision || null, focus: !!opts.focus, nonce: Date.now() };
+  // Ticket to ticket (a crumb, a task in a tree) replaces the entry: closing always returns to the page, never to the
+  // ticket you came from.
+  const hop = S.sheet?.type === 'ticket' && history.state?.sd === 'ticket';
+  S.sheet = { type: 'ticket', key, decision: opts.decision || null, focus: !!opts.focus, tab: opts.tab || null, nonce: Date.now() };
   S.detail = { key, data: null, pending: emptyPending(), error: null, seq: 0 };
   S.seat = null; S.palette = false;
-  if (!opts.fromRoute) history.pushState({ sd: 'ticket' }, '', here(key));
+  if (!opts.fromRoute) history[hop ? 'replaceState' : 'pushState']({ sd: 'ticket' }, '', here(key));
   emit();
   if (ticketByKey(key)?.pr_url) loadPrs();
   await loadDetail();

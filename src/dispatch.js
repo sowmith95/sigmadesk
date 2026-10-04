@@ -80,22 +80,27 @@ export function meetsRequirements(engine, requirements) {
   if (requirements.web && engine === 'codex') return false;
   return true;
 }
-export function selectionFor(agentId, now = Date.now(), requirements = null) {
+// `kind` is the job about to run: an engine that cannot run that kind (Perplexity cannot review a PR or write code) is
+// not a candidate for it. That is a capability gap, not an outage, so a capable engine is chosen even when automatic
+// fallback is off; the run logs the switch.
+export function selectionFor(agentId, now = Date.now(), requirements = null, kind = null) {
   const seat = agentById[agentId];
   if (!seat || seat.enabled === false) return { seat: null, reason: 'Seat disabled' };
   const preferred = seat.engine || 'claude';
   const health = providerHealth(now);
   const primary = health.find((e) => e.id === preferred);
   const resolveSeat = (s) => ({ ...s, model: s.engine === 'codex' && !s.model ? availability.codex?.defaultModel || '' : s.model });
+  const can = (engine) => !kind || !ENGINES[engine]?.supports || ENGINES[engine].supports(kind);
   const ready = (engine) => {
     const p = health.find(e => e.id === engine);
-    return p?.ready && supportsSeat(agentId, engine) && meetsRequirements(engine, requirements)
+    return p?.ready && can(engine) && supportsSeat(agentId, engine) && meetsRequirements(engine, requirements)
       && (engine !== 'perplexity' || health.find(e => e.id === 'claude')?.ready);
   };
-  const reason = preferred === 'perplexity' && primary?.ready && !ready(preferred) ? 'Perplexity needs an available Claude relay'
+  const reason = primary?.ready && !can(preferred) ? `${ENGINES[preferred]?.label || preferred} cannot run ${kind}`
+    : preferred === 'perplexity' && primary?.ready && !ready(preferred) ? 'Perplexity needs an available Claude relay'
     : primary?.ready && !meetsRequirements(preferred, requirements) ? (requirements.connectors?.length ? 'Research connectors need a Claude Code seat' : 'Web research needs a Claude or Perplexity seat') : primary?.reason;
   if (ready(preferred)) return { seat: resolveSeat(seat), fallback: false };
-  if (store.getSettings().auto_fallback === 'true') {
+  if (store.getSettings().auto_fallback === 'true' || (primary?.ready && !can(preferred))) {
     const alternatives = seat.fallbacks ?? health.filter(e => e.id !== preferred && ENGINES[e.id]?.autoFallback !== false)
       .map(e => ({ engine: e.id, ...suggestFor(agentId, e.id) }));
     const alt = alternatives.find(p => ready(p.engine));

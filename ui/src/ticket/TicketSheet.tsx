@@ -13,6 +13,7 @@ import { AsyncButton } from '@/components/desk/AsyncButton';
 import { Tag, Key, Named } from '@/components/desk/Bits';
 import { KIND_LABEL, BUCKET_LABEL, BUCKET_TONE, cardFor, RunCard, Reviews, prReviewsOf, firstName } from '@/components/desk/Work';
 import { Conversation, Brief, PrSummary, ProductReview, ResearchReview, Details, Block, type ConvState } from './parts';
+import { Lineage, EpicTree, EpicProgress, childrenOf, isFeatureRoot } from '@/components/desk/Epic';
 import type { Board, BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -120,7 +121,7 @@ export function TicketSheet() {
   const it = t ? B.byKey[t.key] : undefined;
   // No explicit choice yet: follow the data (a decision that loads after the panel opens still leads).
   const [chosen, setTab] = useState<string | null>(sh.tab || (sh.decision ? 'decision' : null));
-  const tab = chosen ?? (decisions[0] ? 'decision' : 'conversation');
+  const tab = chosen ?? (decisions[0] ? 'decision' : childrenOf(sh.key!).length ? 'tasks' : 'conversation');
   useEffect(() => { if (sh.focus && det?.data) { replyRef.current?.focus(); sh.focus = false; } }, [det?.data]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (t?.pr_url) loadPrs(); }, [t?.pr_url]);
   if (!t) return <Panel title={det?.error || 'Loading ticket…'} onClose={closeSheet}><p className="text-muted-foreground">{det?.error ? 'This ticket could not be loaded.' : 'Loading…'}</p></Panel>;
@@ -128,11 +129,16 @@ export function TicketSheet() {
   const card = cardFor(t, d?.comments);
   const label = (x: BoardItem) => (x.proposal_id ? `Design #${x.proposal_id}` : x.council_id ? `Council #${x.council_id}` : KIND_LABEL[x.kind || ''] || x.kind);
   const reviewsCount = [prReviewsOf(t, d), (d?.product_reviews || []).length, t.research_review].filter(Boolean).length;
+  const kids = childrenOf(t.key);
   const head = (
+    <div className="grid gap-1.5">
+    <Lineage t={t} />
     <div className="flex flex-wrap items-center gap-2">
       {dec ? <Tag tone="needs">{KIND_LABEL[dec.kind || ''] || 'Needs you'}</Tag> : it ? <Tag tone={BUCKET_TONE[it.bucket] || 'neutral'}>{BUCKET_LABEL[it.bucket] || it.bucket}</Tag> : null}
       {it?.stage && <Tag>{it.stage}</Tag>}<Key k={t.key} />
+      {kids.length > 0 && <Tag>Epic</Tag>}
       {nameOf(t) !== t.title && <span className="truncate text-sm text-muted-foreground">{t.title}</span>}
+    </div>
     </div>
   );
   const footer = <Footer t={t} dec={dec} d={d} compose={compose} setCompose={setCompose} onDecided={() => setDecisionId(null)} replyRef={replyRef} />;
@@ -141,12 +147,13 @@ export function TicketSheet() {
       footer={(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); }}>Comment or ask the manager</Button></div>}>
       {decisions.length > 1 && <div role="group" aria-label="Decisions on this ticket" className="flex flex-wrap gap-2">
         {decisions.map((x) => <Button key={x.id} size="sm" variant={dec?.id === x.id ? 'default' : 'secondary'} aria-pressed={dec?.id === x.id} onClick={() => { setDecisionId(x.id); setTab('decision'); }}>{label(x)}</Button>)}</div>}
-      {t.type === 'feature' && !t.parent_key && <div className="flex flex-wrap items-center gap-3 rounded-md bg-primary/10 px-3 py-2"><span className="min-w-0 flex-1 text-sm">This is a feature. Its plan, tasks and grooming session are on its feature page.</span><Button size="sm" variant="secondary" onClick={() => openFeature(t.key)}>Open the feature</Button></div>}
+      {isFeatureRoot(t) && <div className="flex flex-wrap items-center gap-3 rounded-md bg-primary/10 px-3 py-2"><span className="min-w-0 flex-1 text-sm">This is a feature. Its plan, tasks and grooming session are on its feature page.</span><Button size="sm" variant="secondary" onClick={() => openFeature(t.key)}>Open the feature</Button></div>}
       {gone && <p role="status" className="rounded-md bg-blocked/15 px-3 py-2">That decision was resolved or changed while you were reading. Nothing was submitted.</p>}
       {!dec && it && ['blocked', 'queued', 'epic'].includes(it.bucket) && <p className="rounded-md bg-secondary px-3 py-2"><Named text={humanReason(clean(it.reason), S.tickets)} /></p>}
       <Tabs value={dec || tab !== 'decision' ? tab : 'conversation'} onValueChange={setTab} className="min-w-0 gap-4">
         <TabsList className="w-full max-w-full justify-start overflow-x-auto">
           {dec && <TabsTrigger value="decision">Decision</TabsTrigger>}
+          {kids.length > 0 && <TabsTrigger value="tasks">Tasks ({kids.length})</TabsTrigger>}
           <TabsTrigger value="conversation">Conversation</TabsTrigger>
           <TabsTrigger value="run">{card?.live ? 'Live run' : 'Run'}</TabsTrigger>
           <TabsTrigger value="reviews">Reviews{reviewsCount ? ` (${reviewsCount})` : ''}</TabsTrigger>
@@ -156,6 +163,10 @@ export function TicketSheet() {
           {dec.kind === 'product' ? <ProductReview t={t} d={d} msg={reviewMsg} setMsg={setReviewMsg} /> : <Brief dec={dec} t={t} d={d} />}
           <PrSummary t={t} dec={dec} />
           <Reviews raw={prReviewsOf(t, d)} compact={false} t={t} />
+        </TabsContent>}
+        {kids.length > 0 && <TabsContent value="tasks" className="grid gap-4">
+          <Block><EpicProgress epic={t.key} /><EpicTree root={t.key} /></Block>
+          <p className="text-sm text-muted-foreground">{t.status === 'in_progress' ? 'This epic closes by itself when every task above has shipped or been dropped.' : t.status === 'done' ? 'Every task has settled.' : 'Tasks start in the order shown; an indented task belongs to the one above it.'}</p>
         </TabsContent>}
         <TabsContent value="conversation">{d ? <Conversation d={d} live={!!card?.live} tkey={t.key} state={conv} status={t.status} /> : <p className="text-muted-foreground">{det?.error || 'Loading conversation…'}</p>}</TabsContent>
         <TabsContent value="run"><Block><RunCard card={card} /></Block></TabsContent>

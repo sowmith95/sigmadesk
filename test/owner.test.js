@@ -184,3 +184,60 @@ test('the owner can order a task after a sibling, without loops', () => {
   assert.equal(sched.ownerPatch(slice, { after_key: x }).after_key, x, 'a slice of a sub-epic can wait for a task elsewhere in the feature');
   assert.equal(sched.ownerPatch(y, { after_key: '' }).after_key, null);
 });
+
+test('a seat whose engine cannot run a job uses a capable engine for it, even with automatic fallback off', () => {
+  dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: true }, { id: 'perplexity', available: true }]);
+  const team = store.getSettings().team;
+  store.setSetting('team', JSON.stringify({ ...JSON.parse(team || '{}'), manager: { engine: 'perplexity', model: '', effort: 'medium', enabled: true } }));
+  return import('../src/team.js').then(({ applyTeamOverrides: apply }) => {
+    apply(JSON.parse(store.getSettings().team));
+    store.setSetting('auto_fallback', 'false');
+    const review = dispatch.selectionFor('manager', Date.now(), null, 'pr_review');
+    assert.ok(review.seat, review.reason);
+    assert.notEqual(review.seat.engine, 'perplexity', 'Perplexity cannot review a PR');
+    assert.equal(review.fallback, true); assert.match(review.reason, /cannot run pr_review/);
+    assert.equal(dispatch.selectionFor('manager', Date.now(), null, 'groom').seat?.engine, dispatch.selectionFor('manager').seat?.engine, 'kinds it can run keep the seat engine');
+    store.setSetting('auto_fallback', 'true');
+    apply(JSON.parse(team || '{}'));
+    store.setSetting('team', team || '{}');
+  });
+});
+
+test('parents the manager closed while splitting are repaired once; an owner rejection is left alone', () => {
+  const mk = (title, status = 'wontdo') => store.createTicket({ title, status, type: 'feature' });
+  const live = mk('Split with open tasks'); const shipped = mk('Split, all shipped'); const owner = mk('Owner rejected');
+  store.addComment(live.key, 'manager', 'Closed: Split into the tasks below');
+  store.addComment(shipped.key, 'manager', 'Closed: split into two');
+  store.addComment(owner.key, 'owner', 'Closed: not worth it, split or not');
+  store.createTicket({ title: 'open task', status: 'todo', parent_key: live.key });
+  store.createTicket({ title: 'shipped task', status: 'done', parent_key: live.key });
+  store.createTicket({ title: 'done', status: 'done', parent_key: shipped.key });
+  store.createTicket({ title: 'open under owner reject', status: 'todo', parent_key: owner.key });
+  store.kvSet('migration:split-epics:v1', ''); // an earlier recoverOrphans() in this file already ran it once
+  const fixed = sched.repairSplitEpics();
+  assert.ok(fixed.includes(live.key) && fixed.includes(shipped.key) && !fixed.includes(owner.key));
+  assert.equal(store.getTicket(live.key).status, 'in_progress'); assert.match(store.getTicket(live.key).progress_msg, /1\/2/);
+  assert.equal(store.getTicket(shipped.key).status, 'done');
+  assert.equal(store.getTicket(owner.key).status, 'wontdo');
+  assert.match(store.listComments(live.key).at(-1).body, /Reopened as an epic/);
+  assert.deepEqual(sched.repairSplitEpics(), [], 'runs once');
+});
+
+test('the split repair respects later owner decisions and settles nested epics from their real work', () => {
+  store.kvSet('migration:split-epics:v1', '');
+  const root = store.createTicket({ title: 'Nested root', status: 'wontdo', type: 'feature' });
+  const sub = store.createTicket({ title: 'Nested sub-epic', status: 'wontdo', parent_key: root.key });
+  const leaf = store.createTicket({ title: 'Leaf still open', status: 'todo', parent_key: sub.key });
+  store.addComment(root.key, 'manager', 'Closed: split into the sub-epic');
+  store.addComment(sub.key, 'manager', 'Closed: split into one leaf');
+  const later = store.createTicket({ title: 'Owner rejected after split', status: 'wontdo' });
+  store.createTicket({ title: 'kid', status: 'todo', parent_key: later.key });
+  store.addComment(later.key, 'manager', 'Closed: split into kid');
+  store.addComment(later.key, 'owner', '⛔ **Rejected by owner**: not needed');
+  const fixed = sched.repairSplitEpics();
+  assert.ok(fixed.includes(root.key) && fixed.includes(sub.key));
+  assert.ok(!fixed.includes(later.key), 'a later owner decision wins');
+  assert.equal(store.getTicket(root.key).status, 'in_progress', 'the root is not closed early by a stale sub-epic state');
+  assert.equal(store.getTicket(sub.key).status, 'in_progress');
+  assert.equal(store.getTicket(leaf.key).status, 'todo');
+});

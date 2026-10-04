@@ -827,28 +827,47 @@ async function observeExternal(prev, next) {
  * Required checks are learned from PRESENCE on base-branch commits, not success: every check name reported on the
  * last few base commits by a workflow that also runs on pull requests (plus commit-status contexts), whatever its
  * state or conclusion — a suite that failed, was cancelled or is still running is still a suite a PR must pass.
- * Push-only deploy jobs never report on a PR and are excluded. The last N base commits are re-read on every poll
- * (re-runs add names); the set only grows; shrinking it is an owner edit.
+ * Only checks whose workflow is KNOWN to run on pull requests are learned: a check of unknown provenance is skipped
+ * for that round, because a wrongly learned name (an issues, schedule or push-only job) can never report on a PR and
+ * would block every merge. The set grows; names proven impossible on PRs are pruned (auto mode only); other shrinking
+ * is an owner edit. The check → workflow map is kept for per-PR applicability (prs.ciCoverage).
  */
 export const LEARN_BASES = 5;
 export async function learnFromBase(sha) {
   if (!sha) return null;
   const bases = [...kvList('ci:bases').filter((b) => b !== sha), sha].slice(-LEARN_BASES);
   store.kvSet('ci:bases', JSON.stringify(bases));
-  const learned = [];
-  for (const b of bases) learned.push(...await namesOnCommit(b));
+  const learned = []; const files = {}; const impossible = new Set(); const possible = new Set(); let unknown = 0;
+  for (const b of bases) {
+    const seen = await namesOnCommit(b);
+    unknown += seen.unknown;
+    learned.push(...seen.learn);
+    for (const [name, f] of Object.entries(seen.files)) files[name] = [...new Set([...(files[name] || []), ...f])];
+    seen.impossible.forEach((n) => impossible.add(n)); seen.learn.forEach((n) => possible.add(n));
+  }
+  const known = JSON.parse(store.kvGet('ci:check-files') || '{}');
+  store.kvSet('ci:check-files', JSON.stringify({ ...known, ...files }));
   prs.learnChecks(learned);
+  prs.pruneImpossibleChecks([...impossible].filter((n) => !possible.has(n)));
+  store.kvSet('ci:discovery', JSON.stringify({ complete: unknown === 0, unknown, at: new Date().toISOString() }));
   return [...new Set(learned)];
 }
 async function namesOnCommit(sha) {
   const [{ runs, statuses }, wfRuns, wfs] = await Promise.all([prs.checksForCommit(sha), prs.runsForCommit(sha), workflowsAtBase().catch(() => null)]);
-  const prWorkflow = (file) => {
-    const text = wfs?.find((w) => w.file === file)?.text;
-    const on = text ? workflows.parseWorkflow(text)?.on : null;
-    return !on || 'pull_request' in on || 'pull_request_target' in on; // unknown = keep (fail closed)
-  };
+  const out = { learn: [], files: {}, impossible: [], unknown: 0 };
+  if (!wfs) return { ...out, unknown: runs.length || 1 }; // the workflow files could not be read: learn nothing, mark incomplete
+  const parsed = new Map(wfs.map((w) => [w.file, w.text ? workflows.parseWorkflow(w.text) : null]));
   const suiteFile = new Map(wfRuns.map((r) => [r.suite, r.path]));
-  return [...runs.filter((r) => !suiteFile.has(r.suite) || prWorkflow(suiteFile.get(r.suite))).map((r) => r.name), ...statuses.map((x) => x.context)].filter(Boolean);
+  for (const r of runs) {
+    const file = suiteFile.get(r.suite);
+    const wf = file ? parsed.get(file) : undefined;
+    if (!r.name) continue;
+    if (!file || !wf) { out.unknown++; continue; } // unknown provenance: never learned, and the round is incomplete
+    out.files[r.name] = [...new Set([...(out.files[r.name] || []), file])];
+    if (workflows.hasPullRequestTrigger(wf)) out.learn.push(r.name); else out.impossible.push(r.name);
+  }
+  out.learn.push(...statuses.map((x) => x.context).filter(Boolean)); // external CI reports statuses on PR heads too
+  return out;
 }
 
 let sweeping = null;
