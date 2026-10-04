@@ -75,6 +75,7 @@ export function fromProgram(p) {
     connectors: [...(p.tools?.connectors || [])], maxProposals: p.maxProposals,
     minReviewers: p.review?.minReviewers || 1, reviewers: [...(p.review?.reviewers || [])], isNew: false };
 }
+/** @param {any} tpl @param {{ takenIds?: string[], defaultReview?: { minReviewers: number, reviewers: string[] }, seats?: string[] }} [opts] */
 export function fromTemplate(tpl, { takenIds = [], defaultReview = { minReviewers: 1, reviewers: [] }, seats = [] } = {}) {
   const seat = seats.includes(tpl.seat) ? tpl.seat : seats[0] || tpl.seat;
   const reviewers = (defaultReview.reviewers || []).filter((r) => r !== seat);
@@ -82,6 +83,7 @@ export function fromTemplate(tpl, { takenIds = [], defaultReview = { minReviewer
     mode: tpl.focus ? 'directed' : 'own', focus: tpl.focus, sources: [...tpl.sources], web: tpl.web, connectors: [],
     maxProposals: tpl.maxProposals, minReviewers: Math.min(defaultReview.minReviewers || 1, Math.max(1, reviewers.length)), reviewers, isNew: true };
 }
+/** @param {{ takenIds?: string[], defaultReview?: { minReviewers: number, reviewers: string[] }, seats?: string[] }} [opts] */
 export const blankDraft = (opts) => fromTemplate({ id: 'blank', label: 'New research', seat: 'pm', intervalMinutes: 1440, window: 'any', focus: '', sources: [], web: true, maxProposals: 2 }, opts);
 
 /** Changing the researcher removes them from their own reviewer list. The required count stays; if too few reviewers
@@ -107,6 +109,7 @@ export function listWith(saved, draft) {
 export const listWithout = (saved, id) => saved.filter((x) => x.id !== id).map((x) => listWith([x], fromProgram(x))[0]);
 
 /** Same rules the server enforces, phrased for the person filling the form. Empty array = ready to save. */
+/** @param {any} d @param {{ approvedConnectors?: string[], seatEngine?: string }} [opts] @returns {string[]} */
 export function problems(d, { approvedConnectors = [], seatEngine = 'claude' } = {}) {
   const out = [];
   if (!d.label.trim()) out.push('Give the program a name.');

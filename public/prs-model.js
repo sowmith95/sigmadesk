@@ -3,6 +3,7 @@
 export function safeGithubUrl(u) {
   try { const x = new URL(String(u)); return x.protocol === 'https:' && x.hostname === 'github.com' ? x.href : null; } catch { return null; }
 }
+/** @type {Record<string, string>} */
 export const STATE_LABEL = { draft: 'Draft', open: 'Open', approved: 'Approved', merged: 'Merged', closed: 'Closed' };
 export function stateOf(p) {
   if (p.state === 'MERGED') return 'merged';

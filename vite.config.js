@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -14,7 +15,8 @@ export default defineConfig({
   // Lazy chunks and their preloads resolve under /app/ (the bundle's URL), not the site root.
   base: '/app/',
   publicDir: false,
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
+  resolve: { alias: { '@': path.join(root, 'ui', 'src') } },
   server: {
     // `npm run dev:ui` while a desk runs on 8790: live-reloading UI against the real API and stream.
     proxy: { '/api': 'http://127.0.0.1:8790', '/fonts': 'http://127.0.0.1:8790', '/icon.svg': 'http://127.0.0.1:8790' },
@@ -28,7 +30,7 @@ export default defineConfig({
     reportCompressedSize: false,
     modulePreload: { polyfill: false }, // every browser that runs the desk supports modulepreload
     rolldownOptions: {
-      input: path.join(root, 'ui', 'src', 'main.jsx'),
+      input: path.join(root, 'ui', 'src', 'main.tsx'),
       output: {
         entryFileNames: 'main.js',
         chunkFileNames: 'chunks/[name]-[hash].js',

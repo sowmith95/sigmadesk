@@ -63,7 +63,7 @@ export async function openPage(browser, url, viewport) {
   page.on('console', (m) => { if (m.type() === 'error') errors.push(`console: ${m.text()}`); });
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
   await page.goto(url);
-  await page.waitForSelector('.instruments .inst');
-  await page.waitForFunction(() => !document.querySelector('main')?.textContent.includes('Loading the desk'));
+  await page.waitForSelector('[role="group"][aria-label="Desk status"]');
+  await page.waitForFunction(() => !!document.querySelector('main') && document.querySelector('main').textContent.trim() !== 'Loading…');
   return { page, errors };
 }

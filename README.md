@@ -8,11 +8,11 @@ support bot at the front door. You watch all of it live on a Jira-style board fr
 Small, risk-limited bets. Everything measured. Nothing ships without an independent risk check — and nothing merges
 without you.
 
-| Floor | Team & engines | Watch desk |
+| Inbox | Decision panel | Research programs |
 |---|---|---|
-| ![floor](docs/screenshots/floor.png) | ![team](docs/screenshots/team.png) | ![watch](docs/screenshots/watch.png) |
+| ![inbox](docs/screenshots/inbox.png) | ![decision panel](docs/screenshots/ticket.png) | ![research programs](docs/screenshots/research.png) |
 
-<p align="center"><img src="docs/screenshots/phone-floor.png" width="260" alt="phone"> <img src="docs/screenshots/phone-board.png" width="260" alt="phone board"></p>
+<p align="center"><img src="docs/screenshots/phone-inbox.png" width="260" alt="phone inbox"> <img src="docs/screenshots/phone-ticket.png" width="260" alt="phone decision panel"></p>
 
 ## What it does
 
@@ -367,14 +367,31 @@ limit reserves each running seat's full per-run cap, so concurrent runs cannot j
 ## Development
 
 ```bash
-npm test          # node:test, no dependencies
+npm test          # node:test; browser tests skip when no Chromium is cached
 npm run doctor
 ```
+
+The UI is React 19 and TypeScript, styled with Tailwind 4 and shadcn/ui components (Radix primitives, cmdk for
+the command palette, sonner for toasts, lucide icons). Everything is a dev dependency: Vite builds it into
+`public/app/`, which is committed, so the desk still runs with no `npm install`. After changing `ui/src/`:
+
+```bash
+npm install            # once, for the build tools
+npm run build:ui       # rebuild public/app and its stamp (tests fail if the bundle and sources disagree)
+npm run typecheck      # tsc --noEmit (also run by npm test)
+npm run dev:ui         # Vite dev server with hot reload, proxying the API to a running desk
+npm run ui:shots       # phone and desktop screenshots of every page and panel into /tmp/sigmadesk-shots
+```
+
+Pages are addressable: `#/inbox`, `#/work`, `#/team`, `#/research`, `#/prs`, `#/desk`, `#/settings`, and a ticket
+opens at `#/<page>/<KEY>`. Press ⌘K or `/` for the command palette. Shared building blocks live in
+`ui/src/components/desk/` (chips, fields, async buttons, the side panel); `ui/src/components/ui/` holds the generated
+shadcn components.
 
 Source map: `src/server.js` (HTTP + SSE + unix socket), `src/scheduler.js` (who picks what up, desk commands),
 `src/runner.js` (sandboxed runs, evidence, clones, publisher), `src/engines/` (Claude Code, Codex), `src/team.js`
 (seats, routing, permissions, prompts), `src/watch.js` (log watcher), `src/github.js`, `src/db.js` (SQLite),
-`public/` (no-build UI).
+`ui/src/` (UI sources), `public/app/` (built UI, committed).
 
 ## License
 

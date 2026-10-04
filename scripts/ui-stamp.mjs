@@ -20,7 +20,7 @@ const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 /** public/*.js modules the UI imports (relative imports that leave ui/), found by scanning the sources. */
 export function sharedInputs() {
   const found = new Set();
-  for (const f of files(path.join(ROOT, 'ui')).filter((x) => /\.(jsx?|mjs)$/.test(x))) {
+  for (const f of files(path.join(ROOT, 'ui')).filter((x) => /\.(jsx?|mjs|tsx?)$/.test(x))) {
     for (const m of fs.readFileSync(f, 'utf8').matchAll(/from\s+['"]((?:\.\.\/)+public\/[\w./-]+)['"]/g)) {
       const target = path.resolve(path.dirname(f), m[1]);
       if (fs.existsSync(target)) found.add(target);
@@ -38,7 +38,7 @@ export function outputs() {
   return Object.fromEntries(files(OUT).filter((f) => path.basename(f) !== 'build.json').map((f) => [rel(f), sha(fs.readFileSync(f))]).sort(([a], [b]) => a.localeCompare(b)));
 }
 export function sourceHash() {
-  const list = [...files(path.join(ROOT, 'ui')), path.join(ROOT, 'vite.config.js'), path.join(ROOT, 'package-lock.json'), fileURLToPath(import.meta.url), ...sharedInputs()]
+  const list = [...files(path.join(ROOT, 'ui')), ...['vite.config.js', 'package-lock.json', 'tsconfig.json', 'components.json'].map((f) => path.join(ROOT, f)).filter((f) => fs.existsSync(f)), fileURLToPath(import.meta.url), ...sharedInputs()]
     .map(rel).filter((x, i, a) => a.indexOf(x) === i).sort();
   const h = crypto.createHash('sha256');
   for (const rel of list) h.update(rel).update('\0').update(fs.readFileSync(path.join(ROOT, rel))).update('\0');

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// `npm run ui:shots [outDir]` — screenshots of every view and sheet at phone and desktop widths against the isolated
+// `npm run ui:shots [outDir]` — screenshots of every page and panel at phone and desktop widths against the isolated
 // preview desk, plus any console/page errors. For reviewing UI changes; nothing here talks to a real desk.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -14,27 +14,26 @@ const widths = (process.env.WIDTHS || '390,1280').split(',').map(Number);
 const problems = [];
 try {
   for (const w of widths) {
-    const { page, errors } = await openPage(browser, preview.url, { width: w, height: w < 760 ? 844 : 900 });
-    const shot = async (name) => { await page.waitForTimeout(250); await page.screenshot({ path: path.join(out, `${w}-${name}.png`), fullPage: false }); };
-    const sheet = async (name, open) => { await open(); await page.waitForSelector('.sheet-panel'); await shot(name); await page.keyboard.press('Escape'); await page.waitForSelector('.sheet-panel', { state: 'detached' }); };
+    const { page, errors } = await openPage(browser, preview.url, { width: w, height: w < 768 ? 844 : 900 });
+    const shot = async (name) => { await page.waitForTimeout(300); await page.screenshot({ path: path.join(out, `${w}-${name}.png`) }); };
+    const go = async (route) => { await page.evaluate((r) => { location.hash = r; }, route); await page.waitForTimeout(400); };
+    const panel = async (name, open) => { await open(); await page.waitForSelector('[data-panel], [role="dialog"]'); await shot(name); await page.keyboard.press('Escape'); await page.waitForSelector('[data-panel], [role="dialog"]', { state: 'detached' }); };
     await shot('inbox');
-    await page.click('nav.tabs button:has-text("Work")'); await shot('work');
-    await page.click('nav.tabs button:has-text("Team")'); await shot('team');
-    await page.click('nav.tabs button:has-text("Inbox")');
-    await sheet('ticket-question', () => page.click('.dcard.kind-question .title-btn'));
-    await sheet('ticket-design', () => page.click('.dcard.kind-design .title-btn'));
-    await sheet('new-ticket', () => page.click('#btn-new'));
-    await sheet('desk', () => page.click('.inst.desk'));
-    await sheet('money', () => page.click('.inst.money'));
-    await sheet('settings', () => page.click('#btn-gear'));
-    await page.click('#btn-gear'); await page.click('.research-entry'); await page.waitForSelector('.program'); await shot('research');
-    await page.click('.program .slot.who'); await page.waitForSelector('.editor'); await shot('research-editor');
-    await page.click('.editor button:has-text("Cancel")');
-    await page.click('.template:has-text("Quant papers")'); await page.waitForSelector('.editor'); await shot('research-template');
+    for (const p of ['work', 'team', 'desk', 'settings', 'prs']) { await go(`#/${p}`); await shot(p); }
+    await go('#/inbox');
+    await panel('ticket-question', () => page.click('article[data-kind="question"] h3 button'));
+    await panel('ticket-design', () => page.click('article[data-kind="design"] h3 button'));
+    await page.click('article[data-kind="question"] h3 button'); await page.waitForSelector('[data-panel]');
+    await page.getByRole('tab', { name: 'Conversation' }).click(); await shot('ticket-conversation');
+    await page.getByRole('tab', { name: 'Details' }).click(); await shot('ticket-details'); await page.keyboard.press('Escape');
+    await panel('new-ticket', () => page.getByRole('button', { name: 'New ticket' }).click());
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+k' : 'Control+k'); await page.waitForSelector('[cmdk-input]'); await shot('palette'); await page.keyboard.press('Escape');
+    await go('#/research'); await page.waitForSelector('[data-program]'); await shot('research');
+    await page.click('[data-program] button.font-semibold'); await page.waitForSelector('[data-row="seat"]'); await shot('research-editor');
+    await page.getByRole('button', { name: 'Cancel' }).click();
+    await page.click('button:has-text("Quant papers")'); await page.waitForSelector('[data-row="seat"]'); await shot('research-template');
     await page.evaluate(() => document.getElementById('connectors')?.scrollIntoView()); await shot('research-connectors');
-    await page.keyboard.press('Escape');
-    await page.click('nav.tabs button:has-text("Team")'); await sheet('models', () => page.click('.team-model button:has-text("Edit models")'));
-    await sheet('seat', () => page.click('.team-model .title-btn'));
+    await go('#/team'); await panel('models', () => page.getByRole('button', { name: 'Models & fallback' }).first().click());
     if (errors.length) problems.push(`${w}px:\n  ${errors.join('\n  ')}`);
     await page.close();
   }
