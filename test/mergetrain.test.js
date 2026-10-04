@@ -823,3 +823,25 @@ for (const file of ['docs/r5-docs.md', 'app/r5-app.py']) {
     assert.equal(store.reservationOf(t.key).kind, 'refresh', 'held until the refreshed branch is published');
   });
 }
+
+test('the owner can merge past a failed or unconfirmed deploy hold with a reason; never past a running one, never the desk', async () => {
+  resetTrain();
+  const t = await approvedPr('app/override.py', 'o\n', { risk: 'high' });
+  prFor(t, { number: 7 }); setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '6'.repeat(40) } });
+  store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
+  const prev = store.createTicket({ title: 'UI publish that failed', status: 'done' });
+  // A running hold is fresh (the merge refreshes the hold first, and an old one escalates); the others are settled.
+  const held = (state) => store.kvSet('train:deploy', JSON.stringify({ key: prev.key, merge_sha: '5'.repeat(40), at: new Date(Date.now() - (state === 'running' ? 60_000 : 120 * 60_000)).toISOString(), workflows: state === 'running' ? ['.github/workflows/deploy.yml'] : [], state, note: 'which workflows deploy is unknown' }));
+  held('running');
+  await assert.rejects(train.ownerMerge(7, { expectedSha: t.head_sha, deployOverride: 'I checked it and it is fine' }, SAT), /still running; merge after it finishes/);
+  held('escalated');
+  await assert.rejects(train.ownerMerge(7, { expectedSha: t.head_sha }, SAT), /or merge anyway with a reason/);
+  await assert.rejects(train.ownerMerge(7, { expectedSha: t.head_sha, deployOverride: 'ok' }, SAT), /at least 10 characters/);
+  await train.ownerMerge(7, { expectedSha: t.head_sha, method: 'squash', deployOverride: 'UI tests failed before publish; prod unchanged' }, SAT);
+  assert.equal(lockNow().merge_sha, '6'.repeat(40), 'the new merge takes the hold');
+  assert.equal(lockNow().overrode.key, prev.key); assert.equal(lockNow().overrode.state, 'escalated');
+  const audit = JSON.parse(store.kvGet('train:deploy-overrides')).at(-1);
+  assert.equal(audit.reason, 'UI tests failed before publish; prod unchanged'); assert.equal(audit.pr, 7);
+  assert.match(store.listComments(prev.key).at(-1).body, /Deploy hold overridden by the owner[\s\S]*UI tests failed/);
+  assert.match(fs.readFileSync(ghLog, 'utf8'), /merging while the previous deploy is unverified/, 'the reason is posted on the PR');
+});

@@ -325,11 +325,23 @@ export async function mergeCheck(number, { inBusyWindow = false, halted = false 
     noChecksConfigured: (p.statusCheckRollup || []).length === 0 && noWorkflows };
   // With a reason and the market-hours phrase supplied, what remains is what nothing can override.
   const probe = authorizeMerge(p, { ...common, overrideReason: 'x'.repeat(MIN_OVERRIDE_REASON), ciAckReason: 'x'.repeat(MIN_OVERRIDE_REASON), override: OVERRIDE_PHRASE });
-  return { number: p.number, head: p.headRefOid, blockers: probe.blockers, overridable: probe.overridden, ci_gap: probe.acknowledged, busy_window: inBusyWindow,
-    ready: !probe.blockers.length && !probe.overridden.length && !probe.acknowledged.length,
+  // The deploy hold (merge train): a deploying merge waits for the previous deploy; a failed or unconfirmed one can be
+  // passed with the owner's reason, a running one cannot.
+  const train = await import('./mergetrain.js');
+  const lock = train.deployState();
+  let deploy_hold = null;
+  if (lock && !(lock.key && lock.key === key && lock.state === 'merging')) {
+    let deploys = true;
+    try { const wfs = await train.workflowsAtBase(); if (wfs && cov.files.length) deploys = workflowsLib.deploysFor({ files: cov.files, branch: config.project.baseBranch, workflows: wfs, registered: config.deploy?.workflows ?? 'auto' }).deploys; } catch { deploys = true; }
+    if (deploys) deploy_hold = { key: lock.key || null, state: lock.state, note: lock.note || null, merge_sha: lock.merge_sha || null, overridable: train.OVERRIDABLE_HOLDS.includes(lock.state),
+      runs_url: lock.merge_sha && config.project.githubRepo ? `https://github.com/${config.project.githubRepo}/commit/${lock.merge_sha}/checks` : null };
+  }
+  if (deploy_hold && !deploy_hold.overridable) probe.blockers.push(`the deploy of ${deploy_hold.key || String(deploy_hold.merge_sha || '').slice(0, 7)} is still running; merge after it finishes`);
+  return { number: p.number, head: p.headRefOid, blockers: probe.blockers, overridable: probe.overridden, ci_gap: probe.acknowledged, busy_window: inBusyWindow, deploy_hold,
+    ready: !probe.blockers.length && !probe.overridden.length && !probe.acknowledged.length && !deploy_hold,
     coverage: { rows: cov.rows, uncovered: cov.uncovered, gap: cov.gap, firing: cov.firing, areas: cov.areas, files: cov.files.length } };
 }
-export async function merge(number, { method = 'squash', override = '', inBusyWindow = false, expectedSha = '', overrideReason = '', ciAckReason = '', actor = 'owner', halted = false, preflight = null } = {}) {
+export async function merge(number, { method = 'squash', override = '', inBusyWindow = false, expectedSha = '', overrideReason = '', ciAckReason = '', deployOverride = null, actor = 'owner', halted = false, preflight = null } = {}) {
   if (!MERGE_METHODS.includes(method)) fail(`method must be ${MERGE_METHODS.join('|')}`, 400);
   const p = await pr(number);
   const key = keyOfTitle(p.title);
@@ -374,6 +386,9 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   if (acknowledged.length) {
     await gh(['pr', 'comment', String(p.number), '-R', repo(), '--body', store.sanitizeForGithub(`⚠️ **The owner is merging without CI on these files**\n\n${acknowledged.join('; ')}.\n**Owner's reason:** ${String(ciAckReason).trim()}`)]);
     store.logEvent({ kind: 'action', agent_id: 'owner', ticket_key: key, text: `merged #${p.number} without CI coverage: ${acknowledged.join('; ')} — reason: ${String(ciAckReason).trim()}`.slice(0, 1000) });
+  }
+  if (deployOverride) {
+    await gh(['pr', 'comment', String(p.number), '-R', repo(), '--body', store.sanitizeForGithub(`⚠️ **The owner is merging while the previous deploy is unverified**\n\nThe ${deployOverride.state} deploy of ${deployOverride.key || String(deployOverride.merge_sha || '').slice(0, 7)} was not confirmed${deployOverride.note ? ` (${deployOverride.note})` : ''}.\n**Owner's reason:** ${deployOverride.reason}`)]);
   }
   if (preflight) await preflight({ overridden, expectedSha }); // only review overrides relax the final QA/approval recheck
   // --match-head-commit: GitHub merges exactly the approved commit, or refuses if it moved. From here on a failure is

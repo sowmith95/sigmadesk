@@ -599,7 +599,11 @@ export async function authorizeMerge(key, intent, ctx = {}) {
 export const activeIntentFor = (key) => { const i = intentGet(); return i && i.key === key ? i : null; };
 
 /** Persist the intent, the ticket's "merging" stage and (for deploying changes) the deploy lock in ONE transaction. */
-function beginMerge(key, n, head, dep, by, base, epoch = runner.currentEpoch(), reservation = null) {
+// The owner may merge past a deploy hold whose deploy failed or was never confirmed (never one still running: two
+// deploys would overlap), with a reason. The desk's own merges never can.
+export const OVERRIDABLE_HOLDS = ['failed', 'escalated'];
+const MIN_DEPLOY_REASON = 10;
+function beginMerge(key, n, head, dep, by, base, epoch = runner.currentEpoch(), reservation = null, deployOverride = '') {
   const at = new Date().toISOString();
   const intent = { key, pr: n, head, base, deploys: !!dep?.deploys, by, at, epoch, token: crypto.randomBytes(6).toString('hex'), reservation,
     workflows: (dep?.workflows || []).map((w) => w.file) };
@@ -608,8 +612,19 @@ function beginMerge(key, n, head, dep, by, base, epoch = runner.currentEpoch(), 
     if (!reservation || store.reservationOf(key)?.token !== reservation) throw Object.assign(new Error('Not merged: this PR is reserved by another operation.'), { status: 409 });
     if (intent.deploys) {
       const l = lockGet();
-      if (l) throw Object.assign(new Error(`Not merged: the deploy of ${l.key || short(l.merge_sha)} is ${['running', 'merging'].includes(l.state) ? 'still running' : `${l.state} — clear the deploy hold after checking it`}.`), { status: 409 });
-      lockSet({ key, pr: n, head, at, intent_at: at, state: 'merging', by, workflows: intent.workflows, merge_sha: null });
+      let overrode = null;
+      if (l) {
+        const reason = String(deployOverride || '').trim();
+        const canOverride = by === 'owner' && OVERRIDABLE_HOLDS.includes(l.state);
+        if (!canOverride || reason.length < MIN_DEPLOY_REASON) {
+          throw Object.assign(new Error(`Not merged: the deploy of ${l.key || short(l.merge_sha)} is ${['running', 'merging'].includes(l.state) ? 'still running; merge after it finishes'
+            : `${l.state} — clear the deploy hold after checking it${by === 'owner' ? `, or merge anyway with a reason (at least ${MIN_DEPLOY_REASON} characters)` : ''}`}.`), { status: 409 });
+        }
+        overrode = { key: l.key || null, state: l.state, note: l.note || null, merge_sha: l.merge_sha || null, reason, by, at, pr: n, for: key };
+        store.kvSet('train:deploy-overrides', JSON.stringify([...kvList('train:deploy-overrides'), overrode].slice(-50)));
+        intent.overrode = overrode;
+      }
+      lockSet({ key, pr: n, head, at, intent_at: at, state: 'merging', by, workflows: intent.workflows, merge_sha: null, ...(overrode ? { overrode } : {}) });
     }
     if (by === 'desk') store.updateTicket(key, { review_stage: 'merging' });
     intentSet(intent);
@@ -630,7 +645,7 @@ function mergedOk(intent, mergeSha) {
   store.transaction(() => {
     if (intent.deploys) {
       const l = lockGet();
-      const entry = { key: intent.key, pr: intent.pr, head: intent.head, at: new Date().toISOString(), state: 'running', merge_sha: mergeSha, workflows: intent.workflows, by: intent.by };
+      const entry = { key: intent.key, pr: intent.pr, head: intent.head, at: new Date().toISOString(), state: 'running', merge_sha: mergeSha, workflows: intent.workflows, by: intent.by, ...(intent.overrode ? { overrode: intent.overrode } : {}) };
       // only our own "merging" lock turns into the running deploy; if it was cleared meanwhile, queue the deploy
       if (l && l.state === 'merging' && l.intent_at === intent.at) lockSet({ ...entry, id: l.id });
       else if (!l) lockSet(entry);
@@ -793,9 +808,15 @@ async function ownerMergeHeld(n, t, key, opts, now, reservation) {
   const busy = !!dep.deploys && inBusyWindow(now);
   if (dep.deploys) await deployLock();
   // The intent is recorded for the whole call even for non-deploying merges: a branch refresh is refused meanwhile.
-  const intent = beginMerge(key, n, t?.head_sha || null, dep, 'owner', null, runner.currentEpoch(), reservation);
+  const intent = beginMerge(key, n, t?.head_sha || null, dep, 'owner', null, runner.currentEpoch(), reservation, opts.deployOverride);
   try {
-    const out = await dispatch(intent, () => prs.merge(n, { ...opts, inBusyWindow: busy, actor: 'owner', preflight: (ctx) => authorizeMerge(key, intent, ctx) }));
+    const out = await dispatch(intent, () => prs.merge(n, { ...opts, deployOverride: intent.overrode || null, inBusyWindow: busy, actor: 'owner', preflight: (ctx) => authorizeMerge(key, intent, ctx) }));
+    if (intent.overrode) {
+      const o = intent.overrode;
+      const text = `⚠️ **Deploy hold overridden by the owner** to merge #${n}${key ? ` (${key})` : ''}: the ${o.state} deploy of ${o.key || short(o.merge_sha)} was not verified${o.note ? ` (${o.note})` : ''}.\n**Reason:** ${o.reason}`;
+      if (o.key && store.getTicket(o.key)) store.addComment(o.key, 'owner', text);
+      store.logEvent({ kind: 'action', agent_id: 'owner', ticket_key: key || o.key, text: `deploy hold overridden: ${o.state} deploy of ${o.key || short(o.merge_sha)} superseded by #${n} — reason: ${o.reason}`.slice(0, 1000) });
+    }
     let mergeSha = null;
     try { mergeSha = (await prs.mergeInfo(n)).mergeCommit?.oid || null; } catch { /* the lock escalates later */ }
     mergedOk(intent, mergeSha);
