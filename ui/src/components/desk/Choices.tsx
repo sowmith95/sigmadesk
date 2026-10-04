@@ -6,7 +6,7 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { cn } from '@/lib/utils';
 
 export interface Choice<V extends string> { value: V; label: ReactNode; hint?: ReactNode; lead?: ReactNode; disabled?: boolean; title?: string }
-const chip = 'h-auto min-h-9 rounded-full border border-input bg-transparent px-3.5 py-1.5 text-[15px] font-medium text-foreground shadow-none hover:bg-secondary hover:text-foreground '
+const chip = 'h-auto min-h-9 max-w-full whitespace-normal text-left rounded-full border border-input bg-transparent px-3.5 py-1.5 text-[15px] font-medium text-foreground shadow-none hover:bg-secondary hover:text-foreground '
   + 'data-[state=on]:border-primary data-[state=on]:bg-primary data-[state=on]:text-primary-foreground gap-2 max-md:min-h-11 disabled:opacity-45 [&_.hint]:text-muted-foreground data-[state=on]:[&_.hint]:text-primary-foreground/75';
 
 function Items<V extends string>({ options, size }: { options: Choice<V>[]; size?: 'sm' }) {

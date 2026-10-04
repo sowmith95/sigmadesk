@@ -1,19 +1,22 @@
 {
-  "source": "179639d64a80d214127e18208704850b06d37c1419d0c9ef59d4a9d591828df3",
+  "source": "f2a6af322b149307bce1eda81016911b60418331345ec5552f70a261ff6183cd",
   "outputs": {
-    "public/app/chunks/Bits-D_O2g6L4.js": "783ecf54d09f52d63c9c8a6d72c621f20c651fd4d490f8c275b794f3224e8d51",
-    "public/app/chunks/check-0I0azLJq.js": "8b9a83e8ecfbaa6b859e974bd0b77143f852cceb3917ccfafd2eea92063857ca",
-    "public/app/chunks/CommandPalette-B8ZI1Tib.js": "2dc43de34b398d862d7f0b4e48bbbe13da1336201ba8ed31a87a4a6417d3812e",
-    "public/app/chunks/Desk-B_PfsNia.js": "79f2e66002316e24cf3741dc5a8b824eb50111d9d97db5844bc8aeb6a340023f",
-    "public/app/chunks/dialog-8Qd9mtSV.js": "c6faee1a3fa008b940ccd4a08b0762929b2a74627073e8bc95687e5ce0047f98",
-    "public/app/chunks/external-link-C1E4XZCV.js": "4f93ad17abcda3686285e4f0188fc183fbd0086576e8241b9160bd7f6880321a",
-    "public/app/chunks/Features-B4slILpv.js": "95dae23a1abdba6fe6505f4369b4b1ca9b62490b29ce23c756fcecccc8f442aa",
-    "public/app/chunks/Panels-BoAzkkE8.js": "1dccfc93acb05135d6905b2e573e17496c92c4acdb8edb47d604aea46fa9bc34",
-    "public/app/chunks/Prs-B07EgLEV.js": "4bd4f1685d4055966bd674c92ac06bd97e202254e4a923325eb53b9e62d21916",
-    "public/app/chunks/Research-BLEuAO0d.js": "45d2ec6cab5f3e861e497987c05ebd4f432a73abe8c365c5966f2a26d7afb034",
-    "public/app/chunks/Settings-Dpa2ONes.js": "61a174e22ddeb4a568b78ac1a8619e9a3fb4ff3ddd185f833e00d8323868cae1",
-    "public/app/chunks/x-Y5ZyaGPP.js": "2e4c4c2f927335596d1d01a072a55fd0762dea9ffeddf03e64dd4e350dd3330c",
-    "public/app/main.css": "54e520b4fe185386a25ab41884956e94b438c0cd59699ed2198cdc9fa3ea3ed6",
-    "public/app/main.js": "99d2bfbb7d9e3af8c027376eaab824ee3e1dfbd7640a9ee24cdea169bda0a5b6"
+    "public/app/chunks/arrow-left-C_PThnYe.js": "4ac38b9a3cf8b1715f165dfea4cc956d94d6bdd846428923f65eb3bf8171ada8",
+    "public/app/chunks/Bits-LvqU4GPq.js": "02c4316e2c39729506f4c72e9f1ce320d51f1f3147e62f9253b3071a452ab1e1",
+    "public/app/chunks/check-BwEtBX4H.js": "ea250eaac8535f2248a32bcaab6067672aa42c593dec9ac0489308324443500c",
+    "public/app/chunks/CommandPalette-D5O8MvGp.js": "907d98a1336551adfc05ffe7c013a0a98f37d7db45026d4fdb20c9d6ebd29e0c",
+    "public/app/chunks/Desk-C4Jnt3_a.js": "54bb7709580df3299d6cbc6b226d2cf214a69b4e033b18f7f630d07aa36366cb",
+    "public/app/chunks/dialog-F92SHhOC.js": "c293799740d69c13fbb0346d27fd17cded0d50875f65712137980fdf6afe28c9",
+    "public/app/chunks/external-link-CBr5-Okx.js": "0e2fe4bf5a6e79761e278ab748cb10731b42b967c3ef417372e67a14a739e14f",
+    "public/app/chunks/Features-CvV0Jw1J.js": "c4b5ef02211bd93a2c4664025571e1367c0e8f57f3d297521595e7e60f741e3b",
+    "public/app/chunks/Layout-CIjOJIrC.js": "be6db9a678b41afe92687afea15df2d46680611570e44a4f91faabf4cc1ff6f9",
+    "public/app/chunks/Panels-C8bKw-7o.js": "dbf6bafe73f761c4f703504e5b6dbcde9852807347f587b9f3746d77ef564971",
+    "public/app/chunks/Prs-DIkeU335.js": "494988c6189933fc08cf3d89430229ef5ea46a02a4e967d67a72b724bef432f2",
+    "public/app/chunks/Research-8q-WP8sa.js": "2eae9908fd62bb1f02003245b3f30930ee6b6aa6f6e6a5d5dde8f86c37501ed1",
+    "public/app/chunks/Settings-BUmvjsl0.js": "19738d12c0ddd8ce8ced6a1923eec6f53cc67942b0ea12de8b2f8bfa10b06782",
+    "public/app/chunks/textarea-B5qMBOrL.js": "a1b41e42002e7cc365c05091cb63a23716f787e18c1b90cec745cb4e8c02999f",
+    "public/app/hub.js": "c380eade78ebc1fa4b9339829d6a24d5c14993974f9f81869e56befbd57c8322",
+    "public/app/main.css": "502f4893a1d64bb4e31ef8512366ac94319dda23c73c231e72c38311bc3835fe",
+    "public/app/main.js": "c75a4b4ac4f038c2d50bfaf0b4f6ebfef377bd2ce8f3c542bb20ee0aaddba243"
   }
 }

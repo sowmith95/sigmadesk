@@ -356,7 +356,7 @@ export function settingDefaults() {
     open_draft_prs: String(config.github.openDraftPrs), // open PRs at all (name kept for existing databases)
     draft_prs: String(config.github.draftPrs ?? false), // open them as drafts (default: normal open PRs)
     team: '{}', // per-seat {engine, model, effort, enabled} chosen in the UI
-    team_confirmed: 'false', // the owner must confirm who runs on what before the first open
+    team_confirmed: String(config.bootstrap?.teamConfirmed === true), // the owner confirms who runs on what before the first open (the setup wizard records it)
     auto_fallback: String(config.engines.autoFallback),
     // Which engine the Engineering Manager grooms on: 'codex' (default) or 'seat' (the manager seat's own engine).
     groom_engine: 'codex',

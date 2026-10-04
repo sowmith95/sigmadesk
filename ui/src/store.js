@@ -59,9 +59,7 @@ export const agentMap = () => Object.fromEntries(S.agents.map((a) => [a.id, a]))
 export const ticketByKey = (k) => S.tickets.find((x) => x.key === k);
 
 // ---------------- toasts (sonner) ----------------
-export function toast(msg, err = false) {
-  if (err) sonner.error(String(msg), { duration: 6000 }); else sonner.success(String(msg), { duration: 3600 });
-}
+export { toast } from './lib/toast.ts';
 
 // ---------------- API ----------------
 export async function api(method, url, body, timeoutMs = 20000) {

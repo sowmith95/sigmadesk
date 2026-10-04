@@ -369,7 +369,40 @@ Each desk is isolated:
 - agents can read their own clones, but never any project's database or another project's clones.
 
 A desk without `SIGMADESK_HOME` uses the original in-checkout layout, so an existing desk keeps working unchanged.
-The setup wizard (describe the project, approve a recommended team) is next.
+
+### The Projects home and setup wizard
+
+```bash
+npm run hub                                   # http://127.0.0.1:8780 (same hosts and token as the original desk)
+npm run project -- install-hub                # or keep it running as a background service
+```
+
+The Projects home lists every desk with what needs you, what is running and today's spend. **Add a project** walks
+through five steps, each one screen on a phone, with the draft kept if you leave:
+
+1. **Repository:** pick a git checkout on this machine.
+2. **What we found:** languages, stack, tests, CI and deploy workflows, read from files without running anything.
+   Correct anything that is wrong.
+3. **Your goals:** what it does and for whom; what to work on first; what must never break; paths never to touch;
+   what the desk may do on its own; quiet hours for deploying merges; the daily limit; research and log watching.
+4. **Team:** the smallest team that covers the project, each seat with the reason and the evidence. Switch seats off,
+   add advisors from the catalog, or describe your own.
+5. **Review and create:** see every rule and what will be created. Then the desk starts paused, with your approval of
+   the team already recorded.
+
+**Teams.** Core roles are the engineering manager, principals, builders, QA, support, and optionally PM and SRE.
+Advisors come from packs:
+- web product: product design, accessibility;
+- security and privacy;
+- data and ML;
+- mobile;
+- release and infra;
+- trading;
+- or custom advisors you describe.
+
+Advisors review plans from their angle and can research. They never write code and never block approval. A
+project's team lives in `team.json` in its home. The desk refuses to start with an invalid team, and it refuses
+seat changes that would leave a workflow uncovered.
 
 ## Configuration
 

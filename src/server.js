@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import { config, validateConfig } from './config.js';
 import { AGENTS, ENGINEERS, STATUSES, applyTeamOverrides, agentById , TEAM_PROBLEMS } from './team.js';
 import { teamCoverage } from './team-catalog.js';
+import { board } from '../public/attention.js';
 import { ENGINES, detectEngines, presets, suggestFor, SEAT_TIER, TIER_TEXT } from './engines/index.js';
 import * as store from './db.js';
 import * as runner from './runner.js';
@@ -157,6 +158,14 @@ async function ownerRoute(req, res) {
     const body = await readBody(req);
     const result = body.action ? productReview.decide(mm[1], body) : productReview.start(mm[1], body);
     sched.tick(); return send(res, 200, result);
+  }
+  // Versioned summary for the Projects home: enough to show a project card, nothing more.
+  if (req.method === 'GET' && p === '/api/summary') {
+    const snap = snapshot();
+    const B = board(snap);
+    return send(res, 200, { version: 1, id: config.projectId, project: config.project.name, repo: config.project.githubRepo || config.project.repoPath,
+      paused: snap.settings.paused === 'true', team_confirmed: snap.settings.team_confirmed === 'true', needs_you: B.counts.needs_you, working: B.counts.working,
+      blocked: B.counts.blocked, queued: B.counts.queued, spend_today: snap.meta.spend_today, budget: Number(snap.settings.daily_budget_usd), at: store.now() });
   }
   if (req.method === 'GET' && p === '/api/health') return send(res, 200, { at: store.now(), providers: dispatch.providerHealth(), scheduler: sched.health(), watch: snapshot().meta.watch });
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {

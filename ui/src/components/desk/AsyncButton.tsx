@@ -1,6 +1,6 @@
 import { useState, type ComponentProps, type MouseEvent } from 'react';
 import { Button } from '@/components/ui/button';
-import { toast } from '@/store.js';
+import { toast } from '@/lib/toast';
 
 type Props = Omit<ComponentProps<typeof Button>, 'onClick'> & {
   /** Async work; return false to mean "cancelled" (no success toast). */

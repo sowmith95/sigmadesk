@@ -18,7 +18,8 @@
     "check:ui": "node scripts/ui-stamp.mjs --check",
     "typecheck": "tsc --noEmit",
     "ui:shots": "node --disable-warning=ExperimentalWarning scripts/ui-shots.mjs",
-    "project": "node --disable-warning=ExperimentalWarning scripts/project.mjs"
+    "project": "node --disable-warning=ExperimentalWarning scripts/project.mjs",
+    "hub": "node --disable-warning=ExperimentalWarning src/hub/server.js"
   },
   "engines": {
     "node": ">=22.13"
