@@ -28,7 +28,7 @@ process.env.SIGMADESK_DB = ':memory:';
 
 let prs; let ui; let store;
 const setPr = (o) => fs.writeFileSync(ghState, JSON.stringify({ number: 9, title: '[Q-1] thing', state: 'OPEN', isDraft: true, mergeable: 'MERGEABLE',
-  headRefOid: 'abc123', body: 'Opened by SigmaDesk', statusCheckRollup: [{ conclusion: 'SUCCESS' }], ...o }));
+  headRefOid: 'abc1234', baseRefName: 'main', body: 'Opened by SigmaDesk', statusCheckRollup: [{ conclusion: 'SUCCESS' }], ...o }));
 const calls = () => fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [];
 before(async () => {
   store = await import('../src/db.js');
@@ -67,18 +67,19 @@ test('approve falls back to comment + owner-approved label when GitHub blocks se
 test('merge readies a draft and merges exactly the checked head commit', async () => {
   fs.rmSync(log, { force: true });
   setPr({});
-  await prs.merge(9, { method: 'squash' });
+  await prs.merge(9, { method: 'squash', expectedSha: 'abc1234' });
   const c = calls();
   assert.ok(c.some((l) => l.startsWith('pr ready 9')));
-  assert.ok(c.some((l) => /^pr merge 9 -R owner\/demo --squash --delete-branch --match-head-commit abc123$/.test(l)), c.join('\n'));
+  assert.ok(c.some((l) => /^pr merge 9 -R owner\/demo --squash --delete-branch --match-head-commit abc1234$/.test(l)), c.join('\n'));
 });
 
 test('merge refuses red, conflicting or out-of-window PRs without calling merge', async () => {
   fs.rmSync(log, { force: true });
   setPr({ statusCheckRollup: [{ conclusion: 'FAILURE' }] });
-  await assert.rejects(prs.merge(9, {}), /CI is failing/);
+  await assert.rejects(prs.merge(9, { expectedSha: 'abc1234' }), /CI is failing/);
   setPr({});
-  await assert.rejects(prs.merge(9, { inBusyWindow: true }), /market hours/);
+  await assert.rejects(prs.merge(9, { inBusyWindow: true, expectedSha: 'abc1234' }), /market hours/);
+  await assert.rejects(prs.merge(9, {}), /expected head SHA/);
   assert.ok(!calls().some((l) => l.startsWith('pr merge')));
 });
 

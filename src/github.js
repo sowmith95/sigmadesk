@@ -93,6 +93,42 @@ export function flushComments() {
   });
 }
 
+// Two-reviewer PR conversation: a durable outbox. A row is marked sent only after GitHub returned the comment id.
+// Each body carries a hidden marker, so a retry after a crash between "posted" and "recorded" adopts the existing
+// comment instead of posting a duplicate.
+export const outboxMarker = (marker) => `<!-- sigmadesk-review:${marker} -->`;
+export function flushOutbox() {
+  if (!enabled()) return Promise.resolve(0);
+  return enqueue('PR review comments', async () => {
+    let sent = 0;
+    for (const o of store.pendingOutbox()) {
+      const n = Number(String(o.pr_url).match(/\/pull\/(\d+)/)?.[1]);
+      if (!n) continue;
+      const marker = outboxMarker(o.marker);
+      const path = `repos/${config.project.githubRepo}/issues/${n}/comments`;
+      try {
+        let id = '';
+        if (o.attempts > 0) {
+          const found = await gh(['api', path, '--paginate', '--jq', `.[] | select(.body | contains(${JSON.stringify(marker)})) | .id`]);
+          id = found.split('\n').map((x) => x.trim()).filter(Boolean)[0] || '';
+        }
+        if (!id) {
+          store.updateOutbox(o.id, { attempts: o.attempts + 1 });
+          id = (await gh(['api', '-X', 'POST', path, '-f', `body=${o.body}\n\n${marker}`, '--jq', '.id'])).trim();
+        }
+        if (!id) throw new Error('GitHub returned no comment id');
+        store.updateOutbox(o.id, { status: 'sent', gh_comment_id: id, sent_at: store.now(), last_error: null });
+        if (o.review_id) store.updatePrReview(o.review_id, { published_comment_id: id });
+        sent += 1;
+      } catch (err) {
+        store.updateOutbox(o.id, { status: 'failed', last_error: String(err.stderr || err.message).slice(0, 300) });
+        store.logEvent({ kind: 'github', ticket_key: o.ticket_key, agent_id: 'github', text: `PR comment not posted yet (will retry): ${String(err.stderr || err.message).slice(0, 200)}` });
+      }
+    }
+    return sent;
+  });
+}
+
 export function openDraftPr(ticketKey, summary, { base = config.project.baseBranch } = {}) {
   return enqueue('open PR', async () => {
     const t = store.getTicket(ticketKey);

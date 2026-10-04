@@ -19,7 +19,7 @@ const mark = (k) => store.kvSet(`prsync:${k}`, '1');
 const prNumber = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 const trusted = (login) => (config.github.trustedAuthors || []).includes(login);
 // Comments the desk itself wrote (issue mirrors, PR bodies) must never loop back in as owner input.
-const isDeskText = (body) => /SigmaDesk|<!-- sigmadesk:/.test(String(body || ''));
+const isDeskText = (body) => /SigmaDesk|<!-- sigmadesk[:-]/.test(String(body || ''));
 
 export function trackedTickets() {
   return store.listTickets().filter((t) => t.pr_url && !TERMINAL.has(t.status) && prNumber(t.pr_url));

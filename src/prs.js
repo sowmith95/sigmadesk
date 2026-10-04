@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { config } from './config.js';
 import * as store from './db.js';
+import { agentById } from './team.js';
 
 const pexec = promisify(execFile);
 const repo = () => config.project.githubRepo;
@@ -19,7 +20,7 @@ function fail(msg, status = 409) { throw Object.assign(new Error(msg), { status 
 
 const FIELDS = ['number', 'title', 'state', 'isDraft', 'url', 'author', 'createdAt', 'updatedAt', 'mergedAt', 'closedAt',
   'headRefName', 'labels', 'reviewDecision', 'reviewRequests', 'latestReviews', 'mergeable', 'statusCheckRollup',
-  'additions', 'deletions', 'changedFiles', 'headRefOid'].join(',');
+  'additions', 'deletions', 'changedFiles', 'headRefOid', 'baseRefName'].join(',');
 
 export function checksState(rollup = []) {
   if (!rollup.length) return 'none';
@@ -51,6 +52,7 @@ export async function listPrs({ refresh = false } = {}) {
       checks: checksState(p.statusCheckRollup || []), additions: p.additions, deletions: p.deletions, files: p.changedFiles,
       tags: labels.filter((l) => l.startsWith(TAG_PREFIX)).map((l) => l.slice(TAG_PREFIX.length)),
       labels: labels.filter((l) => !SYSTEM_LABEL(l) && !l.startsWith(TAG_PREFIX)),
+      head_sha: p.headRefOid || null, base: p.baseRefName || null, desk_review: t ? deskReview(t, p.headRefOid) : null,
     };
   });
   cache = { at: Date.now(), rows };
@@ -117,17 +119,102 @@ export function mergeBlockers(p, { inBusyWindow = false, override = '' } = {}) {
   return out;
 }
 
-export async function merge(number, { method = 'squash', override = '', inBusyWindow = false } = {}) {
+// ---------------- merge authorization (owner UI merges and desk auto-merges share it) ----------------
+const FAILED = ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE'];
+const PENDING = ['PENDING', 'QUEUED', 'IN_PROGRESS', 'EXPECTED', 'WAITING', 'REQUESTED', 'COMPLETED', ''];
+/** Strict CI verdict: only a positive pass counts. Skipped/neutral-only = inconclusive; nothing reported = none. */
+export function ciVerdict(rollup = []) {
+  if (!rollup.length) return 'none';
+  const v = rollup.map((c) => c.conclusion || c.state || c.status || '');
+  if (v.some((x) => FAILED.includes(x))) return 'failing';
+  if (v.some((x) => PENDING.includes(x))) return 'pending';
+  return v.includes('SUCCESS') ? 'passing' : 'inconclusive';
+}
+export const MIN_OVERRIDE_REASON = 10;
+export const keyOfTitle = (title) => String(title || '').match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1] || null;
+const seatName = (seat) => (seat ? `${agentById[seat]?.name || seat}` : '?');
+
+/**
+ * Every precondition for merging, pure so it is testable. Returns { blockers, overridden }.
+ * gate (only for tickets that went through two-reviewer review): { approvals: store.approvalsAt(key, expectedSha), qaSha }.
+ * An owner may bypass the review-chain blockers (approvals, their publication, QA commit) with an audited reason;
+ * nothing bypasses state, head commit, base branch, conflicts or CI.
+ */
+export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, override = '', actor = 'owner', halted = false, gate = null,
+  overrideReason = '', noChecksConfigured = false, baseBranch = config.project.baseBranch } = {}) {
+  const blockers = []; const chain = [];
+  if (p.state !== 'OPEN') blockers.push(`PR is ${String(p.state).toLowerCase()}`);
+  if (!/^[0-9a-f]{7,40}$/.test(String(expectedSha))) blockers.push('the request did not say which commit it approves (expected head SHA)');
+  else if (p.headRefOid !== expectedSha) blockers.push(`the PR head moved (${String(p.headRefOid).slice(0, 7)} ≠ approved ${String(expectedSha).slice(0, 7)}) — reload and re-check`);
+  if (p.baseRefName !== baseBranch) blockers.push(`the PR targets \`${p.baseRefName || 'unknown'}\`, not \`${baseBranch}\` — merge its base first`);
+  if (p.mergeable === 'CONFLICTING') blockers.push('it conflicts with the base branch — rebase first');
+  else if (p.mergeable !== 'MERGEABLE') blockers.push('GitHub has not finished checking mergeability — try again in a minute');
+  const ci = ciVerdict(p.statusCheckRollup || []);
+  if (ci === 'failing') blockers.push('CI is failing');
+  else if (ci === 'pending') blockers.push('CI is still running');
+  else if (ci === 'inconclusive') blockers.push('CI checks were all skipped or neutral — no positive pass');
+  else if (ci === 'none' && !noChecksConfigured) blockers.push('no CI result has been reported for this commit yet');
+  if (inBusyWindow && (actor !== 'owner' || String(override).trim().toLowerCase() !== OVERRIDE_PHRASE)) {
+    blockers.push(actor === 'owner' ? `merging ${baseBranch} deploys production and the desk is inside its busy window (market hours) — type "${OVERRIDE_PHRASE}" to override` : 'inside the busy window (market hours)');
+  }
+  if (actor !== 'owner' && halted) blockers.push('the desk is paused');
+  if (gate) {
+    const a = gate.approvals || {};
+    if (!a.ok) {
+      const have = [a.context && `${seatName(a.context.seat)}: ${a.context.verdict}`, a.independent && `${seatName(a.independent.seat)}: ${a.independent.verdict}`].filter(Boolean).join(', ');
+      chain.push(`it needs two reviewer approvals at this commit (have: ${have || 'none'})`);
+    } else if (a.unpublished) chain.push('the review comments are not on the PR yet');
+    if (gate.qaSha && gate.qaSha !== expectedSha) chain.push(`QA passed a different commit (${String(gate.qaSha).slice(0, 7)})`);
+  }
+  const reason = String(overrideReason || '').trim();
+  if (chain.length && actor === 'owner' && reason.length >= MIN_OVERRIDE_REASON) return { blockers, overridden: chain };
+  if (chain.length && actor === 'owner') chain[chain.length - 1] += ` — or give an owner override reason (at least ${MIN_OVERRIDE_REASON} characters)`;
+  return { blockers: [...blockers, ...chain], overridden: [] };
+}
+
+// "No checks at all" is a pass only when the repository has no Actions workflows (review.ci = "auto").
+let workflowCache = { at: 0, none: false };
+export async function repoHasNoWorkflows() {
+  if (config.review?.ci === 'required') return false;
+  if (Date.now() - workflowCache.at < 10 * 60_000) return workflowCache.none;
+  try {
+    const n = Number(await gh(['api', `repos/${repo()}/actions/workflows`, '--jq', '.total_count']));
+    workflowCache = { at: Date.now(), none: n === 0 };
+  } catch { workflowCache = { at: Date.now(), none: false }; }
+  return workflowCache.none;
+}
+
+/** Review state for a desk PR row (the DB is authoritative; GitHub only mirrors it). */
+export function deskReview(t, headSha) {
+  if (!store.inReviewFlow(t.key)) return { required: false };
+  const a = store.approvalsAt(t.key, headSha || t.head_sha);
+  const r = (row) => (row ? { seat: row.seat, name: seatName(row.seat), role: row.role, verdict: row.verdict, sha: row.sha, round: row.round } : null);
+  return { required: true, approvals_ok: a.ok, unpublished: a.unpublished, context: r(a.context), independent: r(a.independent),
+    stage: t.review_stage || null, round: t.review_round || 0, risk: t.risk || null, diff_risk: t.diff_risk || null };
+}
+
+export async function merge(number, { method = 'squash', override = '', inBusyWindow = false, expectedSha = '', overrideReason = '', actor = 'owner', halted = false } = {}) {
   if (!MERGE_METHODS.includes(method)) fail(`method must be ${MERGE_METHODS.join('|')}`, 400);
   const p = await pr(number);
-  const blockers = mergeBlockers(p, { inBusyWindow, override });
+  const key = keyOfTitle(p.title);
+  const t = key ? store.getTicket(key) : null;
+  const gate = t && store.inReviewFlow(t.key) ? { approvals: store.approvalsAt(t.key, expectedSha), qaSha: t.qa_sha } : null;
+  if (actor !== 'owner' && !gate) fail('Not merged: the desk only merges PRs that passed two-reviewer review.');
+  const noChecksConfigured = (p.statusCheckRollup || []).length === 0 ? await repoHasNoWorkflows() : false;
+  const { blockers, overridden } = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, noChecksConfigured });
   if (blockers.length) fail(`Not merged: ${blockers.join('; ')}.`);
   if (p.isDraft) await gh(['pr', 'ready', String(p.number), '-R', repo()]);
-  // --match-head-commit: GitHub merges exactly the commit whose checks we just read, or refuses if it moved.
-  await gh(['pr', 'merge', String(p.number), '-R', repo(), `--${method}`, '--delete-branch', '--match-head-commit', p.headRefOid]);
-  note(p, `🔀 **Merged #${p.number}** (${method}) from SigmaDesk${inBusyWindow ? ' — market-hours override' : ''}.`);
+  if (overridden.length) {
+    // Audit first: the reason is on the PR even if the merge call then fails.
+    await gh(['pr', 'comment', String(p.number), '-R', repo(), '--body', `⚠️ **The owner is merging without the full SigmaDesk review**\n\nSkipped: ${overridden.join('; ')}.\n**Owner's reason:** ${String(overrideReason).trim()}`]);
+    store.logEvent({ kind: 'action', agent_id: 'owner', ticket_key: key, text: `merge override on #${p.number}: ${overridden.join('; ')} — reason: ${String(overrideReason).trim()}`.slice(0, 1000) });
+  }
+  // --match-head-commit: GitHub merges exactly the approved commit, or refuses if it moved.
+  await gh(['pr', 'merge', String(p.number), '-R', repo(), `--${method}`, '--delete-branch', '--match-head-commit', expectedSha]);
+  if (actor === 'owner') note(p, `🔀 **Merged #${p.number}** (${method}) from SigmaDesk${inBusyWindow ? ' — market-hours override' : ''}${overridden.length ? ` — review override: ${String(overrideReason).trim()}` : ''}.`);
+  else store.logEvent({ kind: 'github', agent_id: 'github', ticket_key: key, text: `auto-merged #${p.number} (${method}) at ${expectedSha.slice(0, 7)}` });
   bust();
-  return { number: p.number, method };
+  return { number: p.number, method, overridden };
 }
 
 export async function close(number, comment = '') {
