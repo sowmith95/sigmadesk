@@ -4,12 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { config } from './config.js';
+import { config, publisherPath } from './config.js';
 import { agentById, charterFor, permissionsFor, promptFor, DENY_RULES } from './team.js';
 import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
 import { selectionFor, reviewSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
 import * as store from './db.js';
+import * as context from './context.js';
 
 const pexec = promisify(execFile);
 const children = new Map(); // runId -> ChildProcess
@@ -79,6 +80,13 @@ export function applyEvents(events, ctx) {
         store.kvSet(`quota:${e.engine}`, JSON.stringify(q));
         store.bus.emit('msg', { type: 'quota', data: q });
         if (q.status && q.status !== 'allowed') store.logEvent({ ...base, kind: 'system', text: `plan limit: ${q.status} until ${q.resets_at || '?'}` });
+        break;
+      }
+      case 'pplx': {
+        if (e.threadId && e.threadId !== ctx.state.threadSaved) { ctx.state.threadSaved = e.threadId; store.updateRun(run.id, { thread_id: e.threadId }); }
+        if (ctx.state.pack) store.updateRun(run.id, { context_meta: JSON.stringify(ctx.state.pack.meta) });
+        if (e.note) store.logEvent({ ...base, kind: e.error ? 'error' : 'system', text: e.note });
+        if (e.kill) killRun(run.id, `invalid Perplexity message: ${e.kill}`); // fail closed
         break;
       }
       case 'result': ctx.result = { is_error: !e.ok, subtype: e.subtype, total_cost_usd: e.costUsd || 0, cost_known: e.costKnown !== false, num_turns: e.turns ?? null, errors: e.errors || [], result: e.text || ctx.state.lastSay || '', usage: e.usage }; break;
@@ -206,7 +214,7 @@ export async function commitsAhead(dir) {
 // FETCHES objects out of a clone into a bare repo the desk owns, computes the guard diff there against the OWNER's
 // base commit, and pushes from there. No git command ever runs with a clone's config.
 const SAFE = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'diff.external=', '-c', 'core.sshCommand=ssh'];
-const publisherDir = () => path.join(config.root, 'data', 'publisher.git');
+const publisherDir = () => publisherPath();
 async function publisher() {
   const dir = publisherDir();
   if (!fs.existsSync(path.join(dir, 'HEAD'))) await git(['init', '-q', '--bare', dir]);
@@ -270,7 +278,7 @@ export function canResume(run, maxAgeHours) {
 export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketPath = config.socketPath) {
   const deny = [...config.sandbox.denyRead,
     // desk state: run tokens, verdict codes, config, private notes, and every seat's session transcript
-    path.join(config.root, 'data'), config.configFile, path.join(config.root, 'local'), '~/.claude', '~/.codex'];
+    path.join(config.root, 'data'), config.dataDir, config.configFile, path.join(config.root, 'local'), '~/.claude', '~/.codex'];
   if (config.advisors.keyFile) deny.push(config.advisors.keyFile);
   if (config.project.repoPath) deny.push(path.join(config.project.repoPath, '.env'));
   const asRule = (p) => (p.startsWith('~') ? p : `/${p}`);
@@ -379,6 +387,44 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     text: `Automatic fallback: ${agentById[agentId].engine || 'claude'} → ${agent.engine} (${selected.reason}). Saved seat preference retained.` });
 
   const engine = engineOf(agent);
+  const pplx = engine.id === 'perplexity' && engine.supports?.(kind);
+  const px = context.packSettings();
+  // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
+  // Covers the first answer, follow-ups and every permitted page round (bounded by engines.perplexity.maxRunMinutes).
+  const timeoutMin = Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0);
+  const deadlineAt = Date.now() + timeoutMin * 60_000;
+  if (!pplx) return spawnChild();
+
+  // Perplexity thinking seats: the desk builds the context pack (not the relay) before the relay starts. Cancellation
+  // and the run timeout exist before any preparation work; a pack that cannot be built refuses the run (fail closed).
+  const abort = new AbortController();
+  preparing.set(run.id, abort);
+  const prepTimer = setTimeout(() => {
+    store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `timed out after ${timeoutMin} min — stopping` });
+    killRun(run.id, 'timeout');
+  }, timeoutMin * 60_000);
+  return (async () => {
+    let failed = null;
+    try {
+      prompt = `${prompt}${await preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal: abort.signal })}`;
+    } catch (err) { failed = err; } finally { preparing.delete(run.id); clearTimeout(prepTimer); }
+    const now = store.getRun(run.id);
+    if (now.status === 'killed') return endBeforeSpawn('killed', now.result_text || 'stopped while preparing');
+    // The circuit breaker may have tripped while the pack was being built: re-check the fence right before spawning.
+    if (fence != null && fence !== epoch) return endBeforeSpawn('killed', 'stopped by stop-all while preparing');
+    if (failed) return endBeforeSpawn('error', `Run refused: the context pack could not be built — ${store.redact(failed.message).slice(0, 300)}`);
+    return spawnChild();
+  })();
+
+  function endBeforeSpawn(status, text) {
+    context.release(run.id);
+    store.updateRun(run.id, { status, token: null, ended_at: store.now(), result_text: text, cost_usd: 0 });
+    store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text });
+    if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
+    return { run: store.getRun(run.id), result: null, failure: null };
+  }
+
+  function spawnChild() {
   let sock, cmd, env;
   try {
     sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
@@ -403,7 +449,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
 
   let buf = '';
   let lastOutput = Date.now();
-  const idleMin = config.limits.idleTimeoutMin;
+  const idleMin = pplx && config.limits.idleTimeoutMin ? Math.max(config.limits.idleTimeoutMin, px.remoteWaitMinutes + 2) : config.limits.idleTimeoutMin;
   const idleTimer = idleMin ? setInterval(() => {
     if (Date.now() - lastOutput > idleMin * 60_000) {
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `no activity for ${idleMin} min — stopping the seat` });
@@ -425,11 +471,10 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   let stderr = '';
   child.stderr.on('data', (d) => { lastOutput = Date.now(); stderr = (stderr + d).slice(-4000); });
 
-  const timeoutMin = config.limits.runTimeoutMin[kind] ?? 30;
   const timer = setTimeout(() => {
     store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `timed out after ${timeoutMin} min — stopping` });
     killRun(run.id, 'timeout');
-  }, timeoutMin * 60_000);
+  }, Math.max(1000, deadlineAt - Date.now()));
 
   return new Promise((resolve) => {
     let settled = false;
@@ -443,6 +488,12 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       setTimeout(() => evidence.delete(run.id), 60_000).unref();
       sock?.close();
       if (buf.trim()) applyEvents(engine.parse(buf, cwd, ctx.state), ctx);
+      if (ctx.state.pack) {
+        const m = ctx.state.pack.meta;
+        if (!m.delivered && !ctx.state.pplxAsked) store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: 'Perplexity did not receive the full context: the relay never called Perplexity' });
+        store.updateRun(run.id, { context_meta: JSON.stringify(m) });
+        context.release(run.id);
+      }
       const r = ctx.result;
       const prev = store.getRun(run.id);
       const status = prev.status === 'killed' ? 'killed' : r && !r.is_error && code === 0 ? 'success' : 'error';
@@ -473,12 +524,40 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       finish(-1);
     });
   });
+  }
 }
+
+// The Perplexity half of run setup: build the pack, decide whether a retry resumes an earlier thread, record it.
+async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal }) {
+  const secrets = [token, nonce].filter(Boolean);
+  const pack = await context.prepareRun({ runId: run.id, kind, cwd, ticketKey, incidentId, secrets, signal });
+  const live = context.liveFor(run.id);
+  const jobHash = context.jobIdentity({ provenance: provenanceOf(agent, kind), agentId, kind, ticketKey, incidentId, prompt, packHash: pack.hash, secrets });
+  const prev = store.lastThreadRun({ job_hash: jobHash });
+  const prevMeta = context.metaFor(prev);
+  let resumeThread = null;
+  // Same job, same task, same seat contract, same pack, delivered and not invalid: poll that thread, do not re-ask.
+  if (prev && prevMeta?.delivered && prevMeta.packThread && !prevMeta.invalid && prevMeta.remote?.status !== 'error' && Date.now() - Date.parse(prev.started_at) < 2 * 3600_000) {
+    resumeThread = prevMeta.packThread;
+    // Remote state carries over for display, but a completion must be observed again in this run (seq resets).
+    Object.assign(live.meta, { delivered: true, packThread: resumeThread, resumedFrom: prev.id, remote: prevMeta.remote ? { ...prevMeta.remote, seq: 0, source: 'resumed' } : null,
+      fetched: [...(prevMeta.fetched || [])], fetchedPages: prevMeta.fetchedPages, servedPages: prevMeta.servedPages });
+    ctx.state.threadSaved = resumeThread;
+  }
+  store.updateRun(run.id, { job_hash: jobHash, context_hash: pack.hash, context_meta: JSON.stringify(live.meta), ...(resumeThread ? { thread_id: resumeThread } : {}) });
+  store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'system',
+    text: `Context pack for Perplexity: ${pack.meta.chars} chars, sha256 ${pack.hash.slice(0, 12)}, base ${pack.meta.baseSha.slice(0, 10)}${kind === 'review' ? `, head ${pack.meta.headSha.slice(0, 10)}` : ''}${pack.meta.omittedChanged.length ? `, ${pack.meta.omittedChanged.length} changed file(s) omitted for size` : ''}${pack.meta.omitted.length ? `, ${pack.meta.omitted.length} item(s) listed as omitted` : ''}${resumeThread ? ` · resuming thread from run #${prev.id}` : ''}` });
+  ctx.state.pack = live;
+  return context.promptAppendix(pack, { resumeThread });
+}
+
+const preparing = new Map(); // runId -> AbortController while a Perplexity pack is being built
 
 export function killRun(runId, reason = 'killed') {
   const run = store.getRun(runId);
   if (!run || run.status !== 'running') return false;
   store.updateRun(runId, { status: 'killed', result_text: reason });
+  preparing.get(runId)?.abort();
   const pid = children.get(runId)?.pid ?? run.pid;
   if (pid) {
     try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
@@ -490,6 +569,7 @@ export function killRun(runId, reason = 'killed') {
 export function killAll(reason) {
   epoch += 1;
   for (const id of [...children.keys()]) killRun(id, reason);
+  for (const id of [...preparing.keys()]) killRun(id, reason); // runs still building their Perplexity pack
 }
 
 // Terminate every child process group and wait (SIGTERM, then SIGKILL) before the desk exits.
