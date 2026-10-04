@@ -15,7 +15,8 @@ const USAGE = `usage:
   desk revise KEY [--title T]   (revised proposal body on stdin; the author's research revision run only)
   desk connector-propose --name N   (connector case on stdin; thinking seats; owner approval required)
   desk groom KEY --complexity S|M|L|XL --area A [--priority P] [--risk high] [--assign SEAT] [--title T]   (spec on stdin)
-  desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT]   (body on stdin)
+  desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT] [--after KEY]   (body on stdin)
+  desk split KEY "<summary>"   (manager, after create-task: the parent stays open until its tasks are done)
   desk design   (design doc on stdin; principals)
   desk discussion-result   (response on stdin; manager in an owner discussion)
   desk delegate "<summary>"   (principals, after creating slices with create-task [--after SLICE])
@@ -76,7 +77,7 @@ switch (cmd) {
   case 'respond': case 'resolve': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'incident': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'context-file': body.path = pos.join(' '); break;
-  case 'groom': case 'reject': case 'comment': case 'needs-human': case 'revise': takeKey(); body.body = pos.join(' '); break;
+  case 'groom': case 'reject': case 'split': case 'comment': case 'needs-human': case 'revise': takeKey(); body.body = pos.join(' '); break;
   default: body.body = pos.join(' ');
 }
 // --findings @file.json: read the findings from a file the reviewer wrote (JSON is awkward to quote on a command line).

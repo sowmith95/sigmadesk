@@ -144,3 +144,40 @@ test('a failed design discussion can be retried, a queued one cancelled, and bot
   const routed = store.recentEvents({ ticket_key: t.key, limit: 50 }).find((x) => /Sent to the Engineering Manager/.test(x.text));
   assert.equal(routed.agent_id, 'system', 'desk routing notes are not attributed to Morgan');
 });
+
+test('a manager split keeps the parent open as an epic, enforces order, and closes it when the tasks settle', async () => {
+  const parent = store.createTicket({ title: 'Fill-cost journal', status: 'proposed', type: 'feature' });
+  const run = store.createRun({ agent_id: 'manager', ticket_key: parent.key, kind: 'groom', token: 'split-fixture', model: 'codex:fixture' });
+  const made = (s) => s.match(/created (\S+)/)[1];
+  const a = made(await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Verify fills', complexity: 'S', area: 'infra', body: 'Owner-run check' }));
+  const b = made(await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Contract and DDL', complexity: 'M', area: 'db', body: 'Draft', after: a }));
+  await assert.rejects(sched.deskAction(run, 'create-task', { parent: parent.key, title: 'x', complexity: 'S', area: 'db', body: 'y', after: 'SD-9999' }), /same parent/);
+  assert.equal(store.getTicket(b).after_key, a, 'the order is recorded, not just described');
+  // The old "reject the parent after splitting" instruction now records a split.
+  await sched.deskAction(run, 'reject', { key: parent.key, body: 'split into the tasks above' });
+  let p = store.getTicket(parent.key);
+  assert.equal(p.status, 'in_progress'); assert.equal(p.assignee, 'manager');
+  assert.match(store.listComments(parent.key).at(-1).body, /Split/);
+  store.updateTicket(a, { status: 'done' }); sched.rollupParent(parent.key);
+  assert.match(store.getTicket(parent.key).progress_msg, /1\/2/);
+  store.updateTicket(b, { status: 'done' }); sched.rollupParent(parent.key);
+  p = store.getTicket(parent.key);
+  assert.equal(p.status, 'done', 'the epic closes when every task is settled');
+  // A plain reject (no tasks) still closes the ticket.
+  const lone = store.createTicket({ title: 'Duplicate idea', status: 'proposed' });
+  const r2 = store.createRun({ agent_id: 'manager', ticket_key: lone.key, kind: 'groom', token: 'reject-fixture', model: 'codex:fixture' });
+  await sched.deskAction(r2, 'reject', { key: lone.key, body: 'duplicate' });
+  assert.equal(store.getTicket(lone.key).status, 'wontdo');
+});
+
+test('the owner can order a task after a sibling, without loops', () => {
+  const parent = store.createTicket({ title: 'Epic', status: 'in_progress' });
+  const [x, y, z] = ['X', 'Y', 'Z'].map((n) => store.createTicket({ title: n, status: 'todo', parent_key: parent.key }).key);
+  assert.equal(sched.ownerPatch(y, { after_key: x }).after_key, x);
+  assert.equal(sched.ownerPatch(z, { after_key: y }).after_key, y);
+  assert.throws(() => sched.ownerPatch(x, { after_key: z }), /loop/);
+  assert.throws(() => sched.ownerPatch(x, { after_key: x }), /same parent/);
+  const other = store.createTicket({ title: 'Elsewhere', status: 'todo' }).key;
+  assert.throws(() => sched.ownerPatch(y, { after_key: other }), /same parent/);
+  assert.equal(sched.ownerPatch(y, { after_key: '' }).after_key, null);
+});

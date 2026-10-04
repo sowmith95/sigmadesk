@@ -280,7 +280,7 @@ export function Details({ t, d }: { t: Ticket; d: Detail | null }) {
   const Fact = ({ k, children }: { k: string; children: ReactNode }) => <div className="grid grid-cols-[120px_1fr] gap-3"><span className="text-sm text-muted-foreground">{k}</span><span className="min-w-0 [overflow-wrap:anywhere]">{children}</span></div>;
   return (
     <div className="grid gap-5">
-      <Block title="Description"><div className="max-h-[40vh] overflow-auto whitespace-pre-line [overflow-wrap:anywhere]">{t.description || 'No description provided.'}</div></Block>
+      <Block title="Description"><div className="max-h-[50vh] overflow-auto">{t.description ? <Markdown text={t.description} self={t.key} /> : <p className="text-muted-foreground">No description provided.</p>}</div></Block>
       <Block title="Ticket">
         <Sel label="Stage" field="status" options={Object.entries(STAGE_LABEL).filter(([k]) => k !== 'done' || t.status === 'done')} value={t.status} ok="Stage changed" />
         <Sel label="Assignee" field="assignee" options={[['', 'Auto (by size)'], ...(S.meta.engineers || []).map((id: string) => [id, `${amap[id]?.name}, ${amap[id]?.role}`] as [string, string])]} value={t.assignee || ''} ok="Reassigned" />
@@ -288,11 +288,16 @@ export function Details({ t, d }: { t: Ticket; d: Detail | null }) {
         <Fact k="Area and size">{t.area || 'not set'}, {t.complexity || 'not sized'}</Fact>
         <Fact k="Branch"><span className="font-mono">{t.branch || 'none yet'}</span></Fact>
         <Fact k="Requested by">{(t.reporter && amap[t.reporter]?.name) || (t.reporter === 'owner' ? 'You' : t.reporter) || 'unknown'}</Fact>
+        {t.parent_key && <Sel label="Starts after" field="after_key" ok="Order saved"
+          options={[['', 'No order (can start any time)'], ...S.tickets.filter((x: Ticket) => x.parent_key === t.parent_key && x.key !== t.key).map((x: Ticket) => [x.key, `${x.key} ${nameOf(x)}`] as [string, string])]} value={t.after_key || ''} />}
         {t.parent_key && <Fact k="Part of"><button type="button" className="text-primary hover:underline" onClick={() => openTicket(t.parent_key!)}>{nameOf(ticketByKey(t.parent_key) || { title: t.parent_key })}</button></Fact>}
         {t.issue_number && S.meta.repo && <Fact k="GitHub issue"><a className="text-primary hover:underline" href={`https://github.com/${S.meta.repo}/issues/${t.issue_number}`} target="_blank" rel="noopener noreferrer">#{t.issue_number}</a></Fact>}
         <Fact k="Review rounds"><span className="font-mono">{String(t.qa_loops || 0)}</span></Fact>
       </Block>
-      {kids.length > 0 && <Block title="Slices"><ul className="grid gap-1.5">{kids.map((k: Ticket) => <li key={k.key} className="flex items-center justify-between gap-2"><button type="button" className="text-left hover:underline max-md:min-h-11" onClick={() => openTicket(k.key)}>{nameOf(k)}</button><Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag></li>)}</ul></Block>}
+      {kids.length > 0 && t.status === 'wontdo' && kids.some((k: Ticket) => !['done', 'wontdo'].includes(k.status)) && <Block tone="needs" title="Closed with open tasks">
+        <p>This ticket was closed while its tasks are still open. Reopen it as an epic: it tracks the tasks and closes itself when they are all done.</p>
+        <AsyncButton className="justify-self-start" run={async () => { await api('PATCH', `/api/tickets/${t.key}`, { status: 'in_progress' }); await loadSnapshot(); }} ok="Reopened; it closes when its tasks are done">Reopen as an epic</AsyncButton></Block>}
+      {kids.length > 0 && <Block title="Tasks"><ul className="grid gap-1.5">{kids.map((k: Ticket) => <li key={k.key} className="flex items-center justify-between gap-2"><button type="button" className="text-left hover:underline max-md:min-h-11" onClick={() => openTicket(k.key)}>{nameOf(k)}</button><span className="flex items-center gap-2">{k.after_key && <span className="text-xs text-muted-foreground">after {k.after_key}</span>}<Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag></span></li>)}</ul></Block>}
       {(d?.discussions || []).length > 0 && <Block title="Design discussions">{[...d!.discussions].sort((a: Detail, b: Detail) => b.id - a.id).slice(0, 4).map((x: Detail) => <p key={x.id} className="text-sm">#{x.id}: {x.status.replaceAll('_', ' ')}{x.error ? `, ${x.error}` : ''}</p>)}</Block>}
       <div className="flex flex-wrap gap-2">
         <AsyncButton variant="secondary" run={async () => { const v = window.prompt('Short name for this ticket (2 to 5 words):', nameOf(t)); if (v == null) return false; await api('POST', `/api/tickets/${t.key}/name`, { name: v }); await loadSnapshot(); }} ok="Renamed">Rename</AsyncButton>

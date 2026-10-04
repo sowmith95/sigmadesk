@@ -1,5 +1,5 @@
 {
-  "source": "74e27cc3751ed32300f3b0c36ec8bc4106693e649952759e8558d0c53ff21da1",
+  "source": "f88c725dc3f9efa8b37bf9298217223b3485f19bb01b5ccb5f65182ad637d3be",
   "outputs": {
     "public/app/chunks/Bits-vSemRLiX.js": "889903f56315ad9ae4fe36bfe7c0cafb337a01378dedf6ae2b12460c75cff8bb",
     "public/app/chunks/CommandPalette-0FtHD82V.js": "b97fce8b40576423f16a0c671226407ff5f4040b923029d15551983470d17cd8",
@@ -10,7 +10,7 @@
     "public/app/chunks/Research-Caz9zxjZ.js": "72c722ea9b2925118839f46172286ae8e48d52477cb1435ba947f50542e69af4",
     "public/app/chunks/Settings-CvL1fB6Z.js": "9c2335226b4d4123ac84d2c51c51327350d35bdfcee5bfd7acc15e560c186039",
     "public/app/chunks/x-DeAsObuE.js": "5abdc876bf388c7c06ef4aef076d8dfac5e57e4f304059bd503e783672e7a1f7",
-    "public/app/main.css": "b009a00b792edfd67e396fd12237ff41ba729e56bafee574307c365e33281f46",
-    "public/app/main.js": "b9689d6f3937a8936fd60269ef7deec9de8eb721e48689974de97e6c6d7634db"
+    "public/app/main.css": "081575583fd5e89f92ebc6e08fef15d8fab46dd60e872fc6f7b403749aa0f917",
+    "public/app/main.js": "6b9346df5e7079d4deeb8c00dc8136c6c9d697602af2e8a468eb64b4258acee3"
   }
 }
