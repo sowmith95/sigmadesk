@@ -46,6 +46,7 @@ fs.appendFileSync(${JSON.stringify(ghLog)}, JSON.stringify(a) + '\\n');
 const read = (f, def) => { try { return JSON.parse(fs.readFileSync(d + '/' + f, 'utf8')); } catch { return def; } };
 const out = (x) => { process.stdout.write(typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
 if (a[0] === 'pr' && a[1] === 'view' && a.includes('files')) out(read('files.json', []));
+if (a[0] === 'pr' && a[1] === 'ready' && fs.existsSync(d + '/slow-ready')) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 900);
 if (a[0] === 'pr' && a[1] === 'merge') {
   if (fs.existsSync(d + '/slow-merge')) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 800);
   if (fs.existsSync(d + '/fail-merge')) { process.stderr.write('HTTP 502 (timeout)'); process.exit(1); }
@@ -383,6 +384,7 @@ test('live gate right before dispatch: halt, Hold, risk, stop-all fence and a mo
   assert.equal(store.getTicket(t.key).review_stage, 'approved', 'rolled back to the queue');
   // each live condition re-read by authorizeMerge
   const intent = { key: t.key, head: t.head_sha, by: 'desk', deploys: false, epoch: runner.currentEpoch(), at: 'x', base: snap.base };
+  store.kvSet('train:intent', JSON.stringify(intent)); // the gate only accepts the active intent
   store.updateTicket(t.key, { review_stage: 'merging' });
   store.setSetting('paused', 'true');
   await assert.rejects(train.authorizeMerge(t.key, intent), /paused/);
@@ -397,6 +399,7 @@ test('live gate right before dispatch: halt, Hold, risk, stop-all fence and a mo
   landOnMain('notes/moved.txt', 'm\n', 'base moves after the CI was read');
   await assert.rejects(train.authorizeMerge(t.key, intent), /moved since its CI was read/);
   store.updateTicket(t.key, { review_stage: 'approved' });
+  store.kvSet('train:intent', 'null');
   // without a fresh base snapshot the train fails closed
   r = await train.consider(store.getTicket(t.key), { now: SAT, snap: null });
   assert.match(r.reason, /no fresh view of main/);
@@ -519,6 +522,7 @@ test('the live gate re-checks halt AFTER its only await, right before dispatch',
   const snap = await train.watchBase();
   store.updateTicket(t.key, { review_stage: 'merging' });
   const intent = { key: t.key, head: t.head_sha, by: 'desk', deploys: false, epoch: runner.currentEpoch(), at: 'y', base: snap.base };
+  store.kvSet('train:intent', JSON.stringify(intent));
   const pending = train.authorizeMerge(t.key, intent); // now awaiting the remote base lookup
   store.setSetting('paused', 'true'); // halt lands during that await
   await assert.rejects(pending, /paused/);
@@ -527,6 +531,7 @@ test('the live gate re-checks halt AFTER its only await, right before dispatch',
   store.updateTicket(t.key, { merge_hold: 'late hold' });
   await assert.rejects(again, /on hold/);
   store.updateTicket(t.key, { merge_hold: null, review_stage: 'approved' });
+  store.kvSet('train:intent', 'null');
 });
 
 test('required checks: a missing suite blocks; the auto list only grows; none ⇒ owner asked', async () => {
@@ -668,12 +673,12 @@ test('market-window boundary: a sweep that started at 09:29:59 ET cannot dispatc
 
 test('required checks are learned from base commits only (pull-request workflows), never from owner merges', async () => {
   const prs = await prsMod();
-  prs.setRequiredChecks([], 'auto'); store.kvSet('ci:learned', '[]');
+  prs.setRequiredChecks([], 'auto'); store.kvSet('ci:bases', '[]');
   const snap = await train.watchBase();
   setGh(`runs-${snap.base}.json`, [{ path: '.github/workflows/pr.yml', status: 'completed', conclusion: 'success', id: 1, suite: 11 },
     { path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success', id: 2, suite: 22 }]);
-  setGh('check-runs.json', [{ name: 'unit-tests', conclusion: 'success', suite: 11 }, { name: 'deploy-job', conclusion: 'success', suite: 22 },
-    { name: 'flaky', conclusion: 'failure', suite: 11 }]);
+  setGh('check-runs.json', [{ name: 'unit-tests', status: 'completed', conclusion: 'success', suite: 11 }, { name: 'deploy-job', status: 'completed', conclusion: 'success', suite: 22 },
+    { name: 'flaky', status: 'completed', conclusion: 'failure', suite: 11 }]);
   setGh('status.json', [{ context: 'ci/legacy', state: 'success' }]);
   await train.learnFromBase(snap.base);
   assert.deepEqual(prs.requiredChecks().names.sort(), ['ci/legacy', 'unit-tests'], 'push-only deploy jobs and failures are not learned');
@@ -729,4 +734,58 @@ test('updating a seat clone never discards uncommitted edits', async () => {
   assert.equal(backups.length, 1);
   assert.equal(fs.readFileSync(path.join(path.dirname(ws), backups[0], 'notes/dirty.txt'), 'utf8'), 'uncommitted work\n');
   assert.equal(g(ws, 'rev-parse', 'HEAD'), t.head_sha);
+});
+
+// ---------------- fourth verification round ----------------
+test('owner merge vs refresh: no refresh during an owner merge, and a branch rewritten mid-call is never merged', async () => {
+  resetTrain();
+  const t = await approvedPr('docs/owner-vs-refresh.md');
+  store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
+  for (const r of store.unfinishedRuns().filter((x) => x.ticket_key === t.key)) store.updateRun(r.id, { status: 'success', ended_at: store.now(), token: null });
+  setGh('pr.json', { number: 7, title: `[${t.key}] x`, state: 'OPEN', isDraft: true, mergeable: 'MERGEABLE', headRefOid: t.head_sha, headRefName: t.branch, baseRefName: 'main', body: 'SigmaDesk', statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }] });
+  setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '9'.repeat(40) } });
+  const before = merges().length;
+  // 1) the owner merge pauses at `gh pr ready`; a refresh attempted meanwhile is refused (active merge intent)
+  flag('slow-ready', true);
+  let p = train.ownerMerge(7, { expectedSha: t.head_sha }, SAT);
+  await new Promise((r) => setTimeout(r, 300));
+  await assert.rejects(sched.ownerRefreshBase(t.key, {}), /merge of this PR is in progress/);
+  await p;
+  flag('slow-ready', false);
+  assert.equal(merges().length, before + 1, 'the owner merge itself went through');
+  // 2) the exact repro: pause at `gh pr ready`, the branch is rewritten (refresh-style invalidation), then resume
+  const u = await approvedPr('docs/owner-vs-refresh-2.md');
+  store.updateTicket(u.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
+  setGh('pr.json', { number: 7, title: `[${u.key}] x`, state: 'OPEN', isDraft: true, mergeable: 'MERGEABLE', headRefOid: u.head_sha, headRefName: u.branch, baseRefName: 'main', body: 'SigmaDesk', statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }] });
+  flag('slow-ready', true);
+  p = train.ownerMerge(7, { expectedSha: u.head_sha }, SAT);
+  await new Promise((r) => setTimeout(r, 300));
+  store.claimBranchUpdate(u.key, 'refresh', 'owner branch refresh');
+  store.supersedeReviews(u.key, null);
+  store.updateTicket(u.key, { head_sha: null, qa_sha: null, status: 'todo' });
+  await assert.rejects(p, /Not merged: (an owner branch refresh|the branch is being rewritten|the ticket's commit changed|QA has not passed)/);
+  flag('slow-ready', false);
+  assert.equal(merges().length, before + 1, 'the old commit was not dispatched');
+  assert.equal(train.activeIntentFor(u.key), null, 'the intent was rolled back');
+  store.releaseBranchUpdate(u.key, 'refresh');
+});
+
+test('CI learning waits until every check on a base commit has completed, then adds what passed', async () => {
+  const prs = await prsMod();
+  prs.setRequiredChecks([], 'auto'); store.kvSet('ci:bases', '[]');
+  const snap = await train.watchBase();
+  setGh(`runs-${snap.base}.json`, [{ path: '.github/workflows/pr.yml', status: 'in_progress', conclusion: null, id: 1, suite: 11 }]);
+  setGh('check-runs.json', [{ name: 'lint', status: 'completed', conclusion: 'success', suite: 11 }, { name: 'tests', status: 'in_progress', conclusion: null, suite: 11 }]);
+  setGh('status.json', []);
+  const t0 = Date.now();
+  await train.learnFromBase(snap.base, t0);
+  assert.deepEqual(prs.requiredChecks().names, [], 'nothing learned while tests are still running');
+  setGh(`runs-${snap.base}.json`, [{ path: '.github/workflows/pr.yml', status: 'completed', conclusion: 'success', id: 1, suite: 11 }]);
+  setGh('check-runs.json', [{ name: 'lint', status: 'completed', conclusion: 'success', suite: 11 }, { name: 'tests', status: 'completed', conclusion: 'success', suite: 11 }]);
+  await train.learnFromBase(snap.base, t0 + 60_000);
+  assert.deepEqual(prs.requiredChecks().names, [], 'not re-polled within 10 minutes');
+  await train.learnFromBase(snap.base, t0 + 11 * 60_000);
+  assert.deepEqual(prs.requiredChecks().names.sort(), ['lint', 'tests'], 'both learned once complete');
+  fs.rmSync(path.join(ghDir, `runs-${snap.base}.json`));
+  prs.setRequiredChecks(['tests'], 'owner');
 });

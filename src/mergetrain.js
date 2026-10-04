@@ -536,13 +536,31 @@ export const clock = { now: () => new Date() }; // intent.at → started (this p
  * the last check and the dispatch: stop-all fence, halt, ticket status, Hold, stored + diff risk, published approvals,
  * the busy window and deploy-lock ownership for deploying changes.
  */
-export async function authorizeMerge(key, intent) {
+export async function authorizeMerge(key, intent, ctx = {}) {
   const fail = (why) => { throw Object.assign(new Error(`Not merged: ${why}.`), { status: 409 }); };
   const live = intent.base ? await runner.remoteHead(config.project.baseBranch).catch(() => null) : null;
   // ---- synchronous from here to the dispatch ----
   if (intent.base && live !== intent.base) fail(`${config.project.baseBranch} moved since its CI was read (${short(intent.base)} → ${short(live) || '?'}); re-checking next cycle`);
   if (intent.epoch !== runner.currentEpoch()) fail('the desk was stopped (circuit breaker)');
   const t = store.getTicket(key);
+  const mine = intentGet();
+  if (!mine || mine.at !== intent.at) fail('this merge is no longer the active merge intent');
+  if (ctx.expectedSha && intent.head && ctx.expectedSha !== intent.head) fail('the requested commit is not the one this merge was started for');
+  if (t) {
+    // Every merge of a desk ticket (owner too): the branch must not be in the middle of a rewrite, and the commit must
+    // still be the ticket's commit. QA and both approvals must hold for it unless the owner gave a review override.
+    if (TERMINAL.has(t.status)) fail(`the ticket is ${t.status}`);
+    const r = refresh.current(key);
+    if (r && r.status !== 'published') fail('an owner branch refresh of this PR is in progress');
+    const claim = store.branchUpdateOf(key);
+    if (claim) fail(`the branch is being rewritten (${claim.note || claim.who})`);
+    if (!t.head_sha || t.head_sha !== intent.head) fail('the ticket\'s commit changed since this merge started');
+    if (store.inReviewFlow(key) && !(ctx.overridden || []).length) {
+      if (t.qa_sha !== intent.head) fail('QA has not passed this exact commit');
+      const ap0 = store.approvalsAt(key, intent.head);
+      if (!ap0.ok || ap0.unpublished) fail('the two approvals are not complete and published at this commit');
+    }
+  }
   if (intent.by === 'desk') {
     if (store.getSettings().paused === 'true') fail('the desk is paused');
     if (t?.status !== 'ready_for_human' || t.review_stage !== 'merging') fail('the ticket is no longer approved and queued');
@@ -559,6 +577,9 @@ export async function authorizeMerge(key, intent) {
     if (!l || l.key !== key || l.state !== 'merging' || l.intent_at !== intent.at) fail('the deploy lock is not held for this merge');
   }
 }
+
+/** The merge intent currently being dispatched or confirmed for this ticket (null if none). */
+export const activeIntentFor = (key) => { const i = intentGet(); return i && i.key === key ? i : null; };
 
 /** Persist the intent, the ticket's "merging" stage and (for deploying changes) the deploy lock in ONE transaction. */
 function beginMerge(key, n, head, dep, by, base, epoch = runner.currentEpoch()) {
@@ -694,7 +715,7 @@ export async function consider(t, { now = new Date(), snap = null, allowMerge = 
   const am = config.review.autoMerge || {};
   try {
     await dispatch(intent, () => prs.merge(n, { actor: 'desk', method: am.method || 'squash', expectedSha: t.head_sha, inBusyWindow: dep.deploys && inBusyWindow(now),
-      halted: store.getSettings().paused === 'true', preflight: () => authorizeMerge(t.key, intent) }));
+      halted: store.getSettings().paused === 'true', preflight: (ctx) => authorizeMerge(t.key, intent, ctx) }));
   } catch (err) {
     if (err.dispatched) { mergeUnknown(intent, err); return wait('GitHub did not confirm the merge — checking its state before anything else merges', 'unknown'); }
     abortMerge(intent);
@@ -728,9 +749,10 @@ export async function ownerMerge(number, opts, now = new Date()) {
   const busy = !!dep.deploys && inBusyWindow(now);
   const key = t?.key || `PR#${n}`;
   if (dep.deploys) await deployLock();
+  // The intent is recorded for the whole call even for non-deploying merges: a branch refresh is refused meanwhile.
   const intent = beginMerge(key, n, t?.head_sha || null, dep, 'owner', null);
   try {
-    const out = await dispatch(intent, () => prs.merge(n, { ...opts, inBusyWindow: busy, actor: 'owner', preflight: () => authorizeMerge(key, intent) }));
+    const out = await dispatch(intent, () => prs.merge(n, { ...opts, inBusyWindow: busy, actor: 'owner', preflight: (ctx) => authorizeMerge(key, intent, ctx) }));
     let mergeSha = null;
     try { mergeSha = (await prs.mergeInfo(n)).mergeCommit?.oid || null; } catch { /* the lock escalates later */ }
     mergedOk(intent, mergeSha);
@@ -763,9 +785,30 @@ async function observeExternal(prev, next) {
  * push-only deploy job never reports on a PR, so it must not become "required"), plus SUCCESS commit statuses and
  * checks from apps that are not Actions workflows. Each base commit is read once.
  */
-export async function learnFromBase(sha) {
-  if (!sha || kvList('ci:learned').includes(sha)) return null;
+export async function learnFromBase(sha, now = Date.now()) {
+  if (!sha) return null;
+  // The last few base commits are re-polled (at most every 10 min each) until ALL their checks have completed; only
+  // then are their passing checks learned. A commit with anything pending/queued teaches nothing yet. Growth only.
+  const known = kvJsonList('ci:bases');
+  const bases = known.some((b) => b.sha === sha) ? known : [...known, { sha, polled: 0 }].slice(-5);
+  const out = [];
+  for (const b of bases) {
+    if (b.done || now - (b.polled || 0) < 10 * 60_000) continue;
+    b.polled = now;
+    const r = await learnCommit(b.sha);
+    if (r.complete) b.done = true;
+    out.push({ sha: b.sha, ...r });
+  }
+  store.kvSet('ci:bases', JSON.stringify(bases));
+  return out;
+}
+const kvJsonList = (k) => { try { return JSON.parse(store.kvGet(k) || '[]') || []; } catch { return []; } };
+async function learnCommit(sha) {
   const [{ runs, statuses }, wfRuns, wfs] = await Promise.all([prs.checksForCommit(sha), prs.runsForCommit(sha), workflowsAtBase().catch(() => null)]);
+  const pending = runs.some((r) => String(r.status || '').toLowerCase() !== 'completed')
+    || wfRuns.some((r) => String(r.status || '').toLowerCase() !== 'completed')
+    || statuses.some((x) => ['pending', 'expected'].includes(String(x.state).toLowerCase()));
+  if (pending) return { complete: false, learned: [] };
   const prWorkflow = (file) => {
     const text = wfs?.find((w) => w.file === file)?.text;
     const on = text ? workflows.parseWorkflow(text)?.on : null;
@@ -776,8 +819,8 @@ export async function learnFromBase(sha) {
     ...runs.filter((r) => String(r.conclusion).toUpperCase() === 'SUCCESS' && (!suiteFile.has(r.suite) || prWorkflow(suiteFile.get(r.suite)))).map((r) => r.name),
     ...statuses.filter((x) => String(x.state).toUpperCase() === 'SUCCESS').map((x) => x.context),
   ];
-  store.kvSet('ci:learned', JSON.stringify([...kvList('ci:learned'), sha].slice(-50)));
-  return prs.learnChecks(names);
+  prs.learnChecks(names);
+  return { complete: true, learned: names };
 }
 
 let sweeping = null;

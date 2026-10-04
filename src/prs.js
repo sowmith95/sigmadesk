@@ -176,7 +176,7 @@ export function learnChecks(names = []) {
 /** Check runs (with their check suite) and commit statuses GitHub recorded for a commit. */
 export async function checksForCommit(sha) {
   const runs = JSON.parse(await gh(['api', `repos/${repo()}/commits/${encodeURIComponent(String(sha))}/check-runs?per_page=100`,
-    '--jq', '[.check_runs[] | {name, conclusion, suite: .check_suite.id}]']) || '[]');
+    '--jq', '[.check_runs[] | {name, status, conclusion, suite: .check_suite.id}]']) || '[]');
   const statuses = JSON.parse(await gh(['api', `repos/${repo()}/commits/${encodeURIComponent(String(sha))}/status`,
     '--jq', '[.statuses[] | {context, state}]']) || '[]');
   return { runs, statuses };
@@ -284,7 +284,7 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
     store.logEvent({ kind: 'action', agent_id: 'owner', ticket_key: key, text: `merge override on #${p.number}: ${overridden.join('; ')} — reason: ${String(overrideReason).trim()}`.slice(0, 1000) });
   }
   // The live gate (halt/stop-all fence, Hold, risk, window, deploy lock, base freshness) runs last, right before dispatch.
-  if (preflight) await preflight();
+  if (preflight) await preflight({ overridden, expectedSha });
   // --match-head-commit: GitHub merges exactly the approved commit, or refuses if it moved. From here on a failure is
   // "unknown" (GitHub may have merged before the error/timeout reached us): callers must reconcile, never roll back.
   try { await gh(['pr', 'merge', String(p.number), '-R', repo(), `--${method}`, '--delete-branch', '--match-head-commit', expectedSha]); }

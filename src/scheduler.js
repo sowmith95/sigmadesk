@@ -1104,7 +1104,7 @@ export async function ownerRefreshBase(key, { expected_updated_at } = {}) {
   need(t?.head_sha && t.pr_url && ['needs_human', 'ready_for_human', 'todo'].includes(t.status), 'Refresh needs a submitted PR awaiting work or owner review');
   if (expected_updated_at && expected_updated_at !== t.updated_at) throw Object.assign(new Error('The ticket changed. Read it before refreshing.'), { status: 409 });
   if (t.active_run || store.unfinishedRuns().some((r) => r.ticket_key === key)) throw Object.assign(new Error('Wait for this ticket’s workers to finish before refreshing.'), { status: 409 });
-  need(!['merging', 'merge_unknown'].includes(t.review_stage), 'A merge of this PR is being confirmed with GitHub; wait for it to settle');
+  need(!['merging', 'merge_unknown'].includes(t.review_stage) && !mergetrain.activeIntentFor(key), 'A merge of this PR is in progress or being confirmed with GitHub; wait for it to settle');
   need(!store.conflictJobsFor(key).some((j) => ['pending', 'running'].includes(j.status)), 'The builder is resolving a merge conflict on this branch; wait for it to finish');
   store.updateTicket(key, { active_run: -1, status: 'needs_human', progress_msg: 'desk refreshing remote base' });
   try {
