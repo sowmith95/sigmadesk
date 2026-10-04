@@ -81,6 +81,20 @@ model and seat contract match. Partial changes stay in the ticket clone and must
 Adding another execution engine means
 implementing one file in `src/engines/` (`command()` + `parse()` → normalized events).
 
+**Perplexity context packs.** A Perplexity-backed thinking seat (groom, design, consult, owner discussion, review,
+research, triage, investigate) no longer relies on its local relay to pick what to send. `src/context.js` builds a
+deterministic pack from committed git objects: repo, base/head SHAs, the frozen ticket and acceptance criteria, decision
+history, parent design, prerequisites and siblings, playbook rules, protected paths, the files in scope with labelled
+excerpts, and "references found by search" (text matches, not proven callers). Reviews carry the full committed diff
+`<base>...<head_sha>` in whole hunks; when it exceeds the budget the pack says exactly which files or hunks were omitted.
+Secret-looking paths are listed by name only; symlinks and traversal are rejected; run tokens and verdict codes never
+appear. The relay must send the pack verbatim. The desk checks each outgoing call, logs "Perplexity did not receive
+the full context" when it was not sent, records the pack hash and Perplexity `thread_id` on the run, and refuses
+`desk accept pass` until the pack arrived and every omitted changed file was fetched (`desk context-file <path>`) and
+sent on the same thread. Retries resume polling the recorded thread rather than asking again. Knobs under
+`engines.perplexity`: `contextMaxChars` (60000, the whole outgoing message), `relayReserveChars` (8000),
+`remoteWaitMinutes` (8; idle watchdog and run timeouts are raised above it) and `followupRounds` (1).
+
 ## Owner decisions and discussions
 
 Tickets awaiting you show **Approve**, **Needs correction** and **Reject** beside one message box. Approval continues
@@ -236,6 +250,7 @@ Everything lives in `sigmadesk.config.json` (gitignored). See `sigmadesk.config.
 | `project.extraAllowedBash`, `readOnlyPaths` | E.g. a shared virtualenv the seats may use. |
 | `team.<seat>` | Override `name`, `model`, `enabled`, `charter` per seat. |
 | `limits.*` | Concurrency, busy window, daily budget, per-run budgets, timeouts. |
+| `engines.perplexity.*` | Context-pack cap (`contextMaxChars`), remote wait for pending threads, follow-up rounds. |
 | `review.*` | Acceptance reviews, requester session resume (opt-in), rework session resume. |
 | `watch.*` | Log sources (`loki` / `docker` / `file`), thresholds, storm and regression handling. |
 | `pm.*` | PM persona, competitors to study, cadence. |
@@ -248,7 +263,7 @@ Live knobs (concurrency, budget, PM cadence, GitHub sync, draft PRs) are also ed
 
 Agents talk to the desk only through `bin/desk` over the socket: `desk progress 40 "writing tests"`, `desk comment`,
 `desk needs-human "<question>"`, `desk propose`, `desk groom`, `desk consult`, `desk submit`, `desk qa pass|fail`,
-`desk accept pass|changes`, `desk incident file|mute|page`. Run `bin/desk --help` for the full list.
+`desk accept pass|changes`, `desk incident file|mute|page`, `desk context-file <path>` (Perplexity seats). Run `bin/desk --help` for the full list.
 Every subcommand also accepts `--help` or `-h`; help never submits a desk action.
 
 ## How it compares
