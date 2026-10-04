@@ -19,6 +19,8 @@ import * as research from './research.js';
 import * as researchReview from './research-review.js';
 import * as connectors from './connectors.js';
 import * as features from './features.js';
+import * as epicReview from './epic-review.js';
+import * as flow from '../public/flow.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 import { selectionFor, pinnedSelection } from './dispatch.js';
@@ -85,6 +87,8 @@ export function setStatus(key, status, extra = {}) {
 }
 researchReview.hooks.setStatus = setStatus; // holds, waivers and owner decisions on research proposals go through the same door
 features.hooks.setStatus = setStatus; // approving a feature plan starts the feature through the same door
+// An epic review changes order, priority and owner tasks through the owner's own doors (same checks, same events).
+Object.assign(epicReview.hooks, { ownerTask: (...a) => ownerTask(...a), ownerReply: (...a) => ownerReply(...a), ownerPatch: (...a) => ownerPatch(...a) });
 
 // Order may cross sub-epics within one feature (a slice of SD-30 may wait for SD-29, a task of the parent SD-28): two
 // tickets can be ordered when they share the same top-level ancestor.
@@ -172,6 +176,16 @@ export function repairSplitEpics() {
   for (const p of fixed) github.syncIssueState(p.key);
   if (fixed.length) store.logEvent({ kind: 'system', agent_id: 'system', text: `Repaired ${fixed.length} split parent${fixed.length === 1 ? '' : 's'} closed by the old split rule: ${fixed.map((p) => p.key).join(', ')}.` });
   return fixed.map((p) => p.key);
+}
+
+// An ancestor epic ordered after an unfinished task holds this task (SD-30 waiting for SD-29 holds SD-32).
+export function ancestorWaits(t) {
+  const seen = new Set([t.key]);
+  for (let p = t.parent_key && store.getTicket(t.parent_key); p && !seen.has(p.key) && seen.size < 12; p = p.parent_key && store.getTicket(p.parent_key)) {
+    seen.add(p.key);
+    if (p.after_key && store.getTicket(p.after_key)?.status !== 'done') return p;
+  }
+  return null;
 }
 
 function stall(ticket, reason) {
@@ -291,9 +305,11 @@ function orphanedSlice(t) {
 // Preparing a clone takes seconds; if the owner moved, rejected or reassigned the ticket meanwhile, do not start.
 function stillWanted(key, status, agentId) {
   const now = store.getTicket(key);
-  if (now?.status === status && (!now.assignee || now.assignee === agentId || status !== 'in_progress')) return true;
+  const blocked = status === 'in_progress' && now && (now.owner_task || ancestorWaits(now) || (now.after_key && store.getTicket(now.after_key)?.status !== 'done'));
+  if (now?.status === status && !blocked && (!now.assignee || now.assignee === agentId || status !== 'in_progress')) return true;
   store.updateAgent(agentId, { status: 'idle', current_ticket: null, current_run: null });
-  if (now?.active_run === -1) store.updateTicket(key, { active_run: null });
+  if (blocked && now.status === status) setStatus(key, 'todo', { active_run: null, progress_msg: now.owner_task ? 'your task' : 'waiting for its prerequisite' });
+  else if (now?.active_run === -1) store.updateTicket(key, { active_run: null });
   store.logEvent({ agent_id: agentId, ticket_key: key, kind: 'system', text: `start cancelled: the ticket changed (${now?.status || 'gone'}) while its workspace was being prepared` });
   return false;
 }
@@ -601,7 +617,8 @@ export function health() {
         : t.status === 'review' ? (t.review_stage === 'resolving' ? store.conflictJobsFor(t.key).at(-1)?.seat : reviews.enabled() ? reviews.jobFor(t)?.seat : requesterOf(t)) : t.assignee || routeTicket(t);
       const chosen = selectionFor(seat);
       // `code` is the structured reason the UI classifies on; `reason` stays human-readable.
-      const [code, why] = settings.paused === 'true' ? ['paused', 'Desk paused'] : t.after_key && store.getTicket(t.after_key)?.status !== 'done' ? ['dependency', `Waiting for ${t.after_key} to merge`]
+      const held = ancestorWaits(t);
+      const [code, why] = t.owner_task ? ['owner_task', 'Your task: the team cannot do it'] : settings.paused === 'true' ? ['paused', 'Desk paused'] : t.after_key && store.getTicket(t.after_key)?.status !== 'done' ? ['dependency', `Waiting for ${t.after_key} to merge`] : held ? ['dependency', `Waiting for ${held.after_key} (its epic ${held.key} waits for it)`]
         : !chosen.seat ? ['provider_hold', chosen.reason] : setupHold(seat) ? ['setup_retry', `Setup retry after ${setupHold(seat).until}`] : !agentIdle(seat) ? ['seat_busy', 'Seat busy']
           : budgetHeadroom(settings) < runner.runBudget(seat) ? ['budget', 'Daily budget reached'] : ['tick', 'Ready for next scheduler tick'];
       return { key: t.key, seat, code, reason: why, engine: chosen.seat?.engine, fallback: chosen.fallback || false };
@@ -684,6 +701,10 @@ export async function tick() {
     // Owner-requested feature grooming (Codex) runs before ordinary grooming: the owner is waiting on it.
     const plan = features.next();
     if (plan && slots > 0 && agentIdle('manager')) go('manager', (f) => features.launch(plan, f), features.ENGINE, 'feature_groom');
+    // An epic whose tasks are parked on questions gets one manager review (with a principal) instead of N questions.
+    if (!epicReview.next()) { const auto = epicReview.autoCandidate(); if (auto && budgetHeadroom() > 0) epicReview.start(auto, { by: 'desk', reason: 'two or more tasks in this epic are parked on questions' }); }
+    const review = epicReview.next();
+    if (review && slots > 0 && agentIdle('manager')) go('manager', (f) => epicReview.launch(review, f), features.ENGINE, 'epic_review');
     // 2b. Two-reviewer code review (context, then independent) and the author's answers; legacy: requester acceptance.
     if (reviews.enabled()) {
       for (const job of reviews.nextJobs()) {
@@ -739,6 +760,8 @@ export async function tick() {
       if (features.holds(t)) continue; // a feature starts only through its approved plan
       if (t.after_key && store.getTicket(t.after_key)?.status === 'wontdo') { orphanedSlice(t); continue; }
       if (t.after_key && store.getTicket(t.after_key)?.status !== 'done') continue; // waits for its predecessor to merge
+      if (t.owner_task) continue; // the owner's own task: never a seat's
+      if (ancestorWaits(t)) continue; // an epic that waits holds its tasks too
       const parent = t.parent_key && store.getTicket(t.parent_key);
       if (parent && productReview.required(parent) && ['proposed','todo'].includes(parent.status)) {
         if (parent.active_run || parent.status==='proposed') continue;
@@ -771,6 +794,7 @@ export function recoverOrphans() {
   productReview.recover();
   researchReview.recover();
   features.recover();
+  epicReview.recover();
   repairSplitEpics();
   connectors.recover();
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
@@ -820,6 +844,7 @@ export async function deskAction(run, cmd, body = {}) {
   if (run.kind === 'product_review') need(['context-file'].includes(cmd), 'Product reviewers are read-only; return a structured report, not desk mutations');
   if (run.kind === 'council_review') need(false, 'council calls cannot invoke desk commands');
   if (run.kind === 'feature_groom') need(false, 'a grooming session is read-only: return the plan JSON as your final answer');
+  if (run.kind === 'epic_review') need(['list', 'show', 'consult', 'context-file'].includes(cmd), 'an epic review reads and consults; return the review JSON as your final answer');
   // Research kinds are authorized by the run, not the seat: proposals come from research runs that carry a program,
   // a revision run may only revise its own proposal, and reviewers/assessors are read-only.
   if (run.kind === 'research') need(['show', 'list', 'comment', 'needs-human', 'progress', 'propose', 'connector-propose', 'context-file'].includes(cmd), 'research runs read and file proposals; they do not groom, design or build');
@@ -956,6 +981,32 @@ export async function deskAction(run, cmd, body = {}) {
     case 'create-task': {
       need(body.title && body.body, 'title and body required');
       need(COMPLEXITIES.includes(body.complexity) && AREAS.includes(body.area), 'complexity and area required');
+      // Order is enforced only through --after. A gate written in the text ("gated on SD-29") becomes the dependency
+      // when it names exactly one open task of this feature; several need an explicit --after.
+      // --after none: the text names other tasks but this one does not wait for them.
+      let gateNote = '';
+      const parentOf = PRINCIPALS.includes(agentId) ? run.ticket_key : (body.parent || key);
+      if (body.after === 'none') body.after = null;
+      else if (!body.after) {
+        const pseudo = { key: 'NEW-0', parent_key: parentOf, title: body.title, description: body.body, status: 'todo' };
+        const ix = flow.index([...store.listTickets(), pseudo]);
+        const gates = flow.textGates(pseudo, ix, { strong: true });
+        need(gates.length <= 1, `this task's text says it waits on ${gates.join(', ')}; the desk records one prerequisite per task. Pass --after with the one that merges last, or split the task so each part waits on one (--after none if it does not wait at all)`);
+        if (gates.length === 1) { body.after = gates[0]; gateNote = ` (recorded the gate you wrote: after ${gates[0]}; pass --after none if that was not a dependency)`; }
+        else {
+          const maybe = flow.textGates(pseudo, ix);
+          if (maybe.length) gateNote = ` (your text mentions ${maybe.join(', ')}; if it must wait, run desk create-task again with --after, otherwise ignore this)`;
+        }
+      }
+      // A task can never wait for the epic that contains it: that epic only finishes when this task does.
+      if (body.after) { const host = store.getTicket(parentOf); const ix = flow.index(store.listTickets()); need(!host || ![host, ...flow.ancestors(host, ix)].some((a) => a.key === body.after), `--after ${body.after} contains this task; it would wait forever`); }
+      // --owner "<why>": a step only the owner can do (access no seat has). It goes to the owner, never to a seat.
+      const ownerWhy = typeof body.owner === 'string' && body.owner.trim() ? body.owner.trim().slice(0, 500) : body.owner === true ? 'Only the owner can do this step.' : null;
+      const asOwnerTask = (k) => {
+        if (!ownerWhy) return;
+        store.updateTicket(k, { owner_task: 1, assignee: null });
+        store.addComment(k, agentId, `🙋 **This is your task**: ${ownerWhy}`);
+      };
       if (PRINCIPALS.includes(agentId)) {
         // A principal's slices: small, built by cheaper seats, attached to the ticket being designed.
         need(run.kind === 'design' && run.ticket_key, 'slices are created during a design run');
@@ -968,9 +1019,10 @@ export async function deskAction(run, cmd, body = {}) {
           complexity: body.complexity, priority: parent.priority, assignee: body.assign || routeSlice(body), reporter: agentId, source: 'agent', parent_key: run.ticket_key });
         // The slicer is the context reviewer later; slices inherit the parent's risk.
         store.updateTicket(slice.key, { designer: agentId, risk: parent.risk || null, ...(body.after ? { after_key: body.after } : {}) });
-        ev(`sliced ${slice.key} (${body.complexity}) for ${agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
+        asOwnerTask(slice.key);
+        ev(`sliced ${slice.key} (${body.complexity}) for ${ownerWhy ? 'the owner' : agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
         github.createIssue(slice.key);
-        return `created ${slice.key} → ${slice.assignee}`;
+        return `created ${slice.key} → ${ownerWhy ? 'owner' : slice.assignee}${gateNote}`;
       }
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
       const parentKey = body.parent || key;
@@ -980,9 +1032,10 @@ export async function deskAction(run, cmd, body = {}) {
         complexity: body.complexity, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', assignee, reporter: agentId, source: 'agent', parent_key: parentKey });
       const parentRisk = store.getTicket(parentKey)?.risk;
       store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null, ...(body.after ? { after_key: body.after } : {}) });
-      ev(`created task ${t.key} for ${agentById[assignee].role}${body.after ? ` after ${body.after}` : ''}`, t.key);
+      asOwnerTask(t.key);
+      ev(`created task ${t.key} for ${ownerWhy ? 'the owner' : agentById[assignee].role}${body.after ? ` after ${body.after}` : ''}`, t.key);
       github.createIssue(t.key);
-      return `created ${t.key} assigned to ${assignee}`;
+      return `created ${t.key} assigned to ${ownerWhy ? 'the owner' : assignee}${gateNote}`;
     }
     case 'design':
       need(ticket && ticket.key === run.ticket_key && run.kind === 'design', 'design only on the ticket you are designing');
@@ -1038,15 +1091,15 @@ export async function deskAction(run, cmd, body = {}) {
     case 'consult': {
       need(['principal-be', 'principal-fe', 'dba'].includes(body.agent), 'consult principal-be | principal-fe | dba');
       need(body.body, 'question required');
-      need(['groom', 'owner_discussion'].includes(run.kind), 'consults happen during grooming or owner discussions');
-      if (run.kind === 'owner_discussion') {
+      need(['groom', 'owner_discussion', 'epic_review'].includes(run.kind), 'consults happen during grooming, epic reviews or owner discussions');
+      if (run.kind === 'owner_discussion' || run.kind === 'epic_review') {
         const targets = consultTargets.get(run.id) || new Set();
         need(!targets.has(body.agent), 'each principal can be consulted once per discussion');
         need(targets.size < 2, 'at most two principals per discussion');
         targets.add(body.agent); consultTargets.set(run.id, targets);
       }
       consultsByRun.set(run.id, (consultsByRun.get(run.id) || 0) + 1);
-      const maxConsults = run.kind === 'owner_discussion' ? 2 : config.limits.maxConsultsPerGroom;
+      const maxConsults = ['owner_discussion', 'epic_review'].includes(run.kind) ? 2 : config.limits.maxConsultsPerGroom;
       need(consultsByRun.get(run.id) <= maxConsults, `consult limit (${maxConsults}) reached`);
       need(budgetHeadroom() >= runner.runBudget(body.agent), 'daily risk limit reached — groom without a consult');
       need(store.listAgentStates().filter((a) => a.status === 'working').length < capacity() + 1, 'desk at capacity — groom without a consult');
@@ -1404,6 +1457,48 @@ export async function ownerDecision(key, { decision, message = '', expected_upda
   github.flushComments(); return store.getTicket(key);
 }
 
+/**
+ * Owner tasks: a step only the owner can do. Marking one takes it away from the team (any parked question stays on
+ * the record); handing it back routes it to a seat again. Completing it records the owner's notes and unblocks the
+ * tasks that wait on it.
+ */
+export function ownerTask(key, { owner_task, why = '', by = 'owner' } = {}) {
+  const t = store.getTicket(key);
+  need(t, 'no such ticket');
+  need(!['done', 'wontdo'].includes(t.status), 'this ticket is closed');
+  need(!(t.active_run > 0), 'wait for the current run on this ticket to finish');
+  if (owner_task) {
+    need(['triage', 'proposed', 'todo', 'needs_human'].includes(t.status), 'only work that has not started can become your task');
+    store.updateTicket(key, { owner_task: 1, assignee: null, status: 'todo', resume_status: null, progress_msg: 'your task' });
+    if (by === 'manager') store.addComment(key, 'manager', `🙋 **This is your task**: no seat on the team can do it. ${String(why).trim().slice(0, 500)}`);
+    else store.addComment(key, 'owner', `🙋 **I will do this one myself**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'}`);
+  } else {
+    need(t.owner_task, 'this is not an owner task');
+    const assignee = routeTicket({ area: t.area, complexity: t.complexity || 'M', risk: t.risk });
+    store.updateTicket(key, { owner_task: 0, assignee, status: 'todo', progress_msg: null });
+    store.addComment(key, 'owner', `↩️ **Handed back to the team**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'}`);
+  }
+  github.syncIssueState(key); github.flushComments();
+  return store.getTicket(key);
+}
+export function ownerTaskDone(key, { notes = '' } = {}) {
+  const t = store.getTicket(key);
+  need(t?.owner_task, 'only an owner task can be completed this way');
+  need(!['done', 'wontdo'].includes(t.status), 'this task is already closed');
+  // Only work outside the codebase: anything with a run, a commit or a PR ships through QA and merge, never by a click.
+  need(!(t.active_run > 0) && !t.head_sha && !t.pr_url, 'this task has code in flight; it finishes when its PR merges');
+  const text = String(notes).trim();
+  need(text.length >= 3, 'say what you did or found (it is the evidence the next tasks rely on)');
+  store.transaction(() => {
+    store.addComment(key, 'owner', `✅ **Done by the owner**\n\n${text.slice(0, 8000)}`);
+    store.updateTicket(key, { status: 'done', progress: 100, progress_msg: 'done by the owner' });
+  });
+  store.logEvent({ agent_id: 'owner', ticket_key: key, kind: 'done', text: `owner completed ${key}; tasks waiting on it can start` });
+  if (t.parent_key) rollupParent(t.parent_key);
+  github.syncIssueState(key); github.flushComments();
+  return store.getTicket(key);
+}
+
 export function ownerPatch(key, patch) {
   const t = store.getTicket(key);
   need(t, 'no such ticket');
@@ -1430,6 +1525,7 @@ export function ownerPatch(key, patch) {
       const before = store.getTicket(patch.after_key);
       need(t.parent_key && before?.parent_key && before.key !== key && sameTree(before.key, key), 'a task can only start after another task of the same feature');
       for (let k = before, seen = 0; k && seen < 50; k = k.after_key ? store.getTicket(k.after_key) : null, seen++) need(k.key !== key, 'that order would make a loop');
+      need(!flow.wouldCycle(key, before.key, store.listTickets()), 'that order would make a loop (through an epic or a written gate)');
     }
     p.after_key = patch.after_key || null;
   }

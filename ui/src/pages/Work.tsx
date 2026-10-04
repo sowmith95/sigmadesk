@@ -48,7 +48,7 @@ function EpicBoard({ B, matches, closed }: { B: Board; matches: (it: BoardItem) 
     .filter((t) => hit(t) || descendants(t.key).some(hit))
     .map((t) => ({ t, s: leafStats(t.key) }))
     .sort((a, b) => b.s.needs - a.s.needs || b.s.working - a.s.working || String(b.t.updated_at).localeCompare(String(a.t.updated_at)));
-  const loose = [...B.needs_you.filter((it, i, all) => all.findIndex((x) => x.key === it.key) === i), ...B.working, ...B.blocked, ...B.queued]
+  const loose = [...(B.decisions || B.needs_you).filter((it, i, all) => all.findIndex((x) => x.key === it.key) === i), ...B.working, ...B.blocked, ...B.queued]
     .filter((it) => it.ticket && !it.ticket.parent_key && !childrenOf(it.ticket.key).length && matches(it));
   return (
     <div className="grid gap-6">

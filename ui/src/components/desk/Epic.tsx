@@ -6,6 +6,7 @@ import { nameOf } from '../../../../public/names.js';
 import { S, openTicket, openFeature } from '@/store.js';
 import { Tag, SeatAvatar, type Tone } from './Bits';
 import { STAGE_LABEL } from './Work';
+import { OwnerTag } from './Flow';
 import { cn } from '@/lib/utils';
 import type { Ticket } from '@/types';
 
@@ -88,6 +89,7 @@ export function EpicTree({ root, depth = 0, max = 3, hideDone = false }: { root:
         const sub = childrenOf(k.key);
         const dep = byKey(k.after_key);
         const waiting = dep && dep.status !== 'done' && !['done', 'wontdo'].includes(k.status);
+        const parentWait = !waiting && !['done', 'wontdo'].includes(k.status) ? lineageOf(k).map((a) => byKey(a.after_key)).find((d) => d && d.status !== 'done') : undefined;
         const live = S.agents.find((a) => a.current_ticket === k.key && a.status === 'working');
         return (
           <li key={k.key} className="grid gap-1" data-task={k.key}>
@@ -96,9 +98,11 @@ export function EpicTree({ root, depth = 0, max = 3, hideDone = false }: { root:
               <button type="button" onClick={() => openTicket(k.key, sub.length ? { tab: 'tasks' } : {})} title={`${k.key}: ${k.title}`}
                 className={cn('min-w-0 flex-1 basis-48 truncate text-left hover:underline', k.status === 'wontdo' && 'text-muted-foreground line-through')}>{nameOf(k)}</button>
               {(live?.id || k.assignee) && <SeatAvatar id={live?.id || k.assignee} />}
+              <OwnerTag t={k} />
               <Tag tone={toneOf(k)}>{live ? 'Working' : STAGE_LABEL[k.status] || k.status}</Tag>
               <span className="font-mono text-xs text-muted-foreground">{k.key}</span>
               {waiting && <span className="basis-full pl-4 text-xs text-muted-foreground">waits for {nameOf(dep!)} ({dep!.key})</span>}
+              {parentWait && depth === 0 && <span className="basis-full pl-4 text-xs text-muted-foreground">waits for {nameOf(parentWait)} ({parentWait.key}), with its epic</span>}
             </div>
             {sub.length > 0 && (depth + 1 < max ? <EpicTree root={k.key} depth={depth + 1} max={max} hideDone={hideDone} />
               : <button type="button" className="ml-6 justify-self-start text-xs text-primary hover:underline" onClick={() => openTicket(k.key, { tab: 'tasks' })}>{sub.length} more task{sub.length === 1 ? '' : 's'}</button>)}

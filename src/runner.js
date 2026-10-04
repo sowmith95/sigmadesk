@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { config, publisherPath } from './config.js';
-import { agentById, charterFor, featureGroomCharter, productReviewCharter, researchCharter, readOnlyReviewCharter, permissionsFor, promptFor, DENY_RULES, READ_ONLY_KINDS } from './team.js';
+import { agentById, charterFor, featureGroomCharter, epicReviewCharter, productReviewCharter, researchCharter, readOnlyReviewCharter, permissionsFor, promptFor, DENY_RULES, READ_ONLY_KINDS } from './team.js';
 import * as connectors from './connectors.js';
 import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
@@ -349,6 +349,7 @@ export function buildCommand(agent, kind, cwd, { resume = null, fork = false, ex
   const charter = kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.'
     : kind === 'product_review' ? productReviewCharter(agent.id)
       : kind === 'feature_groom' ? featureGroomCharter()
+      : kind === 'epic_review' ? epicReviewCharter()
       : RESEARCH_KINDS.has(kind) ? researchCharter(agent.id, job)
         : kind === 'research_review' || kind === 'connector_assessment' ? readOnlyReviewCharter(agent.id, kind) : charterFor(agent.id);
   const mcpServers = RESEARCH_KINDS.has(kind) && job?.connectors?.length ? connectors.mcpServersFor(job.connectors) : undefined;
@@ -414,7 +415,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   if (reviewProfile && (kind !== 'council_review' || track || resume)) throw new Error('Per-job review models are restricted to fresh, untracked council calls');
   // A research job's requirements (web, connectors) travel into provider selection: fallback may not drop them.
   const requirements = job && RESEARCH_KINDS.has(kind) ? { web: job.web !== false, connectors: (job.connectors || []).map((c) => c.name) } : null;
-  if (pinEngine && !['groom', 'feature_groom'].includes(kind)) throw new Error('Only grooming pins an engine per job');
+  if (pinEngine && !['groom', 'feature_groom', 'epic_review'].includes(kind)) throw new Error('Only grooming pins an engine per job');
   const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : pinEngine ? pinnedSelection(agentId, pinEngine, kind) : selectionFor(agentId, Date.now(), requirements, kind);
   if (!selected.seat) throw Object.assign(new Error(`${agentId}: ${selected.reason}`), { status: 409, providerUnavailable: true });
   const agent = selected.seat;

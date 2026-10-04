@@ -22,6 +22,9 @@ function DecisionCard({ it }: { it: BoardItem }) {
       {t && <Lineage t={t} />}
       <h3 className="text-[17px] font-semibold leading-snug">{t ? <button type="button" className="text-left hover:underline" onClick={open}>{it.verb}</button> : it.verb}</h3>
       <div className="max-w-[68ch]"><Clamp id={`reason-${it.id}`} text={clean(reason)} /></div>
+      {!!it.waiting?.length && <p data-waiting={it.waiting.map((w) => w.key).join(',')} className="text-sm text-muted-foreground">
+        {it.kind === 'epic_review' ? `Also answers ${it.waiting.length} parked question${it.waiting.length === 1 ? '' : 's'}: ` : `${it.waiting.length} more question${it.waiting.length === 1 ? '' : 's'} wait${it.waiting.length === 1 ? 's' : ''} on this: `}
+        {it.waiting.map((w, i) => <span key={w.id}>{i > 0 && ', '}<button type="button" className="hover:text-foreground hover:underline" onClick={() => openTicket(w.key, { decision: w.id })}>{w.name}</button></span>)}</p>}
       <div className="flex flex-wrap items-center gap-2">
         {t?.assignee && <span className="inline-flex items-center gap-2 text-sm text-muted-foreground"><SeatAvatar id={t.assignee} />{agentMap()[t.assignee]?.name || ''}</span>}
         <span className="flex-1" />

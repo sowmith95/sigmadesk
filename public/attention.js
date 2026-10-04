@@ -8,6 +8,7 @@
 //   queued    — will move on its own (seat busy, waiting on a dependency, not yet picked up)
 //   shipped   — done
 //   closed    — won't do (hidden by default)
+import * as flow from './flow.js';
 import { nameOf } from './names.js';
 
 export const BUCKETS = ['needs_you', 'blocked', 'working', 'queued', 'shipped', 'closed'];
@@ -45,6 +46,8 @@ export function decisionsFor(t, ctx = {}) {
     return [{ ...base, id: `${t.key}:research:${rr?.generation || t.research_generation || 1}`, kind: 'research', action: 'Decide proposal', verb: `Decide the research proposal ${name}`,
       reason: rr?.reason || t.progress_msg || 'The second reviewer did not pass this proposal.' }];
   }
+  // A step only the owner can do: it sits with the owner until they complete it or hand it back.
+  if (t.owner_task) return [{ ...base, id: `${t.key}:owner-task`, kind: 'owner_task', action: 'Do it', verb: `Your task: ${name}`, reason: t.progress_msg && t.progress_msg !== 'your task' ? t.progress_msg : 'The team cannot do this step; the tasks after it wait for you.' }];
   const review = productReviews.find(r => r.ticket_key === t.key && (r.stale || ['changes','failed','stale','deferred','rejected'].includes(r.status)));
   if (review) return [{ ...base, id: `${t.key}:product:${review.phase}:${review.revision}`, kind: 'product', action: 'Review feedback', verb: `Resolve review for ${name}`, reason: review.stale ? 'The plan changed; its review must be refreshed.' : `Product/design review: ${review.status}` }];
   if (t.status === 'ready_for_human' && productReviews.some(r => r.ticket_key === t.key && r.phase === 'feedback' && r.status === 'reviewing')) return [];
@@ -129,8 +132,50 @@ export function board(state, extra = {}) {
     if (inc.status === 'paged' && !inc.ticket_key) out.needs_you.push({ key: `incident-${inc.id}`, id: `incident-${inc.id}`, incident: inc, bucket: 'needs_you', kind: 'page',
       action: 'Look at errors', verb: `Check ${inc.label || 'service'} errors`, reason: String(inc.normalized || '').slice(0, 160), name: inc.label });
   }
-  const rank = { guard: 0, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
-  out.needs_you.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
+  // An epic review's one question (and its proposed closes) is the owner's single decision for that epic.
+  const byKey = new Map(tickets.map((t) => [t.key, t]));
+  const covered = new Map();
+  for (const r of state.meta?.epic_reviews || []) {
+    const t = byKey.get(r.key);
+    if (!t || ['done', 'wontdo'].includes(t.status)) continue;
+    const name = nameOf(t);
+    const base = { key: t.key, name, stage: 'Planning', epic: true, worker: null, bucket: 'needs_you', ticket: t, review: r };
+    if (r.status === 'failed') out.needs_you.push({ ...base, id: `${t.key}:epic-review:${r.round}:failed`, kind: 'epic_review', action: 'See what failed', verb: `The review of ${name} failed`, reason: r.error || 'The epic review failed.' });
+    else if (r.status === 'ready' && (r.question_state === 'open' || r.close_state === 'open')) {
+      for (const k of r.question_state === 'open' ? r.result?.question?.covers || [] : []) covered.set(k, t.key);
+      out.needs_you.push({ ...base, id: `${t.key}:epic-review:${r.round}`, kind: 'epic_review', action: r.question_state === 'open' ? 'Answer once' : 'Decide closes',
+        verb: r.question_state === 'open' ? `One question about ${name}` : `Close tasks in ${name}?`, reason: r.result?.question?.text || r.result?.summary || '' });
+    }
+  }
+  // One question, not three: a seat's question whose task only waits on something that already needs the owner is
+  // folded under that item ("2 tasks wait on this"), so the owner sees the one thing to do.
+  const ix = flow.index(tickets);
+  const needKeys = new Set(out.needs_you.filter((d) => d.ticket).map((d) => d.ticket.key));
+  const waiters = new Map();
+  const waitersOf = (k) => { if (!waiters.has(k)) waiters.set(k, new Set(flow.waitingOn(k, tickets, ix).map((w) => w.key))); return waiters.get(k); };
+  let rootList = null;
+  const roots = () => (rootList ||= [...needKeys].filter((k) => ![...needKeys].some((o) => o !== k && waitersOf(o).has(k))));
+  const grouped = [];
+  for (const d of out.needs_you) {
+    if (d.kind !== 'question' || !d.ticket) { grouped.push(d); continue; }
+    const t = d.ticket;
+    if (covered.has(t.key)) { d.waits_on = covered.get(t.key); d.waits_on_kind = 'epic_review'; continue; }
+    // Fold under a root item: one that needs the owner and does not itself wait on another such item.
+    const host = roots().find((k) => k !== t.key && waitersOf(k).has(t.key));
+    if (!host) { grouped.push(d); continue; }
+    if (covered.has(host)) { d.waits_on = covered.get(host); d.waits_on_kind = 'epic_review'; continue; } // its host is answered by the review
+    d.waits_on = host;
+  }
+  for (const d of out.needs_you.filter((x) => x.waits_on)) {
+    const host = grouped.find((g) => g.ticket?.key === d.waits_on && (d.waits_on_kind ? g.kind === d.waits_on_kind : g.kind !== 'epic_review'));
+    if (host) { (host.waiting ||= []).push({ key: d.ticket.key, name: d.name, id: d.id }); } else grouped.push(d);
+  }
+  // `decisions` keeps every decision (the ticket sheet, Work page and palette find a ticket's decision there);
+  // `needs_you` is the grouped Inbox list the counts describe.
+  out.decisions = [...out.needs_you];
+  out.needs_you = grouped;
+  const rank = { guard: 0, owner_task: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
+  for (const list of [out.needs_you, out.decisions]) list.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
   out.shipped.sort((a, b) => String(b.ticket?.updated_at).localeCompare(String(a.ticket?.updated_at)));
   return { ...out, counts: Object.fromEntries(BUCKETS.map((b) => [b, out[b].length])) };
 }

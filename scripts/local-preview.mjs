@@ -91,6 +91,14 @@ for (const [status, title, assignee, priority, area, complexity] of tickets) {
   store.updateTicket(s1.key, { resume_status: 'todo' }); store.addComment(s1.key, 'senior-be', '❓ **Question for the owner:** Should odd-lot fills be journaled, or skipped like the options journal?');
   const s2 = store.createTicket({ title: 'Replay yesterday’s equity fills into the journal', status: 'todo', type: 'task', area: 'backend', complexity: 'S', assignee: 'junior', reporter: 'principal-be', source: 'agent', parent_key: tasks[1] });
   store.updateTicket(s2.key, { after_key: s1.key });
+  // A feature the team split before grooming existed (no plan), whose order lives only in its text: the Next step card,
+  // one-tap gates and the Inbox's grouped question are built for this shape.
+  const audit = store.createTicket({ title: 'Fill audit', description: 'Prove fills match the broker before any journal ships.', status: 'in_progress', type: 'feature', priority: 'P1', area: 'backend', assignee: 'manager' });
+  const v = store.createTicket({ title: 'Verify fills on the production box', status: 'needs_human', type: 'task', area: 'infra', complexity: 'S', assignee: 'sre', parent_key: audit.key, description: 'Count yesterday\'s fills in the production database.' });
+  store.updateTicket(v.key, { resume_status: 'todo', progress_msg: 'needs production access' }); store.addComment(v.key, 'sre', '❓ **Question for the owner:** I have no production access. Can you run the count, or grant read access?');
+  const c = store.createTicket({ title: 'Audit contract and DDL', status: 'needs_human', type: 'task', area: 'db', complexity: 'S', assignee: 'dba', parent_key: audit.key, description: `Draft the audit table. Gated on ${v.key} reporting nonzero rows.` });
+  store.updateTicket(c.key, { resume_status: 'todo' }); store.addComment(c.key, 'dba', `❓ **Question for the owner:** Should I wait for ${v.key}, or draft the DDL now?`);
+  store.createTicket({ title: 'Backfill the audit table', status: 'todo', type: 'task', area: 'backend', complexity: 'S', assignee: 'junior', parent_key: audit.key, description: `Blocked by ${c.key}; replay the last week.` });
 }
 store.logEvent({ kind: 'system', text: 'Isolated demo: all execution seats disabled. No production state or credentials are used.' });
 console.log(`Preview fixture: ${tmp}`);

@@ -313,7 +313,9 @@ function migrate() {
       builder: 'TEXT', contributors: "TEXT DEFAULT '[]'", approved_at: 'TEXT', merge_after: 'TEXT', merge_hold: 'TEXT', reconfirm_from: 'TEXT', reconfirm_kind: 'TEXT', reconfirm_base: 'TEXT',
       // research programs: which program/run proposed it, the frozen review policy, the second-person review state
       research_program: 'TEXT', research_run: 'INTEGER', research_policy: 'TEXT', research_review: 'TEXT', research_generation: 'INTEGER DEFAULT 0',
-      research_revisions: 'INTEGER DEFAULT 0', research_sources: 'TEXT' },
+      research_revisions: 'INTEGER DEFAULT 0', research_sources: 'TEXT',
+      // a task only the owner can do (access no seat has): never dispatched to a seat
+      owner_task: 'INTEGER DEFAULT 0' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     pr_outbox: { next_attempt_at: 'TEXT' },
@@ -417,7 +419,7 @@ export function createTicket(t) {
   return ticket;
 }
 
-const TICKET_FIELDS = new Set(['title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
+const TICKET_FIELDS = new Set(['owner_task', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
   'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key',
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
   'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base',

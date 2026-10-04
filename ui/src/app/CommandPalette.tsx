@@ -12,7 +12,7 @@ export function CommandPalette() {
   const B = currentBoard() as Board;
   const open = S.palette;
   const go = (fn: () => void) => () => { setPalette(false); fn(); };
-  const decisions = B.needs_you.filter((x) => x.ticket);
+  const decisions = (B.decisions || B.needs_you).filter((x) => x.ticket);
   const tickets = (S.tickets as Ticket[]).filter((t) => !['done', 'wontdo'].includes(t.status)).slice(0, 200);
   return (
     <CommandDialog open={open} onOpenChange={setPalette} title="Find or do something" description="Go to a page, open a ticket, or create one.">

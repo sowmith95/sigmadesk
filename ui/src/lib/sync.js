@@ -51,6 +51,12 @@ export function applyDelta(S, m) {
       out.feature = m.data.ticket_key;
       break;
     }
+    case 'epic-review': {
+      const list = (S.meta.epic_reviews ||= []);
+      const i = list.findIndex((r) => r.key === m.data.key);
+      if (i >= 0) list[i] = m.data; else list.push(m.data);
+      break;
+    }
     case 'event':
       if (!S.events.some((e) => e.id === m.data.id)) S.events.push(m.data);
       if (S.events.length > 600) S.events.splice(0, S.events.length - 600);

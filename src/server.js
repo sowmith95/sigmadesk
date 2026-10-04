@@ -1,5 +1,6 @@
 import * as productReview from './product-review.js';
 import * as features from './features.js';
+import * as epicReview from './epic-review.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -73,6 +74,7 @@ export function snapshot() {
       routing: Object.fromEntries(AGENTS.map((a) => { const s = dispatch.selectionFor(a.id); return [a.id, { engine: s.seat?.engine, model: s.seat?.model, effort: s.seat?.effort, tier: SEAT_TIER[a.id], fallback: s.fallback || false, reason: s.reason }]; })),
       product_reviews: productReview.summaries(),
       feature_plans: features.summaries(),
+      epic_reviews: epicReview.summaries(),
       groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
       research: research.status(settings), research_reviews: researchReview.summaries(),
       decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
@@ -213,6 +215,16 @@ async function ownerRoute(req, res) {
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
   if (req.method === 'POST' && (mm = m('^/api/discussions/(\\d+)/(retry|cancel)$'))) return send(res, 200, sched.ownerDiscussion(mm[1], mm[2]));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/refresh-base$'))) return send(res, 200, await sched.ownerRefreshBase(mm[1], await readBody(req)));
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/owner-task$'))) { const b = await readBody(req); return send(res, 200, sched.ownerTask(mm[1], { owner_task: b.owner_task, why: b.why })); }
+  if (req.method === 'POST' && (mm = m('^/api/epics/KEY/review$'))) {
+    const b = await readBody(req);
+    const out = b.action === 'start' ? epicReview.start(mm[1], { by: 'owner', reason: b.reason }) : b.action === 'retry' ? epicReview.retry(mm[1])
+      : b.action === 'answer' ? epicReview.answer(mm[1], b) : b.action === 'close' ? epicReview.decideCloses(mm[1], { approve: !!b.approve, round: b.round })
+        : b.action === 'dismiss' ? epicReview.dismiss(mm[1], b) : null;
+    if (!out) return send(res, 400, { error: 'action must be start, retry, answer, close or dismiss' });
+    return send(res, 200, out);
+  }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/owner-done$'))) return send(res, 200, sched.ownerTaskDone(mm[1], await readBody(req)));
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
   // ---- PR console (owner only; agents have no route to these) ----
   if (req.method === 'GET' && p === '/api/prs') {

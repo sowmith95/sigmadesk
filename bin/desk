@@ -15,7 +15,7 @@ const USAGE = `usage:
   desk revise KEY [--title T]   (revised proposal body on stdin; the author's research revision run only)
   desk connector-propose --name N   (connector case on stdin; thinking seats; owner approval required)
   desk groom KEY --complexity S|M|L|XL --area A [--priority P] [--risk high] [--assign SEAT] [--title T]   (spec on stdin)
-  desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT] [--after KEY]   (body on stdin)
+  desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT] [--after KEY|none] [--owner "<why only the owner can do it>"]   (body on stdin)
   desk split KEY "<summary>"   (manager, after create-task: the parent stays open until its tasks are done)
   desk design   (design doc on stdin; principals)
   desk discussion-result   (response on stdin; manager in an owner discussion)
@@ -48,7 +48,8 @@ if (!cmd || [cmd, ...rest].some((arg) => arg === '-h' || arg === '--help')) {
 const flags = {};
 const pos = [];
 for (let i = 0; i < rest.length; i++) {
-  if (rest[i].startsWith('--')) { flags[rest[i].slice(2)] = rest[i + 1]; i++; } else pos.push(rest[i]);
+  // A flag with no value (`--owner --after X`, or last) is true, never the next flag's name.
+  if (rest[i].startsWith('--')) { const v = rest[i + 1]; if (v === undefined || v.startsWith('--')) flags[rest[i].slice(2)] = true; else { flags[rest[i].slice(2)] = v; i++; } } else pos.push(rest[i]);
 }
 const KEY_RE = /^[A-Z][A-Z0-9]*-\d+$/;
 

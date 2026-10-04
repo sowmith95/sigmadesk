@@ -126,10 +126,11 @@ Read the code this feature touches before planning. Then return ONLY one JSON ob
  "scope":["what is in"],"out_of_scope":["what is deliberately not"],"acceptance":["testable criterion"],
  "risks":["risk and its mitigation"],"questions":["a decision only the owner can make"],
  "tasks":[{"ref":"T1","title":"imperative, under 80 characters","area":"${AREAS.join('|')}","complexity":"S|M","risk":"low|high",
-   "after":null,"description":"what to change, files likely touched, how to test it","acceptance":["testable criterion"]}]}
+   "after":null,"owner":null,"description":"what to change, files likely touched, how to test it","acceptance":["testable criterion"]}]}
 Rules: 1 to 8 tasks in build order, each small (S) or medium (M): if something is larger, split it into more tasks.
 risk is high for anything touching money, orders, auth, migrations, deploys or data deletion. "after" names an earlier ref only
-when that task must be merged first. questions is empty when nothing needs the owner. Under 1200 words. No desk commands.`;
+when that task must be merged first. "owner" is a short reason when only the owner can do the step (production access,
+credentials, a business decision); otherwise null. questions is empty when nothing needs the owner. Under 1200 words. No desk commands.`;
 }
 
 const str = (v, max, name) => { if (typeof v !== 'string' || !v.trim()) bad(`${name} is required`); return v.trim().slice(0, max); };
@@ -155,7 +156,8 @@ export function parsePlan(text) {
     refs.add(ref);
     if (!AREAS.includes(x.area)) bad(`Task ${ref}: area must be one of ${AREAS.join(', ')}`);
     if (!['S', 'M'].includes(x.complexity)) bad(`Task ${ref}: complexity must be S or M (split larger work)`);
-    return { ref, title: str(x.title, 140, `Task ${ref} title`), area: x.area, complexity: x.complexity, risk: x.risk === 'low' ? 'low' : 'high',
+    return { ref, owner: typeof x.owner === 'string' && x.owner.trim() ? x.owner.trim().slice(0, 300) : x.owner === true ? 'Only the owner can do this' : null,
+      title: str(x.title, 140, `Task ${ref} title`), area: x.area, complexity: x.complexity, risk: x.risk === 'low' ? 'low' : 'high',
       after, description: str(x.description, 4000, `Task ${ref} description`), acceptance: list(x.acceptance ?? [], `Task ${ref} acceptance`, { max: 8 }) };
   });
   return store.redactValue({ summary: str(r.summary, 1200, 'summary'), goal: str(r.goal, 1200, 'goal'), users: list(r.users, 'users', { min: 1 }),
@@ -267,7 +269,8 @@ export function approve(key, { expected_revision, edits = [], message = '' } = {
         + `\n\n## Part of feature ${key}: ${t.title}\n${p.plan.goal}\n\nFeature acceptance criteria:\n${p.plan.acceptance.map((a) => `- ${a}`).join('\n')}`;
       const k = store.createTicket({ title: x.title, description: body, type: 'task', status: 'todo', area: x.area, complexity: x.complexity, priority: t.priority,
         assignee: routeTicket({ area: x.area, complexity: x.complexity, risk: x.risk }), reporter: 'manager', source: 'agent', parent_key: key });
-      store.updateTicket(k.key, { risk: x.risk, ...(after ? { after_key: after } : {}) });
+      store.updateTicket(k.key, { risk: x.risk, ...(after ? { after_key: after } : {}), ...(x.owner ? { owner_task: 1, assignee: null } : {}) });
+      if (x.owner) store.addComment(k.key, 'manager', `🙋 **This is your task**: ${x.owner}`);
       keys[x.ref] = k.key;
     }
     const plan = { ...p.plan, tasks };

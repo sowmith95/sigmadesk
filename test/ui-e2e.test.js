@@ -214,3 +214,32 @@ test('epics and tasks link both ways: crumbs on a task, a Tasks tab on its epic,
   assert.deepEqual(errors, []);
   await page.close();
 });
+
+test('a stuck epic shows its next step, records a written gate in one tap, and the Inbox asks one question', { skip, timeout: 90_000 }, async () => {
+  const st = (await api('GET', '/api/state')).body;
+  const audit = st.tickets.find((t) => t.title === 'Fill audit');
+  const [verify, contract, backfill] = ['Verify fills', 'Audit contract', 'Backfill the audit'].map((p) => st.tickets.find((t) => t.title.startsWith(p)));
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 390, height: 844 });
+  const card = page.locator(`article[data-ticket="${verify.key}"]`);
+  await card.waitFor();
+  assert.equal(await card.getAttribute('data-kind'), 'question');
+  assert.equal(await card.locator('[data-waiting]').getAttribute('data-waiting'), contract.key, 'the contract question folds under the one it waits on');
+  assert.equal(await page.locator(`article[data-ticket="${contract.key}"]`).count(), 0);
+  await go(page, `#/features/${audit.key}`);
+  const next = page.locator('[data-next-step]');
+  await next.waitFor();
+  assert.equal(await next.getAttribute('data-next-step'), verify.key);
+  assert.match(await next.textContent(), /2 tasks wait on it/);
+  assert.match(await next.textContent(), /You:/, 'the owner is the one who must act');
+  assert.match(await page.locator('aside[aria-label="Grooming session"]').textContent(), /Already split into 3 open tasks/);
+  assert.equal(await page.getByRole('button', { name: 'Plan with Codex' }).count(), 0, 'a split feature is not offered a plan it cannot start');
+  await page.locator(`[data-gate="${contract.key}>${verify.key}"]`).getByRole('button', { name: /^Make / }).click();
+  await page.locator(`[data-gate="${contract.key}>${verify.key}"]`).waitFor({ state: 'detached' });
+  const after = (await api('GET', '/api/state')).body.tickets;
+  assert.equal(after.find((t) => t.key === contract.key).after_key, verify.key, 'the written gate is now enforced');
+  assert.ok(await page.locator(`[data-gate="${backfill.key}>${contract.key}"]`).count(), 'the other gate is still offered');
+  assert.ok(await page.locator(`[data-epic-review="${audit.key}"]`).count(), 'the epic can be reviewed with the manager');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'fits a phone');
+  assert.deepEqual(errors, []);
+  await page.close();
+});

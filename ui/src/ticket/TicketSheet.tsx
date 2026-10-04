@@ -14,6 +14,7 @@ import { Tag, Key, Named } from '@/components/desk/Bits';
 import { KIND_LABEL, BUCKET_LABEL, BUCKET_TONE, cardFor, RunCard, Reviews, prReviewsOf, firstName } from '@/components/desk/Work';
 import { Conversation, Brief, PrSummary, ProductReview, ResearchReview, Details, Block, type ConvState } from './parts';
 import { Lineage, EpicTree, EpicProgress, childrenOf, isFeatureRoot } from '@/components/desk/Epic';
+import { NextStep, GateSuggestions, EpicReview, OwnerTaskActions } from '@/components/desk/Flow';
 import type { Board, BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -75,10 +76,12 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef }:
   if (dec?.kind === 'question') return <>
     {box(`Your answer to ${who}…`, 'Your answer')}
     <div className={row}>
-      <More items={[talk, { label: 'Approve as asked (no message)', run: decide('approve'), ok: `Approved; ${who} resumes`, disabled: running }, { label: 'Reject ticket…', run: decide('reject'), ok: 'Rejected; ticket closed, local work kept', danger: true, disabled: running }]} />
+      <More items={[talk, { label: 'Approve as asked (no message)', run: decide('approve'), ok: `Approved; ${who} resumes`, disabled: running },
+        { label: 'I will do this one myself', run: async () => { if (!window.confirm(`Take ${t.key} yourself? No engineer will pick it up; the tasks after it wait until you mark it done.`)) return false; await guard(() => api('POST', `/api/tickets/${t.key}/owner-task`, { owner_task: true })); done(); await refresh(); }, ok: 'It is your task now', disabled: running || !!t.head_sha || !!t.pr_url }, { label: 'Reject ticket…', run: decide('reject'), ok: 'Rejected; ticket closed, local work kept', danger: true, disabled: running }]} />
       <span className="flex-1" />
       <AsyncButton data-primary size="lg" disabled={running} run={send('answer')} ok={`Answer delivered; ${who} resumes`}>Answer and continue</AsyncButton>
     </div>{note}</>;
+  if (dec?.kind === 'owner_task' || dec?.kind === 'epic_review') return <div className={row}><More items={[talk]} /><p className="text-sm text-muted-foreground">{dec.kind === 'owner_task' ? 'Mark it done or hand it back above.' : 'Answer the question or decide the closes above.'}</p></div>;
   if (dec && dec.kind !== 'page') {
     const target = dec.kind === 'design' ? ` #${dec.proposal_id}` : dec.kind === 'council' ? ` #${dec.council_id}` : '';
     const primaryLabel = dec.kind === 'merge' ? 'Review merge' : dec.kind === 'design' ? `Approve design${target}` : dec.kind === 'council' ? `Approve council${target}` : dec.kind === 'research' ? 'Approve for grooming' : 'Approve publication';
@@ -115,7 +118,7 @@ export function TicketSheet() {
   const conv = useRef<ConvState>({ agent: '', follow: true, top: 0 });
   const replyRef = useRef<HTMLTextAreaElement>(null);
   const B = currentBoard() as Board;
-  const decisions = t ? B.needs_you.filter((x) => x.key === t.key) : [];
+  const decisions = t ? (B.decisions || B.needs_you).filter((x) => x.key === t.key) : [];
   const dec = decisionId ? decisions.find((x) => x.id === decisionId) || null : decisions[0] || null;
   const gone = !!decisionId && !dec;
   const it = t ? B.byKey[t.key] : undefined;
@@ -160,12 +163,15 @@ export function TicketSheet() {
           <TabsTrigger value="details">Details</TabsTrigger>
         </TabsList>
         {dec && <TabsContent value="decision" className="grid gap-4">
-          {dec.kind === 'product' ? <ProductReview t={t} d={d} msg={reviewMsg} setMsg={setReviewMsg} /> : <Brief dec={dec} t={t} d={d} />}
+          {dec.kind === 'product' ? <ProductReview t={t} d={d} msg={reviewMsg} setMsg={setReviewMsg} /> : dec.kind === 'owner_task' ? <OwnerTaskActions t={t} /> : dec.kind === 'epic_review' ? <EpicReview root={t.key} /> : <Brief dec={dec} t={t} d={d} />}
           <PrSummary t={t} dec={dec} />
           <Reviews raw={prReviewsOf(t, d)} compact={false} t={t} />
         </TabsContent>}
         {kids.length > 0 && <TabsContent value="tasks" className="grid gap-4">
+          {!['done', 'wontdo'].includes(t.status) && <NextStep root={t.key} />}
           <Block><EpicProgress epic={t.key} /><EpicTree root={t.key} /></Block>
+          {!['done', 'wontdo'].includes(t.status) && <GateSuggestions root={t.key} />}
+          {!t.parent_key && !['done', 'wontdo'].includes(t.status) && <EpicReview root={t.key} />}
           <p className="text-sm text-muted-foreground">{t.status === 'in_progress' ? 'This epic closes by itself when every task above has shipped or been dropped.' : t.status === 'done' ? 'Every task has settled.' : 'Tasks start in the order shown; an indented task belongs to the one above it.'}</p>
         </TabsContent>}
         <TabsContent value="conversation">{d ? <Conversation d={d} live={!!card?.live} tkey={t.key} state={conv} status={t.status} /> : <p className="text-muted-foreground">{det?.error || 'Loading conversation…'}</p>}</TabsContent>

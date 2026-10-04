@@ -18,6 +18,7 @@ import { Tag, Key, Empty, Section, SeatAvatar, type Tone } from '@/components/de
 import { Markdown } from '@/components/desk/Markdown';
 import { STAGE_LABEL } from '@/components/desk/Work';
 import { EpicTree, EpicProgress } from '@/components/desk/Epic';
+import { NextStep, GateSuggestions, EpicReview } from '@/components/desk/Flow';
 import { cn } from '@/lib/utils';
 import type { FeaturePlan, PlanTask, Ticket } from '@/types';
 
@@ -147,8 +148,9 @@ function PlanTasks({ p, edits, setEdits, editable }: { p: FeaturePlan; edits: Re
   );
 }
 
-function SessionStatus({ p }: { p: FeaturePlan | null }) {
+function SessionStatus({ p, split = 0 }: { p: FeaturePlan | null; split?: number }) {
   const groom = S.meta.groom || {};
+  if (!p && split) return <p className="flex items-start gap-2"><Check className="mt-1 size-4 shrink-0 text-shipped" aria-hidden />Already split into {plural(split, 'open task')} by the team, so there is no plan to approve. To change the order or priorities, review the epic with the manager below.</p>;
   if (!p) return <p className="text-muted-foreground">Not planned yet. Morgan grooms it on Codex: reads the code, then writes the goal, scope, acceptance criteria, risks and tasks.</p>;
   if (p.status === 'queued') return <p className="flex items-center gap-2"><CircleDot className="size-4 text-muted-foreground" aria-hidden />Round {p.revision} is waiting for Codex{groom.ready === false ? `: ${groom.reason || 'Codex is not available'}` : '.'}</p>;
   if (p.status === 'grooming') {
@@ -173,14 +175,15 @@ function Session({ t, p, history, edits }: { t: Ticket; p: FeaturePlan | null; h
     if (['revise', 'start', 'approve'].includes(action)) { setDraft(dk, ''); setText(''); }
     await loadFeature();
   };
-  const canReply = !p || ['ready', 'failed', 'discarded'].includes(p.status);
+  const split = p ? 0 : kidsOf(t.key).filter((k) => !['done', 'wontdo'].includes(k.status)).length;
+  const canReply = (!p && !split) || (!!p && ['ready', 'failed', 'discarded'].includes(p.status));
   const closed = ['done', 'wontdo'].includes(t.status);
   const rounds = history.filter((h) => h.revision < (p?.revision || 0));
   const included = p?.plan ? p.plan.tasks.filter((x) => edits[x.ref]?.include !== false).length : 0;
   return (
-    <aside aria-label="Grooming session" className={cn('grid content-start gap-4 rounded-lg border bg-card p-4 lg:sticky lg:top-20', p?.status !== 'approved' && !closed && 'max-lg:order-first')}>
+    <aside aria-label="Grooming session" className="grid content-start gap-4 rounded-lg border bg-card p-4">
       <div className="flex items-center gap-2"><SeatAvatar id="manager" size="md" /><div className="grid"><b>Grooming with Codex</b><span className="text-[13px] text-muted-foreground">{agentMap().manager?.name || 'Morgan'}, Engineering Manager{p?.model ? `, ${String(p.model).replace(':', ' · ')}` : ''}</span></div></div>
-      <SessionStatus p={p} />
+      <SessionStatus p={p} split={split} />
       {rounds.length > 0 && <details className="text-sm"><summary className="cursor-pointer text-muted-foreground">Earlier rounds ({rounds.length})</summary>
         <ol className="mt-2 grid gap-2">{rounds.map((h) => <li key={h.revision} className="grid gap-1 rounded-md bg-secondary p-2.5">
           <span className="text-xs text-muted-foreground">Round {h.revision}{h.plan ? `, ${plural(h.plan.tasks.length, 'task')}` : `, ${h.status}`}</span>
@@ -233,6 +236,7 @@ function FeatureDoc({ fkey }: { fkey: string }) {
       </div>
       <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         <article className="grid min-w-0 max-w-[72ch] gap-6 text-[16px] leading-relaxed">
+          {kids.length > 0 && !['done', 'wontdo'].includes(t.status) && <div className="grid gap-3 text-[15px] leading-normal"><NextStep root={t.key} /><GateSuggestions root={t.key} /></div>}
           {plan && <p className="text-[18px] leading-relaxed">{plan.summary}</p>}
           <RequestEditor t={t} request={request} />
           {plan && <>
@@ -251,7 +255,10 @@ function FeatureDoc({ fkey }: { fkey: string }) {
           {plan && extra.length > 0 && <DocSection title="Other tasks"><ul className="grid gap-1.5">{extra.map((k) => <li key={k.key} className="flex items-center gap-2"><button type="button" className="min-w-0 flex-1 text-left hover:underline" onClick={() => openTicket(k.key)}>{nameOf(k)}</button>
             {k.after_key && <span className="text-xs text-muted-foreground">after {k.after_key}</span>}<Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag></li>)}</ul></DocSection>}
         </article>
-        <Session t={t} p={p} history={(fd?.data?.history || []) as FeaturePlan[]} edits={edits} />
+        <div className={cn('grid content-start gap-4 lg:sticky lg:top-20', p && p.status !== 'approved' && !['done', 'wontdo'].includes(t.status) && 'max-lg:order-first')}>
+          <Session t={t} p={p} history={(fd?.data?.history || []) as FeaturePlan[]} edits={edits} />
+          {kids.length > 0 && !['done', 'wontdo'].includes(t.status) && <EpicReview root={t.key} />}
+        </div>
       </div>
     </div>
   );
