@@ -20,7 +20,7 @@ fs.writeFileSync(cfg, JSON.stringify({ project: { repoPath: owner }, github: { s
 process.env.SIGMADESK_CONFIG = cfg; process.env.SIGMADESK_WORKSPACES = path.join(tmp, 'workspaces');
 let config, store, refresh, runner, sched;
 before(async () => {
-  ({ config } = await import('../src/config.js')); config.root = tmp;
+  ({ config } = await import('../src/config.js')); config.root = tmp; config.dataDir = path.join(tmp, 'data');
   store = await import('../src/db.js'); store.openDb(':memory:');
   refresh = await import('../src/refresh.js'); runner = await import('../src/runner.js'); sched = await import('../src/scheduler.js');
 });

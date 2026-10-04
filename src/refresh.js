@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { config } from './config.js';
+import { config, publisherPath } from './config.js';
 import * as store from './db.js';
 import { stageApproved, workspaceDir, withGitLock } from './runner.js';
 
@@ -44,7 +44,7 @@ const env = () => {
 };
 const git = (dir, args) => exec(config.bins.git, [...SAFE, '-C', dir, ...args], { env: env(), timeout: 180000, maxBuffer: 32 << 20 });
 const lines = (s) => s.split('\0').filter(Boolean);
-const trustedDir = (key) => path.join(config.root, 'data', 'refresh', key);
+const trustedDir = (key) => path.join(config.dataDir, 'refresh', key);
 
 // Check each ancestor, including the workspace itself. Never follow agent symlinks.
 function safePath(root, rel = '') {
@@ -115,7 +115,7 @@ export async function prepare(ticket) {
     safePath(config.workspaceRoot, key); safePath(ws, '.git');
     if (fs.existsSync(dir)) fs.renameSync(dir, `${dir}-${Date.now()}-backup`);
     fs.mkdirSync(path.dirname(dir), { recursive: true });
-    await exec(config.bins.git, [...SAFE, 'clone', '-q', '--no-hardlinks', '--no-checkout', path.join(config.root, 'data', 'publisher.git'), dir], { env: env() });
+    await exec(config.bins.git, [...SAFE, 'clone', '-q', '--no-hardlinks', '--no-checkout', publisherPath(), dir], { env: env() });
     await git(dir, ['check-ref-format', '--branch', ticket.branch]);
     await git(dir, ['config', 'user.name', 'SigmaDesk']); await git(dir, ['config', 'user.email', 'desk@local.invalid']);
     await git(dir, ['checkout', '-q', '-b', ticket.branch, ticket.head_sha]);
