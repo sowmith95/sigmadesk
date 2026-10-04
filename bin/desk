@@ -24,6 +24,7 @@ const USAGE = `usage:
   desk council [--profile LENS] [--reviewer MODEL] [--challenger MODEL] "<question>"  (manager/principals; once per run)
   desk route KEY pm|manager|human "<why>" [--type T] [--priority P]
   desk submit "<summary>"
+  desk continue-rebase                     (implementer: after editing desk-listed conflict files)
   desk qa pass|fail "<notes>"
   desk accept pass|changes "<notes>"
   desk incident file --title T --severity P0-P3 --area A   (analysis on stdin)
@@ -68,7 +69,7 @@ switch (cmd) {
   case 'groom': case 'reject': case 'comment': case 'needs-human': takeKey(); body.body = pos.join(' '); break;
   default: body.body = pos.join(' ');
 }
-if (!body.body && !['show', 'list', 'progress'].includes(cmd)) body.body = await stdinText();
+if (!body.body && !['show', 'list', 'progress', 'continue-rebase'].includes(cmd)) body.body = await stdinText();
 else if (['groom', 'propose', 'create-task', 'incident', 'design'].includes(cmd) && !body.body) body.body = await stdinText();
 
 const token = process.env.DESK_RUN_TOKEN;

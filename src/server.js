@@ -12,6 +12,7 @@ import * as sched from './scheduler.js';
 import * as watch from './watch.js';
 import * as prsync from './prsync.js';
 import * as prs from './prs.js';
+import * as refresh from './refresh.js';
 import { nameOf } from '../public/names.js';
 import * as dispatch from './dispatch.js';
 import * as advisors from './advisors.js';
@@ -142,7 +143,7 @@ async function ownerRoute(req, res) {
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
-    return send(res, 200, { ticket: t, comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
+    return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)/events$'))) return send(res, 200, store.recentEvents({ agent_id: mm[1], limit: 300 }));
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)$'))) {
@@ -163,6 +164,7 @@ async function ownerRoute(req, res) {
   }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode, { expected_updated_at: b.expected_updated_at })); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/refresh-base$'))) return send(res, 200, await sched.ownerRefreshBase(mm[1], await readBody(req)));
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
   // ---- PR console (owner only; agents have no route to these) ----
   if (req.method === 'GET' && p === '/api/prs') {

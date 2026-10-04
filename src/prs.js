@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { config } from './config.js';
 import * as store from './db.js';
+import * as refresh from './refresh.js';
 
 const pexec = promisify(execFile);
 const repo = () => config.project.githubRepo;
@@ -19,7 +20,7 @@ function fail(msg, status = 409) { throw Object.assign(new Error(msg), { status 
 
 const FIELDS = ['number', 'title', 'state', 'isDraft', 'url', 'author', 'createdAt', 'updatedAt', 'mergedAt', 'closedAt',
   'headRefName', 'labels', 'reviewDecision', 'reviewRequests', 'latestReviews', 'mergeable', 'statusCheckRollup',
-  'additions', 'deletions', 'changedFiles', 'headRefOid'].join(',');
+  'additions', 'deletions', 'changedFiles', 'headRefOid', 'baseRefName'].join(',');
 
 export function checksState(rollup = []) {
   if (!rollup.length) return 'none';
@@ -65,6 +66,11 @@ async function pr(number) {
   return p;
 }
 const bust = () => { cache.at = 0; };
+export async function assertRefreshable(number, ticket) {
+  const p = await pr(number);
+  if (p.state !== 'OPEN' || p.headRefName !== ticket.branch) fail('Refresh requires this ticket’s open PR branch');
+  if (p.baseRefName !== config.project.baseBranch) fail('Merge the predecessor first: this stacked PR targets a different base');
+}
 const note = (p, text) => {
   const key = p.title.match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1];
   if (key && store.getTicket(key)) store.addComment(key, 'owner', text);
@@ -121,6 +127,14 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   if (!MERGE_METHODS.includes(method)) fail(`method must be ${MERGE_METHODS.join('|')}`, 400);
   const p = await pr(number);
   const blockers = mergeBlockers(p, { inBusyWindow, override });
+  const key = p.title.match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1];
+  if (key && refresh.current(key)) {
+    if (p.baseRefName !== config.project.baseBranch) blockers.push('PR base changed since refreshed QA');
+    // GraphQL baseRefOid may describe the PR's original base. Read the live branch ref.
+    const base = JSON.parse(await gh(['api', `repos/${repo()}/git/ref/heads/${config.project.baseBranch}`])).object.sha;
+    blockers.push(...refresh.validationBlockers(key, p.headRefOid, base));
+    if (refresh.current(key).status !== 'published') blockers.push('the rebased branch has not been published after QA');
+  }
   if (blockers.length) fail(`Not merged: ${blockers.join('; ')}.`);
   if (p.isDraft) await gh(['pr', 'ready', String(p.number), '-R', repo()]);
   // --match-head-commit: GitHub merges exactly the commit whose checks we just read, or refuses if it moved.

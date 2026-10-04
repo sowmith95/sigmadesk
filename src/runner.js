@@ -99,7 +99,7 @@ export function slugify(s) {
 }
 
 let gitLock = Promise.resolve();
-function withGitLock(fn) {
+export function withGitLock(fn) {
   const p = gitLock.then(fn, fn);
   gitLock = p.catch(() => {});
   return p;
@@ -232,15 +232,17 @@ export async function stageApproved(key, cloneDir, sha) {
     const { stdout: names } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--name-only', `refs/sigmadesk/base...${sha}`]);
     const { stdout: stat } = await git([...SAFE, '-C', pub, 'diff', '--no-ext-diff', '--shortstat', `refs/sigmadesk/base...${sha}`]);
     const lines = Number(stat.match(/(\d+) insertion/)?.[1] || 0) + Number(stat.match(/(\d+) deletion/)?.[1] || 0);
-    return { files: names.split('\n').filter(Boolean), lines };
+    const { stdout: baseSha } = await git(['-C', pub, 'rev-parse', 'refs/sigmadesk/base']);
+    return { files: names.split('\n').filter(Boolean), lines, baseSha: baseSha.trim() };
   });
 }
-export function pushBranch(key, branch, sha) {
+export function pushBranch(key, branch, sha, { lease } = {}) {
   if (!/^[0-9a-f]{40}$/.test(String(sha))) return Promise.reject(new Error('refusing to push without an approved commit SHA'));
   return withGitLock(async () => {
     const pub = await publisher();
     const { stdout: url } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']); // owner's remote
-    return git([...SAFE, '-C', pub, 'push', url.trim(), `${sha}:refs/heads/${branch}`], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } });
+    if (lease != null && !/^[0-9a-f]{40}$/.test(lease)) throw new Error('invalid branch lease');
+    return git([...SAFE, '-C', pub, 'push', ...(lease ? [`--force-with-lease=refs/heads/${branch}:${lease}`] : []), url.trim(), `${sha}:refs/heads/${branch}`], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' } });
   });
 }
 

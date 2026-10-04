@@ -838,6 +838,13 @@ function renderSheet() {
   const needsDecision = taskDecision || proposals.length;
   const targetSelect = options.length > 1 ? h('select', { id: 'decision-target', 'aria-label': 'Decision applies to', onchange: (e) => { sh.decisionTarget = e.target.value; renderSheet(); } }, options.map(([value, label]) => h('option', { value, selected: value === decisionTarget }, label))) : null;
   const question = /publish guard/.test(t.progress_msg || '') ? t.progress_msg : d?.comments?.filter((c) => c.body.startsWith('❓')).at(-1)?.body.replace(/^❓\s*\*\*Question for the owner:\*\*\s*/, '');
+  const refreshable = t.pr_url && t.head_sha && ['needs_human', 'ready_for_human', 'todo'].includes(t.status) && (!d?.refresh || ['rebased', 'published'].includes(d.refresh.status));
+  const branchRefresh = refreshable || d?.refresh ? h('div', { class: 'discussion-status' },
+    h('p', {}, d?.refresh ? `Branch refresh · ${d.refresh.status}${d.refresh.base ? ` · base ${d.refresh.base.slice(0, 10)}` : ''}` : 'PR conflict or stale base? The desk can refresh it and return it to the engineer.'),
+    refreshable ? h('button', { class: 'btn', type: 'button', disabled: !!t.active_run, onclick: act(async () => {
+      await api('POST', `/api/tickets/${t.key}/refresh-base`, { expected_updated_at: t.updated_at });
+      if (S.sheet === sh) openTicket(t.key);
+    }, 'Branch refreshed · engineer and fresh QA queued') }, 'Refresh branch & resume') : null) : null;
   const decisionCard = needsDecision ? h('div', { class: 'decision-card' }, h('div', { class: 'row' }, h('b', {}, targetSelect ? 'Your decision' : designDecision ? `Design proposal #${decisionTarget}` : t.status === 'needs_human' ? 'Your decision is needed' : 'Ready for your review'), targetSelect),
       h('p', {}, designDecision ? 'Review the recommendation above. Approval records the design; corrections return it to the manager.' : t.status === 'needs_human' ? question || t.progress_msg || 'The engineer is waiting for your direction.' : t.pr_url ? 'Approval records your review. Open the draft PR for the final merge, or request changes below.' : 'Approve draft publication or request changes. You control the final merge.'),
       !designDecision && /publish guard/.test(t.progress_msg || '') ? h('p', { class: 'warn' }, 'Approval pushes the guarded commit and opens a draft PR. Review its diff first.') : null,
@@ -876,7 +883,7 @@ function renderSheet() {
     worker ? h('div', { class: 'msg typing-row' }, avatar(worker.id, 'md'), h('div', { class: 'msg-b' }, h('div', { class: 'msg-t dots' }, h('i'), h('i'), h('i'),
       h('span', {}, worker.last_action ? ` ${worker.last_action}` : '')))) : null,
   ];
-  const footer = h('div', { class: 'ticket-footer' }, decisionCard || h('div', { class: 'composer' }, reply),
+  const footer = h('div', { class: 'ticket-footer' }, branchRefresh, decisionCard || h('div', { class: 'composer' }, reply),
     h('div', { class: 'message-actions' }, destination, h('button', { class: 'btn', type: 'button', onclick: send }, 'Send message')),
     h('small', { class: 'composer-help' }, 'Discussion → manager · Answer → task · Comment → thread'));
   sheetShell(head, body, footer);

@@ -96,8 +96,8 @@ function toast(msg, err = false) {
   toast.timer = setTimeout(() => { t.hidden = true; }, err ? 6000 : 3600);
 }
 
-async function api(method, url, body) {
-  const res = await fetch(url, { method, signal: AbortSignal.timeout(20000), headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+async function api(method, url, body, timeoutMs = 20000) {
+  const res = await fetch(url, { method, signal: AbortSignal.timeout(timeoutMs), headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
   const j = await res.json().catch(() => ({}));
   if (!res.ok) throw Object.assign(new Error(j.message || j.error || `HTTP ${res.status}`), { status: res.status, code: j.error });
   return j;
@@ -161,6 +161,7 @@ function apply(m) {
     case 'incident': upsert(S.incidents, m.data); break;
     case 'quota': refreshMeta(); break;
     case 'discussion': into('discussions', m.data); refreshMeta(); break;
+    case 'branch-refresh': if (mine(m.data.ticket_key) && sh.detail) sh.detail.refresh = m.data; break;
     case 'council': delete S.councils[m.data.id]; refreshMeta(); break;
     case 'event':
       if (!S.events.some((e) => e.id === m.data.id)) S.events.push(m.data);
@@ -722,12 +723,20 @@ function prSummary(t, dec) {
       files ? h('p', { class: 'muted small' }, `Engineer lists ${files.files.length} file${files.files.length === 1 ? '' : 's'}: ${files.files.map((f) => f.split('/').pop()).join(', ')}`) : null);
   }
   const pr = prFor(t);
+  const r = S.sheet?.detail?.refresh;
+  const refreshable = t.head_sha && ['needs_human', 'ready_for_human', 'todo'].includes(t.status) && (!r || ['rebased', 'published'].includes(r.status));
   return h('section', { class: 'prsum', 'aria-label': 'Pull request' },
     h('h3', {}, `Pull request #${n}`),
     pr ? h('p', {}, ciChip(t), ` +${pr.additions} −${pr.deletions} in ${pr.files} files`)
       : h('p', { class: 'muted' }, S.prsLoading ? 'Loading CI status from GitHub…' : S.prs?.error ? `GitHub status unavailable: ${S.prs.error}` : 'CI status not loaded.'),
     h('p', { class: 'muted small' }, `Merging into ${S.prs?.base || 'main'} deploys production.`),
+    r ? h('p', { class: 'muted small', role: 'status' }, `Branch refresh: ${r.status === 'conflicts' ? 'engineer resolving conflicts' : r.status === 'rebased' ? 'rebased — fresh validation in progress' : r.status === 'published' ? 'published after fresh QA' : 'preparing'} · base ${r.base?.slice(0, 10) || 'pending'}`) : null,
     h('div', { class: 'row-actions' }, dec?.kind === 'merge' ? null : h('button', { class: 'btn', type: 'button', onclick: () => prsUi.openActions(prsCtx(), n) }, 'PR actions'),
+      refreshable ? h('button', { class: 'btn', type: 'button', disabled: !!t.active_run, onclick: act(async () => {
+        const sh = S.sheet;
+        await api('POST', `/api/tickets/${t.key}/refresh-base`, { expected_updated_at: sh.version }, 300000);
+        await loadSnapshot(); if (S.sheet === sh) loadDetail(sh);
+      }, 'Branch refreshed — engineer and fresh QA queued') }, 'Refresh branch & resume') : null,
       href ? h('a', { class: 'btn ghost', href, target: '_blank', rel: 'noopener noreferrer' }, 'Open on GitHub') : null));
 }
 
