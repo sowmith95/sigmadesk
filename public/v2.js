@@ -5,6 +5,7 @@ import { nameOf, linkKeys } from './names.js';
 import { portrait, presenceOf } from './avatars.js';
 import { board, deskStatus, humanReason } from './attention.js';
 import { runCard } from './runcard.js';
+import { conversationItems, nearLatest } from './conversation.js';
 
 const VIEWS = ['inbox', 'work', 'team'];
 const STAGE_LABEL = { triage: 'Intake', proposed: 'Proposed', todo: 'To do', in_progress: 'Building', qa: 'QA', review: 'Acceptance', needs_human: 'Needs you', ready_for_human: 'Ready for review', done: 'Shipped', wontdo: 'Closed' };
@@ -111,7 +112,7 @@ const act = (fn, ok) => async (...a) => {
 };
 
 // ---------------- data sync (same contract as the classic client) ----------------
-let es, syncing = false, snapshotSeq = 0;
+let es, reconnectTimer, syncing = false, snapshotSeq = 0;
 const pendingDeltas = [];
 async function loadSnapshot() {
   syncing = true;
@@ -129,10 +130,17 @@ async function loadSnapshot() {
   } finally { if (seq === snapshotSeq) syncing = false; }
 }
 function connect() {
+  clearTimeout(reconnectTimer);
   es?.close();
   es = new EventSource('/api/stream');
-  es.onopen = () => { S.connected = true; syncing = true; loadSnapshot().catch(() => {}); };
-  es.onerror = () => { S.connected = false; renderTop(); };
+  es.onopen = () => { S.connected = true; syncing = true; loadSnapshot().then(() => {
+    if (S.sheet?.type === 'ticket') return loadDetail(S.sheet);
+  }).catch(() => {}); };
+  es.onerror = () => {
+    S.connected = false; renderTop(); renderSheet();
+    // Some failed HTTP responses close EventSource permanently instead of retrying.
+    if (es.readyState === EventSource.CLOSED) reconnectTimer = setTimeout(connect, 3000);
+  };
   es.onmessage = (e) => {
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
@@ -303,6 +311,10 @@ function nowLine(card, { compact = false } = {}) {
   if (card.issue) out.push(h('p', { class: 'issue' }, h('span', { class: 'issue-l' }, 'Last check: '), card.issue.text));
   if (card.stale) out.push(h('p', { class: `stale ${card.stale.severe ? 'severe' : ''}` }, `No update for ${card.stale.minutes} min`));
   if (compact) {
+    if (card.live && card.run?.model) {
+      const [provider, ...model] = card.run.model.split(':');
+      out.push(h('p', { class: 'facts' }, `Running on ${{ codex: 'Codex', claude: 'Claude', perplexity: 'Perplexity' }[provider] || provider}${model.length ? ` · ${model.join(':')}` : ''}`));
+    }
     const bits = [card.plan ? `Plan ${card.plan.done} of ${card.plan.total}` : null, card.elapsedMin != null && card.live ? `${mins(card.elapsedMin)} elapsed` : null,
       card.cost ? (card.cost.running ? `${money(card.cost.reserve)} cap reserved` : card.cost.label) : null].filter(Boolean);
     if (bits.length) out.push(h('p', { class: 'facts mono' }, bits.join(' · ')));
@@ -449,6 +461,7 @@ function workCard(it) {
       card ? nowLine(card, { compact: true }) : null,
       h('div', { class: 'kcard-f' }, t.assignee ? h('span', { class: 'who small' }, avatar(it.worker || t.assignee), firstName(it.worker || t.assignee)) : null,
         h('span', { class: 'spacer' }), it.bucket === 'shipped' ? h('span', { class: 'muted small' }, ago(t.updated_at)) : null)),
+    h('button', { class: 'btn ghost small', type: 'button', onclick: () => openTicket(t.key) }, it.bucket === 'working' ? 'View live conversation' : 'View conversation'),
     kids.length ? disclose(`epic-${t.key}`, `${kids.length} slice${kids.length === 1 ? '' : 's'}`, h('ul', { class: 'slices' }, kids.map((k) => h('li', {},
       h('button', { class: 'linkish', type: 'button', onclick: () => openTicket(k.key) }, nameOf(k)), chip(STAGE_LABEL[k.status] || k.status, k.status === 'done' ? 'green' : ['needs_human', 'ready_for_human'].includes(k.status) ? 'amber' : ''))))) : null);
 }
@@ -551,7 +564,7 @@ function sheetShell(head, body, footer = null, sig = '') {
   const typingInFooter = same && old.querySelector('.sheet-f')?.contains(active) && editing(active);
   const typingInBody = same && old.querySelector('.sheet-b')?.contains(active) && editing(active);
   // A field mid-edit in the body: ticket/seat/desk sheets wait; the PR console and PR sheet re-render (their drafts are kept).
-  if (typingInBody && !['prs', 'pr'].includes(S.sheet.type)) return;
+  if (typingInBody && active.getAttribute('aria-label') !== 'Conversation participant' && !['prs', 'pr'].includes(S.sheet.type)) return;
   const caret = editing(active) ? { id: active.id, label: active.getAttribute('aria-label'), sel: active.selectionStart } : null;
   const headEl = h('div', { class: 'sheet-h' }, head);
   const bodyEl = h('div', { class: 'sheet-b' }, body);
@@ -559,6 +572,7 @@ function sheetShell(head, body, footer = null, sig = '') {
     old.querySelector('.sheet-h').replaceWith(headEl);
     old.querySelector('.sheet-b').replaceWith(bodyEl);
     bodyEl.scrollTop = prevScroll;
+    restoreConversation(bodyEl);
     return;
   }
   const panel = h('div', { class: 'sheet-panel', role: 'dialog', 'aria-modal': 'true', 'data-id': id, 'data-sig': sig }, headEl, bodyEl, footer ? h('div', { class: 'sheet-f' }, footer) : null);
@@ -570,6 +584,7 @@ function sheetShell(head, body, footer = null, sig = '') {
   for (const el of BACKGROUND()) el.inert = true;
   panel.setAttribute('aria-label', panel.querySelector('h2')?.textContent || 'Details');
   if (same) bodyEl.scrollTop = prevScroll;
+  restoreConversation(bodyEl);
   if (same && caret) {
     const n = (caret.id && $(caret.id)) || [...panel.querySelectorAll('input, select, textarea')].find((x) => x.getAttribute('aria-label') === caret.label);
     if (n) { n.focus(); if (caret.sel != null && ['text', 'search', 'textarea'].includes(n.type)) try { n.setSelectionRange(caret.sel, caret.sel); } catch { /* not text */ } return; }
@@ -596,7 +611,7 @@ function openPrConsole() { S.sheet = { type: 'prs' }; renderSheet(); }
 
 // ---- ticket sheet ----
 async function openTicket(key, opts = {}) {
-  const sh = { type: 'ticket', key, detail: null, mode: null, compose: false, decisionId: opts.decision || null, focus: !!opts.focus, pending: { comments: [], events: [], discussions: [] } };
+  const sh = { type: 'ticket', key, detail: null, conversation: { agent: '', follow: true, top: 0 }, mode: null, compose: false, decisionId: opts.decision || null, focus: !!opts.focus, pending: { comments: [], events: [], discussions: [] } };
   S.sheet = sh;
   history.replaceState(null, '', `#${key}`);
   renderSheet();
@@ -618,25 +633,55 @@ async function loadDetail(sh) {
   } catch (e) { if (S.sheet === sh) { sh.error = e.message; renderSheet(); } }
 }
 
-function threadView(d) {
+function restoreConversation(body) {
+  const log = body.querySelector('.conversation-log');
+  const state = S.sheet?.conversation;
+  if (!log || !state) return;
+  log.scrollTop = state.follow ? log.scrollHeight : state.top;
+}
+
+function threadView(d, card) {
+  const sh = S.sheet, state = sh.conversation;
   const amap = agentMap();
-  const items = [
-    ...d.comments.map((c) => ({ id: `c${c.id}`, ts: c.ts, who: c.author, text: c.body, kind: 'comment' })),
-    ...d.events.filter((e) => e.kind === 'say' && !String(e.text).startsWith('→ Engineering Manager:')).map((e) => ({ id: `e${e.id}`, ts: e.ts, who: e.agent_id, text: e.text, kind: 'say' })),
-  ].sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
-  if (!items.length) return h('p', { class: 'muted' }, 'No messages yet.');
-  return h('div', { class: 'thread' }, items.map((it) => {
+  const items = conversationItems({ ...d, agent: state.agent });
+  const all = conversationItems(d);
+  const participants = [...new Set(all.map((i) => i.who))];
+  const whoName = (id) => amap[id]?.name || ({ owner: 'You', system: 'Desk', github: 'GitHub' }[id]) || id;
+  const label = !S.connected ? 'Reconnecting…' : card.live ? 'Live updates' : 'Up to date';
+  const follow = h('button', { class: 'btn small', type: 'button', disabled: state.follow, onclick: () => {
+    state.follow = true; renderSheet();
+  } }, state.follow ? 'Following latest' : 'Jump to latest');
+  const log = h('div', { class: 'thread conversation-log', role: 'region', 'aria-label': 'Task conversation', tabindex: '0', onscroll: (e) => {
+    if (!e.currentTarget.isConnected) return;
+    state.top = e.currentTarget.scrollTop;
+    state.follow = nearLatest(e.currentTarget);
+    follow.disabled = state.follow;
+    follow.textContent = state.follow ? 'Following latest' : 'Jump to latest';
+  } }, items.length ? items.map((it) => {
     const mine = it.who === 'owner';
     const ask = String(it.text).startsWith('❓');
-    const who = amap[it.who]?.name || (mine ? 'You' : it.who === 'system' ? 'Desk' : it.who === 'github' ? 'GitHub' : it.who || 'Desk');
+    const who = whoName(it.who);
+    const run = S.runs.find((r) => r.id === it.runId);
+    const meta = [amap[it.who]?.role, run?.model?.replace(':', ' · ')].filter(Boolean).join(' · ');
+    if (it.kind === 'technical') return h('div', { class: 'conversation-steps' }, disclose(`steps-${sh.key}-${it.id}`,
+      `${who} · ${it.steps.length} execution step${it.steps.length === 1 ? '' : 's'}`,
+      h('div', { class: 'log mono' }, it.steps.map((e) => h('div', {}, h('time', { datetime: e.ts }, hhmm(e.ts)), ' ', e.raw)))));
     const text = ask ? questionText(it.text) : clean(it.text);
-    const long = text.length > 420;
-    const textEl = long ? disclose(`msg-${it.id}`, h('span', {}, named(`${text.slice(0, 280).trim()}…`), h('span', { class: 'more' }, ' Show all')), h('div', { class: 'msg-t' }, named(text)), { cls: 'long' })
+    const textEl = text.length > 1200 ? disclose(`msg-${it.id}`, h('span', {}, named(`${text.slice(0, 800).trim()}…`), h('span', { class: 'more' }, ' Show all')), h('div', { class: 'msg-t' }, named(text)), { cls: 'long' })
       : h('div', { class: 'msg-t' }, named(text));
-    return h('div', { class: `msg ${mine ? 'mine' : ''} ${ask ? 'ask' : ''} ${it.kind}` },
+    const update = !['comment', 'say'].includes(it.kind);
+    return h('article', { class: `msg ${mine ? 'mine' : ''} ${ask ? 'ask' : ''} ${update ? 'update' : ''}`, 'data-message': it.id },
       mine ? null : avatar(it.who, 'md'),
-      h('div', { class: 'msg-b' }, h('div', { class: 'msg-h' }, h('b', {}, ask ? `${who} asks you` : who), h('span', { class: 'muted small' }, ago(it.ts))), textEl));
-  }));
+      h('div', { class: 'msg-b' }, h('div', { class: 'msg-h' }, h('b', {}, ask ? `${who} asks you` : who),
+        h('time', { class: 'muted small', datetime: it.ts, title: new Date(it.ts).toLocaleString() }, hhmm(it.ts))),
+      meta ? h('p', { class: 'muted small msg-meta' }, meta) : null, textEl));
+  }) : h('p', { class: 'muted' }, 'No recorded updates yet. Messages will appear here as the team works.'));
+  return h('section', { class: 'conversation', 'aria-label': 'Conversation' },
+    h('div', { class: 'conversation-h' }, h('h3', {}, 'Conversation'), h('span', { class: 'muted small', role: 'status' }, label), h('span', { class: 'spacer' }), follow),
+    h('div', { class: 'conversation-h' }, h('label', { class: 'small' }, 'Show ', h('select', { 'aria-label': 'Conversation participant', onchange: (e) => {
+      state.agent = e.target.value; state.follow = true; state.top = 0; renderSheet();
+    } }, h('option', { value: '', selected: !state.agent }, 'Everyone'), participants.map((id) => h('option', { value: id, selected: state.agent === id }, whoName(id)))))),
+    log, h('p', { class: 'muted small' }, 'Recorded messages and progress updates · latest 600 activity events. Expand execution steps for technical details.'));
 }
 
 function runCardView(card, { withEvidence = true } = {}) {
@@ -894,21 +939,22 @@ function renderTicketSheet() {
   ];
   const hist = [
     disclose(`hist-run-${t.key}`, card.live ? 'Current run' : 'Execution history', runCardView(card, { withEvidence: true }), { cls: 'hist' }),
-    disclose(`hist-thread-${t.key}`, `Conversation${d ? ` · ${d.comments.length}` : ''}`, d ? threadView(d) : h('p', { class: 'muted' }, sh.error || 'Loading…'), { cls: 'hist' }),
+
   ];
   const body = dec ? [
     briefView(dec, t, d, card),
     prSummary(t, dec),
     reviewsView(prReviewsOf(t, d)),
+    d ? threadView(d, card) : h('p', { class: 'muted' }, sh.error || 'Loading conversation…'),
     hist,
     moreView(t, d),
   ] : [
     gone ? h('p', { class: 'status-line blocked' }, 'That decision was resolved or changed while you were reading. Nothing was submitted.') : null,
     it && ['blocked', 'queued', 'epic'].includes(it.bucket) ? h('p', { class: `status-line ${it.bucket}` }, named(humanReason(clean(it.reason), S.tickets))) : null,
-    runCardView(card, { withEvidence: true }),
+    d ? threadView(d, card) : h('p', { class: 'muted' }, sh.error || 'Loading conversation…'),
+    disclose(`hist-run-${t.key}`, card.live ? 'Current run details' : 'Execution history', runCardView(card, { withEvidence: true })),
     prSummary(t, null),
     reviewsView(prReviewsOf(t, d)),
-    h('section', { 'aria-label': 'Thread' }, h('h3', {}, 'Thread'), d ? threadView(d) : h('p', { class: 'muted' }, sh.error || 'Loading…')),
     moreView(t, d),
   ];
   const sig = `${dec?.id || 'none'}|${sh.mode || ''}|${!!t.active_run}|${sh.compose}|${dec?.kind === 'design' ? !!(d?.discussions || []).find((x) => x.id === dec.proposal_id) : ''}|${dec?.kind === 'council' ? `${councilFor(dec.council_id)?.status}${councilFor(dec.council_id)?.stale}` : ''}`;

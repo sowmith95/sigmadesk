@@ -393,3 +393,15 @@ input::placeholder, textarea::placeholder { color: var(--steel); } /* ≥4.5:1 o
   .disc > summary { min-height: 44px; }
   .mrow { padding: 12px 12px 12px 16px; }
 }
+
+/* A readable task conversation, with raw commands behind disclosures. */
+.conversation { min-width: 0; }
+.conversation-h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.conversation-h h3 { margin: 0; font-size: 16px; }
+.conversation-h select { max-width: 100%; }
+.conversation-log { max-height: 52vh; min-height: 180px; overflow-y: auto; overscroll-behavior: contain; padding: 8px 8px 12px 0; margin-bottom: 8px; overflow-anchor: none; }
+.conversation-log .msg-h { flex-wrap: wrap; }
+.conversation-log .msg-meta { margin: 0 0 5px; overflow-wrap: anywhere; }
+.conversation-log .msg.update .msg-b { background: transparent; border-left: 2px solid var(--steel); border-radius: 0; padding: 4px 10px; }
+.conversation-steps { padding-left: 42px; min-width: 0; color: var(--steel); font-size: 13px; }
+.conversation-steps .log { white-space: pre-wrap; overflow-wrap: anywhere; }

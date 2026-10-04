@@ -61,6 +61,18 @@ test('a tool exit is a note under Now; a real error replaces Now until an explic
   assert.equal(ok.now.text, 'Retried push');
 });
 
+test('Codex exit errors remain check notes while the engineer continues working', () => {
+  const events = [ev('action', '70% · completing mock checks', 3), ev('error', 'exit 1: WebSocket server error: Error: listen EPERM: operation not permitted 0.0.0.0:24678', 2)];
+  const card = runCard({ ticket, events, runs, agents, now: NOW });
+  assert.equal(card.live, true);
+  assert.equal(card.now.error, false);
+  assert.equal(card.now.text, 'Completing mock checks');
+  assert.equal(card.issue.text, 'Local preview could not start inside the sandbox');
+  const lint = runCard({ ticket, events: [ev('error', 'exit 1: C408 Unnecessary dict() call', 1)], runs, agents, now: NOW });
+  assert.equal(lint.now.error, false);
+  assert.equal(lint.issue.text, 'A command exited with code 1');
+});
+
 test('a failed run shows red; another run\'s events never leak into this run', () => {
   id = 0;
   const failed = [{ ...runs[0], status: 'error', ended_at: at(1) }];

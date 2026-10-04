@@ -46,13 +46,14 @@ export function humanizeError(text) {
   if (/No such file or directory/i.test(t)) return 'A command referenced a path that does not exist';
   if (/command not found/i.test(t)) return 'A command is not installed in the workspace';
   if (/timed? ?out/i.test(t)) return 'A command timed out';
+  if (/listen EPERM|WebSocket server error.*operation not permitted/i.test(t)) return 'Local preview could not start inside the sandbox';
   if (/permission denied/i.test(t)) return 'A command was denied permission';
-  const code = t.match(/^Exit code (\d+)/i);
+  const code = t.match(/^Exit(?: code)?\s+(\d+)\b/i);
   if (code) return `A command exited with code ${code[1]}`;
   return firstLine(raw, 140);
 }
 /** A non-zero exit from a tool the agent ran: ordinary during work, not a run failure. */
-export const isToolExit = (text) => /^\s*Exit code \d+/i.test(String(text || ''));
+export const isToolExit = (text) => /^\s*Exit(?: code)?\s+\d+\b/i.test(String(text || ''));
 const FAILED = new Set(['error', 'failed', 'killed', 'timeout', 'budget']);
 
 const firstLine = (s, n = 180) => {
