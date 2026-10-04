@@ -528,3 +528,30 @@ async function consultInner({ agentId, ticketKey, question }) {
     if (!store.getAgentState(agentId)?.current_run) store.updateAgent(agentId, { status: 'idle', current_ticket: null });
   }
 }
+
+// ---------------- review snapshots (two-reviewer PRs) ----------------
+// A reviewer never works in the author's writable clone: it gets a fresh checkout of exactly the reviewed commit,
+// built from the desk-owned publisher repo (stageApproved must have fetched that commit first).
+export const reviewSnapshotDir = (key, seat) => path.join(config.workspaceRoot, `_review-${key}-${seat}`);
+export function reviewSnapshot(key, seat, sha) {
+  if (!/^[0-9a-f]{40}$/.test(String(sha))) return Promise.reject(new Error('review snapshot needs a full commit SHA'));
+  if (!/^[A-Za-z0-9-]+$/.test(`${key}${seat}`)) return Promise.reject(new Error('invalid review snapshot name'));
+  return withGitLock(async () => {
+    const pub = await publisher();
+    const dir = reviewSnapshotDir(key, seat);
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    const base = config.project.baseBranch;
+    await git(['init', '-q', dir]);
+    await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', dir, 'fetch', '-q', '--no-tags', pub,
+      `+refs/sigmadesk/${key}:refs/heads/sigmadesk-review`, `+refs/sigmadesk/base:refs/remotes/origin/${base}`]);
+    const { stdout: got } = await git(['-C', dir, 'rev-parse', 'refs/heads/sigmadesk-review']);
+    if (got.trim() !== sha) throw new Error(`review snapshot is at ${got.trim().slice(0, 7)}, expected ${sha.slice(0, 7)}`);
+    await git([...SAFE, '-C', dir, 'checkout', '-q', '--detach', sha]);
+    return dir;
+  });
+}
+export function removeReviewSnapshot(key, seat) {
+  const dir = reviewSnapshotDir(key, seat);
+  if (dir.startsWith(config.workspaceRoot) && fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+}
