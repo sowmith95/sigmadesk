@@ -179,7 +179,7 @@ async function ownerRoute(req, res) {
     const n = Number(mm[1]);
     const out = mm[2] === 'approve' ? await prs.approve(n, String(b.message || '').slice(0, 4000))
       : mm[2] === 'ready' ? await prs.ready(n)
-        : mm[2] === 'merge' ? await prs.merge(n, { method: b.method || 'squash', override: b.override || '', inBusyWindow: sched.inBusyWindow(),
+        : mm[2] === 'merge' ? await mergetrain.ownerMerge(n, { method: b.method || 'squash', override: b.override || '', inBusyWindow: sched.inBusyWindow(),
           expectedSha: String(b.expected_sha || ''), overrideReason: String(b.override_reason || '').slice(0, 2000), actor: 'owner' })
           : mm[2] === 'close' ? await prs.close(n, String(b.comment || '').slice(0, 2000))
             : mm[2] === 'reviewer' ? await prs.addReviewer(n, b.login)

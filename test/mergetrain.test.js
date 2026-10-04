@@ -178,13 +178,13 @@ test('merge-tree: clean, real conflicts (content, rename/delete, binary) and err
 test('deploying PR inside the window is scheduled, then merges after the window; non-deploying merges at once', async () => {
   const docs = await approvedPr('docs/guide.md');
   prFor(docs); setGh('merge.json', { mergeCommit: { oid: 'd'.repeat(40) } });
-  let r = await train.consider(docs, { now: WED_11_ET });
+  let r = await train.consider(docs, { now: WED_11_ET, snap: await train.watchBase() });
   assert.equal(r.action, 'merged', JSON.stringify(r));
   assert.equal(train.deployState(), null, 'no deploy lock for a non-deploying merge');
 
   const app = await approvedPr('app/feature.py');
   prFor(app);
-  r = await train.consider(app, { now: WED_11_ET });
+  r = await train.consider(app, { now: WED_11_ET, snap: await train.watchBase() });
   assert.equal(r.action, 'scheduled');
   const t = store.getTicket(app.key);
   assert.equal(t.merge_after, '2026-09-30T20:15:00.000Z');
@@ -196,7 +196,7 @@ test('deploying PR inside the window is scheduled, then merges after the window;
   assert.equal(merges().length, before, 'still waiting');
   assert.equal(store.listOutbox(app.key).filter((o) => /Scheduled/.test(o.body)).length, 1, 'scheduled once, not every minute');
   setGh('merge.json', { mergeCommit: { oid: 'e'.repeat(40) } });
-  r = await train.consider(store.getTicket(app.key), { now: WED_AFTER });
+  r = await train.consider(store.getTicket(app.key), { now: WED_AFTER, snap: await train.watchBase() });
   assert.equal(r.action, 'merged', JSON.stringify(r));
   assert.deepEqual(merges().at(-1).slice(-2), ['--match-head-commit', app.head_sha]);
   assert.equal(store.getTicket(app.key).merge_after, null);
@@ -208,23 +208,23 @@ test('one deploying merge at a time: wait for the deploy run, owner on failure o
   const next = await approvedPr('app/second.py');
   prFor(next);
   setGh('runs.json', [{ workflowName: 'Deploy', status: 'in_progress', conclusion: '' }]);
-  let r = await train.consider(next, { now: WED_AFTER });
-  assert.equal(r.action, 'queued'); assert.match(r.reason, /deploy of M-\d+ is still running/);
+  let r = await train.consider(next, { now: WED_AFTER, snap: await train.watchBase() });
+  assert.equal(r.action, 'queued', JSON.stringify(r)); assert.match(r.reason, /deploy of M-\d+ is still running/);
   setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'failure' }]);
-  r = await train.consider(store.getTicket(next.key), { now: WED_AFTER });
+  r = await train.consider(store.getTicket(next.key), { now: WED_AFTER, snap: await train.watchBase() });
   assert.match(r.reason, /last deploy failed/);
   assert.equal(train.deployState().state, 'failed');
   train.clearDeployLock('owner');
   // timeout: a run that never finishes
   store.kvSet('train:deploy', JSON.stringify({ key: 'M-1', merge_sha: 'e'.repeat(40), at: new Date(WED_AFTER - 50 * 60_000).toISOString(), workflows: ['Deploy'], state: 'running' }));
   setGh('runs.json', [{ workflowName: 'Deploy', status: 'queued', conclusion: '' }]);
-  r = await train.consider(store.getTicket(next.key), { now: WED_AFTER });
+  r = await train.consider(store.getTicket(next.key), { now: WED_AFTER, snap: await train.watchBase() });
   assert.match(r.reason, /did not finish/);
-  assert.equal(train.deployState().state, 'timed_out');
+  assert.equal(train.deployState().state, 'escalated');
   train.clearDeployLock('owner');
   setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success' }]);
   setGh('merge.json', { mergeCommit: { oid: 'f'.repeat(40) } });
-  r = await train.consider(store.getTicket(next.key), { now: WED_AFTER });
+  r = await train.consider(store.getTicket(next.key), { now: WED_AFTER, snap: await train.watchBase() });
   assert.equal(r.action, 'merged');
   setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success' }]);
   assert.equal(await train.deployLock(WED_AFTER), null, 'a finished, green deploy releases the lock');
@@ -357,4 +357,146 @@ test('after_key is sequencing, not stacking: a squash-merged parent is dropped w
   assert.equal(u.action, 'updated');
   assert.equal(g(origin, 'rev-parse', `${u.head}^`), snap.base, 'only the child commit sits on top of main');
   assert.match(store.listOutbox(child0.key).at(-1).body, new RegExp(`dropping the commits of ${parent.key}`));
+});
+
+// ---------------- release-blocker fixes (independent review) ----------------
+const lockNow = () => train.deployState();
+const resetTrain = () => { train.clearDeployLock('test'); store.kvSet('train:intent', 'null'); setGh('runs.json', []); };
+
+test('live gate right before dispatch: halt, Hold, risk, stop-all fence and a moved base all stop the merge', async () => {
+  resetTrain();
+  const t = await approvedPr('docs/gate.md');
+  prFor(t);
+  const before = merges().length;
+  const snap = await train.watchBase();
+  // stop-all between the checks and the dispatch: the fence (epoch) no longer matches
+  let r = await train.consider(t, { now: SAT, snap, epoch: runner.currentEpoch() - 1 });
+  assert.match(r.reason, /stopped \(circuit breaker\)/);
+  assert.equal(store.getTicket(t.key).review_stage, 'approved', 'rolled back to the queue');
+  // each live condition re-read by authorizeMerge
+  const intent = { key: t.key, head: t.head_sha, by: 'desk', deploys: false, epoch: runner.currentEpoch(), at: 'x', base: snap.base };
+  store.updateTicket(t.key, { review_stage: 'merging' });
+  store.setSetting('paused', 'true');
+  await assert.rejects(train.authorizeMerge(t.key, intent), /paused/);
+  store.setSetting('paused', 'false');
+  store.updateTicket(t.key, { merge_hold: 'owner said wait' });
+  await assert.rejects(train.authorizeMerge(t.key, intent), /on hold/);
+  store.updateTicket(t.key, { merge_hold: null, risk: 'high' });
+  await assert.rejects(train.authorizeMerge(t.key, intent), /high-risk/);
+  store.updateTicket(t.key, { risk: 'low' });
+  await assert.rejects(train.authorizeMerge(t.key, { ...intent, deploys: true }, WED_11_ET), /deploy lock is not held|busy window/);
+  await train.authorizeMerge(t.key, intent); // all clear
+  landOnMain('notes/moved.txt', 'm\n', 'base moves after the CI was read');
+  await assert.rejects(train.authorizeMerge(t.key, intent), /moved since its CI was read/);
+  store.updateTicket(t.key, { review_stage: 'approved' });
+  // without a fresh base snapshot the train fails closed
+  r = await train.consider(store.getTicket(t.key), { now: SAT, snap: null });
+  assert.match(r.reason, /no fresh view of main/);
+  assert.equal(merges().length, before, 'nothing was merged');
+});
+
+test('merge intent + deploy lock are persisted before merging and reconciled after a crash', async () => {
+  resetTrain();
+  const t = await approvedPr('app/intent.py');
+  // crash after GitHub merged but before the desk recorded it
+  store.kvSet('train:intent', JSON.stringify({ key: t.key, pr: 7, head: t.head_sha, deploys: true, by: 'desk', at: 'a1', workflows: ['Deploy'] }));
+  store.kvSet('train:deploy', JSON.stringify({ key: t.key, state: 'merging', intent_at: 'a1', workflows: ['Deploy'] }));
+  setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '1'.repeat(40) } });
+  assert.deepEqual(await train.reconcileIntent(), { reconciled: 'merged' });
+  assert.equal(lockNow().state, 'running'); assert.equal(lockNow().merge_sha, '1'.repeat(40));
+  assert.equal(store.kvGet('train:intent'), 'null');
+  // crash before GitHub merged: rolled back, lock released
+  resetTrain();
+  store.kvSet('train:intent', JSON.stringify({ key: t.key, pr: 7, head: t.head_sha, deploys: true, by: 'desk', at: 'a2', workflows: ['Deploy'] }));
+  store.kvSet('train:deploy', JSON.stringify({ key: t.key, state: 'merging', intent_at: 'a2', workflows: ['Deploy'] }));
+  setGh('merge.json', { state: 'OPEN', mergeCommit: null });
+  assert.deepEqual(await train.reconcileIntent(), { reconciled: 'rolled_back' });
+  assert.equal(lockNow(), null);
+  // a desk merge takes the lock BEFORE dispatching (seen by the fake gh at merge time)
+  prFor(t); setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '2'.repeat(40) } });
+  const r = await train.consider(store.getTicket(t.key), { now: SAT, snap: await train.watchBase() });
+  assert.equal(r.action, 'merged', JSON.stringify(r));
+  assert.equal(lockNow().merge_sha, '2'.repeat(40));
+});
+
+test('deploy lock: every expected workflow must succeed; missing or failed stays locked and escalates', async () => {
+  resetTrain();
+  const at = new Date(SAT.getTime() - 10 * 60_000).toISOString();
+  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at, workflows: ['Deploy', 'Publish UI'], state: 'running' }));
+  setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success', databaseId: 1 }]);
+  assert.ok(await train.deployLock(SAT), 'one of two expected deploys is not enough');
+  setGh('runs.json', []);
+  assert.ok(await train.deployLock(SAT), 'no runs at all is not a release');
+  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at: new Date(SAT.getTime() - 60 * 60_000).toISOString(), workflows: ['Deploy', 'Publish UI'], state: 'running' }));
+  assert.equal((await train.deployLock(SAT)).state, 'escalated');
+  assert.match(lockNow().note, /Deploy never started|Publish UI never started/);
+  resetTrain();
+  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at, workflows: ['Deploy', 'Publish UI'], state: 'running' }));
+  setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success', databaseId: 1 }, { workflowName: 'Publish UI', status: 'completed', conclusion: 'skipped', databaseId: 2 }]);
+  assert.equal((await train.deployLock(SAT)).state, 'failed', 'skipped is not a successful deploy');
+  resetTrain();
+  store.kvSet('train:deploy', JSON.stringify({ key: null, merge_sha: '3'.repeat(40), at, workflows: ['Deploy', 'Publish UI'], state: 'running' }));
+  setGh('runs.json', [{ workflowName: 'Deploy', status: 'completed', conclusion: 'success', databaseId: 1 }, { workflowName: 'Publish UI', status: 'completed', conclusion: 'success', databaseId: 2 }]);
+  assert.equal(await train.deployLock(SAT), null);
+});
+
+test('owner merges of deploying changes and external deploying commits on main take the deploy lock', async () => {
+  resetTrain();
+  const t = await approvedPr('app/owner.py', 'x\n', { risk: 'high' });
+  prFor(t, { number: 7 }); setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '4'.repeat(40) } });
+  store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
+  await train.ownerMerge(7, { expectedSha: t.head_sha, method: 'squash' });
+  assert.equal(lockNow().by, 'owner'); assert.equal(lockNow().merge_sha, '4'.repeat(40));
+  await assert.rejects(train.ownerMerge(7, { expectedSha: t.head_sha }), /deploy of .* still running/, 'a second deploying merge waits');
+  resetTrain();
+  await train.sweep({ now: SAT }); // remember the current base
+  landOnMain('app/hotfix.py', 'h\n', 'hotfix merged on GitHub by hand');
+  store.setSetting('paused', 'true'); // nothing in the queue should move; only the watcher runs
+  await train.sweep({ now: SAT });
+  store.setSetting('paused', 'false');
+  assert.equal(lockNow().by, 'external');
+  assert.deepEqual(lockNow().workflows, ['Deploy']);
+  resetTrain();
+});
+
+test('a force-push journaled before a crash is recognized as the desk\'s own update, not a foreign push', async () => {
+  resetTrain();
+  const t = await approvedPr('notes/journal.txt');
+  landOnMain('notes/other.txt', 'o\n', 'unrelated (#392)');
+  const snap = await train.watchBase();
+  // what lazyUpdate would have produced and pushed before the desk died
+  const w = path.join(tmp, `j-${seq}`); execFileSync('git', ['clone', '-q', '-b', t.branch, origin, w]);
+  g(w, 'fetch', '-q', origin, 'main'); g(w, 'rebase', '-q', 'FETCH_HEAD'); const newHead = g(w, 'rev-parse', 'HEAD');
+  g(w, 'push', '-q', '-f', 'origin', `HEAD:${t.branch}`);
+  await runner.fetchIntoPublisher(t.key, w, newHead);
+  store.kvSet(`train:push:${t.key}`, JSON.stringify({ old: t.head_sha, new: newHead, base: snap.base, how: 'rebased onto `main`', incoming: '#392', at: 'x' }));
+  const snap2 = await train.watchBase();
+  const u = await train.lazyUpdate(store.getTicket(t.key), snap2);
+  assert.equal(u.action, 'updated');
+  assert.equal(store.getTicket(t.key).head_sha, newHead); assert.equal(store.getTicket(t.key).merge_hold, null);
+  assert.equal(store.kvGet(`train:push:${t.key}`), 'null');
+});
+
+test('approved PRs whose GitHub branch holds an older commit are re-published', async () => {
+  const t = await approvedPr('docs/republish.md');
+  store.kvSet(`published:${t.key}`, '0'.repeat(40));
+  store.setSetting('open_draft_prs', 'true');
+  sched.retryPublications();
+  for (let i = 0; i < 50 && store.kvGet(`published:${t.key}`) !== t.head_sha; i++) await new Promise((r) => setTimeout(r, 50));
+  assert.equal(store.kvGet(`published:${t.key}`), t.head_sha);
+});
+
+test('resolve jobs only run on engines that enforce the spend cap', async () => {
+  const team = await import('../src/team.js');
+  assert.equal(runner.capsSpend({ ...team.agentById.junior, engine: 'claude' }), true);
+  assert.equal(runner.capsSpend({ ...team.agentById.junior, engine: 'codex' }), false);
+  const t = { builder: 'junior', assignee: 'junior', area: 'backend', complexity: 'S' };
+  assert.equal(train.resolverFor(t), 'junior');
+  team.applyTeamOverrides({ junior: { engine: 'codex' } });
+  assert.notEqual(train.resolverFor(t), 'junior', 'a builder on an uncapped engine is skipped');
+  team.applyTeamOverrides({ junior: { engine: 'codex' }, 'senior-be': { engine: 'codex' }, 'senior-fe': { engine: 'codex' }, dba: { engine: 'codex' } });
+  assert.equal(train.resolverFor(t), null);
+  team.applyTeamOverrides({});
+  const args = runner.buildCommand({ ...team.agentById.junior, model: 'opus' }, 'resolve', '/tmp/x').args;
+  assert.equal(args[args.indexOf('--max-budget-usd') + 1], '1.5');
 });

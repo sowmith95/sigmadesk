@@ -68,6 +68,11 @@ without you.
   re-confirm with a range-diff); a real conflict becomes a durable resolve job for the engineer who built the PR — a
   fresh, budget-capped run (`resolve.budgetUsd`, session resume off by default) in an isolated clone with a compact
   conflict pack — followed by QA and both reviewers re-confirming the resolution. Each step is posted on the PR.
+  Merges fail closed: every merge (desk or owner) takes the deploy lock first when it redeploys, persists its intent
+  before calling GitHub, and re-checks halt / stop-all / Hold / risk / window / lock / base freshness immediately before
+  the merge call. The desk can only narrow the gap between "CI read" and "merged"; to make it atomic, protect the base
+  branch with required status checks and "Require branches to be up to date before merging" (or a merge queue) —
+  `npm run doctor` warns when that is missing.
 - **On-call SRE.** A deterministic watcher (no LLM) tails Loki / docker / files, fingerprints errors, and wakes the SRE
   only for new or chronic signatures. The SRE files a root-caused bug, mutes noise, or pages you. Error storms become
   one page, not fifty tickets. A fixed signature that comes back reopens as a regression.
