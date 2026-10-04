@@ -853,9 +853,10 @@ test('the merge check asks GitHub: a deploy that finished green releases its loc
   setGh(`runs-${'9'.repeat(40)}.json`, [{ path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success', id: 1 }]);
   setGh('pr.json', { number: 78, title: 'hand-written PR', state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', headRefOid: 'd'.repeat(40), baseRefName: 'main', body: 'SigmaDesk', statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }] });
   setGh('files.json', ['app/handmade.py']);
-  const check = await prs.mergeCheck(78);
-  assert.equal(check.deploy_hold, null, 'no hold: the deploy it waited for is done');
-  assert.ok(!check.blockers.some((b) => /still running/.test(b)));
-  assert.equal(lockNow(), null);
-  resetTrain();
+  try {
+    const check = await prs.mergeCheck(78);
+    assert.equal(check.deploy_hold, null, 'no hold: the deploy it waited for is done');
+    assert.ok(!check.blockers.some((b) => /still running/.test(b)));
+    assert.equal(lockNow(), null);
+  } finally { resetTrain(); }
 });

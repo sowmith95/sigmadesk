@@ -329,7 +329,10 @@ export async function mergeCheck(number, { inBusyWindow = false, halted = false 
   // passed with the owner's reason, a running one cannot.
   const train = await import('./mergetrain.js');
   // Ask GitHub, not the stored lock: a deploy that finished since the last check releases here (Recheck shows it).
-  const lock = await train.deployLock();
+  // GitHub slow (or a DB hiccup): after 10 s use the stored lock; the PR sync loop finishes the refresh meanwhile.
+  let timer;
+  const lock = await Promise.race([train.deployLock(), new Promise((r) => { timer = setTimeout(() => r(train.deployState()), 10_000); })])
+    .catch(() => train.deployState()).finally(() => clearTimeout(timer));
   let deploy_hold = null;
   if (lock && !(lock.key && lock.key === key && lock.state === 'merging')) {
     let deploys = true;
