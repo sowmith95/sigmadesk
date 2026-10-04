@@ -11,32 +11,12 @@
   <link rel="apple-touch-icon" href="/icon.svg">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="preload" href="/fonts/ibm-plex-sans-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="/v2.css">
+  <!-- The desk UI is built from ui/ by `npm run build:ui` into public/app (committed; see vite.config.js). -->
+  <link rel="stylesheet" href="/app/main.css">
 </head>
 <body>
-  <a class="skip" href="#view">Skip to content</a>
-  <header class="hdr">
-    <div class="hdr-row">
-      <div class="brand"><span class="sigma" aria-hidden="true">σ</span><span class="brand-name">SigmaDesk</span><span class="project" id="project"></span></div>
-      <nav class="tabs" id="tabs" aria-label="Views">
-        <button data-view="inbox" type="button">Inbox<span class="tab-n" id="tab-inbox-n" hidden></span></button>
-        <button data-view="work" type="button">Work</button>
-        <button data-view="team" type="button">Team</button>
-      </nav>
-      <div class="hdr-actions">
-        <button class="btn primary" id="btn-new" type="button" aria-label="New ticket"><span aria-hidden="true">+</span><span class="lbl">New ticket</span></button>
-        <button class="icon-btn" id="btn-gear" type="button" aria-label="Settings">
-          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 8.6a3.4 3.4 0 1 0 0 6.8 3.4 3.4 0 0 0 0-6.8Zm8.2 4.6-.1-1.2 1.9-1.5-1.9-3.3-2.3.8a7 7 0 0 0-2-1.2L15.4 4h-3.8l-.4 2.4a7 7 0 0 0-2 1.2l-2.3-.8L5 10.1 7 11.6a7 7 0 0 0 0 2.4l-2 1.5 1.9 3.3 2.3-.8a7 7 0 0 0 2 1.2l.4 2.4h3.8l.4-2.4a7 7 0 0 0 2-1.2l2.3.8 1.9-3.3-1.9-1.5.1-1.2Z"/></svg>
-        </button>
-      </div>
-    </div>
-    <div class="instruments" id="instruments" role="group" aria-label="Desk status"></div>
-  </header>
-  <div id="banner" class="banner" role="status" hidden></div>
-  <main id="view" tabindex="-1"></main>
-  <div id="sheet" class="sheet" hidden></div>
-  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
-  <noscript>SigmaDesk needs JavaScript.</noscript>
-  <script type="module" src="/v2.js"></script>
+  <div id="root"></div>
+  <noscript>SigmaDesk needs JavaScript. The <a href="/classic.html">Classic view</a> also needs it.</noscript>
+  <script type="module" src="/app/main.js"></script>
 </body>
 </html>

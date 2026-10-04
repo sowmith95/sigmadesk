@@ -1,0 +1,93 @@
+/* Component kit: selectable chips, token input, stepper, toggle rows, status steps, and the research sentence.
+   Same tokens as desk.css. Selected = solid blue (the desk's action colour); resting chips are outlined so a row of
+   choices reads as choices, not as status badges (status chips stay filled and small). */
+.chip-group, .chip-input, .stepper { display: grid; gap: 8px; min-width: 0; }
+.chip-group-l { color: var(--steel); font-size: 14px; }
+.chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.choice { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--raised-2); background: transparent; color: var(--fog);
+  border-radius: 999px; padding: 6px 14px; min-height: 38px; font-weight: 500; font-size: 15px; line-height: 1.2; text-align: left; }
+.choice:hover:not(:disabled) { background: var(--raised); }
+.choice[aria-checked="true"], .choice[aria-pressed="true"] { background: var(--blue); border-color: var(--blue); color: var(--ink); }
+.choice[aria-checked="true"] .choice-h, .choice[aria-pressed="true"] .choice-h { color: var(--ink); opacity: .75; }
+.choice:disabled { opacity: .45; cursor: not-allowed; }
+.choice.with-lead { padding-left: 4px; }
+.choice .pav, .choice .av { margin-right: 2px; }
+.choice-h { color: var(--steel); font-weight: 400; font-size: 13px; }
+.choice.square { width: 40px; padding: 0; justify-content: center; font-size: 18px; border-radius: var(--rc); }
+.choice.ghosted { border-style: dashed; color: var(--steel); font-size: 14px; min-height: 34px; }
+.chip-group.compact .choice { min-height: 34px; padding: 4px 12px; font-size: 14px; }
+
+.token-box { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: var(--ink); border: 1px solid var(--raised-2); border-radius: var(--rc); padding: 6px 8px; min-height: 46px; }
+.token-box:focus-within { border-color: var(--blue); }
+.token-box input[type="text"] { flex: 1 1 140px; border: 0; background: transparent; min-height: 32px; padding: 4px; }
+.token { display: inline-flex; align-items: center; gap: 2px; background: var(--raised); border-radius: 999px; padding: 2px 4px 2px 12px; font-size: 14px; }
+.token button { border: 0; background: none; color: var(--steel); width: 26px; height: 26px; border-radius: 50%; font-size: 16px; line-height: 1; }
+.token button:hover { background: var(--raised-2); color: var(--fog); }
+.suggestions { gap: 6px; }
+.field-error { color: var(--red); font-size: 14px; }
+.field-hint { margin-top: -2px; }
+
+.stepper-row { display: flex; align-items: center; gap: 10px; }
+.stepper-v { min-width: 72px; text-align: center; font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; border-radius: var(--rc); padding: 6px 0; }
+
+.toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; cursor: pointer; }
+.toggle-l { display: grid; gap: 2px; }
+.toggle-l b { font-weight: 500; }
+
+.steps { list-style: none; margin: 0; padding: 0; display: flex; gap: 6px; flex-wrap: wrap; }
+.step { display: inline-flex; align-items: center; gap: 6px; color: var(--steel); font-size: 13px; }
+.step + .step::before { content: ''; width: 18px; height: 1px; background: var(--raised-2); margin-right: 2px; }
+.step-dot { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--steel); }
+.step.done { color: var(--fog); } .step.done .step-dot { background: var(--green); border-color: var(--green); }
+.step.now { color: var(--fog); font-weight: 600; } .step.now .step-dot { background: var(--blue); border-color: var(--blue); }
+.step.failed { color: var(--red); } .step.failed .step-dot { background: var(--red); border-color: var(--red); }
+
+/* ---------- research ---------- */
+.rs-intro { color: var(--steel); max-width: 62ch; }
+.rs-market { display: inline-flex; align-items: center; gap: 8px; color: var(--steel); font-size: 14px; }
+.rs-market .dot { margin: 0; }
+.program { background: var(--ink); border-radius: var(--r); padding: 18px 18px 14px; display: grid; gap: 12px; }
+.program.off .program-sentence { color: var(--steel); }
+.program-sentence { font-size: 20px; line-height: 1.6; font-weight: 400; margin: 0; max-width: 34em; overflow-wrap: anywhere; }
+.slot { border: 0; background: none; color: inherit; font: inherit; padding: 0 1px; border-bottom: 2px solid var(--blue); border-radius: 0; cursor: pointer; text-align: left; }
+.slot:hover { background: var(--blue-bg); }
+.slot:focus-visible { border-radius: 3px; }
+.slot.who { font-weight: 600; }
+.program-meta { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; color: var(--steel); font-size: 14px; }
+.program-meta .spacer { min-width: 8px; }
+.editor { display: grid; gap: 20px; border-top: 1px solid rgba(138, 151, 171, .14); padding-top: 16px; }
+.editor-row { display: grid; gap: 8px; }
+.editor-row > h4 { margin: 0; font-size: 15px; font-weight: 600; }
+.editor-row > p.muted { margin-top: -4px; font-size: 14px; }
+.editor-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.problems { margin: 0; padding: 10px 12px 10px 28px; background: var(--red-bg); border-radius: var(--rc); color: var(--fog); font-size: 14px; display: grid; gap: 2px; }
+.templates { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr)); }
+.template { border: 1px dashed var(--raised-2); background: transparent; color: var(--fog); border-radius: var(--r); padding: 12px 14px; text-align: left; display: grid; gap: 4px; min-height: 76px; }
+.template:hover { background: var(--slate); border-style: solid; }
+.template b { font-weight: 600; }
+.template span { color: var(--steel); font-size: 14px; }
+.topic textarea { min-height: 84px; }
+.rs-section { display: grid; gap: 12px; }
+.rs-section > h3 { font-size: 17px; }
+
+.connector { background: var(--ink); border-radius: var(--r); padding: 16px; display: grid; gap: 10px; }
+.connector-h { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.connector-h b { font-size: 16px; }
+.facts-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.case-form { display: grid; gap: 14px; }
+.case-form textarea { min-height: 64px; }
+
+@media (max-width: 760px) {
+  .program { padding: 16px 14px 12px; }
+  .program-sentence { font-size: 18px; }
+  .choice { min-height: 44px; }
+  .choice.square { width: 44px; }
+  .editor-actions .btn.primary { flex: 1 1 100%; order: -1; }
+}
+
+/* Settings → Research entry is a whole-row button. */
+.set.research-entry { border: 0; color: inherit; width: 100%; text-align: left; cursor: pointer; }
+.set.research-entry:hover { background: var(--raised); }
+.seat-list li { list-style: none; }
+.token-x.btn { min-height: 26px; width: 26px; padding: 0; background: none; color: var(--steel); border-radius: 50%; }
+@media (max-width: 760px) { .token button, .token-x.btn { width: 36px; height: 36px; min-height: 36px; } }

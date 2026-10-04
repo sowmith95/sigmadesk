@@ -104,6 +104,12 @@ export function programs(settings = store.getSettings()) {
 }
 export const get = (id, settings) => programs(settings).find((p) => p.id === id) || null;
 export const configured = (settings = store.getSettings()) => !!settings.research_programs;
+// Identifies the saved list an editor started from (conditional saves). Derived lists use the inputs they derive from.
+export function revision(settings = store.getSettings()) {
+  const basis = settings.research_programs || JSON.stringify([settings.pm_enabled, settings.pm_interval_min, config.research.programs]);
+  let h = 0; for (let i = 0; i < basis.length; i++) h = (Math.imul(h, 31) + basis.charCodeAt(i)) | 0;
+  return `r${(h >>> 0).toString(36)}`;
+}
 export function save(list) {
   const normalized = validatePrograms(list);
   store.writeSetting('research_programs', JSON.stringify(normalized));
@@ -146,7 +152,7 @@ export function job(p, { focus = '', room = p.maxProposals } = {}) {
 }
 export function status(settings = store.getSettings(), now = new Date()) {
   const market = config.research.marketHours;
-  return { configured: configured(settings), programs: programs(settings).map((p) => ({ ...p, ...eligibility(p, { now, settings }) })), windows: WINDOWS,
+  return { configured: configured(settings), revision: revision(settings), programs: programs(settings).map((p) => ({ ...p, ...eligibility(p, { now, settings }) })), windows: WINDOWS,
     market_hours: { ...market, open_now: inWindow(now, market) }, problems: lastProblems, seats: Object.keys(agentById), connectors: connectors.summary(),
     case_sections: connectors.CASE_SECTIONS, sdlc_stages: connectors.SDLC_STAGES, default_review: config.research.review };
 }
