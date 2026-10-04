@@ -1,3 +1,4 @@
+import * as productReview from './product-review.js';
 // PR console: every PR the desk opened, with live GitHub state, and the owner's actions on them
 // (approve, ready, merge, close, reviewers, tags). Agents never reach this module: it is called only from owner
 // routes on the TCP listener. Merging the base branch may deploy production, so merges are guarded.
@@ -128,6 +129,14 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   const p = await pr(number);
   const blockers = mergeBlockers(p, { inBusyWindow, override });
   const key = p.title.match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1];
+  if (key) {
+    const ticket = store.getTicket(key);
+    const plan = ticket && productReview.current(ticket.parent_key || key);
+    if (plan || productReview.current(key, 'feedback')) {
+      const feedback = productReview.current(key, 'feedback');
+      if (productReview.blocks(ticket) || !feedback || feedback.stale || feedback.status !== 'approved' || ticket.head_sha !== p.headRefOid) blockers.push('product/design or user feedback approval is missing or stale for this commit');
+    }
+  }
   if (key && refresh.current(key)) {
     if (p.baseRefName !== config.project.baseBranch) blockers.push('PR base changed since refreshed QA');
     // GraphQL baseRefOid may describe the PR's original base. Read the live branch ref.

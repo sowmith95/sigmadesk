@@ -93,9 +93,14 @@ export const codex = {
   usesSocket: false,
   models: () => {
     const m = userModel();
-    return [{ id: '', tier: 'any', note: m ? `your Codex default (${m})` : 'your Codex default' }, ...(config.engines?.codex?.models || []).map((id) => ({ id, tier: 'any', note: '' }))];
+    let cache = {};
+    try { cache = JSON.parse(fs.readFileSync(path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'models_cache.json'), 'utf8')); } catch { /* configured catalog remains available */ }
+    const choices = (cache.models || []).filter(x => x.visibility === 'list').map(x => ({ id: x.slug, label: x.display_name, tier: 'any',
+      efforts: (x.supported_reasoning_levels || []).map(x => x.effort).filter(x => x !== 'ultra'), note: `Local Codex catalog${cache.fetched_at ? ` · ${cache.fetched_at}` : ''}; access checked on use` }));
+    for (const id of config.engines?.codex?.models || []) if (!choices.some(x => x.id === id)) choices.push({ id, tier: 'any', note: 'Configured model; access checked on use' });
+    return [{ id: '', tier: 'any', note: m ? `your Codex default (${m})` : 'your Codex default' }, ...choices];
   },
-  efforts: ['low', 'medium', 'high', 'xhigh'],
+  efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
   suggest(tier) {
     return { frontier: { model: '', effort: 'high' }, strong: { model: '', effort: 'high' }, fast: { model: '', effort: 'medium' }, cheap: { model: '', effort: 'low' } }[tier];
   },
@@ -108,10 +113,11 @@ export const codex = {
   budgetUsd: () => config.engines?.codex?.reserveUsd ?? 2,
 
   command({ seat, charter, cwd, resume, extraDirs = [], kind }) {
-    const effort = seat.effort === 'max' ? 'xhigh' : seat.effort;
+    const effort = seat.effort;
     const model = seat.model || userModel();
     const common = ['--json', '--skip-git-repo-check', ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : []),
-      ...(kind === 'council_review' ? ['-c', 'default_permissions="sigmadesk_review"', '-c', 'features.shell_tool=false'] : [])];
+      ...(['council_review','product_review'].includes(kind) ? ['-c', 'default_permissions="sigmadesk_review"'] : []),
+      ...(kind === 'council_review' ? ['-c', 'features.shell_tool=false'] : [])];
     const args = resume
       ? ['exec', 'resume', ...common, resume, '-']
       : ['exec', ...common, '-C', cwd, '-'];
@@ -123,7 +129,7 @@ export const codex = {
       // Codex has no system-prompt flag: the charter leads the prompt.
       wrapPrompt: (prompt) => `<seat-charter>\n${charter}\n</seat-charter>\n\n${prompt}`,
       env: { CODEX_HOME: codexHome() },
-      mailbox: kind !== 'council_review',
+      mailbox: !['council_review','product_review'].includes(kind),
     };
   },
 

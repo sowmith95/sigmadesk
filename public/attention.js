@@ -13,7 +13,7 @@ import { nameOf } from './names.js';
 export const BUCKETS = ['needs_you', 'blocked', 'working', 'queued', 'shipped', 'closed'];
 const OPEN_STAGES = { triage: 'Intake', proposed: 'Proposed', todo: 'To do', in_progress: 'Building', qa: 'QA', review: 'Acceptance' };
 // Structured scheduler wait codes (scheduler.health): these move by themselves; provider_hold / budget need someone.
-const SELF_CODES = new Set(['paused', 'dependency', 'seat_busy', 'tick', 'setup_retry']);
+const SELF_CODES = new Set(['paused', 'dependency', 'seat_busy', 'tick', 'setup_retry', 'product_review']);
 // Fallback for older servers that send only a human reason.
 const SELF_RESOLVING = /desk paused|seat busy|waiting for \S+ to (merge|finish)|capacity|concurrent|busy window|queued behind|next (scheduler )?tick|setup retry/i;
 const selfResolving = (w) => (w.code ? SELF_CODES.has(w.code) : SELF_RESOLVING.test(w.reason || ''));
@@ -26,11 +26,14 @@ const firstName = (agents, id) => (agents.find((a) => a.id === id)?.name || '').
  * each pending design proposal, each finished council. `id` is unique per decision; `key` stays the ticket key.
  */
 export function decisionsFor(t, ctx = {}) {
-  const { agents = [], proposals = [], councils = [] } = ctx;
+  const { agents = [], proposals = [], councils = [], productReviews = [] } = ctx;
   if (['done', 'wontdo'].includes(t.status)) return [];
   const name = nameOf(t);
   const base = { key: t.key, name, stage: OPEN_STAGES[t.status] || null, epic: false, worker: null, bucket: 'needs_you' };
   const out = [];
+  const review = productReviews.find(r => r.ticket_key === t.key && (r.stale || ['changes','failed','stale','deferred','rejected'].includes(r.status)));
+  if (review) return [{ ...base, id: `${t.key}:product:${review.phase}:${review.revision}`, kind: 'product', action: 'Review feedback', verb: `Resolve review for ${name}`, reason: review.stale ? 'The plan changed; its review must be refreshed.' : `Product/design review: ${review.status}` }];
+  if (t.status === 'ready_for_human' && productReviews.some(r => r.ticket_key === t.key && r.phase === 'feedback' && r.status === 'reviewing')) return [];
   if (t.status === 'needs_human') {
     if (isGuard(t)) out.push({ ...base, id: `${t.key}:guard`, kind: 'guard', action: 'Approve publication', verb: `Unblock publish guard on ${name}`, reason: 'The change touches protected paths or is unusually large. Review the diff before it is pushed.' });
     else out.push({ ...base, id: `${t.key}:question`, kind: 'question', action: 'Answer and continue', verb: `Answer ${firstName(agents, t.assignee)}`, reason: t.progress_msg || 'Waiting for your direction.' });
@@ -61,6 +64,9 @@ export function attend(t, ctx = {}) {
   const decisions = decisionsFor(t, ctx);
   if (decisions.length) return { ...decisions[0], epic: base.epic, worker: base.worker };
 
+  const review = (ctx.productReviews || []).find(r => r.ticket_key === t.key && r.status === 'reviewing' && !r.stale);
+  if (review) return { ...base, bucket: worker ? 'working' : 'queued', stage: review.phase === 'plan' ? 'Product review' : 'User feedback', verb: name, reason: worker ? `${firstName(agents, worker.id)} is reviewing` : 'Review waiting for available reviewers and capacity' };
+
   // An epic is a summary of its slices, never an extra working/queued item: the slices carry the counts.
   if (base.epic) {
     const done = kids.filter((k) => k.status === 'done').length;
@@ -90,7 +96,7 @@ export function humanReason(reason, tickets) {
 export function board(state, extra = {}) {
   const tickets = state.tickets || [];
   const ctx = { agents: state.agents || [], tickets, events: state.events || [], waiting: state.meta?.scheduler?.waiting || [],
-    proposals: extra.proposals || state.meta?.decisions?.proposals || [], councils: state.meta?.council?.councils || [] };
+    proposals: extra.proposals || state.meta?.decisions?.proposals || [], councils: state.meta?.council?.councils || [], productReviews: state.meta?.product_reviews || [] };
   const out = Object.fromEntries(BUCKETS.map((b) => [b, []]));
   out.epics = [];
   for (const t of tickets) {

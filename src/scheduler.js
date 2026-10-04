@@ -1,3 +1,4 @@
+import * as productReview from './product-review.js';
 import crypto from 'node:crypto';
 import { config } from './config.js';
 import { agentById, ENGINEERS, PRINCIPALS, BUILDERS, AREAS, COMPLEXITIES, STATUSES, routeTicket, routeSlice, promptFor } from './team.js';
@@ -409,6 +410,8 @@ export function health() {
   const queued = store.listTickets().filter((t) => ['triage', 'proposed', 'todo', 'qa', 'review'].includes(t.status));
   return { last_tick: lastTick, last_error: lastError, paused: settings.paused === 'true', budget_headroom: budgetHeadroom(settings),
     queued: queued.length, discussions: store.pendingDiscussions().length, waiting: queued.filter((t) => !t.active_run).map((t) => {
+      const review = productReview.current(t.key) || (t.parent_key && productReview.current(t.parent_key));
+      if (review && (review.stale || review.status !== 'approved')) return { key: t.key, code: review.status === 'reviewing' && !review.stale ? 'product_review' : 'review_decision', reason: review.stale ? 'Product/design review is stale' : `Product/design review: ${review.status}` };
       const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa' : t.status === 'review' ? requesterOf(t) : t.assignee || routeTicket(t);
       const chosen = selectionFor(seat);
       // `code` is the structured reason the UI classifies on; `reason` stays human-readable.
@@ -498,6 +501,13 @@ export async function tick() {
       if (t.active_run || !seat || !agentIdle(seat)) continue;
       go(seat, (f) => launchReview(t, seat, f));
     }
+    productReview.refreshChangedPlans();
+    // Bounded independent product/design reviews; preserve capacity for QA/SRE.
+    let reviewSlots = 2 - store.listAgentStates().filter(a => a.status === 'working' && a.current_kind === 'product_review').length;
+    for (const { r, m } of productReview.pending()) {
+      if (slots <= 1 || reviewSlots <= 0) break;
+      if (agentIdle(m.agent_id) && go(m.agent_id, f => productReview.launch(r, m, f))) reviewSlots--;
+    }
     // 3. Engineers pick up groomed work by routing (area × complexity × risk).
     council.pump();
     slots = capacity(s) - workCount(); headroom = budgetHeadroom(s);
@@ -506,6 +516,13 @@ export async function tick() {
       if (t.active_run) continue;
       if (t.after_key && store.getTicket(t.after_key)?.status === 'wontdo') { orphanedSlice(t); continue; }
       if (t.after_key && store.getTicket(t.after_key)?.status !== 'done') continue; // waits for its predecessor to merge
+      const parent = t.parent_key && store.getTicket(t.parent_key);
+      if (parent && productReview.required(parent) && ['proposed','todo'].includes(parent.status)) {
+        if (parent.active_run || parent.status==='proposed') continue;
+        productReview.ensure(parent); // slices cannot race ahead of their parent's first review
+      }
+      if (productReview.required(t)) productReview.ensure(t);
+      if (productReview.blocks(t)) continue;
       const who = t.assignee && ENGINEERS.includes(t.assignee) && agentById[t.assignee].enabled !== false ? t.assignee : routeTicket(t);
       if (!agentIdle(who)) continue;
       if (PRINCIPALS.includes(who)) go(who, (f) => launchDesign(t, who, f));
@@ -526,6 +543,7 @@ export async function tick() {
 
 // ---------------- recovery ----------------
 export function recoverOrphans() {
+  productReview.recover();
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
   for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });
   for (const run of store.unfinishedRuns()) {
@@ -566,6 +584,7 @@ function fmtTicket(t, comments) {
 
 export async function deskAction(run, cmd, body = {}) {
   const agentId = run.agent_id;
+  if (run.kind === 'product_review') need(['context-file'].includes(cmd), 'Product reviewers are read-only; return a structured report, not desk mutations');
   if (run.kind === 'council_review') need(false, 'council calls cannot invoke desk commands');
   if (run.kind === 'owner_discussion') {
     need(['list', 'show', 'comment', 'consult', 'discussion-result', 'context-file'].includes(cmd), 'design discussions can only read, consult and respond');
@@ -900,6 +919,13 @@ export function retryPublications() {
 }
 
 async function publishInner(t, key, { ownerApproved = false } = {}) {
+  const plan = productReview.current(t.parent_key || key);
+  if (plan || productReview.current(key, 'feedback')) {
+    if (productReview.blocks(t)) return;
+    if (t.active_run || store.unfinishedRuns().some(r => r.ticket_key === key)) return;
+    const feedback = productReview.ensure(t, 'feedback');
+    if (feedback.stale || feedback.status !== 'approved') return;
+  }
   let staged;
   try {
     staged = await runner.stageApproved(key, runner.workspaceDir(key), t.head_sha);

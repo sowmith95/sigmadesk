@@ -201,7 +201,7 @@ test('engines: codex seat builds a sandboxed, network-off command with an isolat
   const cmd = runner.buildCommand(seat, 'qa', '/tmp/ws');
   assert.equal(cmd.args[1], 'exec');
   assert.ok(!cmd.args.includes('workspace-write'), 'the permission profile replaces -s');
-  assert.ok(cmd.args.includes('model_reasoning_effort=xhigh'), 'max maps to xhigh for codex');
+  assert.ok(cmd.args.includes('model_reasoning_effort=max'), 'explicit reasoning effort is preserved');
   assert.ok(cmd.mailbox);
   const toml = fs.readFileSync(path.join(cmd.env.CODEX_HOME, 'config.toml'), 'utf8');
   assert.match(toml, /default_permissions = "sigmadesk_seat"/);

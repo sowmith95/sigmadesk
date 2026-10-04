@@ -405,3 +405,10 @@ input::placeholder, textarea::placeholder { color: var(--steel); } /* ≥4.5:1 o
 .conversation-log .msg.update .msg-b { background: transparent; border-left: 2px solid var(--steel); border-radius: 0; padding: 4px 10px; }
 .conversation-steps { padding-left: 42px; min-width: 0; color: var(--steel); font-size: 13px; }
 .conversation-steps .log { white-space: pre-wrap; overflow-wrap: anywhere; }
+.model-profile { border: 1px solid var(--steel); border-radius: 8px; padding: 12px; display: grid; gap: 10px; min-width: 0; }
+.model-profile legend { padding: 0 6px; font-weight: 600; }
+.model-profile select { width: 100%; min-width: 0; }
+.team-model { padding: 14px; display: grid; gap: 8px; }
+.team-model .wrap { overflow-wrap: anywhere; }
+.review-round { display: grid; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--steel); }
+.review-round textarea { width: 100%; }

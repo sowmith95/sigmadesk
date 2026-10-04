@@ -446,7 +446,7 @@ const SECTIONS = ['Decision history (design, consults, submissions, QA, owner)',
 export async function buildPack({ kind, baseSha, headSha, cloneDir = '', inputs = {}, secrets = [], settings = packSettings(), signal }) {
   const S = (t) => scrub(t, secrets);
   const { ticket, comments = [], parent, parentComments = [], prerequisite, siblings = [], children = [], incident } = inputs;
-  const review = kind === 'review';
+  const review = kind === 'review' || (kind === 'product_review' && !!ticket?.head_sha);
   const mergeBase = review ? (await tgit(['merge-base', baseSha, headSha], { signal, allowFail: true }) || '').trim() : null;
   if (review && !SHA.test(mergeBase)) throw new PackError('the reviewed commit shares no history with the base');
   const tree = await listTree(headSha, signal);
@@ -641,9 +641,11 @@ export async function prepareRun({ runId, kind, cwd, ticketKey = null, incidentI
   const deadline = AbortSignal.timeout(settings.deadlineSeconds * 1000);
   const sig = signal ? AbortSignal.any([signal, deadline]) : deadline;
   const inputs = gatherInputs({ ticketKey, incidentId });
+  // Product reviewers receive a frozen brief in the task; never leak a concurrent peer's conclusion.
+  if (kind === 'product_review') { inputs.comments = []; inputs.parentComments = []; }
   try {
     const baseSha = await freezeBase(runId, { signal: sig });
-    const headSha = kind === 'review' ? await importHead(runId, cwd, inputs.ticket?.head_sha, { signal: sig }) : baseSha;
+    const headSha = (kind === 'review' || (kind === 'product_review' && inputs.ticket?.head_sha)) ? await importHead(runId, cwd, inputs.ticket?.head_sha, { signal: sig }) : baseSha;
     const pack = await buildPack({ kind, baseSha, headSha, cloneDir: cwd, inputs, secrets, settings, signal: sig });
     pack.meta.file = writePackFile(runId, pack.text);
     active.set(runId, liveEntry(pack.meta, pack.text, secrets, cwd));

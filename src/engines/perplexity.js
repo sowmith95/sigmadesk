@@ -15,7 +15,7 @@ const ALLOW = [T('call_perplexity_computer'), T('read_thread'), T('answer_questi
 const BLOCK = [T('confirm_action_approve'), T('create_attachment_upload'), T('create_asset_download'), T('projects_list'), T('notify_connected')];
 // owner_discussion is the manager's design discussion (scheduler.launchDiscussion); without it here, a manager seat on
 // Perplexity silently ran those on local Claude.
-export const THINK_KINDS = ['research', 'groom', 'design', 'consult', 'review', 'triage', 'investigate', 'owner_discussion'];
+export const THINK_KINDS = ['research', 'groom', 'design', 'consult', 'review', 'triage', 'investigate', 'owner_discussion', 'product_review'];
 
 // From models.list on the owner's account (2026-10-03). Ids are passed straight to call_perplexity_computer.
 export const MODELS = [
@@ -46,7 +46,7 @@ function connected() {
   return value;
 }
 
-function relayCharter(seat) {
+function relayCharter(seat, kind) {
   const model = seat.model || 'pplx_asi_kimi_k3';
   return `
 
@@ -56,7 +56,7 @@ Your judgment comes from ${labelOf(model)}, reached with ${T('call_perplexity_co
    more files only if something specific is missing, and add those excerpts after the pack, never inside it.
 2. Call ${T('call_perplexity_computer')} ONCE with model="${model}", effort="${seat.effort || 'medium'}" (do not pass mode — Computer rejects mode+model together).
    Tell it to answer read-only: no connected apps, no files, no accounts, nothing outside this conversation.
-3. Act on its answer by running the desk commands it decides, quoting its reasoning where useful. For a follow-up, call
+3. ${kind==='product_review'?'Return its structured review JSON as your final answer. Do not run desk mutations.':'Act on its answer by running the desk commands it decides, quoting its reasoning where useful.'} For a follow-up, call
    again with the same thread_id.
 4. Never approve a Computer action (only ${T('confirm_action_deny')}). If Perplexity fails or times out, say so with
    \`desk comment\` and stop — do not substitute your own judgment.
@@ -89,11 +89,11 @@ export const perplexity = {
   command(args) {
     const hands = config.engines?.perplexity?.hands || 'sonnet';
     // Build/QA jobs need local file edits: they never go to Perplexity, whatever the seat setting says.
-    if (!this.supports(args.kind)) return claude.command({ ...args, seat: { ...args.seat, engine: 'claude', model: hands, effort: 'medium' } });
+    if (!this.supports(args.kind)) throw new Error(`Perplexity cannot run ${args.kind}; choose a local execution provider`);
     const cmd = claude.command({
       ...args,
       seat: { ...args.seat, engine: 'claude', model: hands, effort: 'low' },
-      charter: `${args.charter}${relayCharter(args.seat)}`,
+      charter: `${args.charter}${relayCharter(args.seat,args.kind)}`,
       perms: { ...args.perms, allow: [...args.perms.allow, ...ALLOW] },
       denyRules: [...args.denyRules, ...BLOCK],
     });

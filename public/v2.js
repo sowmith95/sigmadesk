@@ -10,7 +10,7 @@ import { conversationItems, nearLatest } from './conversation.js';
 const VIEWS = ['inbox', 'work', 'team'];
 const STAGE_LABEL = { triage: 'Intake', proposed: 'Proposed', todo: 'To do', in_progress: 'Building', qa: 'QA', review: 'Acceptance', needs_human: 'Needs you', ready_for_human: 'Ready for review', done: 'Shipped', wontdo: 'Closed' };
 const BUCKET_LABEL = { needs_you: 'Needs you', blocked: 'Blocked', working: 'Working', queued: 'Queued', shipped: 'Shipped', closed: 'Closed' };
-const KIND_LABEL = { question: 'Question', guard: 'Publish guard', merge: 'Ready to merge', publish: 'Ready to publish', design: 'Design decision', council: 'Council verdict', page: 'Production errors' };
+const KIND_LABEL = { product: 'Product review', question: 'Question', guard: 'Publish guard', merge: 'Ready to merge', publish: 'Ready to publish', design: 'Design decision', council: 'Council verdict', page: 'Production errors' };
 
 const S = {
   agents: [], tickets: [], events: [], runs: [], settings: {}, meta: {}, incidents: [],
@@ -165,11 +165,12 @@ function apply(m) {
     case 'ticket': upsert(S.tickets, m.data, 'key'); break;
     case 'agent': { const a = S.agents.find((x) => x.id === m.data.id); if (a) Object.assign(a, m.data); break; }
     case 'run': upsert(S.runs, m.data); if (m.data.status !== 'running') refreshMeta(); break;
-    case 'settings': S.settings = m.data; break;
+    case 'settings': { const teamChanged=S.settings.team!==m.data.team; S.settings = m.data; if(teamChanged)refreshMeta(); break; }
     case 'incident': upsert(S.incidents, m.data); break;
     case 'quota': refreshMeta(); break;
     case 'discussion': into('discussions', m.data); refreshMeta(); break;
     case 'branch-refresh': if (mine(m.data.ticket_key) && sh.detail) sh.detail.refresh = m.data; break;
+    case 'product-review': if (mine(m.data.ticket_key) && sh.detail) upsert(sh.detail.product_reviews ||= [], m.data, 'phase'); refreshMeta(); break;
     case 'council': delete S.councils[m.data.id]; refreshMeta(); break;
     case 'event':
       if (!S.events.some((e) => e.id === m.data.id)) S.events.push(m.data);
@@ -505,29 +506,22 @@ function renderWork() {
 }
 
 // ---------------- Team ----------------
-function seatCard(a) {
-  const t = ticketByKey(a.current_ticket);
-  const card = t ? cardFor(t) : null;
-  const run = S.runs.find((r) => r.id === a.current_run);
-  const elapsed = run?.started_at ? Math.round((Date.now() - Date.parse(run.started_at)) / 60_000) : null;
-  return h('article', { class: 'seat' },
-    h('button', { class: 'seat-main', type: 'button', onclick: () => openSeat(a.id) },
-      h('div', { class: 'seat-h' }, avatar(a.id, 'lg'), h('div', { class: 'seat-who' }, h('b', {}, a.name), h('span', { class: 'muted small' }, a.role)),
-        h('span', { class: 'spacer' }), chip(presenceOf(a).text))),
-    t ? h('button', { class: 'seat-ticket', type: 'button', onclick: () => openTicket(t.key) }, h('span', {}, nameOf(t)), keyTag(t.key)) : h('p', { class: 'muted small' }, a.current_kind ? `Running ${a.current_kind}` : ''),
-    card ? nowLine({ ...card, plan: null, cost: null, elapsedMin: null }, { compact: true }) : null,
-    h('p', { class: 'facts mono' }, [elapsed != null ? mins(elapsed) : null, run ? `${money(run.reserve_usd)} reserved` : null, `${money(a.spend_today)} today`].filter(Boolean).join(' · ')));
-}
-
 function renderTeam() {
-  const active = S.agents.filter((a) => a.status === 'working');
-  const idle = S.agents.filter((a) => a.status !== 'working');
+  const active = S.agents.filter(a=>a.status==='working');
   return [
-    h('div', { class: 'toolbar' }, h('h1', { class: 'page-h' }, 'Team'), h('span', { class: 'spacer' }), h('span', { class: 'muted' }, `${active.length} working`)),
-    active.length ? h('div', { class: 'grid-cards' }, active.map(seatCard)) : h('div', { class: 'empty-state' }, h('p', { class: 'big' }, 'Nobody is running.'), h('p', { class: 'muted' }, S.settings.paused === 'true' ? 'The desk is halted.' : 'Seats pick up work on the next scheduler tick.')),
-    disclose('idle-seats', `${idle.length} available`, h('ul', { class: 'seat-list' }, idle.map((a) => h('li', {}, h('button', { class: 'idle-row', type: 'button', onclick: () => openSeat(a.id) },
-      avatar(a.id, 'md'), h('span', { class: 'seat-who' }, h('b', {}, a.name), h('span', { class: 'muted small' }, a.role)), h('span', { class: 'spacer' }),
-      h('span', { class: 'muted small' }, a.enabled === false ? 'Off desk' : a.last_action_at ? `active ${ago(a.last_action_at)}` : 'Available'))))), { cls: 'idle-d' }),
+    h('div',{class:'toolbar'},h('h1',{class:'page-h'},'Team'),h('span',{class:'spacer'}),
+      h('button',{class:'btn',type:'button',onclick:act(async()=>{await api('POST','/api/settings',{key:'auto_fallback',value:S.settings.auto_fallback==='true'?'false':'true'});await loadSnapshot();},'Fallback policy updated')},`Automatic fallback: ${S.settings.auto_fallback==='true'?'on':'off'}`),h('span',{class:'muted'},`${active.length} working`)),
+    h('div',{class:'grid-cards'},[...active,...S.agents.filter(a=>a.status!=='working')].map(a=>{
+      const route=S.meta.routing?.[a.id] || {}, run=S.runs.find(r=>r.id===a.current_run);
+      return h('article',{class:'kcard team-model'},
+        h('div',{class:'row'},avatar(a.id,'md'),h('button',{class:'title-btn',type:'button',onclick:()=>openSeat(a.id)},a.name),h('span',{class:'spacer'}),chip(a.enabled===false?'Off':a.status==='working'?'Working':'Available')),
+        h('p',{class:'muted small'},a.role),h('p',{class:'small wrap'},`Preferred: ${a.engine} · ${a.model || 'Account default'}`),
+        h('p',{class:'small wrap'},run?`Running: ${run.model}`:`Next run: ${route.engine || 'Waiting'} · ${route.model || route.reason || ''}`),
+        h('p',{class:'muted small wrap'},`Fallback: ${a.fallbacks===undefined?'automatic compatible provider':a.fallbacks.length?a.fallbacks.map(p=>`${p.engine}/${p.model || 'default'}`).join(' → '):'wait for preferred provider'}`),
+        route.fallback?h('p',{class:'muted small'},route.reason):null,
+        a.current_ticket?h('button',{class:'btn ghost small',type:'button',onclick:()=>openTicket(a.current_ticket)},'View live conversation'):null,
+        h('button',{class:'btn',type:'button',onclick:()=>openModelSettings(a.id)},'Edit models & fallback'));
+    })),
   ];
 }
 
@@ -564,7 +558,7 @@ function sheetShell(head, body, footer = null, sig = '') {
   const typingInFooter = same && old.querySelector('.sheet-f')?.contains(active) && editing(active);
   const typingInBody = same && old.querySelector('.sheet-b')?.contains(active) && editing(active);
   // A field mid-edit in the body: ticket/seat/desk sheets wait; the PR console and PR sheet re-render (their drafts are kept).
-  if (typingInBody && active.getAttribute('aria-label') !== 'Conversation participant' && !['prs', 'pr'].includes(S.sheet.type)) return;
+  if (typingInBody && active.getAttribute('aria-label') !== 'Conversation participant' && !['prs', 'pr', 'models'].includes(S.sheet.type)) return;
   const caret = editing(active) ? { id: active.id, label: active.getAttribute('aria-label'), sel: active.selectionStart } : null;
   const headEl = h('div', { class: 'sheet-h' }, head);
   const bodyEl = h('div', { class: 'sheet-b' }, body);
@@ -597,6 +591,7 @@ function renderSheet() {
   const sh = S.sheet;
   if (!sh) return;
   if (sh.type === 'ticket') return renderTicketSheet();
+  if (sh.type === 'models') return renderModelSettings();
   if (sh.type === 'seat') return renderSeatSheet();
   if (sh.type === 'new') return renderNewSheet();
   if (sh.type === 'desk') return renderDeskSheet();
@@ -872,6 +867,7 @@ function ticketFooter(t, dec, sh) {
       throw e;
     }
   }, okMsg);
+  if (dec?.kind === 'product') return h('p',{class:'muted small'},'Resolve the objections in Product & design review.');
   const note = running ? h('p', { class: 'muted small' }, 'The worker is finishing; decisions unlock when its run settles.') : null;
 
   if (dec?.kind === 'question') {
@@ -942,11 +938,12 @@ function renderTicketSheet() {
 
   ];
   const body = dec ? [
-    briefView(dec, t, d, card),
+    dec.kind === 'product' ? productReviewView(t,d) : briefView(dec, t, d, card),
     prSummary(t, dec),
     reviewsView(prReviewsOf(t, d)),
     d ? threadView(d, card) : h('p', { class: 'muted' }, sh.error || 'Loading conversation…'),
     hist,
+    dec.kind === 'product' ? null : productReviewView(t,d),
     moreView(t, d),
   ] : [
     gone ? h('p', { class: 'status-line blocked' }, 'That decision was resolved or changed while you were reading. Nothing was submitted.') : null,
@@ -955,6 +952,7 @@ function renderTicketSheet() {
     disclose(`hist-run-${t.key}`, card.live ? 'Current run details' : 'Execution history', runCardView(card, { withEvidence: true })),
     prSummary(t, null),
     reviewsView(prReviewsOf(t, d)),
+    productReviewView(t,d),
     moreView(t, d),
   ];
   const sig = `${dec?.id || 'none'}|${sh.mode || ''}|${!!t.active_run}|${sh.compose}|${dec?.kind === 'design' ? !!(d?.discussions || []).find((x) => x.id === dec.proposal_id) : ''}|${dec?.kind === 'council' ? `${councilFor(dec.council_id)?.status}${councilFor(dec.council_id)?.stale}` : ''}`;
@@ -991,6 +989,7 @@ function renderSeatSheet() {
     run ? h('div', { class: 'row-actions' }, h('span', { class: 'mono small' }, `${run.kind} run · ${money(run.reserve_usd)} reserved`), h('span', { class: 'spacer' }),
       h('button', { class: 'btn danger', type: 'button', onclick: act(async () => { if (!confirm(`Stop ${a.name}'s current run?`)) return false; await api('POST', `/api/runs/${run.id}/kill`, {}); }, 'Stopping the run') }, 'Stop run')) : null,
     st ? h('div', { class: 'tiles' }, tile('Shipped', String(st.shipped)), tile('First-pass QA', pct(st.first_pass_rate)), tile('Runs', String(st.runs)), tile('Spend 7 d', money(st.cost_7d)), tile('Cost per shipped', st.cost_per_shipped == null ? '—' : money(st.cost_per_shipped)), tile('Today', money(a.spend_today))) : null,
+    h('button',{class:'btn',type:'button',onclick:()=>openModelSettings(a.id)},'Edit models & fallback'),
     h('h3', {}, 'Recent log'),
     log,
   ]);
@@ -1085,9 +1084,82 @@ function renderSettingsSheet() {
     h('h3', {}, 'Team'),
     h('ul', { class: 'seat-list' }, S.agents.map((a) => { const r = S.meta.routing?.[a.id] || {}; return h('li', { class: 'idle-row' }, avatar(a.id, 'md'), h('span', { class: 'seat-who' }, h('b', {}, a.name), h('span', { class: 'muted small' }, a.role)), h('span', { class: 'spacer' }),
       h('span', { class: 'mono small' }, a.enabled === false ? 'off' : `${r.engine || a.engine}${(r.model ?? a.model) ? ` · ${r.model ?? a.model}` : ''}`)); })),
-    h('p', { class: 'muted small' }, 'The model picker lives in Classic view for now.'),
+    h('div',{class:'row-actions'},S.agents.map(a=>h('button',{class:'btn small',type:'button',onclick:()=>openModelSettings(a.id)},`${a.name} · Edit models`))),
     h('div', { class: 'row-actions' }, h('a', { class: 'btn', href: '/classic.html' }, 'Open Classic view'), h('button', { class: 'btn', type: 'button', onclick: openPrConsole }, 'Pull requests')),
   ]);
+}
+
+// ---- per-seat model controls ----
+async function openModelSettings(id) {
+  const a = agentMap()[id];
+  const sh = { type: 'models', id, draft: { engine:a.engine, model:a.model || '', effort:a.effort, enabled:a.enabled !== false,
+    mode:a.fallbacks === undefined ? 'automatic' : a.fallbacks.length ? 'custom' : 'off', fallbacks:structuredClone(a.fallbacks || []) } };
+  S.sheet=sh; renderSheet();
+  try { sh.catalog=await api('GET','/api/engines'); } catch(e) { sh.error=e.message; }
+  if(S.sheet===sh) renderSheet();
+}
+function renderModelSettings() {
+  const sh=S.sheet, a=agentMap()[sh.id], d=sh.draft, catalog=sh.catalog;
+  const form = (p, title) => {
+    const allowed=catalog.seats.find(s=>s.id===a.id)?.supported_engines || ['claude','codex'];
+    const engines=catalog.engines.filter(e=>allowed.includes(e.id));
+    const engine=engines.find(e=>e.id===p.engine);
+    const models=engine?.models || [];
+    const health=(S.meta.providers || []).find(x=>x.id===p.engine);
+    const efforts=models.find(m=>m.id===p.model)?.efforts || engine?.efforts || [];
+    const field=(label,values,value,change)=>h('label',{class:'field'},h('span',{},label),h('select',{'aria-label':label,onchange:e=>{change(e.target.value);renderSheet();}}, values.map(([v,l])=>h('option',{value:v,selected:v===value},l))));
+    return h('fieldset',{class:'model-profile'},h('legend',{},title),
+      field(`${title} provider`,engines.map(e=>[e.id,`${e.label}${e.available?'':' · unavailable'}`]),p.engine,v=>{p.engine=v;Object.assign(p,catalog.seats.find(s=>s.id===a.id)?.suggestions[v] || {model:catalog.engines.find(e=>e.id===v)?.models[0]?.id || '',effort:'medium'});}),
+      field(`${title} model`,models.map(m=>[m.id,m.label || m.id || m.note || 'Account default']),p.model,v=>{p.model=v;const e=models.find(m=>m.id===v)?.efforts || engine.efforts;if(!e.includes(p.effort))p.effort=e.includes('high')?'high':e[0];}),
+      field(`${title} reasoning`,efforts.map(e=>[e,e]),p.effort,v=>p.effort=v),
+      h('p',{class:'small',role:'status'},health?.ready?'Provider ready':health?.reason || 'Provider status unavailable'),
+      h('p',{class:'muted small'},models.find(m=>m.id===p.model)?.note || engine?.costs || ''),
+      p.engine==='perplexity'?h('p',{class:'muted small'},'Thinking roles only. Uses Perplexity credits plus a local Claude relay; both must be available.'):null);
+  };
+  const running=S.runs.find(r=>r.id===a.current_run);
+  sheetShell([h('div',{class:'row'},h('h2',{},`${a.name} · Models`),h('span',{class:'spacer'}),closeBtn()),h('p',{class:'muted'},a.role)],
+    !catalog?h('p',{class:'muted'},sh.error || 'Loading installed providers and model catalogs…'):[
+      h('p',{},running?`Current run: ${running.model}. Saved changes apply to the next run.`:'Changes apply to the next run.'),
+      h('label',{class:'check'},h('input',{type:'checkbox',checked:d.enabled,onchange:e=>d.enabled=e.target.checked}),'Seat enabled'),
+      form(d,'Preferred'),
+      h('label',{class:'field'},h('span',{},'Fallback policy'),h('select',{'aria-label':'Fallback policy',onchange:e=>{d.mode=e.target.value;if(d.mode==='custom'&&!d.fallbacks.length){const alt=catalog.engines.find(e=>e.id!==d.engine&&e.id!=='perplexity');if(alt)d.fallbacks.push({engine:alt.id,...catalog.seats.find(s=>s.id===a.id)?.suggestions[alt.id]});}renderSheet();}},
+        [['automatic','Automatic compatible provider'],['custom','My fallback order'],['off','Wait for preferred provider']].map(([v,l])=>h('option',{value:v,selected:v===d.mode},l)))),
+      d.mode==='custom'?d.fallbacks.map((p,i)=>h('div',{},form(p,`Fallback ${i+1}`),h('button',{class:'btn ghost small',type:'button',onclick:()=>{d.fallbacks.splice(i,1);renderSheet();}},'Remove fallback'))):null,
+      d.mode==='custom'&&d.fallbacks.length<3?h('button',{class:'btn',type:'button',onclick:()=>{d.fallbacks.push({engine:'codex',model:'',effort:'medium'});renderSheet();}},'Add fallback'):null,
+      h('p',{class:'muted small'},'Provider quota holds apply to all its models. If every compatible provider is unavailable, work waits and keeps its state.'),
+      S.settings.auto_fallback!=='true'?h('p',{class:'amber-t'},'Automatic fallback is globally off. Enable it from Team to use these backups.'):null,
+    ],catalog?h('div',{class:'f-actions'},h('button',{class:'btn primary',type:'button',onclick:act(async()=>{
+      if(d.mode==='custom'&&!d.fallbacks.length)throw new Error('Add a fallback or choose another policy.');
+      await api('POST','/api/team',{seats:{[a.id]:{engine:d.engine,model:d.model,effort:d.effort,enabled:d.enabled,fallback_mode:d.mode,
+        ...(d.mode==='automatic'?{}:{fallbacks:d.mode==='off'?[]:d.fallbacks})}}});
+      await loadSnapshot();openSeat(a.id);
+    },'Model preferences saved for the next run')},'Save models')):null);
+}
+
+function productReviewView(t,d) {
+  const reviews=d?.product_reviews || (S.meta.product_reviews || []).filter(r=>r.ticket_key===t.key);
+  const sh=S.sheet;
+  const action=(r,type)=>act(async()=>{
+    await api('POST',`/api/tickets/${t.key}/product-review`,{phase:r.phase,revision:r.revision,action:type,message:sh.reviewMessage || ''});
+    sh.reviewMessage='';sh.decisionId=null;sh.mode=null;await loadSnapshot();if(S.sheet===sh)await loadDetail(sh);
+  },'Review updated');
+  return h('section',{class:'product-review','aria-label':'Product and design review'},h('h3',{},'Product & design review'),
+    t.parent_key && (S.meta.product_reviews || []).some(r=>r.ticket_key===t.parent_key)?h('button',{class:'btn small',type:'button',onclick:()=>openTicket(t.parent_key)},'View parent feature review'):null,
+    reviews.length?reviews.map(r=>h('div',{class:'review-round'},
+      h('p',{},h('b',{},r.phase==='plan'?'Before implementation':'User feedback'),` · ${r.stale?'Stale':r.status} · revision ${r.revision}`),
+      h('p',{class:'muted small'},r.status==='reviewing'?'Independent perspectives, one bounded challenge round, then engineering manager synthesis.':'Every required perspective must support the plan. Objections remain visible.'),
+      r.members.map(m=>disclose(`product-${t.key}-${r.phase}-${r.revision}-${m.agent_id}`,
+        `${agentMap()[m.agent_id]?.name || m.agent_id} · ${agentMap()[m.agent_id]?.role || m.stage} · ${m.report?.verdict || m.status}`,
+        m.report?[m.initial_report?h('p',{class:'muted small'},`Initial ${m.initial_report.verdict}: ${m.initial_report.recommendation}`):null,h('p',{},m.report.recommendation),...['users','benefits','drawbacks','alternatives','evidence','conditions'].map(k=>h('div',{},h('b',{},k[0].toUpperCase()+k.slice(1)),h('ul',{},m.report[k].map(x=>h('li',{},x))))) ,
+          ...['architecture','rollout','success_metric'].map(k=>h('p',{},h('b',{},`${k.replace('_',' ')}: `),m.report[k])),h('p',{class:'muted small'},m.model || '')]
+          :h('p',{class:'muted'},m.error || (m.status==='pending'?'Waiting for capacity, provider availability, and preceding reviews.':'Review in progress.')))),
+      r.status!=='reviewing'?[h('textarea',{rows:2,'aria-label':`${r.phase} review correction`,placeholder:'Correction or new evidence…',value:sh.reviewMessage || '',oninput:e=>{sh.reviewMessage=e.target.value;}}),
+        h('div',{class:'row-actions'},h('button',{class:'btn',type:'button',onclick:action(r,'revise')},'Revise & review'),
+          r.status==='failed'&&!r.stale?h('button',{class:'btn',type:'button',onclick:action(r,'retry')},'Retry failed reviews'):null,
+          h('button',{class:'btn ghost',type:'button',onclick:action(r,'defer')},'Defer plan'),h('button',{class:'btn danger',type:'button',onclick:action(r,'reject')},'Reject plan'))]:null))
+      :h('p',{class:'muted small'},'New root feature plans receive independent product and architecture review before implementation. You can request a review for this task.'),
+    h('div',{class:'row-actions'},!reviews.some(r=>r.phase==='plan')&&!t.head_sha?h('button',{class:'btn',type:'button',disabled:!!t.active_run,onclick:act(async()=>{await api('POST',`/api/tickets/${t.key}/product-review`,{phase:'plan'});await loadDetail(sh);},'Product review queued')},'Review this plan'):null,
+      !reviews.some(r=>r.phase==='feedback')&&t.head_sha?h('button',{class:'btn',type:'button',disabled:!!t.active_run,onclick:act(async()=>{await api('POST',`/api/tickets/${t.key}/product-review`,{phase:'feedback'});await loadDetail(sh);},'User feedback queued')},'Request user feedback'):null));
 }
 
 // ---- new ticket ----

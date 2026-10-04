@@ -31,6 +31,13 @@ test('isolated HTTP desk: UI, live events, settings, ticket decisions and deskto
   const html = await fetch(url); assert.match(html.headers.get('content-security-policy'), /default-src 'self'/); assert.match(await html.text(), /\/v2\.js/);
   assert.match(await (await fetch(`${url}/classic.html`)).text(), /Reliability/);
   assert.equal((await fetch(`${url}/fonts/ibm-plex-sans-latin-400-normal.woff2`)).headers.get('content-type'), 'font/woff2');
+  const engineCatalog = await (await request('GET','/api/engines')).json();
+  assert.ok(engineCatalog.seats.find(s=>s.id==='qa').supported_engines.every(e=>e!=='perplexity'));
+  assert.equal((await request('POST','/api/team',{seats:{'senior-be':{engine:'codex',model:'',effort:'medium',enabled:false,fallbacks:[{engine:'claude',model:'sonnet',effort:'high'}]}}})).status,200);
+  const configured=await (await request('GET','/api/state')).json();
+  assert.equal(configured.agents.find(a=>a.id==='senior-be').fallbacks[0].model,'sonnet');
+  assert.equal((await request('POST','/api/team',{seats:{qa:{engine:'perplexity',model:'pplx_asi_kimi_k3'}}})).status,400);
+  assert.equal((await request('POST','/api/team',{seats:{'senior-be':{fallback_mode:'automatic',enabled:false}}})).status,200);
   const abort = new AbortController(); const stream = await fetch(url + '/api/stream', { signal: abort.signal });
   const reader = stream.body.getReader(); await reader.read();
   const created = await request('POST', '/api/tickets', { title: 'HTTP acceptance fixture', description: 'Verify owner decisions', type: 'bug', priority: 'P1' }); assert.equal(created.status, 201);

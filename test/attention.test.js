@@ -86,3 +86,12 @@ test('working counts leaves only; linked pages are not double-counted; no provid
   assert.deepEqual(b.needs_you.map((x) => x.key), ['incident-2']);
   assert.equal(deskStatus({ settings: {}, meta: { providers: [{ id: 'claude', available: false }] } }).label, 'Offline');
 });
+
+test('product review objections surface as decisions and pending feedback never advertises publication',()=>{
+ const t=T('R-1','todo');
+ const changes={ticket_key:t.key,phase:'plan',revision:1,status:'changes'};
+ const result=board({tickets:[t],meta:{product_reviews:[changes]}});
+ assert.equal(result.needs_you[0].kind,'product');
+ const waiting=board({tickets:[{...t,status:'ready_for_human'}],meta:{product_reviews:[{...changes,phase:'feedback',status:'reviewing'}]}});
+ assert.equal(waiting.needs_you.length,0);assert.equal(waiting.queued[0].stage,'User feedback');
+});

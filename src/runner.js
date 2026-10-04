@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { config, publisherPath } from './config.js';
-import { agentById, charterFor, permissionsFor, promptFor, DENY_RULES } from './team.js';
+import { agentById, charterFor, productReviewCharter, permissionsFor, promptFor, DENY_RULES } from './team.js';
 import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
 import { selectionFor, reviewSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
@@ -200,6 +200,19 @@ export function ensureReadonlyWorkspace(seatId = 'scratch') {
   });
 }
 
+// Reviewers inspect a separate clone pinned to the submitted object; no worker checkout is reused.
+export async function ensureProductReviewWorkspace(seatId, ticket) {
+  const dir = await ensureReadonlyWorkspace(seatId);
+  if (!ticket.head_sha) return dir;
+  await stageApproved(ticket.key, workspaceDir(ticket.key), ticket.head_sha);
+  await withGitLock(async () => {
+    await git([...SAFE, '-c', 'protocol.file.allow=always', '-C', dir, 'fetch', '-q', '--no-tags', publisherDir(), ticket.head_sha]);
+    await git([...SAFE, '-C', dir, 'checkout', '-q', '--detach', ticket.head_sha]);
+  });
+  if (await headSha(dir) !== ticket.head_sha) throw new Error('Review snapshot does not match submitted commit');
+  return dir;
+}
+
 export const headSha = async (dir) => (await git(['-C', dir, 'rev-parse', 'HEAD'])).stdout.trim();
 
 export async function commitsAhead(dir) {
@@ -289,10 +302,10 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
       failIfUnavailable: config.sandbox.enabled,
       // The OS sandbox is the boundary, so sandboxed shell commands run without per-command allowlisting
       // (deny rules still apply). The support bot keeps the strict allowlist: it only ever needs `desk`.
-      autoAllowBashIfSandboxed: config.sandbox.enabled && kind !== 'triage',
+      autoAllowBashIfSandboxed: config.sandbox.enabled && !['triage','product_review'].includes(kind),
       network: { allowedDomains: config.sandbox.allowedDomains, allowUnixSockets: [socketPath] },
       // readOnlyPaths and other seats' clones stay readable but are explicitly write-protected.
-      filesystem: { denyRead: deny, allowWrite: [cwd], denyWrite: [...config.project.readOnlyPaths, ...extraDirs, config.project.repoPath].filter(Boolean) },
+      filesystem: { denyRead: deny, allowWrite: kind==='product_review'?[]:[cwd], denyWrite: [...config.project.readOnlyPaths, ...extraDirs, config.project.repoPath, ...(kind==='product_review'?[cwd]:[])].filter(Boolean) },
     },
     permissions: {
       deny: deny.flatMap((p) => [`Read(${asRule(p)})`, `Read(${asRule(p)}/**)`]),
@@ -319,7 +332,7 @@ export const engineOf = (seat) => ENGINES[seat?.engine || 'claude'] || ENGINES.c
 export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath } = {}) {
   return engineOf(agent).command({
     seat: agent, kind, cwd, resume, fork, extraDirs,
-    perms: permissionsFor(kind, cwd), denyRules: DENY_RULES, charter: kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.' : charterFor(agent.id), settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
+    perms: permissionsFor(kind, cwd), denyRules: DENY_RULES, charter: kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.' : kind==='product_review'?productReviewCharter(agent.id):charterFor(agent.id), settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
   });
 }
 

@@ -1,3 +1,4 @@
+import * as productReview from './product-review.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,6 +20,7 @@ import * as advisors from './advisors.js';
 import * as council from './council.js';
 import * as runtime from './runtime.js';
 import * as usage from './usage.js';
+import { normalizeSeat, supportsSeat } from './team-settings.js';
 
 const PUBLIC = path.join(config.root, 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -61,6 +63,7 @@ export function snapshot() {
       quota: JSON.parse(store.kvGet('quota:claude') || 'null'), plan_hold_at: config.limits.planHoldAt,
       providers: dispatch.providerHealth(), scheduler: sched.health(), advisors: advisors.status(), council: council.status(), background: runtime.status(), usage: usage.status(),
       routing: Object.fromEntries(AGENTS.map((a) => { const s = dispatch.selectionFor(a.id); return [a.id, { engine: s.seat?.engine, model: s.seat?.model, effort: s.seat?.effort, tier: SEAT_TIER[a.id], fallback: s.fallback || false, reason: s.reason }]; })),
+      product_reviews: productReview.summaries(),
       decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
   };
@@ -139,11 +142,16 @@ async function ownerRoute(req, res) {
     advisors.runReview(id).catch((err) => store.logEvent({ kind: 'error', agent_id: 'architecture-board', text: err.message }));
     return send(res, 202, { ok: true, id });
   }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/product-review$'))) {
+    const body = await readBody(req);
+    const result = body.action ? productReview.decide(mm[1], body) : productReview.start(mm[1], body);
+    sched.tick(); return send(res, 200, result);
+  }
   if (req.method === 'GET' && p === '/api/health') return send(res, 200, { at: store.now(), providers: dispatch.providerHealth(), scheduler: sched.health(), watch: snapshot().meta.watch });
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
-    return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
+    return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)/events$'))) return send(res, 200, store.recentEvents({ agent_id: mm[1], limit: 300 }));
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)$'))) {
@@ -201,21 +209,17 @@ async function ownerRoute(req, res) {
       engines, tiers: TIER_TEXT,
       presets: presets(available).map((pr) => ({ id: pr.id, label: pr.label, note: pr.note,
         seats: Object.fromEntries(AGENTS.map((a) => { const eng = pr.engine(a.id); return [a.id, { engine: eng, ...suggestFor(a.id, eng) }]; })) })),
-      seats: AGENTS.map((a) => ({ id: a.id, name: a.name, role: a.role, tier: SEAT_TIER[a.id] || 'strong', engine: a.engine, model: a.model, effort: a.effort, enabled: a.enabled,
+      seats: AGENTS.map((a) => ({ id: a.id, name: a.name, role: a.role, tier: SEAT_TIER[a.id] || 'strong', engine: a.engine, model: a.model, effort: a.effort, enabled: a.enabled, fallbacks: a.fallbacks, supported_engines: Object.keys(ENGINES).filter(e => supportsSeat(a.id, e)),
         suggestions: Object.fromEntries(available.map((e) => [e, suggestFor(a.id, e)])) })),
     });
   }
   if (req.method === 'POST' && p === '/api/team') {
     const b = await readBody(req);
     const clean = JSON.parse(store.getSettings().team || '{}');
-    const avail = new Set((await detectEngines()).filter((e) => e.available).map((e) => e.id));
+    // Preferences may target an offline provider; readiness controls dispatch, not saving.
     for (const [id, o] of Object.entries(b.seats || {})) {
       if (!agentById[id] || !o || typeof o !== 'object') return send(res, 400, { error: `invalid seat ${id}` });
-      if (o.engine && !ENGINES[o.engine]) return send(res, 400, { error: `unknown engine ${o.engine}` });
-      if (o.engine && !avail.has(o.engine)) return send(res, 400, { error: `${ENGINES[o.engine].label} is not installed on this machine` });
-      const engine = o.engine || agentById[id].engine;
-      if (o.effort && !ENGINES[engine].efforts.includes(o.effort)) return send(res, 400, { error: `invalid effort ${o.effort}` });
-      clean[id] = { engine, model: String(o.model ?? agentById[id].model ?? '').slice(0, 80), effort: o.effort || agentById[id].effort, enabled: o.enabled !== false };
+      clean[id] = normalizeSeat(id, o);
     }
     store.setSetting('team', JSON.stringify(clean));
     applyTeamOverrides(clean);
