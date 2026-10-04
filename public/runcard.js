@@ -126,6 +126,7 @@ export function deriveEvidence({ ticket = {}, comments = [], events = [] } = {})
  * Build the run card for one ticket.
  * input: { ticket, events (any order; filtered to the ticket), runs, agents, comments, now }
  */
+/** @param {{ ticket?: any, events?: any[], runs?: any[], agents?: any[], comments?: any[], now?: number }} [o] */
 export function runCard({ ticket, events = [], runs = [], agents = [], comments = [], now = Date.now() } = {}) {
   if (!ticket) return null;
   const tEvents = events.filter((e) => e.ticket_key === ticket.key).sort(byId);

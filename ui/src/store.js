@@ -2,17 +2,21 @@
 // while a snapshot is in flight), a debounced snapshot refresh after deltas that change derived server state, a resync
 // every 15 s while visible, and a reconnect when the stream closes. Components subscribe with useDesk().
 import { useSyncExternalStore } from 'react';
+import { toast as sonner } from 'sonner';
 import { board } from '../../public/attention.js';
+import { parse, href, PAGES } from './app/router.ts';
 import { applyDelta, mergeDetail, emptyPending } from './lib/sync.js';
 import { questionText } from './lib/format.js';
 
-const VIEWS = ['inbox', 'work', 'team'];
 const readJSON = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || 'null') ?? d; } catch { return d; } };
 
+/** @type {import('./types').DeskState} */
 export const S = {
   agents: [], tickets: [], events: [], runs: [], settings: {}, meta: {}, incidents: [],
   connected: false, loadError: null, loaded: false,
-  view: VIEWS.includes(localStorage.getItem('sd2.view')) ? localStorage.getItem('sd2.view') : 'inbox',
+  view: parse(location.hash).page !== 'inbox' || /^#\/inbox/.test(location.hash) ? parse(location.hash).page
+    : PAGES.includes(localStorage.getItem('sd2.view')) ? localStorage.getItem('sd2.view') : 'inbox',
+  palette: false, // command palette open
   sheet: null, // { type, ...params } — which sheet is open
   detail: null, // { key, data, pending, error } for the open ticket sheet
   seat: null, // { id, events, stats } for the open seat sheet
@@ -21,7 +25,6 @@ export const S = {
   open: {}, // disclosure state that survives re-renders
   seen: new Set(), painted: false,
   drafts: readJSON('sd2.drafts', {}),
-  toasts: [],
 };
 
 // ---------------- subscription ----------------
@@ -36,6 +39,7 @@ export function emit() {
 const subscribe = (l) => { listeners.add(l); return () => listeners.delete(l); };
 const getVersion = () => version;
 let boardCache = { v: -1, b: null };
+/** @returns {import('./types').Board} */
 export function currentBoard() {
   if (boardCache.v !== version) {
     const b = board(S);
@@ -47,16 +51,14 @@ export function currentBoard() {
 }
 /** Re-render on any store change; read S and currentBoard() directly. */
 export function useDesk() { useSyncExternalStore(subscribe, getVersion); return S; }
+/** @returns {Record<string, import('./types').Agent>} */
 export const agentMap = () => Object.fromEntries(S.agents.map((a) => [a.id, a]));
+/** @param {string} k @returns {import('./types').Ticket | undefined} */
 export const ticketByKey = (k) => S.tickets.find((x) => x.key === k);
 
-// ---------------- toasts ----------------
-let toastSeq = 0;
+// ---------------- toasts (sonner) ----------------
 export function toast(msg, err = false) {
-  const id = ++toastSeq;
-  S.toasts = [{ id, msg: String(msg), err }];
-  emit();
-  setTimeout(() => { if (S.toasts[0]?.id === id) { S.toasts = []; emit(); } }, err ? 6000 : 3600);
+  if (err) sonner.error(String(msg), { duration: 6000 }); else sonner.success(String(msg), { duration: 3600 });
 }
 
 // ---------------- API ----------------
@@ -78,7 +80,10 @@ export async function loadSnapshot() {
     if (seq !== snapshotSeq) return;
     Object.assign(S, snap);
     S.loadError = null; S.loaded = true;
-    for (const m of pending.splice(0)) applyDelta(S, m);
+    // Replayed messages keep their follow-ups (they used to be dropped).
+    let research = false;
+    for (const m of pending.splice(0)) research = applyDelta(S, m).research || research;
+    if (research && researchVisible()) loadResearch().catch(() => {});
     emit();
   } catch (e) {
     if (seq === snapshotSeq) { S.loadError = e.message; for (const m of pending.splice(0)) applyDelta(S, m); emit(); }
@@ -105,12 +110,25 @@ export function connect() {
     if (syncing) { pending.push(m); return; }
     const out = applyDelta(S, m);
     if (out.meta) refreshMeta();
-    if (out.research && S.sheet?.type === 'research') loadResearch().catch(() => {});
+    if (out.research && researchVisible()) loadResearch().catch(() => {});
     emit();
   };
 }
 export function start() {
   connect();
+  // Back/forward and pasted links: the URL decides the page and the open ticket.
+  const onRoute = () => {
+    const r = parse(location.hash);
+    if (r.page !== S.view) { S.view = r.page; localStorage.setItem('sd2.view', r.page); }
+    if (r.ticket && (S.sheet?.type !== 'ticket' || S.sheet.key !== r.ticket)) openTicket(r.ticket, { fromRoute: true });
+    else if (!r.ticket && S.sheet?.type === 'ticket') { S.sheet = null; S.detail = null; }
+    emit();
+  };
+  window.addEventListener('popstate', onRoute);
+  window.addEventListener('hashchange', onRoute);
+  // A bare or unknown URL gets the current page's hash, so Back from a ticket lands on a page and not outside the app.
+  if (parse(location.hash).ticket) queueMicrotask(onRoute);
+  else if (location.hash !== href(S.view)) history.replaceState({ sd: 'page' }, '', href(S.view));
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') connect(); });
   setInterval(() => { if (document.visibilityState === 'visible' && S.connected) loadSnapshot().catch(() => {}); }, 15_000);
   setInterval(() => { if (document.visibilityState === 'visible') emit(); }, 30_000); // "waiting N min" clocks
@@ -119,8 +137,12 @@ export function start() {
 // ---------------- view + sheets ----------------
 export function setView(v) {
   if (S.view !== v) window.scrollTo(0, 0);
-  S.view = v; localStorage.setItem('sd2.view', v); emit();
+  S.view = v; localStorage.setItem('sd2.view', v);
+  if (S.sheet?.type === 'ticket') { S.sheet = null; S.detail = null; }
+  history.pushState({ sd: 'page' }, '', href(v));
+  emit();
 }
+export function setPalette(open) { S.palette = open; emit(); }
 export function openSheet(sheet) {
   S.sheet = sheet;
   if (sheet.type !== 'ticket') S.detail = null;
@@ -128,15 +150,17 @@ export function openSheet(sheet) {
   emit();
 }
 export function closeSheet() {
+  const wasTicket = S.sheet?.type === 'ticket';
   S.sheet = null; S.detail = null; S.seat = null;
-  if (location.hash) history.replaceState(null, '', location.pathname);
+  // A ticket we opened pushed a history entry: going back closes it and keeps Back meaningful.
+  if (wasTicket) { if (history.state?.sd === 'ticket') history.back(); else history.replaceState({ sd: 'page' }, '', href(S.view)); }
   emit();
 }
 export async function openTicket(key, opts = {}) {
   S.sheet = { type: 'ticket', key, decision: opts.decision || null, focus: !!opts.focus, nonce: Date.now() };
   S.detail = { key, data: null, pending: emptyPending(), error: null, seq: 0 };
-  S.seat = null;
-  history.replaceState(null, '', `#${key}`);
+  S.seat = null; S.palette = false;
+  if (!opts.fromRoute) history.pushState({ sd: 'ticket' }, '', href(S.view, key));
   emit();
   if (ticketByKey(key)?.pr_url) loadPrs();
   await loadDetail();
@@ -197,7 +221,13 @@ export function councilFor(id) {
   }
   return null;
 }
-export async function loadResearch() {
+const researchVisible = () => S.view === 'research' || S.sheet?.type === 'research';
+let researchLoading = null; // coalesce bursts of refresh requests
+export function loadResearch() {
+  if (!researchLoading) researchLoading = fetchResearch().finally(() => { researchLoading = null; });
+  return researchLoading;
+}
+async function fetchResearch() {
   try {
     const [data, conns] = await Promise.all([api('GET', '/api/research'), api('GET', '/api/connectors')]);
     S.research = { data, connectors: conns.connectors, sections: conns.case_sections, stages: conns.sdlc_stages, error: null };

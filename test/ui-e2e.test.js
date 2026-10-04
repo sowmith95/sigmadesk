@@ -1,6 +1,7 @@
-// Browser interaction tests for the React desk against the isolated preview desk. Skipped when no Chromium is cached
-// (scripts/ui-browser.mjs finds playwright's cache or $SIGMADESK_CHROMIUM). They exercise the behaviours a rewrite can
-// silently lose: drafts surviving live updates, a vanished decision, focus return, conditional research saves.
+// Browser interaction tests for the desk UI against the isolated preview desk. Skipped when no Chromium is cached
+// (scripts/ui-browser.mjs finds playwright's cache or $SIGMADESK_CHROMIUM). They pin the behaviours a redesign can
+// silently lose: drafts surviving live updates, a vanished decision, focus return, URL routing, conditional research
+// saves, connector proposals, and no horizontal overflow on phones.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { startPreview, launch, openPage, findChromium } from '../scripts/ui-browser.mjs';
@@ -10,75 +11,93 @@ let preview, browser;
 before(async () => { if (skip) return; preview = await startPreview(); browser = await launch(); });
 after(async () => { await browser?.close(); await preview?.stop(); });
 const api = (method, p, b) => fetch(preview.url + p, { method, headers: { 'Content-Type': 'application/json' }, body: b === undefined ? undefined : JSON.stringify(b) }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) }));
+const go = (page, hash) => page.evaluate((h) => { location.hash = h; }, hash);
 
-test('a reply draft survives live updates, persists, and Escape returns focus to the card', { skip, timeout: 60_000 }, async () => {
+test('a reply draft survives live updates, persists, and closing returns focus to the card', { skip, timeout: 60_000 }, async () => {
   const { page, errors } = await openPage(browser, preview.url, { width: 1280, height: 900 });
-  const card = page.locator('.dcard.kind-question').first();
-  const key = (await card.locator('.key').textContent()).trim();
-  await card.locator('.title-btn').click();
+  const card = page.locator('article[data-kind="question"]').first();
+  const key = await card.getAttribute('data-ticket');
+  await card.locator('h3 button').click();
   const reply = page.locator('#reply');
   await reply.click(); await reply.fill('Page after five errors');
-  // Live updates while typing: a comment on this ticket and an edit to another ticket.
   await api('POST', `/api/tickets/${key}/reply`, { body: 'Context from the owner', mode: 'comment' });
   const other = (await api('GET', '/api/state')).body.tickets.find((t) => t.key !== key);
   await api('PATCH', `/api/tickets/${other.key}`, { priority: 'P3' });
+  await page.getByRole('tab', { name: 'Conversation' }).click();
   await page.waitForSelector('text=Context from the owner');
-  assert.equal(await reply.inputValue(), 'Page after five errors');
-  assert.equal(await page.evaluate(() => document.activeElement?.id), 'reply', 'focus stays in the reply');
+  await page.getByRole('tab', { name: 'Decision' }).click();
+  assert.equal(await reply.inputValue(), 'Page after five errors', 'switching tabs and live updates keep the draft');
+  assert.match(page.url(), new RegExp(`#/inbox/${key}$`), 'the open ticket is in the URL');
   assert.match(await page.evaluate(() => localStorage.getItem('sd2.drafts')), /Page after five errors/);
+  await reply.focus();
   await page.keyboard.press('Escape');
-  await page.waitForSelector('.sheet-panel', { state: 'detached' });
-  assert.equal(await page.evaluate(() => document.activeElement?.closest('[data-key]')?.dataset.key?.split(':')[0]), key, 'focus returns to the card that opened it');
-  // Reopening restores the draft.
-  await card.locator('.title-btn').click();
-  assert.equal(await page.locator('#reply').inputValue(), 'Page after five errors');
-  await page.keyboard.press('Escape');
+  await page.waitForSelector('[data-panel]', { state: 'detached' });
+  assert.equal(await page.evaluate(() => document.activeElement?.closest('[data-key]')?.getAttribute('data-key')?.split(':')[0]), key, 'focus returns to the card that opened it');
+  assert.match(page.url(), /#\/inbox$/, 'closing returns to the page URL');
+  await card.locator('h3 button').click();
+  assert.equal(await page.locator('#reply').inputValue(), 'Page after five errors', 'reopening restores the draft');
+  await page.goBack(); await page.waitForSelector('[data-panel]', { state: 'detached' });
   assert.deepEqual(errors, []);
   await page.close();
 });
 
 test('a decision resolved elsewhere while open shows a notice instead of switching decisions', { skip, timeout: 60_000 }, async () => {
   const { page, errors } = await openPage(browser, preview.url, { width: 390, height: 844 });
-  await page.locator('.dcard.kind-design .title-btn').first().click();
+  const card = page.locator('article[data-kind="design"]').first();
+  const key = await card.getAttribute('data-ticket');
+  await card.locator('h3 button').click();
   await page.waitForSelector('text=Recommendation #1');
-  const key = (await page.locator('.sheet-h .key').textContent()).trim();
   const r = await api('POST', `/api/tickets/${key}/decision`, { decision: 'approve', message: 'from another device', discussion_id: 1 });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   await page.waitForSelector('text=That decision was resolved or changed while you were reading');
-  assert.equal(await page.locator('button:has-text("Approve design")').count(), 0, 'no stale approve button');
+  assert.equal(await page.getByRole('button', { name: /Approve design/ }).count(), 0, 'no stale approve button');
   assert.deepEqual(errors, []);
   await page.close();
 });
 
-test('research: add a program from a template, change it with chips, and a concurrent save is refused without losing the edit', { skip, timeout: 90_000 }, async () => {
+test('pages and tickets are addressable: deep links open the ticket, Back closes it, legacy #KEY still works', { skip, timeout: 60_000 }, async () => {
+  const key = (await api('GET', '/api/state')).body.tickets.find((t) => t.status === 'todo').key;
+  const { page, errors } = await openPage(browser, `${preview.url}/#/work/${key}`, { width: 1280, height: 900 });
+  await page.waitForSelector('[data-panel]');
+  assert.equal(await page.locator('header h1').textContent(), 'Work');
+  await page.getByRole('button', { name: 'Close' }).click();
+  await page.waitForSelector('[data-panel]', { state: 'detached' });
+  assert.match(page.url(), /#\/work$/, 'a cold deep link closes to its page, not out of the app');
+  await page.getByRole('navigation', { name: 'Pages' }).getByRole('button', { name: 'Research' }).click();
+  assert.match(page.url(), /#\/research$/); await page.waitForSelector('[data-program]');
+  await page.goBack(); assert.equal(await page.locator('header h1').textContent(), 'Work');
+  await go(page, `#${key}`); await page.waitForSelector('[data-panel]');
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('research: add from a template, change it through the sentence, and a concurrent save is refused without losing the edit', { skip, timeout: 90_000 }, async () => {
   const { page, errors } = await openPage(browser, preview.url, { width: 1280, height: 900 });
-  await page.click('#btn-gear'); await page.click('.research-entry');
-  await page.waitForSelector('.program');
-  await page.click('.template:has-text("Quant papers")');
-  await page.click('button:has-text("Add program")');
-  await page.waitForSelector('.toast:has-text("Program added")');
+  await go(page, '#/research');
+  await page.waitForSelector('[data-program]');
+  await page.getByRole('button', { name: /Quant papers/ }).click();
+  await page.getByRole('button', { name: 'Add program' }).click();
+  await page.waitForSelector('text=Program added');
   let saved = (await api('GET', '/api/research')).body;
   const quant = saved.programs.find((p) => p.id === 'quant-papers');
   assert.ok(quant, 'saved'); assert.deepEqual([quant.seat, quant.window, quant.intervalMinutes, quant.sources.includes('arxiv.org')], ['quant-research', 'off-market', 1440, true]);
   assert.ok(!quant.review.reviewers.includes('quant-research'), 'never their own reviewer');
-  // Edit through the sentence: tap "once a day", pick Weekly, save.
   const card = page.locator('[data-program="quant-papers"]');
-  await card.locator('.slot:has-text("once a day")').click();
-  await card.locator('[role="radio"]:has-text("Weekly")').click();
-  await card.locator('button:has-text("Save program")').click();
-  await page.waitForSelector('.toast:has-text("Program saved")');
+  await card.getByRole('button', { name: 'once a day' }).click();
+  await card.getByRole('radio', { name: 'Weekly' }).click();
+  await card.getByRole('button', { name: 'Save program' }).click();
+  await page.waitForSelector('text=Program saved');
   saved = (await api('GET', '/api/research')).body;
   assert.equal(saved.programs.find((p) => p.id === 'quant-papers').intervalMinutes, 10080);
-  // Someone else saves while this editor is open: the save is refused and the typed name is kept.
-  await card.locator('button:has-text("Edit")').click();
+  await card.getByRole('button', { name: 'Edit' }).click();
   await card.locator('#program-name').fill('Quant papers, weekly digest');
   const others = saved.programs.map((p) => ({ ...p, maxProposals: p.id === 'quant-papers' ? 3 : p.maxProposals }));
   assert.equal((await api('PUT', '/api/research/programs', { programs: others })).status, 200);
-  await card.locator('button:has-text("Save program")').click();
-  await page.waitForSelector('.toast.err:has-text("changed since you opened them")');
+  await card.getByRole('button', { name: 'Save program' }).click();
+  await page.waitForSelector('text=changed since you opened them');
   assert.equal(await card.locator('#program-name').inputValue(), 'Quant papers, weekly digest');
-  await card.locator('button:has-text("Save program")').click();
-  await page.waitForSelector('.toast:has-text("Program saved")');
+  await card.getByRole('button', { name: 'Save program' }).click();
+  await page.waitForSelector('text=Program saved');
   assert.equal((await api('GET', '/api/research')).body.programs.find((p) => p.id === 'quant-papers').label, 'Quant papers, weekly digest');
   assert.deepEqual(errors.filter((e) => !/status of 409/.test(e)), [], 'only the expected conflict response is logged');
   await page.close();
@@ -86,21 +105,38 @@ test('research: add a program from a template, change it with chips, and a concu
 
 test('connectors: the guided case form proposes a connector that awaits assessment', { skip, timeout: 60_000 }, async () => {
   const { page, errors } = await openPage(browser, preview.url, { width: 390, height: 844 });
-  await page.click('#btn-gear'); await page.click('.research-entry');
-  await page.click('button:has-text("Propose a connector")');
+  await go(page, '#/research');
+  await page.getByRole('button', { name: 'Propose a connector' }).click();
   await page.fill('#conn-name', 'paper-search');
   await page.fill('#conn-purpose', 'Search arXiv and Semantic Scholar');
-  const form = page.locator('.case-form');
   for (const label of ['Purpose', 'Benefit to the application', 'How it is used', 'Cost', 'Time', 'Data leaving the machine', 'Risks and fallback', 'Success measure'])
-    await form.locator(`label.field:has(> span:text-is("${label}")) textarea`).fill(`${label} details`);
-  await form.locator('[aria-pressed]:has-text("Discovery")').click();
-  await form.locator('label.field:has(> span:text-is("Expected effect")) input').fill('proposals cite primary sources');
-  await page.click('button:has-text("Propose connector")');
-  await page.waitForSelector('.toast:has-text("Connector proposed")');
+    await page.getByLabel(label, { exact: true }).fill(`${label} details`);
+  await page.getByRole('button', { name: 'Discovery' }).click();
+  await page.getByLabel('Expected effect').fill('proposals cite primary sources');
+  await page.getByRole('button', { name: 'Propose connector' }).click();
+  await page.waitForSelector('text=Connector proposed');
   const c = (await api('GET', '/api/connectors')).body.connectors.find((x) => x.name === 'paper-search');
   assert.equal(c.status, 'proposed'); assert.equal(c.proposed_by, 'owner');
   assert.match(c.case_md, /## SDLC stage improved\ndiscovery — proposals cite primary sources/);
-  await page.waitForSelector('.connector:has-text("paper-search") button:has-text("Request assessment")');
+  await page.locator('article', { hasText: 'paper-search' }).getByRole('button', { name: 'Request assessment' }).waitFor();
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('no page scrolls sideways on a 320 px phone, and the command palette opens a ticket', { skip, timeout: 90_000 }, async () => {
+  const { page, errors } = await openPage(browser, preview.url, { width: 320, height: 700 });
+  for (const r of ['#/inbox', '#/work', '#/team', '#/research', '#/prs', '#/desk', '#/settings']) {
+    await go(page, r); await page.waitForTimeout(300);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${r} fits 320 px`);
+  }
+  const t = (await api('GET', '/api/state')).body.tickets.find((x) => x.status === 'todo');
+  await go(page, '#/inbox');
+  await page.getByRole('button', { name: 'More' }).click();
+  await page.waitForSelector('[cmdk-input]');
+  await page.keyboard.type(t.key);
+  await page.keyboard.press('Enter');
+  await page.waitForSelector('[data-panel]');
+  assert.match(page.url(), new RegExp(`/${t.key}$`));
   assert.deepEqual(errors, []);
   await page.close();
 });
