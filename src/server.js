@@ -1,4 +1,5 @@
 import * as productReview from './product-review.js';
+import * as features from './features.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -69,6 +70,8 @@ export function snapshot() {
       providers: dispatch.providerHealth(), scheduler: sched.health(), advisors: advisors.status(), council: council.status(), background: runtime.status(), usage: usage.status(),
       routing: Object.fromEntries(AGENTS.map((a) => { const s = dispatch.selectionFor(a.id); return [a.id, { engine: s.seat?.engine, model: s.seat?.model, effort: s.seat?.effort, tier: SEAT_TIER[a.id], fallback: s.fallback || false, reason: s.reason }]; })),
       product_reviews: productReview.summaries(),
+      feature_plans: features.summaries(),
+      groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
       research: research.status(settings), research_reviews: researchReview.summaries(),
       decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
@@ -166,6 +169,21 @@ async function ownerRoute(req, res) {
   }
 
   if (req.method === 'POST' && p === '/api/tickets') return send(res, 201, sched.ownerCreate(await readBody(req)));
+  if (req.method === 'POST' && p === '/api/features') return send(res, 201, features.create(await readBody(req)));
+  if (req.method === 'GET' && (mm = m('^/api/features/KEY$'))) {
+    const t = store.getTicket(mm[1]);
+    if (!features.isFeature(t)) return send(res, 404, { error: 'Feature not found' });
+    return send(res, 200, { ticket: withName(t), plan: features.current(t.key), history: features.history(t.key), request: features.requestOf(t.description) });
+  }
+  if (req.method === 'POST' && (mm = m('^/api/features/KEY/plan$'))) {
+    const b = await readBody(req);
+    const k = mm[1];
+    const out = b.action === 'start' || b.action === 'revise' ? features.start(k, { direction: b.message, expected_revision: b.expected_revision })
+      : b.action === 'retry' ? features.retry(k, b) : b.action === 'discard' ? features.discard(k, b)
+        : b.action === 'approve' ? features.approve(k, { expected_revision: b.expected_revision, edits: b.edits, message: b.message })
+          : (() => { throw Object.assign(new Error('Choose start, revise, retry, discard or approve'), { status: 400 }); })();
+    return send(res, 200, out);
+  }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/merge-hold$'))) { const b = await readBody(req); return send(res, 200, mergetrain.setHold(mm[1], b.hold !== false, b.reason)); }
   if (req.method === 'GET' && p === '/api/ci/required-checks') return send(res, 200, { ...prs.requiredChecks(), history: JSON.parse(store.kvGet('ci:history') || '[]') });
   if (req.method === 'POST' && p === '/api/ci/required-checks') return send(res, 200, prs.setRequiredChecks((await readBody(req)).names || [], 'owner'));

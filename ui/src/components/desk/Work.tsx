@@ -4,7 +4,7 @@ import { ChevronRight } from 'lucide-react';
 import { runCard } from '../../../../public/runcard.js';
 import { humanReason } from '../../../../public/attention.js';
 import { safeGithubUrl } from '../../../../public/prs-model.js';
-import { S, api, agentMap, openTicket, openSheet, prFor, setOpen } from '@/store.js';
+import { S, api, agentMap, openTicket, openSheet, prFor, setOpen, openFeature } from '@/store.js';
 import { mergeEvents } from '@/lib/sync.js';
 import { clean, money, mins, hhmm, prNumber } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
@@ -14,7 +14,7 @@ import { cn } from '@/lib/utils';
 import type { BoardItem, Ticket, Comment } from '@/types';
 
 export const STAGE_LABEL: Record<string, string> = { triage: 'Intake', proposed: 'Proposed', todo: 'To do', in_progress: 'Building', qa: 'QA', review: 'Acceptance', needs_human: 'Needs you', ready_for_human: 'Ready for review', done: 'Shipped', wontdo: 'Closed' };
-export const KIND_LABEL: Record<string, string> = { product: 'Product review', question: 'Question', guard: 'Publish guard', merge: 'Ready to merge', publish: 'Ready to publish', design: 'Design decision', council: 'Council verdict', page: 'Production errors', research: 'Research proposal' };
+export const KIND_LABEL: Record<string, string> = { product: 'Product review', question: 'Question', guard: 'Publish guard', merge: 'Ready to merge', publish: 'Ready to publish', design: 'Design decision', council: 'Council verdict', page: 'Production errors', research: 'Research proposal', plan: 'Feature plan' };
 export const BUCKET_LABEL: Record<string, string> = { needs_you: 'Needs you', blocked: 'Blocked', working: 'Working', queued: 'Queued', shipped: 'Shipped', closed: 'Closed', epic: 'Epic' };
 export const BUCKET_TONE: Record<string, Tone> = { needs_you: 'needs', blocked: 'blocked', shipped: 'shipped' };
 export const firstName = (id?: string | null) => ((id && agentMap()[id]?.name) || '').split(/\s+/)[0] || 'The engineer';
@@ -90,7 +90,14 @@ export function CiTag({ t }: { t: Ticket }) {
 export const prReviewsOf = (t: Ticket, d?: Record<string, unknown> | null) => (d?.pr_reviews || (d?.ticket as Ticket | undefined)?.pr_reviews || t?.pr_reviews || null) as unknown;
 const VERDICT = (v?: string): [string, string, Tone] => (/approv|pass|lgtm/i.test(v || '') ? ['✓', 'approved', 'shipped'] : /chang|fail|reject|request|block/i.test(v || '') ? ['✎', 'changes requested', 'needs'] : ['…', 'pending', 'neutral']);
 type Reviewer = { seat?: string; name?: string; role?: string; context?: string; verdict?: string; state?: string; status?: string; sha?: string; round?: number; findings?: unknown };
-export function Reviews({ raw, compact = false }: { raw: unknown; compact?: boolean }) {
+/** Why reviewers who are "pending" are not reviewing yet (they review a pull request, and only while the ticket is in review). */
+export function reviewHold(t?: Ticket | null): string | null {
+  if (!t || t.status === 'review') return null;
+  if (t.status === 'needs_human' && /publish guard/i.test(String(t.progress_msg || ''))) return 'They start after you approve publication: they review the pull request, which opens only once the branch is pushed.';
+  if (t.status === 'needs_human') return 'They continue after you answer: the ticket is waiting for you.';
+  return null;
+}
+export function Reviews({ raw, compact = false, t }: { raw: unknown; compact?: boolean; t?: Ticket | null }) {
   let rv: unknown = raw;
   if (typeof rv === 'string') { try { rv = JSON.parse(rv); } catch { return null; } }
   if (!rv || typeof rv !== 'object') return null;
@@ -102,7 +109,10 @@ export function Reviews({ raw, compact = false }: { raw: unknown; compact?: bool
   const round = o.round ?? (Math.max(0, ...list.map((x) => Number(x.round) || 0)) || null);
   const findings = list.flatMap((x) => (Array.isArray(x.findings) ? x.findings.map((f: unknown) => ({ f, by: who(x) })) : []));
   const people = list.map((x, i) => {
-    const [g, word, tone] = VERDICT(x.verdict || x.state || x.status);
+    const hold = reviewHold(t);
+    const raw2 = x.verdict || x.state || x.status;
+    const [g, word0, tone] = VERDICT(raw2);
+    const word = hold && /pending/i.test(word0) ? 'waiting for you' : word0;
     const label = `${who(x)}${x.role ? `, ${x.role}` : ''}: ${word}${x.sha ? ` at ${String(x.sha).slice(0, 8)}` : ''}`;
     return <span key={i} className="inline-flex items-center gap-1.5 text-sm" title={label} aria-label={label}><SeatAvatar id={x.seat} /><Tag tone={tone}>{g}</Tag>{!compact && <span>{who(x)}, {word}</span>}</span>;
   });
@@ -111,6 +121,7 @@ export function Reviews({ raw, compact = false }: { raw: unknown; compact?: bool
     <section aria-label="Pull request reviews" className="grid gap-2">
       <h3 className="font-semibold">Code review{round ? `, round ${round}` : ''}</h3>
       <div className="flex flex-wrap gap-3">{people}</div>
+      {reviewHold(t) && <p className="text-sm text-muted-foreground">{reviewHold(t)}</p>}
       {findings.length > 0 && <Disclose id="review-findings" summary={`Findings (${findings.length})`}><ul className="grid list-disc gap-2 pl-5">{findings.map(({ f, by }, i) => {
         const x = f as { text?: string; title?: string; body?: string; issue?: string; severity?: string; response?: string };
         const text = typeof f === 'string' ? f : x.text || x.title || x.body || x.issue || JSON.stringify(f);
@@ -149,6 +160,7 @@ export function DecisionButton({ it, label, className, size }: { it: BoardItem; 
     case 'question': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id, focus: true })}>{text}</Button>;
     case 'merge': return <Button size={size} className={className} onClick={() => { const n = prNumber(t.pr_url); if (n) openSheet({ type: 'pr', number: n }); else openTicket(t.key, { decision: it.id }); }}>{text}</Button>;
     case 'page': return <Button size={size} className={className} onClick={() => openSheet({ type: 'desk' })}>{text}</Button>;
+    case 'plan': return <Button size={size} className={className} onClick={() => openFeature(t.key)}>{text}</Button>;
     case 'guard': case 'publish':
       return <AsyncButton size={size} className={className}
         confirm={it.kind === 'guard' ? `Lift the publish guard on ${it.name}?\n\nThe change touches protected paths or is unusually large. Approving pushes the branch and opens a draft PR. You still merge.`

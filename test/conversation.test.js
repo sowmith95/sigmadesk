@@ -66,9 +66,9 @@ test('the server\'s real echo strings never duplicate a message', () => {
 
 test('only the latest unanswered question is open; discussions show their state in the thread', () => {
   const comments = [{ id: 1, author: 'junior', ts: at(1), body: '❓ First?' }, { id: 2, author: 'owner', ts: at(2), body: 'Yes.' },
-    { id: 3, author: 'junior', ts: at(3), body: '❓ Second?' }];
+    { id: 3, author: 'junior', ts: at(3), body: '❓ Second?' }, { id: 4, author: 'owner', ts: at(4), body: 'Looking into it (comment only).' }];
   const items = conversationItems({ comments, status: 'needs_human', discussions: [{ id: 7, status: 'failed', created_at: at(2), error: 'provider unavailable' }] });
-  assert.deepEqual(items.map((i) => [i.id, !!i.open]), [['c1', false], ['c2', false], ['d7', false], ['c3', true]]);
+  assert.deepEqual(items.map((i) => [i.id, !!i.open]), [['c1', false], ['c2', false], ['d7', false], ['c3', true], ['c4', false]], 'a comment does not close the question');
   assert.match(items[2].text, /#7: Failed/);
   assert.equal(conversationItems({ comments, status: 'todo' }).some((i) => i.open), false);
 });
@@ -78,4 +78,10 @@ test('day labels for multi-day threads', () => {
   assert.equal(dayLabel('2026-10-04T09:00:00', now), 'Today');
   assert.equal(dayLabel('2026-10-03T09:00:00', now), 'Yesterday');
   assert.match(dayLabel('2026-09-28T09:00:00', now), /Sep/);
+});
+
+test('short narration that happens to match a comment is kept', () => {
+  const comments = [{ id: 1, author: 'qa', ts: at(30), body: 'Checking the layout on mobile next, then the API contract.' }];
+  const events = [{ id: 1, kind: 'say', agent_id: 'qa', ts: at(10), text: 'Checking the layout' }];
+  assert.deepEqual(conversationItems({ comments, events }).map((i) => i.id), ['e1', 'c1']);
 });

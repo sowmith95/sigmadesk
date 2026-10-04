@@ -18,6 +18,9 @@ function echoes(e, c) {
   if (!near(c.ts, e.ts, e.kind === 'say' ? 180_000 : 5_000)) return false;
   const ev = comparable(e.text), body = comparable(c.body);
   if (!ev) return false;
+  // Narration is dropped when it is the comment itself, a consult echo, or a long lead-in of it (a run's wrap-up),
+  // never because a short phrase happens to start the comment.
+  if (e.kind === 'say') return body === ev || ((ECHO_PREFIX.test(e.text) || ev.length >= 60) && body.startsWith(ev.slice(0, 300)));
   return body === ev || (ev.length >= 24 && body.startsWith(ev.slice(0, 300)));
 }
 
@@ -26,12 +29,12 @@ const DISCUSSION_STATE = { queued: 'Waiting for the manager', running: 'The mana
 
 export function conversationItems({ comments = [], events = [], discussions = [], status = '', agent = '' } = {}) {
   const items = new Map();
-  const lastOwner = comments.filter((c) => c.author === 'owner').reduce((m, c) => (c.ts > m ? c.ts : m), '');
   const lastAsk = [...comments].filter((c) => String(c.body).startsWith('❓')).sort((a, b) => String(a.ts).localeCompare(String(b.ts)) || a.id - b.id).at(-1);
   for (const c of comments) {
     const ask = String(c.body).startsWith('❓');
     items.set(`c${c.id}`, { id: `c${c.id}`, ts: c.ts, who: c.author, text: c.body, kind: 'comment', ask,
-      open: ask && c === lastAsk && status === 'needs_human' && !(lastOwner > c.ts) });
+      // Open while the ticket is still held for the owner: a comment is not an answer; answering resumes the ticket.
+      open: ask && c === lastAsk && status === 'needs_human' });
   }
   for (const e of events) {
     if (comments.some((c) => echoes(e, c))) continue;

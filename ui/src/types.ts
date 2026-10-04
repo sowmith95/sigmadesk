@@ -25,10 +25,16 @@ export interface DeskState {
   agents: Agent[]; tickets: Ticket[]; events: DeskEvent[]; runs: Run[]; incidents: any[];
   settings: Record<string, string>; meta: Record<string, any>;
   connected: boolean; loadError: string | null; loaded: boolean;
-  view: string; palette: boolean;
+  view: string; palette: boolean; feature: string | null; featureDetail: { key: string; data: any; error: string | null; seq: number } | null;
   sheet: { type: string; key?: string; id?: string; number?: number; decision?: string | null; focus?: boolean; tab?: string; nonce?: number; banner?: any } & Record<string, any> | null;
   detail: { key: string; data: any; pending: any; error: string | null; seq: number } | null;
   seat: { id: string; events: any[] | null; stats: any } | null;
   questions: Record<string, any>; prs: any; prsAt: number; prsLoading: boolean; councils: Record<number, any>;
   research: any; open: Record<string, boolean>; seen: Set<string>; painted: boolean; drafts: Record<string, string>;
 }
+
+export interface PlanTask { ref: string; title: string; area: string; complexity: 'S' | 'M'; risk: 'low' | 'high'; after: string | null; description: string; acceptance: string[] }
+export interface FeaturePlanBody { summary: string; goal: string; users: string[]; scope: string[]; out_of_scope: string[]; acceptance: string[]; risks: string[]; questions: string[]; tasks: PlanTask[] }
+export interface FeaturePlan { ticket_key: string; revision: number; status: 'queued' | 'grooming' | 'ready' | 'failed' | 'approved' | 'discarded'; engine: string; direction?: string;
+  plan: FeaturePlanBody | null; error?: string | null; run_id?: number | null; model?: string | null; stale?: boolean; attempts?: number; created_at?: string; updated_at?: string;
+  approved_at?: string; approved_tasks?: string[]; task_keys?: Record<string, string> }

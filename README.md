@@ -184,6 +184,42 @@ Perplexity's Agent API routes the other model families. “Configured” means a
 Provider IDs and request formats were checked against [Perplexity](https://docs.perplexity.ai/docs/agent-api/models),
 [Gemini](https://ai.google.dev/gemini-api/docs/models), and [xAI](https://docs.x.ai/developers/grok-4-7).
 
+## Features: grooming with Codex, then your approval
+
+A feature is something you want built, in your words. On the Features page, **New feature** asks for a name and what it
+should do for whom. Morgan, the Engineering Manager, then runs a grooming round on **Codex**: a read-only run that reads the
+repository and returns a plan with these parts:
+
+- a two-sentence summary;
+- the goal and who it is for;
+- what is in and out of scope;
+- testable acceptance criteria;
+- risks;
+- questions only you can answer;
+- one to eight small or medium tasks in build order.
+
+The feature's page shows that plan as a document, with the grooming session beside it:
+
+- **Reply to Codex** to start another round. The previous plan and your note go into the prompt, and earlier rounds stay
+  readable.
+- **Edit the tasks** before approving: rename, resize or switch off any of them. A task that depends on another needs both.
+- **Approve** to create the tasks with their order enforced. Each task brief carries the feature's goal and criteria. The
+  feature moves to building and closes itself when its tasks are settled.
+
+Nothing starts before approval. A feature with a plan in progress is held from triage, ordinary grooming and
+implementation. An approved plan is the plan gate, so no separate product review is needed. QA, code review and your
+merge approval still apply.
+
+With GitHub sync on, an approved feature and its tasks get issues. The feature's issue carries the plan and a task
+checklist that ticks as tasks merge. GitHub mirrors the desk; decisions happen on the desk. An issue you wrote yourself
+keeps your text, and the desk adds its section between markers. Approved features are reconciled with GitHub on every
+start.
+
+Ordinary grooming also runs on Codex by default (Settings → Grooming can switch back to Morgan's own engine). When Morgan
+splits a ticket, `desk split` keeps the parent open as an epic that closes when its tasks are done, and `--after` records
+the order between tasks. You can change a task's order in its Details tab, and reopen a parent that was closed while its
+tasks were open.
+
 ## Research programs and the second-person review
 
 Research is configured as **programs** (Settings → Research): which seat researches, how often, whether only during or
@@ -383,7 +419,7 @@ npm run dev:ui         # Vite dev server with hot reload, proxying the API to a 
 npm run ui:shots       # phone and desktop screenshots of every page and panel into /tmp/sigmadesk-shots
 ```
 
-Pages are addressable: `#/inbox`, `#/work`, `#/team`, `#/research`, `#/prs`, `#/desk`, `#/settings`, and a ticket
+Pages are addressable: `#/inbox`, `#/work`, `#/features` (a feature's document at `#/features/<KEY>`), `#/team`, `#/research`, `#/prs`, `#/desk`, `#/settings`, and a ticket
 opens at `#/<page>/<KEY>`. Press ⌘K or `/` for the command palette. Shared building blocks live in
 `ui/src/components/desk/` (chips, fields, async buttons, the side panel); `ui/src/components/ui/` holds the generated
 shadcn components.

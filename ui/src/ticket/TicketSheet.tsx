@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { MoreHorizontal } from 'lucide-react';
 import { nameOf } from '../../../public/names.js';
 import { humanReason } from '../../../public/attention.js';
-import { S, api, ticketByKey, currentBoard, closeSheet, openSheet, loadDetail, loadSnapshot, loadPrs, councilFor, draftKey, setDraft, toast } from '@/store.js';
+import { S, api, ticketByKey, currentBoard, closeSheet, openSheet, openFeature, loadDetail, loadSnapshot, loadPrs, councilFor, draftKey, setDraft, toast } from '@/store.js';
 import { clean, prNumber } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -141,6 +141,7 @@ export function TicketSheet() {
       footer={(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); }}>Comment or ask the manager</Button></div>}>
       {decisions.length > 1 && <div role="group" aria-label="Decisions on this ticket" className="flex flex-wrap gap-2">
         {decisions.map((x) => <Button key={x.id} size="sm" variant={dec?.id === x.id ? 'default' : 'secondary'} aria-pressed={dec?.id === x.id} onClick={() => { setDecisionId(x.id); setTab('decision'); }}>{label(x)}</Button>)}</div>}
+      {t.type === 'feature' && !t.parent_key && <div className="flex flex-wrap items-center gap-3 rounded-md bg-primary/10 px-3 py-2"><span className="min-w-0 flex-1 text-sm">This is a feature. Its plan, tasks and grooming session are on its feature page.</span><Button size="sm" variant="secondary" onClick={() => openFeature(t.key)}>Open the feature</Button></div>}
       {gone && <p role="status" className="rounded-md bg-blocked/15 px-3 py-2">That decision was resolved or changed while you were reading. Nothing was submitted.</p>}
       {!dec && it && ['blocked', 'queued', 'epic'].includes(it.bucket) && <p className="rounded-md bg-secondary px-3 py-2"><Named text={humanReason(clean(it.reason), S.tickets)} /></p>}
       <Tabs value={dec || tab !== 'decision' ? tab : 'conversation'} onValueChange={setTab} className="min-w-0 gap-4">
@@ -154,13 +155,13 @@ export function TicketSheet() {
         {dec && <TabsContent value="decision" className="grid gap-4">
           {dec.kind === 'product' ? <ProductReview t={t} d={d} msg={reviewMsg} setMsg={setReviewMsg} /> : <Brief dec={dec} t={t} d={d} />}
           <PrSummary t={t} dec={dec} />
-          <Reviews raw={prReviewsOf(t, d)} compact={false} />
+          <Reviews raw={prReviewsOf(t, d)} compact={false} t={t} />
         </TabsContent>}
         <TabsContent value="conversation">{d ? <Conversation d={d} live={!!card?.live} tkey={t.key} state={conv} status={t.status} /> : <p className="text-muted-foreground">{det?.error || 'Loading conversation…'}</p>}</TabsContent>
         <TabsContent value="run"><Block><RunCard card={card} /></Block></TabsContent>
         <TabsContent value="reviews" className="grid gap-4">
           <PrSummary t={t} dec={null} />
-          <Block><Reviews raw={prReviewsOf(t, d)} />{!prReviewsOf(t, d) && <p className="text-sm text-muted-foreground">No code review yet.</p>}</Block>
+          <Block><Reviews raw={prReviewsOf(t, d)} t={t} />{!prReviewsOf(t, d) && <p className="text-sm text-muted-foreground">No code review yet.</p>}</Block>
           {dec?.kind !== 'product' && <ProductReview t={t} d={d} msg={reviewMsg} setMsg={setReviewMsg} />}
           <ResearchReview t={t} d={d} />
         </TabsContent>

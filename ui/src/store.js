@@ -16,6 +16,8 @@ export const S = {
   connected: false, loadError: null, loaded: false,
   view: parse(location.hash).page !== 'inbox' || /^#\/inbox/.test(location.hash) ? parse(location.hash).page
     : PAGES.includes(localStorage.getItem('sd2.view')) ? localStorage.getItem('sd2.view') : 'inbox',
+  feature: parse(location.hash).feature, // the open feature document (Features page)
+  featureDetail: null, // { key, data, error, seq } for the open feature document
   palette: false, // command palette open
   sheet: null, // { type, ...params } — which sheet is open
   detail: null, // { key, data, pending, error } for the open ticket sheet
@@ -83,6 +85,7 @@ export async function loadSnapshot() {
     // Replayed messages keep their follow-ups (they used to be dropped).
     let research = false;
     for (const m of pending.splice(0)) research = applyDelta(S, m).research || research;
+    if (S.feature && S.featureDetail?.key === S.feature) loadFeature().catch(() => {});
     if (research && researchVisible()) loadResearch().catch(() => {});
     emit();
   } catch (e) {
@@ -110,6 +113,7 @@ export function connect() {
     if (syncing) { pending.push(m); return; }
     const out = applyDelta(S, m);
     if (out.meta) refreshMeta();
+    if (out.feature && out.feature === S.featureDetail?.key) loadFeature().catch(() => {});
     if (out.research && researchVisible()) loadResearch().catch(() => {});
     emit();
   };
@@ -120,6 +124,7 @@ export function start() {
   const onRoute = () => {
     const r = parse(location.hash);
     if (r.page !== S.view) { S.view = r.page; localStorage.setItem('sd2.view', r.page); }
+    if (r.feature !== S.feature) { S.feature = r.feature; if (r.feature) loadFeature(); else S.featureDetail = null; }
     if (r.ticket && (S.sheet?.type !== 'ticket' || S.sheet.key !== r.ticket)) openTicket(r.ticket, { fromRoute: true });
     else if (!r.ticket && S.sheet?.type === 'ticket') { S.sheet = null; S.detail = null; }
     emit();
@@ -128,16 +133,20 @@ export function start() {
   window.addEventListener('hashchange', onRoute);
   // A bare or unknown URL gets the current page's hash, so Back from a ticket lands on a page and not outside the app.
   if (parse(location.hash).ticket) queueMicrotask(onRoute);
-  else if (location.hash !== href(S.view)) history.replaceState({ sd: 'page' }, '', href(S.view));
+  else if (location.hash !== here()) history.replaceState({ sd: 'page' }, '', here());
+  if (S.feature) loadFeature();
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') connect(); });
   setInterval(() => { if (document.visibilityState === 'visible' && S.connected) loadSnapshot().catch(() => {}); }, 15_000);
   setInterval(() => { if (document.visibilityState === 'visible') emit(); }, 30_000); // "waiting N min" clocks
 }
 
 // ---------------- view + sheets ----------------
+/** The current page's URL (with the open feature), optionally with a ticket over it. */
+export const here = (ticket = null) => href(S.view, ticket, S.view === 'features' ? S.feature : null);
 export function setView(v) {
-  if (S.view !== v) window.scrollTo(0, 0);
+  if (S.view !== v || S.feature) window.scrollTo(0, 0);
   S.view = v; localStorage.setItem('sd2.view', v);
+  S.feature = null; S.featureDetail = null;
   if (S.sheet?.type === 'ticket') { S.sheet = null; S.detail = null; }
   history.pushState({ sd: 'page' }, '', href(v));
   emit();
@@ -153,14 +162,14 @@ export function closeSheet() {
   const wasTicket = S.sheet?.type === 'ticket';
   S.sheet = null; S.detail = null; S.seat = null;
   // A ticket we opened pushed a history entry: going back closes it and keeps Back meaningful.
-  if (wasTicket) { if (history.state?.sd === 'ticket') history.back(); else history.replaceState({ sd: 'page' }, '', href(S.view)); }
+  if (wasTicket) { if (history.state?.sd === 'ticket') history.back(); else history.replaceState({ sd: 'page' }, '', here()); }
   emit();
 }
 export async function openTicket(key, opts = {}) {
   S.sheet = { type: 'ticket', key, decision: opts.decision || null, focus: !!opts.focus, nonce: Date.now() };
   S.detail = { key, data: null, pending: emptyPending(), error: null, seq: 0 };
   S.seat = null; S.palette = false;
-  if (!opts.fromRoute) history.pushState({ sd: 'ticket' }, '', href(S.view, key));
+  if (!opts.fromRoute) history.pushState({ sd: 'ticket' }, '', here(key));
   emit();
   if (ticketByKey(key)?.pr_url) loadPrs();
   await loadDetail();
@@ -179,6 +188,30 @@ export async function loadDetail() {
   } catch (e) { if (S.detail === d && seq === d.seq) d.error = e.message; }
   emit();
 }
+/** Open a feature's document on the Features page. */
+export function openFeature(key) {
+  window.scrollTo(0, 0);
+  S.view = 'features'; localStorage.setItem('sd2.view', 'features');
+  S.feature = key; S.sheet = null; S.detail = null; S.palette = false;
+  history.pushState({ sd: 'page' }, '', href('features', null, key));
+  emit();
+  return loadFeature();
+}
+export async function loadFeature() {
+  const key = S.feature;
+  if (!key) return;
+  const fd = S.featureDetail?.key === key ? S.featureDetail : (S.featureDetail = { key, data: null, error: null, seq: 0 });
+  const seq = ++fd.seq;
+  try {
+    const data = await api('GET', `/api/features/${key}`);
+    if (S.featureDetail !== fd || seq !== fd.seq) return;
+    fd.data = data; fd.error = null;
+  } catch (e) { if (S.featureDetail === fd && seq === fd.seq) fd.error = e.status === 404 ? 'This is not a feature.' : e.message; }
+  emit();
+}
+/** A feature's current plan from the snapshot (kept live by the stream). */
+export const planFor = (key) => (S.meta.feature_plans || []).find((p) => p.ticket_key === key) || null;
+
 export async function openSeat(id) {
   S.sheet = { type: 'seat', id };
   S.seat = { id, events: null, stats: null };

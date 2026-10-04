@@ -1,5 +1,5 @@
 import { useEffect, type ReactNode } from 'react';
-import { Inbox, KanbanSquare, Users, FlaskConical, GitPullRequest, Activity, Settings, Plus, Search } from 'lucide-react';
+import { Inbox, Lightbulb, KanbanSquare, Users, FlaskConical, GitPullRequest, Activity, Settings, Plus, Search } from 'lucide-react';
 import { deskStatus } from '../../../public/attention.js';
 import { S, currentBoard, setView, setPalette, openSheet } from '@/store.js';
 import { money } from '@/lib/format.js';
@@ -11,6 +11,7 @@ import type { Page } from './router';
 
 export const NAV: { page: Page; label: string; icon: typeof Inbox; primary?: boolean }[] = [
   { page: 'inbox', label: 'Inbox', icon: Inbox, primary: true }, { page: 'work', label: 'Work', icon: KanbanSquare, primary: true },
+  { page: 'features', label: 'Features', icon: Lightbulb, primary: true },
   { page: 'team', label: 'Team', icon: Users, primary: true }, { page: 'research', label: 'Research', icon: FlaskConical },
   { page: 'prs', label: 'Pull requests', icon: GitPullRequest }, { page: 'desk', label: 'Desk', icon: Activity }, { page: 'settings', label: 'Settings', icon: Settings },
 ];
@@ -24,7 +25,7 @@ function Rail({ needs }: { needs: number }) {
         const active = S.view === page;
         const item = (
           <button key={page} type="button" onClick={() => setView(page)} aria-current={active ? 'page' : undefined}
-            className={cn('relative flex h-10 items-center gap-3 rounded-md px-2.5 text-[15px] font-medium text-muted-foreground hover:bg-secondary hover:text-foreground', active && 'bg-secondary text-foreground', i === 3 && 'mt-4')}>
+            className={cn('relative flex h-10 items-center gap-3 rounded-md px-2.5 text-[15px] font-medium text-muted-foreground hover:bg-secondary hover:text-foreground', active && 'bg-secondary text-foreground', i === 4 && 'mt-4')}>
             <Icon className="size-5 shrink-0" aria-hidden /><span className="hidden xl:inline">{label}</span>
             {page === 'inbox' && needs > 0 && <span className="absolute left-7 top-1 rounded-full bg-needs px-1.5 font-mono text-[11px] font-semibold text-background xl:static xl:ml-auto">{needs}</span>}
             <span className="sr-only xl:hidden">{label}</span>
@@ -37,9 +38,9 @@ function Rail({ needs }: { needs: number }) {
 }
 
 function MobileTabs({ needs }: { needs: number }) {
-  const more = !['inbox', 'work', 'team'].includes(S.view);
+  const more = !['inbox', 'work', 'features', 'team'].includes(S.view);
   return (
-    <nav aria-label="Pages" className="fixed inset-x-0 bottom-0 z-30 grid grid-cols-4 gap-1 border-t bg-card/95 px-2 pb-[calc(env(safe-area-inset-bottom)+6px)] pt-1.5 backdrop-blur md:hidden">
+    <nav aria-label="Pages" className="fixed inset-x-0 bottom-0 z-30 grid grid-cols-5 gap-1 border-t bg-card/95 px-2 pb-[calc(env(safe-area-inset-bottom)+6px)] pt-1.5 backdrop-blur md:hidden">
       {NAV.filter((n) => n.primary).map(({ page, label, icon: Icon }) => (
         <button key={page} type="button" onClick={() => setView(page)} aria-current={S.view === page ? 'page' : undefined}
           className={cn('relative grid min-h-12 place-items-center gap-0.5 rounded-md text-xs font-medium text-muted-foreground', S.view === page && 'bg-secondary text-foreground')}>
@@ -102,7 +103,9 @@ export function Shell({ title, actions, children }: { title: string; actions?: R
             <Button variant="outline" onClick={() => setPalette(true)} className="gap-2 text-muted-foreground max-md:size-10 max-md:p-0" aria-label="Find or do something">
               <Search className="size-4" /><span className="max-md:hidden">Find or do…</span><kbd className="rounded border bg-secondary px-1.5 font-mono text-[11px] max-md:hidden">{isMac ? '⌘K' : 'Ctrl K'}</kbd>
             </Button>
-            <Button onClick={() => openSheet({ type: 'new' })} className="max-md:size-10 max-md:p-0" aria-label="New ticket"><Plus className="size-4" /><span className="max-md:hidden">New ticket</span></Button>
+            {S.view === 'features'
+              ? <Button onClick={() => openSheet({ type: 'new-feature' })} className="max-md:size-10 max-md:p-0" aria-label="New feature"><Plus className="size-4" /><span className="max-md:hidden">New feature</span></Button>
+              : <Button onClick={() => openSheet({ type: 'new' })} className="max-md:size-10 max-md:p-0" aria-label="New ticket"><Plus className="size-4" /><span className="max-md:hidden">New ticket</span></Button>}
           </div>
           <StatusStrip B={B} />
         </header>

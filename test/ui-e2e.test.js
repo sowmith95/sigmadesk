@@ -32,6 +32,8 @@ test('a reply draft survives live updates, persists, and closing returns focus t
   await reply.focus();
   await page.keyboard.press('Escape');
   await page.waitForSelector('[data-panel]', { state: 'detached' });
+  // Focus moves back once the panel's exit and the route change settle (a frame or two after it detaches).
+  await page.waitForFunction((k) => document.activeElement?.closest('[data-key]')?.getAttribute('data-key')?.split(':')[0] === k, key, { timeout: 3000 }).catch(() => {});
   assert.equal(await page.evaluate(() => document.activeElement?.closest('[data-key]')?.getAttribute('data-key')?.split(':')[0]), key, 'focus returns to the card that opened it');
   assert.match(page.url(), /#\/inbox$/, 'closing returns to the page URL');
   await card.locator('h3 button').click();
@@ -137,6 +139,50 @@ test('no page scrolls sideways on a 320 px phone, and the command palette opens 
   await page.keyboard.press('Enter');
   await page.waitForSelector('[data-panel]');
   assert.match(page.url(), new RegExp(`/${t.key}$`));
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('features: a ready plan is reviewed, a task is renamed, and approval starts the work in order', { skip, timeout: 90_000 }, async () => {
+  const { page, errors } = await openPage(browser, preview.url, { width: 390, height: 844 });
+  const plans = (await api('GET', '/api/state')).body.meta.feature_plans;
+  const ready = plans.find((p) => p.status === 'ready');
+  await page.getByRole('navigation', { name: 'Pages' }).getByRole('button', { name: 'Features' }).click();
+  await page.locator(`[data-feature="${ready.ticket_key}"] h3 button`).click();
+  assert.match(page.url(), new RegExp(`#/features/${ready.ticket_key}$`));
+  await page.getByLabel('Task 3 title').fill('Daily fill-cost card');
+  await page.getByLabel('Include task 1').click();
+  await page.getByRole('button', { name: /Approve plan and start 2 tasks/ }).click();
+  await page.waitForSelector('text=keep both or drop both');
+  await page.getByLabel('Include task 1').click();
+  await page.getByRole('button', { name: /Approve plan and start 3 tasks/ }).click();
+  await page.waitForSelector('text=Approved; tasks created');
+  const st = (await api('GET', '/api/state')).body;
+  const kids = st.tickets.filter((t) => t.parent_key === ready.ticket_key).sort((a, b) => a.key.localeCompare(b.key, 'en', { numeric: true }));
+  assert.deepEqual(kids.map((k) => k.title).at(-1), 'Daily fill-cost card');
+  assert.equal(kids[1].after_key, kids[0].key); assert.equal(kids[2].after_key, kids[1].key);
+  assert.equal(st.tickets.find((t) => t.key === ready.ticket_key).status, 'in_progress');
+  await page.waitForSelector(`text=You approved round ${ready.revision}`);
+  await page.getByRole('button', { name: 'Daily fill-cost card' }).click();
+  await page.waitForSelector('[data-panel]');
+  assert.match(page.url(), new RegExp(`#/features/${ready.ticket_key}/${kids[2].key}$`), 'a task opens over its feature');
+  await page.goBack(); await page.waitForSelector('[data-panel]', { state: 'detached' });
+  assert.match(page.url(), new RegExp(`#/features/${ready.ticket_key}$`));
+  assert.deepEqual(errors.filter((e) => !/status of 400/.test(e)), []);
+  await page.close();
+});
+
+test('features: a new feature is described in a dialog and lands on its page waiting for Codex', { skip, timeout: 60_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/features`, { width: 1280, height: 900 });
+  await page.getByRole('button', { name: 'New feature' }).click();
+  await page.getByLabel('Name').fill('Strategy P&L heatmap');
+  await page.getByLabel('What should it do, and for whom?').fill('A heatmap of daily P&L by strategy for the evening review.');
+  await page.getByRole('radio', { name: 'Frontend' }).click();
+  await page.getByRole('button', { name: 'Create and plan with Codex' }).click();
+  await page.waitForSelector('text=is waiting for Codex');
+  const t = (await api('GET', '/api/state')).body.tickets.find((x) => x.title === 'Strategy P&L heatmap');
+  assert.equal(t.type, 'feature'); assert.equal(t.status, 'proposed'); assert.equal(t.area, 'frontend');
+  assert.match(page.url(), new RegExp(`#/features/${t.key}$`));
   assert.deepEqual(errors, []);
   await page.close();
 });

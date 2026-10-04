@@ -19,10 +19,11 @@ export const emptyPending = () => ({ comments: [], events: [], discussions: [], 
  * S.detail = { key, data, pending, seq } is the open ticket's detail (or null). Until `data` arrives, every detail-scoped
  * item (comments, events, discussions, reviews, branch refresh) is parked in `pending` so none is lost.
  * S.seat = { id, events } is the open seat sheet (or null).
- * Returns { meta: boolean (refresh the snapshot soon), research: boolean (refetch research/connectors) }.
+ * Returns { meta: boolean (refresh the snapshot soon), research: boolean (refetch research/connectors), feature: key whose
+ * feature document should be refetched }.
  */
 export function applyDelta(S, m) {
-  const out = { meta: false, research: false };
+  const out = { meta: false, research: false, feature: null };
   const d = S.detail;
   const mine = (k) => d && d.key === k;
   const into = (field, item) => {
@@ -31,7 +32,7 @@ export function applyDelta(S, m) {
     upsert(list, item);
   };
   switch (m.type) {
-    case 'ticket': upsert(S.tickets, m.data, 'key'); break;
+    case 'ticket': upsert(S.tickets, m.data, 'key'); out.feature = m.data.parent_key || m.data.key; break;
     case 'agent': { const a = S.agents.find((x) => x.id === m.data.id); if (a) Object.assign(a, m.data); break; }
     case 'run': upsert(S.runs, m.data); if (m.data.status !== 'running') out.meta = true; break;
     case 'settings': { const teamChanged = S.settings.team !== m.data.team; S.settings = m.data; out.meta = teamChanged; out.research = true; break; }
@@ -43,6 +44,13 @@ export function applyDelta(S, m) {
     case 'research-review': into('research_reviews', m.data); out.meta = true; break;
     case 'connector': out.meta = true; out.research = true; break;
     case 'council': delete S.councils[m.data.id]; out.meta = true; break;
+    case 'feature-plan': {
+      const plans = (S.meta.feature_plans ||= []);
+      const i = plans.findIndex((p) => p.ticket_key === m.data.ticket_key);
+      if (i >= 0) plans[i] = m.data; else plans.push(m.data);
+      out.feature = m.data.ticket_key;
+      break;
+    }
     case 'event':
       if (!S.events.some((e) => e.id === m.data.id)) S.events.push(m.data);
       if (S.events.length > 600) S.events.splice(0, S.events.length - 600);
