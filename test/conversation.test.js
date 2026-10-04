@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { conversationItems, nearLatest } from '../public/conversation.js';
+import { conversationItems, nearLatest, comparable, dayLabel } from '../public/conversation.js';
 const event = (id, kind, text, who = 'engineer', run = 1) => ({ id, kind, text, agent_id: who, run_id: run, ts: `2026-10-04T02:00:${String(id).padStart(2, '0')}Z` });
 
 test('conversation interleaves owner messages, agent updates and handoffs chronologically', () => {
@@ -38,7 +38,44 @@ test('follow latest pauses when the reader scrolls up', () => {
 test('comment activity echoes are removed without hiding repeated comments or unrelated events', () => {
   const comments = [{ id: 1, author: 'owner', ts: '2026-10-04T02:00:01Z', body: 'Approved the design.' },
     { id: 2, author: 'owner', ts: '2026-10-04T02:00:02Z', body: 'Approved the design.' }];
-  const events = [event(1, 'system', 'Approved the design.', 'owner'), event(2, 'action', 'Commented: Approved the', 'owner'),
+  const events = [event(1, 'system', 'Approved the design.', 'owner'), event(2, 'action', 'commented: Approved the design.', 'owner'),
     event(10, 'system', 'Approved the design.', 'owner')];
   assert.deepEqual(conversationItems({ comments, events }).map(i=>i.id), ['c1', 'c2', 'e10']);
+});
+
+const at = (s) => `2026-10-04T02:00:${String(s).padStart(2, '0')}Z`;
+test('the server\'s real echo strings never duplicate a message', () => {
+  const comments = [
+    { id: 1, author: 'senior-be', ts: at(1), body: 'Tests are green on the branch; opening the PR next.' },
+    { id: 2, author: 'senior-be', ts: at(2), body: '❓ **Question for the owner:** Should alerts **page** after three errors?' },
+    { id: 3, author: 'manager', ts: at(3), body: '🗣 **Asked Rowan (Principal Backend Engineer):** Is a queue needed here?' },
+    { id: 4, author: 'principal-be', ts: at(4), body: '💬 No queue; a cron-free retry loop is enough for this volume.' },
+    { id: 5, author: 'manager', ts: at(50), body: '💬 **Design response #2**\n\nUse a feature branch and one owner-controlled merge.' },
+  ];
+  const events = [
+    { id: 1, kind: 'action', agent_id: 'senior-be', ts: at(1), text: 'commented: Tests are green on the branch; opening the PR next.' },
+    { id: 2, kind: 'action', agent_id: 'senior-be', ts: at(2), text: 'asked the owner: Should alerts **page** after three errors?' },
+    { id: 3, kind: 'action', agent_id: 'manager', ts: at(3), text: '🗣 planning discussion with Principal Backend Engineer: Is a queue needed here?' },
+    { id: 4, kind: 'say', agent_id: 'principal-be', ts: at(4), text: '→ Engineering Manager: No queue; a cron-free retry loop is enough for this volume.' },
+    { id: 5, kind: 'say', agent_id: 'manager', ts: at(20), text: 'Use a feature branch and one owner-controlled merge.' },
+    { id: 6, kind: 'say', agent_id: 'manager', ts: at(21), text: 'Reading the merge train code first.' },
+  ];
+  assert.deepEqual(conversationItems({ comments, events }).map((i) => i.id), ['c1', 'c2', 'c3', 'c4', 'e6', 'c5']);
+  assert.equal(comparable('commented: **Bold** `x`…'), 'bold x');
+});
+
+test('only the latest unanswered question is open; discussions show their state in the thread', () => {
+  const comments = [{ id: 1, author: 'junior', ts: at(1), body: '❓ First?' }, { id: 2, author: 'owner', ts: at(2), body: 'Yes.' },
+    { id: 3, author: 'junior', ts: at(3), body: '❓ Second?' }];
+  const items = conversationItems({ comments, status: 'needs_human', discussions: [{ id: 7, status: 'failed', created_at: at(2), error: 'provider unavailable' }] });
+  assert.deepEqual(items.map((i) => [i.id, !!i.open]), [['c1', false], ['c2', false], ['d7', false], ['c3', true]]);
+  assert.match(items[2].text, /#7: Failed/);
+  assert.equal(conversationItems({ comments, status: 'todo' }).some((i) => i.open), false);
+});
+
+test('day labels for multi-day threads', () => {
+  const now = new Date('2026-10-04T15:00:00');
+  assert.equal(dayLabel('2026-10-04T09:00:00', now), 'Today');
+  assert.equal(dayLabel('2026-10-03T09:00:00', now), 'Yesterday');
+  assert.match(dayLabel('2026-09-28T09:00:00', now), /Sep/);
 });

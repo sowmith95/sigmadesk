@@ -116,7 +116,7 @@ export const codex = {
     const effort = seat.effort;
     const model = seat.model || userModel();
     const common = ['--json', '--skip-git-repo-check', ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : []),
-      ...(['council_review','product_review'].includes(kind) ? ['-c', 'default_permissions="sigmadesk_review"'] : []),
+      ...(['council_review','product_review','feature_groom'].includes(kind) ? ['-c', 'default_permissions="sigmadesk_review"'] : []),
       ...(kind === 'council_review' ? ['-c', 'features.shell_tool=false'] : [])];
     const args = resume
       ? ['exec', 'resume', ...common, resume, '-']
@@ -129,7 +129,7 @@ export const codex = {
       // Codex has no system-prompt flag: the charter leads the prompt.
       wrapPrompt: (prompt) => `<seat-charter>\n${charter}\n</seat-charter>\n\n${prompt}`,
       env: { CODEX_HOME: codexHome() },
-      mailbox: !['council_review','product_review'].includes(kind),
+      mailbox: !['council_review','product_review','feature_groom'].includes(kind),
     };
   },
 

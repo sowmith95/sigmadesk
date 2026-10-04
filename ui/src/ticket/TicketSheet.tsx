@@ -60,11 +60,21 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef }:
   );
   const note = running ? <p className="text-sm text-muted-foreground">The worker is finishing; decisions unlock when its run settles.</p> : null;
   const row = 'flex flex-wrap items-center gap-2 max-md:[&>[data-primary]]:order-first max-md:[&>[data-primary]]:basis-full';
-  if (dec?.kind === 'product') return <p className="text-sm text-muted-foreground">Resolve the objections in the Reviews tab.</p>;
+  const composeUi = <>
+    {box('Message the manager about this ticket…', 'Message')}
+    <div className={row}>
+      <Button variant="ghost" onClick={() => setCompose(false)}>{dec ? 'Back to the decision' : 'Cancel'}</Button>
+      <AsyncButton variant="secondary" run={send('comment')} ok="Comment saved to the thread">Comment only</AsyncButton>
+      <span className="flex-1" />
+      <AsyncButton data-primary size="lg" run={send('discussion')} ok="Sent to the manager; the ticket keeps its place">Ask the manager</AsyncButton>
+    </div><p className="text-sm text-muted-foreground">Asking the manager starts a design discussion. It does not answer or approve anything.</p></>;
+  const talk = { label: 'Comment or ask the manager…', run: async () => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); return false; }, ok: '' };
+  if (compose) return composeUi;
+  if (dec?.kind === 'product') return <div className={row}><More items={[talk]} /><p className="text-sm text-muted-foreground">Resolve the objections in the Reviews tab.</p></div>;
   if (dec?.kind === 'question') return <>
     {box(`Your answer to ${who}…`, 'Your answer')}
     <div className={row}>
-      <More items={[{ label: 'Approve as asked (no message)', run: decide('approve'), ok: `Approved; ${who} resumes`, disabled: running }, { label: 'Reject ticket…', run: decide('reject'), ok: 'Rejected; ticket closed, local work kept', danger: true, disabled: running }]} />
+      <More items={[talk, { label: 'Approve as asked (no message)', run: decide('approve'), ok: `Approved; ${who} resumes`, disabled: running }, { label: 'Reject ticket…', run: decide('reject'), ok: 'Rejected; ticket closed, local work kept', danger: true, disabled: running }]} />
       <span className="flex-1" />
       <AsyncButton data-primary size="lg" disabled={running} run={send('answer')} ok={`Answer delivered; ${who} resumes`}>Answer and continue</AsyncButton>
     </div>{note}</>;
@@ -79,7 +89,7 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef }:
     return <>
       {changes && box('What should change? (required)', 'Requested changes')}
       <div className={row}>
-        <More items={[{ label: dec.kind === 'design' ? `Reject design${target}…` : dec.kind === 'council' ? `Reject council${target}…` : dec.kind === 'research' ? 'Reject proposal…' : 'Reject ticket…', run: decide('reject'),
+        <More items={[talk, { label: dec.kind === 'design' ? `Reject design${target}…` : dec.kind === 'council' ? `Reject council${target}…` : dec.kind === 'research' ? 'Reject proposal…' : 'Reject ticket…', run: decide('reject'),
           ok: ['design', 'council'].includes(dec.kind || '') ? 'Recommendation rejected' : 'Rejected; ticket closed, local work kept', danger: true, disabled: blockedAll }]} />
         <span className="flex-1" />
         {changes ? <Button variant="ghost" onClick={() => setMode(null)}>Cancel</Button>
@@ -90,15 +100,7 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef }:
             : <AsyncButton data-primary size="lg" disabled={cantApprove} run={decide('approve')} ok={okApprove}>{primaryLabel}</AsyncButton>}
       </div>{note}</>;
   }
-  if (!compose) return null;
-  return <>
-    {box('Message the manager about this ticket…', 'Message')}
-    <div className={row}>
-      <Button variant="ghost" onClick={() => setCompose(false)}>Cancel</Button>
-      <AsyncButton variant="secondary" run={send('comment')} ok="Comment saved to the thread">Comment only</AsyncButton>
-      <span className="flex-1" />
-      <AsyncButton data-primary size="lg" run={send('discussion')} ok="Sent to the manager; the ticket keeps its place">Send to manager</AsyncButton>
-    </div></>;
+  return null;
 }
 
 export function TicketSheet() {
@@ -116,7 +118,9 @@ export function TicketSheet() {
   const dec = decisionId ? decisions.find((x) => x.id === decisionId) || null : decisions[0] || null;
   const gone = !!decisionId && !dec;
   const it = t ? B.byKey[t.key] : undefined;
-  const [tab, setTab] = useState<string>(sh.tab || (sh.decision || decisions[0] ? 'decision' : it?.bucket === 'working' ? 'conversation' : 'conversation'));
+  // No explicit choice yet: follow the data (a decision that loads after the panel opens still leads).
+  const [chosen, setTab] = useState<string | null>(sh.tab || (sh.decision ? 'decision' : null));
+  const tab = chosen ?? (decisions[0] ? 'decision' : 'conversation');
   useEffect(() => { if (sh.focus && det?.data) { replyRef.current?.focus(); sh.focus = false; } }, [det?.data]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (t?.pr_url) loadPrs(); }, [t?.pr_url]);
   if (!t) return <Panel title={det?.error || 'Loading ticket…'} onClose={closeSheet}><p className="text-muted-foreground">{det?.error ? 'This ticket could not be loaded.' : 'Loading…'}</p></Panel>;
@@ -134,7 +138,7 @@ export function TicketSheet() {
   const footer = <Footer t={t} dec={dec} d={d} compose={compose} setCompose={setCompose} onDecided={() => setDecisionId(null)} replyRef={replyRef} />;
   return (
     <Panel wide label={nameOf(t)} title={nameOf(t)} head={head} onClose={closeSheet}
-      footer={(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); }}>Message the manager</Button></div>}>
+      footer={(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); }}>Comment or ask the manager</Button></div>}>
       {decisions.length > 1 && <div role="group" aria-label="Decisions on this ticket" className="flex flex-wrap gap-2">
         {decisions.map((x) => <Button key={x.id} size="sm" variant={dec?.id === x.id ? 'default' : 'secondary'} aria-pressed={dec?.id === x.id} onClick={() => { setDecisionId(x.id); setTab('decision'); }}>{label(x)}</Button>)}</div>}
       {gone && <p role="status" className="rounded-md bg-blocked/15 px-3 py-2">That decision was resolved or changed while you were reading. Nothing was submitted.</p>}
@@ -152,7 +156,7 @@ export function TicketSheet() {
           <PrSummary t={t} dec={dec} />
           <Reviews raw={prReviewsOf(t, d)} compact={false} />
         </TabsContent>}
-        <TabsContent value="conversation">{d ? <Conversation d={d} live={!!card?.live} tkey={t.key} state={conv} /> : <p className="text-muted-foreground">{det?.error || 'Loading conversation…'}</p>}</TabsContent>
+        <TabsContent value="conversation">{d ? <Conversation d={d} live={!!card?.live} tkey={t.key} state={conv} status={t.status} /> : <p className="text-muted-foreground">{det?.error || 'Loading conversation…'}</p>}</TabsContent>
         <TabsContent value="run"><Block><RunCard card={card} /></Block></TabsContent>
         <TabsContent value="reviews" className="grid gap-4">
           <PrSummary t={t} dec={null} />

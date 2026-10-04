@@ -182,6 +182,7 @@ async function ownerRoute(req, res) {
   }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode, { expected_updated_at: b.expected_updated_at })); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
+  if (req.method === 'POST' && (mm = m('^/api/discussions/(\\d+)/(retry|cancel)$'))) return send(res, 200, sched.ownerDiscussion(mm[1], mm[2]));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/refresh-base$'))) return send(res, 200, await sched.ownerRefreshBase(mm[1], await readBody(req)));
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
   // ---- PR console (owner only; agents have no route to these) ----

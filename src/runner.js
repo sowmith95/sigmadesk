@@ -5,11 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { config, publisherPath } from './config.js';
-import { agentById, charterFor, productReviewCharter, researchCharter, readOnlyReviewCharter, permissionsFor, promptFor, DENY_RULES, READ_ONLY_KINDS } from './team.js';
+import { agentById, charterFor, featureGroomCharter, productReviewCharter, researchCharter, readOnlyReviewCharter, permissionsFor, promptFor, DENY_RULES, READ_ONLY_KINDS } from './team.js';
 import * as connectors from './connectors.js';
 import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
-import { selectionFor, reviewSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
+import { selectionFor, reviewSelection, pinnedSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
 import * as store from './db.js';
 import * as context from './context.js';
 
@@ -341,6 +341,7 @@ export function jobPermissions(kind, job) {
 export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath, job = null } = {}) {
   const charter = kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.'
     : kind === 'product_review' ? productReviewCharter(agent.id)
+      : kind === 'feature_groom' ? featureGroomCharter()
       : RESEARCH_KINDS.has(kind) ? researchCharter(agent.id, job)
         : kind === 'research_review' || kind === 'connector_assessment' ? readOnlyReviewCharter(agent.id, kind) : charterFor(agent.id);
   const mcpServers = RESEARCH_KINDS.has(kind) && job?.connectors?.length ? connectors.mcpServersFor(job.connectors) : undefined;
@@ -400,12 +401,13 @@ export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: St
  * Start one agent run. Resolves when the process exits with {run, result}.
  * The prompt goes over stdin so the variadic tool flags cannot swallow it.
  */
-export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null, job = null }) {
+export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null, job = null, pinEngine = null }) {
   if (fence != null && fence !== epoch) return Promise.resolve({ run: null, result: null, aborted: true });
   if (reviewProfile && (kind !== 'council_review' || track || resume)) throw new Error('Per-job review models are restricted to fresh, untracked council calls');
   // A research job's requirements (web, connectors) travel into provider selection: fallback may not drop them.
   const requirements = job && RESEARCH_KINDS.has(kind) ? { web: job.web !== false, connectors: (job.connectors || []).map((c) => c.name) } : null;
-  const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : selectionFor(agentId, Date.now(), requirements);
+  if (pinEngine && !['groom', 'feature_groom'].includes(kind)) throw new Error('Only grooming pins an engine per job');
+  const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : pinEngine ? pinnedSelection(agentId, pinEngine, kind) : selectionFor(agentId, Date.now(), requirements);
   if (!selected.seat) throw Object.assign(new Error(`${agentId}: ${selected.reason}`), { status: 409, providerUnavailable: true });
   const agent = selected.seat;
   if (ENGINES[agent.engine || 'claude']?.supports && !ENGINES[agent.engine || 'claude'].supports(kind)) throw Object.assign(new Error(`${agentId}: ${ENGINES[agent.engine].label} cannot run ${kind}`), { status: 409 });

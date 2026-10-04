@@ -61,6 +61,17 @@ export function reviewSelection(agentId, profile) {
   if (!health?.ready) return { seat: null, reason: health?.reason || 'Provider unavailable' };
   return { seat: { ...agentById[agentId], engine: engine.id, model: profile.model || health.default_model, effort: profile.effort, role: 'Council Reviewer' }, fallback: false };
 }
+// One job pinned to one engine (the owner asked for a Codex grooming session). No silent fallback: if that engine is not
+// ready the job waits and says why. The seat keeps its name and role; only the engine, model and effort change.
+export function pinnedSelection(agentId, engineId, kind, now = Date.now()) {
+  const seat = agentById[agentId];
+  const engine = ENGINES[engineId];
+  if (!seat || seat.enabled === false) return { seat: null, reason: 'Seat disabled' };
+  if (!engine || (engine.supports && !engine.supports(kind))) return { seat: null, reason: `${engine?.label || engineId} cannot run ${kind}` };
+  const health = providerHealth(now).find((p) => p.id === engineId);
+  if (!health?.ready) return { seat: null, reason: health?.reason || `${engine.label} is not available`, retry_at: health?.retry_at };
+  return { seat: { ...seat, engine: engineId, model: health.default_model || '', effort: 'high' }, fallback: false };
+}
 // Job requirements a provider must carry (research programs): web tools and approved MCP connectors. Fallback may
 // never pick an engine that would silently drop them; the run is refused instead.
 export function meetsRequirements(engine, requirements) {

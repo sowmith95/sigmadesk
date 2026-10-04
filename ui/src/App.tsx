@@ -59,7 +59,7 @@ export function App() {
       <Shell title={TITLES[page] || 'Inbox'}><Boundary resetKey={page}><Suspense fallback={<Loading />}>{content}</Suspense></Boundary></Shell>
       <Overlay />
       {S.palette && <Suspense fallback={null}><CommandPalette /></Suspense>}
-      <Toaster position="bottom-center" />
+      <Toaster position="top-center" />
     </TooltipProvider>
   );
 }
