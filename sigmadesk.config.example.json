@@ -102,6 +102,7 @@
       "prepareDeadlineSeconds": 45,
       "pageChars": 0,
       "pageRounds": 6,
+      "maxRunMinutes": 90,
       "secretPatterns": []
     }
   },

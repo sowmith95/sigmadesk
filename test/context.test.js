@@ -37,6 +37,8 @@ w('src/big.js', `${Array.from({ length: 400 }, (_, i) => `export const v${i} = $
 w('src/giant.js', `${Array.from({ length: 1500 }, (_, i) => `export const g${i} = ${i};`).join('\n')}\n`);
 w('config/app.json', '{"name":"demo"}\n');
 w('constructor', 'a file named like an Object.prototype property\n');
+const LONG = `deep/${'a'.repeat(200)}/${'b'.repeat(200)}/${'c'.repeat(200)}/${'d'.repeat(200)}/${'f'.repeat(89)}.js`;
+w(LONG, `${Array.from({ length: 300 }, (_, i) => `export const long${i} = ${i};`).join('\n')}\n`);
 w('__proto__', 'another one\n');
 w('src/minified.js', `// head\n${'x'.repeat(10)}\nconst blob = "${'q'.repeat(120000)}END";\n// tail\n`);
 fs.symlinkSync('../outside/secret.txt', path.join(owner, 'link.js'));
@@ -500,4 +502,98 @@ test('stop-all aborts a run that is still building its pack', async () => {
     assert.equal(out.run.status, 'killed');
     assert.equal(out.run.pid, null, 'never spawned');
   } finally { Object.assign(seat, saved); }
+});
+
+test('stale completion: a read issued before a follow-up cannot vouch for it, even if its answer arrives later', async () => {
+  const DONE = '{"thread_status":"idle","web_state":{"thread_status":"idle","entries":[{"status":"WORKFLOW_COMPLETED"}]}}';
+  const { live, run, pack } = await packFor('groom', ticketFor());
+  call(live, { message: pack.text });
+  const staleRead = id();
+  ctx.recordSend(live, staleRead, 'read', { thread_id: 'thread-A-0001' }); // read issued…
+  call(live, { message: 'A follow-up question', thread_id: 'thread-A-0001' }); // …follow-up sent and acknowledged…
+  ctx.recordResult(live, staleRead, { text: DONE }); // …then the old read's completed snapshot arrives
+  assert.match(ctx.acceptBlockers(live.meta), /No completed Perplexity answer/);
+  read(live, 'thread-A-0001', DONE);
+  assert.equal(ctx.acceptBlockers(live.meta), null, 'a read issued after the follow-up counts');
+  // An older snapshot arriving late never overwrites a newer state.
+  const older = id();
+  ctx.recordSend(live, older, 'read', { thread_id: 'thread-A-0001' });
+  read(live, 'thread-A-0001', '{"thread_status":"idle","web_state":{"entries":[{"status":"WORKFLOW_ERROR"}]}}');
+  ctx.recordResult(live, older, { text: DONE });
+  assert.equal(live.meta.remote.status, 'error');
+  ctx.release(run.id);
+});
+
+test('pagination with a 901-char path and pageChars=2000 terminates within the cap; an impossible budget errors clearly', async () => {
+  assert.equal(LONG.length, 901);
+  const { run } = await packFor('groom', ticketFor());
+  const settings = { ...ctx.packSettings(), pageChars: 2000 };
+  const first = await ctx.serveFile(run.id, LONG, 1, settings);
+  const pages = Number(first.match(/pages="(\d+)"/)[1]);
+  assert.match(first, /path-sha256="[0-9a-f]{64}"/);
+  const blocks = [first];
+  for (let p = 2; p <= pages; p++) blocks.push(await ctx.serveFile(run.id, LONG, p, settings));
+  for (const b of blocks) assert.ok(b.length <= 2000, `${b.length}`);
+  assert.ok(blocks.join('').includes('export const long299 = 299;'));
+  ctx.release(run.id);
+  const again = await packFor('groom', ticketFor());
+  await assert.rejects(ctx.serveFile(again.run.id, LONG, 1, { ...ctx.packSettings(), pageChars: 600 }), /leaves no room/);
+  assert.throws(() => ctx.paginate('x'.repeat(1000), 150), /below 200/);
+  ctx.release(again.run.id);
+});
+
+test('a failed (resumed) pack thread can be replaced: the new thread carries coverage and completion', async () => {
+  const DONE = '{"thread_status":"idle","web_state":{"entries":[{"status":"WORKFLOW_COMPLETED"}]}}';
+  const { live, run, pack } = await packFor('groom', ticketFor());
+  call(live, { message: pack.text }, { text: '{"thread_id":"thread-old-0001"}' });
+  call(live, { message: await ctx.serveFile(run.id, 'src/caller.js'), thread_id: 'thread-old-0001' });
+  assert.deepEqual(live.meta.fetched, ['src/caller.js']);
+  read(live, 'thread-old-0001', '{"thread_status":"idle","web_state":{"entries":[{"status":"WORKFLOW_ERROR"}]}}');
+  assert.match(ctx.acceptBlockers(live.meta), /failed or was cancelled/);
+  const ev = call(live, { message: `Retrying.\n${pack.text}` }, { text: '{"thread_id":"thread-new-0002"}' });
+  assert.ok(ev.some((e) => /now carries the review/.test(e.note)));
+  assert.equal(live.meta.packThread, 'thread-new-0002');
+  assert.deepEqual(live.meta.fetched, [], 'coverage starts over on the new thread');
+  read(live, 'thread-old-0001', DONE);
+  assert.match(ctx.acceptBlockers(live.meta), /No completed Perplexity answer on thread thread-new-0002/);
+  read(live, 'thread-new-0002', DONE);
+  assert.equal(ctx.acceptBlockers(live.meta), null);
+  // Without a failure, a second pack on a new thread does not move the pack thread.
+  call(live, { message: pack.text }, { text: '{"thread_id":"thread-third-0003"}' });
+  assert.equal(live.meta.packThread, 'thread-new-0002');
+  ctx.release(run.id);
+});
+
+test('run timeout covers follow-ups and page rounds; a lower cap reduces page rounds and the relay is told', () => {
+  const px = config.engines.perplexity;
+  const saved = { ...px };
+  try {
+    let s = ctx.packSettings();
+    assert.equal(s.pageRounds, 6);
+    assert.equal(s.runMinutes, 8 * (1 + 1 + 6) + 10);
+    assert.ok(!s.pageRoundsCapped);
+    Object.assign(px, { maxRunMinutes: 40 });
+    s = ctx.packSettings();
+    assert.equal(s.pageRounds, 1, 'floor((40-10)/8) - 1 - 1');
+    assert.ok(s.pageRoundsCapped && s.runMinutes <= 40);
+    assert.equal(s.runMinutes, 8 * 3 + 10);
+    assert.match(ctx.relayRules(s), /at most 1 page follow-ups, limited by the 40-minute run cap/);
+  } finally { Object.assign(px, saved); }
+});
+
+test('PR reconciliation reads the publisher repo under a custom data dir', async () => {
+  const { publisherPath } = await import('../src/config.js');
+  const prsync = await import('../src/prsync.js');
+  const pub = publisherPath();
+  assert.equal(pub, path.join(data, 'publisher.git'));
+  assert.ok(fs.existsSync(path.join(pub, 'HEAD')), 'packs created it under SIGMADESK_DATA');
+  gc('checkout', '-q', '-b', 'stack', mainSha);
+  wc('stack1.txt', 'one\n'); gc('add', 'stack1.txt'); gc('commit', '-qm', 's1'); const s1 = gc('rev-parse', 'HEAD');
+  wc('stack2.txt', 'two\n'); gc('add', 'stack2.txt'); gc('commit', '-qm', 's2'); const s2 = gc('rev-parse', 'HEAD');
+  execFileSync('git', ['--git-dir', pub, '-c', 'protocol.file.allow=always', 'fetch', '-q', clone, `+${s2}:refs/test/stack`]);
+  execFileSync('git', ['--git-dir', pub, 'update-ref', 'refs/sigmadesk/base', mainSha]);
+  const u = ticketFor({ status: 'ready_for_human', head_sha: s1 });
+  store.updateTicket(u.key, { branch: 'sigmadesk/stack-1', pr_url: 'https://github.com/o/r/pull/7' });
+  const t = ticketFor({ status: 'ready_for_human', head_sha: s2 });
+  assert.deepEqual(await prsync.stackBaseFor(store.getTicket(t.key)), { key: u.key, branch: 'sigmadesk/stack-1', pr: 7 });
 });

@@ -109,7 +109,10 @@ undoes it). Stop-all also aborts runs that are still building their pack. A retr
 contract and pack) resumes polling the recorded thread; anything else asks afresh. Knobs under `engines.perplexity`:
 `contextMaxChars` (60000), `relayReserveChars` (8000), `remoteWaitMinutes` (8; idle watchdog and run timeouts are
 raised above it), `followupRounds` (1), `pageRounds` (6), `pageChars` (0 = the pack budget), `secretPatterns` ([]),
-`prepareDeadlineSeconds` (45).
+`prepareDeadlineSeconds` (45), `maxRunMinutes` (90; the run timeout covers the first answer, follow-ups and page rounds, and
+fewer page rounds are allowed when the cap is lower). Remote state is dated by when it was requested, so a `read_thread`
+issued before a follow-up never counts as that follow-up's answer; if the pack thread fails, a replacement thread
+carrying the pack takes over (coverage and completion start over on it).
 
 ## Owner decisions and discussions
 
