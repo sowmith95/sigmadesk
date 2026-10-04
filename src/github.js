@@ -135,10 +135,11 @@ export function openDraftPr(ticketKey, summary, { base = config.project.baseBran
     if (!t?.branch || t.pr_url) return t?.pr_url;
     const open = JSON.parse(await gh(['pr', 'list', '-R', config.project.githubRepo, '--head', t.branch, '--state', 'all', '--json', 'url', '--limit', '1']));
     if (open[0]?.url) { store.updateTicket(t.key, { pr_url: open[0].url }); return open[0].url; }
-    const body = `${summary}\n\n${t.issue_number ? `Closes #${t.issue_number}\n\n` : ''}---\nBuilt by **${agentById[t.assignee]?.name || 'SigmaDesk'} (${agentById[t.assignee]?.role || 'engineer'})**, independently checked by QA at \`${String(t.head_sha || '').slice(0, 10)}\`. Draft — needs human review before merge.\n\n_Opened by [SigmaDesk](https://github.com/${config.project.githubOwner})._`;
-    const url = await gh(['pr', 'create', '-R', config.project.githubRepo, '--draft', '--base', base, '--head', t.branch, '--title', `[${t.key}] ${t.title}`, '--body', body]);
+    const body = `${summary}\n\n${t.issue_number ? `Closes #${t.issue_number}\n\n` : ''}---\nBuilt by **${agentById[t.assignee]?.name || 'SigmaDesk'} (${agentById[t.assignee]?.role || 'engineer'})**, independently checked by QA at \`${String(t.head_sha || '').slice(0, 10)}\`. ${Number(config.review.required) > 0 ? 'Two desk reviewers review it next; their comments appear below.' : 'Needs human review before merge.'}\n\n_Opened by [SigmaDesk](https://github.com/${config.project.githubOwner})._`;
+    const draft = store.getSettings().draft_prs === 'true';
+    const url = await gh(['pr', 'create', '-R', config.project.githubRepo, ...(draft ? ['--draft'] : []), '--base', base, '--head', t.branch, '--title', `[${t.key}] ${t.title}`, '--body', body]);
     store.updateTicket(t.key, { pr_url: url.split('\n').pop() });
-    store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: `opened draft PR ${url}` });
+    store.logEvent({ kind: 'github', ticket_key: t.key, agent_id: 'github', text: `opened ${draft ? 'draft ' : ''}PR ${url}` });
     return url;
   }, ticketKey);
 }

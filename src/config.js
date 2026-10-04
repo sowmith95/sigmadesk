@@ -45,7 +45,7 @@ const DEFAULTS = {
     busyWindow: { enabled: false, timezone: 'America/New_York', days: [1, 2, 3, 4, 5], start: '09:30', end: '16:15', maxConcurrent: 1 },
     dailyBudgetUsd: 150,
     runBudgetUsd: { fable: 8, opus: 5, sonnet: 3, haiku: 0.75 },
-    runTimeoutMin: { implement: 45, qa: 20, review: 20, pr_review: 25, respond: 45, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, design: 20, council_review: 5 },
+    runTimeoutMin: { implement: 45, qa: 20, review: 20, pr_review: 25, respond: 45, resolve: 30, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, design: 20, council_review: 5 },
     maxQaLoops: 2,
     planHoldAt: 0.8, // hold new runs when the Claude plan's 5-hour window is this full (leave room for you)
     maxConsultsPerGroom: 1,
@@ -68,7 +68,8 @@ const DEFAULTS = {
     maxRounds: 3, // change requests per ticket before the owner is asked to settle the disagreement
     escalateAfterMinutes: 240, // an assigned reviewer seat that stays switched off this long → owner
     // Auto-merge after two approvals: only when the stored ticket risk AND the diff classifier both say low.
-    autoMerge: { enabled: true, excludeRiskHigh: true, outsideBusyWindowOnly: true, method: 'squash' },
+    // Deploying merges inside the busy window are scheduled for the window's end, not blocked (see deploy.*).
+    autoMerge: { enabled: true, excludeRiskHigh: true, method: 'squash' },
     // "auto": a PR with no checks at all may merge only if the repo has no GitHub Actions workflows.
     // "required": no checks reported = not mergeable. Skipped/neutral-only checks never count as a pass.
     ci: 'auto',
@@ -76,6 +77,23 @@ const DEFAULTS = {
     riskPaths: ['**/oms/**', '**/*order_execution*', '**/*order_execution*/**', '**/*position_manager*', '**/clients/alpaca*',
       '**/clients/alpaca*/**', '**/risk/**', '**/migrations/**', '**/*migration*.sql', '**/docker-compose*', '**/compose*.y*ml',
       '**/Dockerfile*', '.github/**', '**/.env*', '**/*.sh'],
+  },
+  // Which merges redeploy something. "auto": every workflow whose on.push trigger matches the base branch and the
+  // PR's files deploys; or list the deploying workflow files, e.g. ["deploy-mac-mini.yml"]. Unreadable = deploys.
+  deploy: {
+    workflows: 'auto',
+    waitMinutes: 45, // after a deploying merge, wait this long for its deploy run before asking the owner
+    graceMinutes: 3, // no deploy run seen this long after the merge = the merge did not trigger one
+  },
+  // Merge train: serialized merges, a free conflict check after every base move, real conflicts to the builder.
+  mergeTrain: {
+    enabled: true,
+    updateWhenBehind: true, // the queue front is brought up to date with the base (lazy rebase) before merging
+  },
+  resolve: {
+    budgetUsd: 1.5, // per conflict-resolution run (Claude CLI hard cap)
+    resume: 'never', // 'never' | 'if-cheaper': resume the builder's session only when it is estimated cheaper
+    maxAttempts: 2,
   },
   // The watch desk: deterministic log watching; the SRE seat is only woken for new, recurring error signatures.
   watch: {
@@ -105,7 +123,8 @@ const DEFAULTS = {
   },
   github: {
     sync: true,
-    openDraftPrs: true,
+    openDraftPrs: true, // open a PR at all after QA (name kept for compatibility)
+    draftPrs: false, // open it as a draft (false = a normal open PR)
     label: 'sigmadesk',
     pollMinutes: 5,
     // Only issues authored by these logins are imported (prompt-injection guard). Empty = repo owner.

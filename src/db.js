@@ -233,6 +233,25 @@ CREATE TABLE IF NOT EXISTS pr_outbox (
   sent_at TEXT
 );
 CREATE INDEX IF NOT EXISTS pr_outbox_status ON pr_outbox(status, id);
+CREATE TABLE IF NOT EXISTS conflict_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT NOT NULL,
+  pr_number INTEGER,
+  base_sha TEXT NOT NULL,
+  head_sha TEXT NOT NULL,
+  seat TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  files_json TEXT DEFAULT '[]',
+  incoming_json TEXT DEFAULT '[]',
+  note TEXT,
+  run_id INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  result_sha TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(ticket_key, base_sha, head_sha)
+);
+CREATE INDEX IF NOT EXISTS conflict_jobs_status ON conflict_jobs(status, id);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -254,7 +273,9 @@ function migrate() {
     tickets: { stalls: 'INTEGER DEFAULT 0', head_sha: 'TEXT', origin_session: 'TEXT', after_key: 'TEXT',
       // two-reviewer PRs: stored risk (groom/parent), diff classifier result, who designed/sliced it, frozen reviewers
       risk: 'TEXT', diff_risk: 'TEXT', designer: 'TEXT', qa_sha: 'TEXT', review_round: 'INTEGER DEFAULT 0', review_stage: 'TEXT',
-      reviewer_context: 'TEXT', reviewer_independent: 'TEXT' },
+      reviewer_context: 'TEXT', reviewer_independent: 'TEXT',
+      // merge train (#3): original builder, approval time (queue order), scheduled/held merges, light re-confirm reviews
+      builder: 'TEXT', approved_at: 'TEXT', merge_after: 'TEXT', merge_hold: 'TEXT', reconfirm_from: 'TEXT', reconfirm_kind: 'TEXT', reconfirm_base: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT' },
   };
@@ -288,7 +309,8 @@ export function settingDefaults() {
     pm_interval_min: String(config.pm.intervalMinutes),
     max_open_proposals: String(config.pm.maxOpenProposals),
     github_sync: String(config.github.sync),
-    open_draft_prs: String(config.github.openDraftPrs),
+    open_draft_prs: String(config.github.openDraftPrs), // open PRs at all (name kept for existing databases)
+    draft_prs: String(config.github.draftPrs ?? false), // open them as drafts (default: normal open PRs)
     team: '{}', // per-seat {engine, model, effort, enabled} chosen in the UI
     team_confirmed: 'false', // the owner must confirm who runs on what before the first open
     auto_fallback: String(config.engines.autoFallback),
@@ -306,7 +328,7 @@ export function setSetting(key, value) {
     if (!String(value).trim() || !Number.isFinite(n) || n < min || n > max || (key !== 'daily_budget_usd' && !Number.isInteger(n)))
       throw Object.assign(new Error(`${key} must be ${key === 'daily_budget_usd' ? 'a number' : 'an integer'} from ${min} to ${max}`), { status: 400 });
   }
-  if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'team_confirmed', 'auto_fallback'].includes(key) && !['true', 'false'].includes(String(value)))
+  if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'draft_prs', 'team_confirmed', 'auto_fallback'].includes(key) && !['true', 'false'].includes(String(value)))
     throw Object.assign(new Error(`${key} must be true or false`), { status: 400 });
   q('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value));
   announce({ type: 'settings', data: getSettings() });
@@ -343,7 +365,8 @@ export function createTicket(t) {
 
 const TICKET_FIELDS = new Set(['title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
   'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key',
-  'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent']);
+  'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
+  'builder', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base']);
 
 export function updateTicket(key, patch) {
   const cols = Object.keys(patch).filter((k) => TICKET_FIELDS.has(k));
@@ -602,7 +625,9 @@ export function approvalsAt(key, sha) {
   const context = sha ? latestReview(key, 'context', sha) : null;
   const independent = sha ? latestReview(key, 'independent', sha) : null;
   const ok = context?.verdict === 'approve' && independent?.verdict === 'approve' && context.seat !== independent.seat;
-  return { ok, context, independent, unpublished: q("SELECT COUNT(*) n FROM pr_outbox WHERE ticket_key=? AND status<>'sent'").get(key).n };
+  // Only the reviewers' verdicts and the approval summary must be on the PR before a merge (not status notices).
+  const unpublished = q("SELECT COUNT(*) n FROM pr_outbox WHERE ticket_key=? AND status<>'sent' AND (review_id IS NOT NULL OR marker LIKE ?)").get(key, `${key}:approved:%`).n;
+  return { ok, context, independent, unpublished };
 }
 export const inReviewFlow = (key) => !!q('SELECT 1 FROM pr_reviews WHERE ticket_key=? LIMIT 1').get(key);
 export function addFinding(f) {
@@ -630,6 +655,23 @@ export function updateOutbox(id, patch) {
   const cols = Object.keys(patch).filter((k) => ['status', 'attempts', 'gh_comment_id', 'last_error', 'sent_at'].includes(k));
   if (cols.length) q(`UPDATE pr_outbox SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
   return q('SELECT * FROM pr_outbox WHERE id=?').get(id);
+}
+
+// ---------- conflict jobs (merge train): durable, one per (ticket, base, head) ----------
+export const getConflictJob = (id) => q('SELECT * FROM conflict_jobs WHERE id=?').get(id) || null;
+export const conflictJobsFor = (key) => q('SELECT * FROM conflict_jobs WHERE ticket_key=? ORDER BY id').all(key);
+export const openConflictJobs = () => q("SELECT * FROM conflict_jobs WHERE status IN ('pending','running') ORDER BY id").all();
+export function createConflictJob(j) {
+  const info = q('INSERT OR IGNORE INTO conflict_jobs(ticket_key,pr_number,base_sha,head_sha,seat,files_json,incoming_json) VALUES (?,?,?,?,?,?,?)')
+    .run(j.ticket_key, j.pr_number ?? null, j.base_sha, j.head_sha, j.seat, JSON.stringify(j.files || []), JSON.stringify(j.incoming || []));
+  const row = q('SELECT * FROM conflict_jobs WHERE ticket_key=? AND base_sha=? AND head_sha=?').get(j.ticket_key, j.base_sha, j.head_sha);
+  if (info.changes) announce({ type: 'conflict-job', data: row });
+  return { job: row, created: info.changes > 0 };
+}
+export function updateConflictJob(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['status', 'seat', 'note', 'run_id', 'attempts', 'result_sha'].includes(k));
+  if (cols.length) q(`UPDATE conflict_jobs SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), now(), id);
+  const row = getConflictJob(id); announce({ type: 'conflict-job', data: row }); return row;
 }
 
 // ---------- small durable key/value store (watch cursors etc.) ----------

@@ -217,6 +217,16 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   return { number: p.number, method, overridden };
 }
 
+/** The commit a merged PR produced on the base branch (null while unknown). */
+export async function mergeCommitOf(number) {
+  const out = JSON.parse(await gh(['pr', 'view', String(Number(number)), '-R', repo(), '--json', 'mergeCommit,state']) || '{}');
+  return out.mergeCommit?.oid || null;
+}
+/** Workflow runs GitHub started for a commit (used to wait for a deploy before the next deploying merge). */
+export async function runsForCommit(sha) {
+  return JSON.parse(await gh(['run', 'list', '-R', repo(), '--commit', String(sha), '--json', 'workflowName,status,conclusion,databaseId', '-L', '50']) || '[]');
+}
+
 export async function close(number, comment = '') {
   const p = await pr(number);
   if (p.state !== 'OPEN') fail(`PR #${p.number} is already ${p.state.toLowerCase()}`);
