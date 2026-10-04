@@ -117,6 +117,13 @@ const DEFAULTS = {
     autoFallback: true,
     fallbackCooldownMinutes: 15,
     codex: { bin: '', models: [], pricing: null, reserveUsd: 2 },
+    // Perplexity thinking seats: the desk builds a context pack the local relay must send verbatim.
+    perplexity: {
+      contextMaxChars: 60000, // hard cap on the whole outgoing message (pack + task + relay additions)
+      relayReserveChars: 8000, // part of that cap left for the task paragraph and relay additions
+      remoteWaitMinutes: 8, // how long the relay polls a pending thread; run watchdogs are raised above it
+      followupRounds: 1, // follow-ups on the same thread with files the model asked for
+    },
   },
   advisors: {
     // Optional JSON file with perplexity/gemini/xai keys. Never expose it to a seat.
@@ -222,6 +229,10 @@ export function validateConfig(c = config) {
   if (c.github.sync && !c.project.githubRepo) problems.push('github.sync is on but project.githubRepo is unknown');
   if (!fs.existsSync(c.project.playbook)) problems.push(`playbook not found: ${c.project.playbook}`);
   if (!(c.engines.fallbackCooldownMinutes >= 1 && c.engines.fallbackCooldownMinutes <= 1440)) problems.push('engines.fallbackCooldownMinutes must be between 1 and 1440');
+  const px = c.engines.perplexity || {};
+  if (!(px.contextMaxChars >= 10000 && px.contextMaxChars <= 400000)) problems.push('engines.perplexity.contextMaxChars must be between 10000 and 400000');
+  if (!(px.remoteWaitMinutes >= 1 && px.remoteWaitMinutes <= 60)) problems.push('engines.perplexity.remoteWaitMinutes must be between 1 and 60');
+  if (!(Number.isInteger(px.followupRounds) && px.followupRounds >= 0 && px.followupRounds <= 3)) problems.push('engines.perplexity.followupRounds must be 0-3');
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');
   return problems;
 }

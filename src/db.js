@@ -200,7 +200,8 @@ function migrate() {
   const want = {
     tickets: { stalls: 'INTEGER DEFAULT 0', head_sha: 'TEXT', origin_session: 'TEXT', after_key: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
-    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT' },
+    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT',
+      thread_id: 'TEXT', context_hash: 'TEXT', context_meta: 'TEXT' },
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -400,6 +401,11 @@ export function spendByAgentSince(isoTs) {
 }
 export function lastRunFor(ticketKey, agentId, kind) {
   return q('SELECT * FROM runs WHERE ticket_key=? AND agent_id=? AND kind=? AND session_id IS NOT NULL ORDER BY id DESC LIMIT 1').get(ticketKey, agentId, kind) || null;
+}
+// The latest unfinished-business Perplexity thread for the same job: a retry resumes polling it instead of re-asking.
+export function lastThreadRun({ ticket_key = null, agent_id, kind, incident_id = null }) {
+  return q("SELECT * FROM runs WHERE agent_id=? AND kind=? AND ticket_key IS ? AND incident_id IS ? AND thread_id IS NOT NULL AND ended_at IS NOT NULL AND status!='success' ORDER BY id DESC LIMIT 1")
+    .get(agent_id, kind, ticket_key, incident_id) || null;
 }
 export function runBySession(sessionId) {
   return q('SELECT * FROM runs WHERE session_id=? ORDER BY id DESC LIMIT 1').get(sessionId) || null;
