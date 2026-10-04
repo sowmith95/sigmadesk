@@ -15,6 +15,9 @@ import * as prs from './prs.js';
 import * as reviews from './reviews.js';
 import * as mergetrain from './mergetrain.js';
 import * as refresh from './refresh.js';
+import * as research from './research.js';
+import * as researchReview from './research-review.js';
+import * as connectors from './connectors.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 import { selectionFor } from './dispatch.js';
@@ -44,18 +47,10 @@ export function isTestCommand(cmd) {
 }
 
 // ---------------- limits ----------------
-function localParts(d, tz) {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
-    .formatToParts(d).map((p) => [p.type, p.value]));
-  const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(parts.weekday);
-  return { day, mins: Number(parts.hour) * 60 + Number(parts.minute) };
-}
-const toMins = (hhmm) => { const [h, m] = String(hhmm).split(':').map(Number); return h * 60 + (m || 0); };
-
+// The pure window test lives in research.js (market windows for research programs share it).
 export function inBusyWindow(d = new Date(), w = config.limits.busyWindow) {
   if (!w?.enabled) return false;
-  const { day, mins } = localParts(d, w.timezone);
-  return w.days.includes(day) && mins >= toMins(w.start) && mins < toMins(w.end);
+  return research.inWindow(d, w);
 }
 export function startOfToday() {
   const d = new Date();
@@ -87,6 +82,7 @@ export function setStatus(key, status, extra = {}) {
   if (t.parent_key) rollupParent(t.parent_key);
   return t;
 }
+researchReview.hooks.setStatus = setStatus; // holds, waivers and owner decisions on research proposals go through the same door
 
 // An epic (a principal's delegated ticket) tracks its slices: progress rolls up; it closes when every slice is settled.
 export function rollupParent(parentKey) {
@@ -122,9 +118,9 @@ function stall(ticket, reason) {
 }
 
 // ---------------- job launchers ----------------
-async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [], nonce = null, fence = runner.currentEpoch(), onStart = null, outcome = null }) {
+async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [], nonce = null, fence = runner.currentEpoch(), onStart = null, outcome = null, job = null }) {
   const before = ticket?.status;
-  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs, nonce, fence, onStart });
+  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs, nonce, fence, onStart, job });
   if (ticket) store.updateTicket(ticket.key, { active_run: store.getAgentState(agentId).current_run });
   const { run, aborted, failure } = await p;
   if (aborted) {
@@ -466,15 +462,38 @@ export function watchDecisions() {
   return d;
 }
 
-export async function launchResearch(focus = '', fence = runner.currentEpoch()) {
-  if (!agentIdle('pm')) throw new Error('PM is busy');
+// One admission path for scheduled, manual and program-specific research: the program's seat, its engine fit, and a
+// proposal allowance reserved against the global room (net of allowances other running research jobs still hold).
+export function researchAllowance(settings = store.getSettings()) {
+  const held = store.unfinishedRuns().filter((r) => r.kind === 'research' && r.job).reduce((n, r) => { try { const j = JSON.parse(r.job); return n + Math.max(0, (j.maxProposals || 0) - (j.proposals || 0)); } catch { return n; } }, 0);
+  return Number(settings.max_open_proposals) - store.ticketsByStatus('proposed').length - held;
+}
+export async function launchResearch(focus = '', fence = runner.currentEpoch(), programId = research.DEFAULT_PROGRAM) {
   const s = store.getSettings();
+  const p = research.get(programId, s);
+  if (!p) throw Object.assign(new Error(`Unknown research program ${programId}`), { status: 404 });
+  if (!agentIdle(p.seat)) throw new Error(`${agentById[p.seat]?.name || p.seat} is busy`);
   if (s.paused === 'true') throw Object.assign(new Error('Open the desk before starting research'), { status: 409 });
-  if (!selectionFor('pm').seat) throw Object.assign(new Error(`PM: ${selectionFor('pm').reason}`), { status: 409 });
-  const room = Math.max(1, Number(s.max_open_proposals) - store.ticketsByStatus('proposed').length);
-  const extra = `${focus ? `The owner asked you to focus on: ${focus}. ` : ''}File at most ${Math.min(3, room)} proposals.`;
-  const { cwd } = await readonlyJob('pm', null);
-  return launch({ fence, agentId: 'pm', kind: 'research', ticket: null, cwd, prompt: promptFor('research', { extra }) });
+  const sel = selectionFor(p.seat, Date.now(), research.requirements(p));
+  if (!sel.seat) throw Object.assign(new Error(`${agentById[p.seat]?.name || p.seat}: ${sel.reason}`), { status: 409 });
+  const room = researchAllowance(s);
+  if (room <= 0) throw Object.assign(new Error('Enough proposals are waiting for grooming; research resumes when the funnel thins'), { status: 409 });
+  const job = research.job(p, { focus, room });
+  const extra = `Program "${p.label}" (${p.id}). ${job.focus ? `Focus: ${job.focus}. ` : ''}File at most ${job.maxProposals} proposal${job.maxProposals === 1 ? '' : 's'}; each one is reviewed by another seat before grooming.`;
+  const { cwd } = await readonlyJob(p.seat, null);
+  return launch({ fence, agentId: p.seat, kind: 'research', ticket: null, cwd, prompt: promptFor('research', { extra }), job });
+}
+// Independent assessment of a proposed connector: a read-only run whose structured answer lands on the connector record.
+async function launchConnectorAssessment(c, seat, fence) {
+  store.updateAgent(seat, { status: 'working', current_ticket: null, current_kind: 'connector_assessment', last_action: `Assessing connector ${c.name}`, last_action_at: store.now() });
+  try {
+    const cwd = await runner.ensureReadonlyWorkspace(seat);
+    const outcome = await runner.startRun({ agentId: seat, kind: 'connector_assessment', cwd, fence, prompt: connectors.assessmentPrompt(c), job: { web: true, connector: c.name },
+      onStart: (run) => connectors.markAssessmentRun(c.name, run.id) });
+    if (outcome.aborted || outcome.run?.status !== 'success') throw new Error(outcome.run?.result_text || 'Assessment interrupted');
+    connectors.completeAssessment(c.name, { report: connectors.parseAssessment(outcome.result?.result || outcome.run.result_text), run_id: outcome.run.id, reviewer: seat });
+  } catch (e) { connectors.completeAssessment(c.name, { error: e.message }); }
+  finally { if (!store.getAgentState(seat)?.current_run) store.updateAgent(seat, { status: 'idle', current_ticket: null, current_kind: null }); }
 }
 
 // ---------------- the tick ----------------
@@ -491,6 +510,7 @@ export function health() {
   const queued = store.listTickets().filter((t) => ['triage', 'proposed', 'todo', 'qa', 'review'].includes(t.status));
   return { last_tick: lastTick, last_error: lastError, paused: settings.paused === 'true', budget_headroom: budgetHeadroom(settings),
     queued: queued.length, discussions: store.pendingDiscussions().length, waiting: queued.filter((t) => !t.active_run).map((t) => {
+      if (researchReview.blocks(t)) return { key: t.key, code: 'research_review', reason: researchReview.reasonFor(t) };
       const review = productReview.current(t.key) || (t.parent_key && productReview.current(t.parent_key));
       if (review && (review.stale || review.status !== 'approved')) return { key: t.key, code: review.status === 'reviewing' && !review.stale ? 'product_review' : 'review_decision', reason: review.stale ? 'Product/design review is stale' : `Product/design review: ${review.status}` };
       const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa'
@@ -597,11 +617,30 @@ export async function tick() {
       }
     }
     productReview.refreshChangedPlans();
-    // Bounded independent product/design reviews; preserve capacity for QA/SRE.
-    let reviewSlots = 2 - store.listAgentStates().filter(a => a.status === 'working' && a.current_kind === 'product_review').length;
+    // Bounded independent reviews (product/design, second-person research reviews, revisions, connector assessments)
+    // share one allowance of two and preserve capacity for QA/SRE. Review debt runs before new discovery.
+    const REVIEW_KINDS = ['product_review', 'research_review', 'research_revision', 'connector_assessment'];
+    let reviewSlots = 2 - store.listAgentStates().filter(a => a.status === 'working' && REVIEW_KINDS.includes(a.current_kind)).length;
+    const reviewRoom = () => slots > (capacity(s) > 1 ? 1 : 0) && reviewSlots > 0;
     for (const { r, m } of productReview.pending()) {
-      if (slots <= (capacity(s)>1?1:0) || reviewSlots <= 0) break;
+      if (!reviewRoom()) break;
       if (agentIdle(m.agent_id) && go(m.agent_id, f => productReview.launch(r, m, f))) reviewSlots--;
+    }
+    for (const { t, reviewer } of researchReview.nextAssignments()) {
+      if (!reviewRoom()) break;
+      if (!agentIdle(reviewer)) continue;
+      const a = researchReview.assign(t, reviewer);
+      if (go(reviewer, (f) => researchReview.launch(a, f))) reviewSlots--; else researchReview.cancel(a.id, 'not admitted this tick');
+    }
+    for (const t of researchReview.nextRevisions()) {
+      if (!reviewRoom()) break;
+      if (agentIdle(t.reporter) && go(t.reporter, (f) => researchReview.launchRevision(t, f))) reviewSlots--;
+    }
+    for (const c of connectors.pendingAssessments()) {
+      if (!reviewRoom()) break;
+      const seat = connectors.assessorFor(c, (id) => agentById[id]?.enabled !== false);
+      if (!seat) { connectors.completeAssessment(c.name, { error: 'no eligible assessor seat is enabled' }); continue; }
+      if (agentIdle(seat) && go(seat, (f) => launchConnectorAssessment(c, seat, f))) reviewSlots--;
     }
     // 3. Engineers pick up groomed work by routing (area × complexity × risk).
     council.pump();
@@ -618,18 +657,20 @@ export async function tick() {
       }
       if (productReview.required(t)) productReview.ensure(t);
       if (productReview.blocks(t)) continue;
+      if (researchReview.blocks(t) || (parent && researchReview.blocks(parent))) continue; // a research proposal needs its second review first
       const who = t.assignee && ENGINEERS.includes(t.assignee) && agentById[t.assignee].enabled !== false ? t.assignee : routeTicket(t);
       if (!agentIdle(who)) continue;
       if (PRINCIPALS.includes(who)) go(who, (f) => launchDesign(t, who, f));
       else go(who, (f) => launchImplement(t, who, f));
     }
-    // 4. Manager grooms proposals (consulting principals inside the run).
-    const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run);
+    // 4. Manager grooms proposals (consulting principals inside the run); research proposals wait for their second review.
+    const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run && !researchReview.blocks(t));
     if (proposed && slots > 0 && agentIdle('manager')) go('manager', (f) => launchGroom(proposed, f));
-    // 5. PM researches on a cadence while the funnel is thin.
-    if (s.pm_enabled === 'true' && slots > 0 && agentIdle('pm') && store.ticketsByStatus('proposed').length < Number(s.max_open_proposals)) {
-      const last = store.lastRunOfKind('research');
-      if (!last || Date.now() - Date.parse(last.started_at) > Number(s.pm_interval_min) * 60_000) go('pm', (f) => launchResearch('', f));
+    // 5. Research programs on their own cadence and market window while the funnel is thin (oldest last run first).
+    for (const p of research.due(s)) {
+      if (slots <= 0 || researchAllowance(s) <= 0) break;
+      if (!agentIdle(p.seat) || !selectionFor(p.seat, Date.now(), research.requirements(p)).seat) continue;
+      go(p.seat, (f) => launchResearch('', f, p.id));
     }
   } finally {
     ticking = false;
@@ -639,6 +680,8 @@ export async function tick() {
 // ---------------- recovery ----------------
 export function recoverOrphans() {
   productReview.recover();
+  researchReview.recover();
+  connectors.recover();
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
   for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });
   for (const run of store.unfinishedRuns()) {
@@ -660,8 +703,10 @@ export function recoverOrphans() {
 }
 
 // ---------------- desk CLI actions (called by seats with their run token) ----------------
+// Thinking seats may propose a connector (a case, never a binding); the owner approves. Builders, QA and support cannot.
+const THINKERS = Object.keys(agentById).filter((id) => !BUILDERS.includes(id) && !['qa', 'support'].includes(id));
 const PERMS = {
-  propose: ['pm'], groom: ['manager'], 'create-task': ['manager', ...PRINCIPALS], reject: ['manager'], consult: ['manager'],
+  groom: ['manager'], 'create-task': ['manager', ...PRINCIPALS], reject: ['manager'], consult: ['manager'], 'connector-propose': THINKERS,
   design: PRINCIPALS, delegate: PRINCIPALS, 'peer-review': ['manager', ...PRINCIPALS], council: ['manager', ...PRINCIPALS],
   route: ['support'], submit: ENGINEERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
@@ -683,6 +728,11 @@ export async function deskAction(run, cmd, body = {}) {
   const agentId = run.agent_id;
   if (run.kind === 'product_review') need(['context-file'].includes(cmd), 'Product reviewers are read-only; return a structured report, not desk mutations');
   if (run.kind === 'council_review') need(false, 'council calls cannot invoke desk commands');
+  // Research kinds are authorized by the run, not the seat: proposals come from research runs that carry a program,
+  // a revision run may only revise its own proposal, and reviewers/assessors are read-only.
+  if (run.kind === 'research') need(['show', 'list', 'comment', 'needs-human', 'progress', 'propose', 'connector-propose', 'context-file'].includes(cmd), 'research runs read and file proposals; they do not groom, design or build');
+  if (run.kind === 'research_revision') need(['show', 'list', 'comment', 'progress', 'revise', 'context-file'].includes(cmd), 'a revision run may only revise its own proposal');
+  if (['research_review', 'connector_assessment'].includes(run.kind)) need(['show', 'list', 'context-file'].includes(cmd), 'reviewers are read-only; return the structured JSON as your final answer');
   if (run.kind === 'owner_discussion') {
     need(['list', 'show', 'comment', 'consult', 'discussion-result', 'context-file'].includes(cmd), 'design discussions can only read, consult and respond');
     need(!body.key || body.key === run.ticket_key, 'discussion belongs to its original ticket');
@@ -765,16 +815,42 @@ export async function deskAction(run, cmd, body = {}) {
       return 'Parked for the owner. Stop working on this ticket now and end your run.';
     }
     case 'propose': {
+      need(run.kind === 'research', 'proposals are filed from research runs only');
+      const live = store.getRun(run.id);
+      let job = null; try { job = live?.job ? JSON.parse(live.job) : null; } catch { job = null; }
+      need(job && job.program, 'this research run carries no program; the owner starts research from Settings → Research');
+      need((job.proposals || 0) < job.maxProposals, `your proposal allowance for this session (${job.maxProposals}) is used up — stop now`);
+      need(store.ticketsByStatus('proposed').length < Number(store.getSettings().max_open_proposals), 'enough proposals are waiting for grooming — stop proposing');
       need(body.title && body.body, 'title and body (stdin) required');
-      const t = store.createTicket({ title: body.title, description: body.body, type: body.type || 'feature', status: 'proposed',
-        area: AREAS.includes(body.area) ? body.area : null, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', reporter: agentId, source: 'pm' });
-      store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null });
-      ev(`proposed ${t.key}: ${t.title}`, t.key);
-      return `created ${t.key}`;
+      need(String(body.body).length <= 20000, 'proposal body must be at most 20000 characters');
+      const t = store.transaction(() => {
+        const created = store.createTicket({ title: body.title, description: body.body, type: body.type || 'feature', status: 'proposed',
+          area: AREAS.includes(body.area) ? body.area : null, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', reporter: agentId, source: 'research' });
+        job.proposals = (job.proposals || 0) + 1;
+        store.updateRun(run.id, { job: JSON.stringify(job) });
+        store.updateTicket(created.key, { origin_session: live.session_id || null });
+        researchReview.open(created, job, live);
+        return store.getTicket(created.key);
+      });
+      ev(`proposed ${t.key}: ${t.title} (program ${job.program})`, t.key);
+      return `created ${t.key}; it waits for an independent second review before grooming. ${job.maxProposals - job.proposals} proposal(s) left this session.`;
+    }
+    case 'revise': {
+      need(ticket, 'ticket key required');
+      const out = researchReview.revise(ticket, run, { title: body.title, body: body.body });
+      ev(`revised ${ticket.key} after review (generation ${out.research_generation})`);
+      return 'Proposal revised; a fresh second review follows. Your run is complete — stop now.';
+    }
+    case 'connector-propose': {
+      need(['research', 'research_revision', 'design', 'groom', 'owner_discussion', 'consult', 'product_review'].includes(run.kind) || true, 'connector proposals come from thinking runs');
+      const c = connectors.propose({ name: body.name, purpose: body.purpose, case_md: body.body, proposed_by: agentId });
+      ev(`proposed connector ${c.name}`);
+      return `connector ${c.name} proposed. The owner must assess and approve it before any program can use it; continue your task without it.`;
     }
     case 'groom': {
       need(ticket && ticket.key === run.ticket_key && run.kind === 'groom', 'you can only groom the ticket you were given');
       need(ticket.status === 'proposed', 'ticket must be in proposed');
+      need(!researchReview.blocks(ticket), 'this research proposal awaits its independent second review; it cannot be groomed yet');
       need(COMPLEXITIES.includes(body.complexity), 'complexity S|M|L|XL required');
       need(AREAS.includes(body.area), `area one of ${AREAS.join('|')}`);
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
@@ -1154,7 +1230,8 @@ export function ownerReply(key, text, mode = 'auto', { expected_updated_at } = {
   if (discussion) {
     request = store.createDiscussion(key, String(text).slice(0, 8000));
     store.logEvent({ ticket_key: key, agent_id: 'manager', kind: 'system', text: `Owner message routed to Engineering Manager for design discussion #${request.id}. Existing ticket state preserved.` });
-  } else if (mode !== 'comment' && t.status === 'needs_human') setStatus(key, t.resume_status || 'todo', { resume_status: null, stalls: 0 });
+  } else if (mode !== 'comment' && t.status === 'needs_human' && researchReview.held(t)) researchReview.ownerDecide(t, 'correction', text); // an answer to a held proposal sends it back with these notes
+  else if (mode !== 'comment' && t.status === 'needs_human') setStatus(key, t.resume_status || 'todo', { resume_status: null, stalls: 0 });
   github.flushComments();
   return { ...store.getTicket(key), message_route: discussion ? 'discussion' : mode === 'comment' ? 'comment' : 'answer', discussion: request || null };
 }
@@ -1180,6 +1257,7 @@ export async function ownerDecision(key, { decision, message = '', expected_upda
   need(['needs_human', 'ready_for_human'].includes(t.status), 'ticket is not awaiting an owner decision');
   if (expected_updated_at && expected_updated_at !== t.updated_at) throw Object.assign(new Error('The request changed. Review the latest ticket before deciding.'), { status: 409 });
   if (t.active_run && store.getRun(t.active_run)?.token) throw Object.assign(new Error('The worker is finishing. Try once its run settles.'), { status: 409 });
+  if (t.status === 'needs_human' && researchReview.held(t)) { const out = researchReview.ownerDecide(t, decision, note); github.flushComments(); return out; }
   if (decision === 'approve' && /publish guard/.test(t.progress_msg || '')) {
     if (note) store.addComment(key, 'owner', note);
     await ownerApprovePublish(key); return store.getTicket(key);
@@ -1220,6 +1298,7 @@ export function ownerPatch(key, patch) {
   if (patch.assignee !== undefined) { need(!patch.assignee || ENGINEERS.includes(patch.assignee), 'bad assignee'); p.assignee = patch.assignee || null; }
   if (patch.complexity) { need(COMPLEXITIES.includes(patch.complexity), 'bad complexity'); p.complexity = patch.complexity; }
   if (patch.area) { need(AREAS.includes(patch.area), 'bad area'); p.area = patch.area; }
+  if (p.status && ['todo', 'in_progress', 'qa', 'review'].includes(p.status) && researchReview.blocks(t)) need(false, 'this research proposal is waiting on its second review; waive the review or wait for it before moving the ticket');
   if (p.status && t.active_run > 0 && p.status !== t.status) runner.killRun(t.active_run, 'owner moved the ticket');
   if (p.status === 'qa' && !t.head_sha) need(false, 'only submitted work can go to QA');
   const out = store.updateTicket(key, { ...p, stalls: 0 });

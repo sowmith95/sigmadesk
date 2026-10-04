@@ -53,7 +53,7 @@ export const claude = {
   },
   budgetUsd: (seat) => config.limits.runBudgetUsd[seat.model] ?? 3,
 
-  command({ seat, perms, denyRules, charter, settings, resume, fork }) {
+  command({ seat, perms, denyRules, charter, settings, resume, fork, mcpServers }) {
     return {
       bin: config.bins.claude,
       args: [
@@ -66,7 +66,8 @@ export const claude = {
         '--max-budget-usd', String(config.limits.runBudgetUsd[seat.model] ?? 3),
         '--setting-sources', '', // none of the machine's hooks/plugins
         '--settings', JSON.stringify(settings),
-        '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+        // No MCP servers unless the run's server-owned job carries approved research connectors (transport fields only).
+        '--strict-mcp-config', '--mcp-config', JSON.stringify({ mcpServers: mcpServers || {} }),
         '--permission-mode', 'dontAsk',
         '--tools', perms.tools.join(','),
         ...(perms.allow.length ? ['--allowedTools', ...perms.allow] : []),

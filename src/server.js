@@ -23,6 +23,9 @@ import * as council from './council.js';
 import * as runtime from './runtime.js';
 import * as usage from './usage.js';
 import { normalizeSeat, supportsSeat } from './team-settings.js';
+import * as research from './research.js';
+import * as researchReview from './research-review.js';
+import * as connectors from './connectors.js';
 
 const PUBLIC = path.join(config.root, 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -66,6 +69,7 @@ export function snapshot() {
       providers: dispatch.providerHealth(), scheduler: sched.health(), advisors: advisors.status(), council: council.status(), background: runtime.status(), usage: usage.status(),
       routing: Object.fromEntries(AGENTS.map((a) => { const s = dispatch.selectionFor(a.id); return [a.id, { engine: s.seat?.engine, model: s.seat?.model, effort: s.seat?.effort, tier: SEAT_TIER[a.id], fallback: s.fallback || false, reason: s.reason }]; })),
       product_reviews: productReview.summaries(),
+      research: research.status(settings), research_reviews: researchReview.summaries(),
       decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
   };
@@ -153,7 +157,7 @@ async function ownerRoute(req, res) {
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
-    return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
+    return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), research_reviews: researchReview.forTicket(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)/events$'))) return send(res, 200, store.recentEvents({ agent_id: mm[1], limit: 300 }));
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)$'))) {
@@ -256,15 +260,36 @@ async function ownerRoute(req, res) {
     store.logEvent({ kind: 'system', agent_id: 'owner', text: '⛔ Circuit breaker — desk halted and every running seat stopped' });
     return send(res, 200, { ok: true });
   }
-  if (req.method === 'POST' && p === '/api/control/research') {
-    const b = await readBody(req);
+  // Research programs: "Run now" bypasses cadence and window, never budget, capacity, engine fit or the proposal allowance.
+  const startProgram = async (programId, focus) => {
+    const prog = research.get(programId);
+    if (!prog) return send(res, 404, { error: `unknown research program ${programId}` });
     if (store.getSettings().paused === 'true') return send(res, 409, { error: 'Open the desk before starting research' });
-    if (!dispatch.selectionFor('pm').seat) return send(res, 409, { error: `PM: ${dispatch.selectionFor('pm').reason}` });
-    if (store.getAgentState('pm')?.status === 'working') return send(res, 409, { error: 'PM is busy' });
-    if (sched.budgetHeadroom() < runner.runBudget('pm')) return send(res, 409, { error: 'daily risk limit would be exceeded' });
+    const sel = dispatch.selectionFor(prog.seat, Date.now(), research.requirements(prog));
+    if (!sel.seat) return send(res, 409, { error: `${agentById[prog.seat]?.name || prog.seat}: ${sel.reason}` });
+    if (store.getAgentState(prog.seat)?.status === 'working') return send(res, 409, { error: `${agentById[prog.seat]?.name || prog.seat} is busy` });
+    if (sched.budgetHeadroom() < runner.runBudget(prog.seat)) return send(res, 409, { error: 'daily risk limit would be exceeded' });
     if (sched.workCount() >= sched.capacity()) return send(res, 409, { error: 'desk is at capacity — try again when a seat frees up' });
-    sched.launchResearch(String(b.focus || '').slice(0, 500)).catch((err) => store.logEvent({ kind: 'error', agent_id: 'pm', text: err.message }));
-    return send(res, 202, { ok: true });
+    if (sched.researchAllowance() <= 0) return send(res, 409, { error: 'enough proposals are waiting for grooming' });
+    sched.launchResearch(String(focus || '').slice(0, 500), undefined, prog.id).catch((err) => store.logEvent({ kind: 'error', agent_id: prog.seat, text: err.message }));
+    return send(res, 202, { ok: true, program: prog.id });
+  };
+  if (req.method === 'POST' && p === '/api/control/research') return startProgram(research.DEFAULT_PROGRAM, (await readBody(req)).focus);
+  if (req.method === 'GET' && p === '/api/research') return send(res, 200, { ...research.status(), reviews: researchReview.summaries() });
+  if (req.method === 'PUT' && p === '/api/research/programs') { const b = await readBody(req); const saved = research.save(b.programs); sched.tick(); return send(res, 200, { programs: saved, status: research.status() }); }
+  if (req.method === 'POST' && p === '/api/research/programs/reset') return send(res, 200, { programs: research.reset(), status: research.status() });
+  if (req.method === 'POST' && (mm = m('^/api/research/programs/([a-z0-9-]+)/run$'))) return startProgram(mm[1], (await readBody(req)).focus);
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/research-review/waive$'))) { const b = await readBody(req); const t = researchReview.waive(mm[1], String(b.note || '').slice(0, 2000)); sched.tick(); return send(res, 200, t); }
+  if (req.method === 'GET' && p === '/api/connectors') return send(res, 200, { connectors: connectors.list(), case_sections: connectors.CASE_SECTIONS, sdlc_stages: connectors.SDLC_STAGES });
+  if (req.method === 'POST' && p === '/api/connectors') { const b = await readBody(req); return send(res, 201, connectors.propose({ name: b.name, purpose: b.purpose, case_md: b.case_md, proposed_by: 'owner' })); }
+  if (req.method === 'POST' && (mm = m('^/api/connectors/([a-z0-9-]+)/(case|assess|approve|reject|retire)$'))) {
+    const b = await readBody(req), name = mm[1], action = mm[2];
+    const out = action === 'case' ? connectors.updateCase(name, { purpose: b.purpose, case_md: b.case_md })
+      : action === 'assess' ? connectors.requestAssessment(name)
+        : action === 'approve' ? connectors.approve(name, { binding: b.binding, tools: b.tools, review_after_days: b.review_after_days ?? 30, note: b.note })
+          : action === 'reject' ? connectors.reject(name, b.reason) : connectors.retire(name, b.reason);
+    if (action === 'assess') sched.tick();
+    return send(res, 200, out);
   }
   if (req.method === 'POST' && (mm = m('^/api/incidents/(\\d+)$'))) {
     const inc = store.getIncident(Number(mm[1]));
@@ -386,6 +411,8 @@ export async function main() {
   }
   store.openDb();
   try { applyTeamOverrides(JSON.parse(store.getSettings().team || '{}')); } catch { /* ignore bad JSON */ }
+  connectors.seed(); // config-defined connectors start as proposed; nothing is usable until assessed and approved
+  for (const problem of (research.programs(), research.problems())) store.logEvent({ kind: 'error', agent_id: 'owner', text: `research programs: ${problem}` });
   const engines = await dispatch.refreshAvailability();
   engines.forEach((e) => runner.setEngineVersion(e.id, e.version));
   sched.recoverOrphans();

@@ -100,12 +100,21 @@ test('busy window honours timezone and days', () => {
 });
 
 test('desk actions: role permissions are enforced', async () => {
-  const pmRun = fakeRun('pm', 'research');
+  // Proposals are authorized by the run: a research run carrying a program job, never a bare seat.
+  await assert.rejects(sched.deskAction(fakeRun('pm', 'research'), 'propose', { title: 'x', body: 'y' }), /carries no program/);
+  await assert.rejects(sched.deskAction(fakeRun('pm', 'consult'), 'propose', { title: 'x', body: 'y' }), /research runs only/);
+  const job = { program: 'product-discovery', seat: 'pm', maxProposals: 1, proposals: 0, web: true, connectors: [], sources: [], focus: '', review: { minReviewers: 1, reviewers: ['trading-advisor'] } };
+  const pmRun = fakeRun('pm', 'research', null, { program: 'product-discovery', job });
   const out = await sched.deskAction(pmRun, 'propose', { title: 'Faster flow read', body: '## Problem\nslow', area: 'frontend', priority: 'P1' });
   const key = out.match(/T-\d+/)[0];
   assert.equal(store.getTicket(key).status, 'proposed');
-  await assert.rejects(sched.deskAction(pmRun, 'groom', { key, complexity: 'S', area: 'frontend' }), /cannot run "groom"/);
+  assert.deepEqual([store.getTicket(key).source, store.getTicket(key).research_review, store.getTicket(key).research_program], ['research', 'pending', 'product-discovery']);
+  await assert.rejects(sched.deskAction(pmRun, 'propose', { title: 'second', body: 'z' }), /allowance/);
+  await assert.rejects(sched.deskAction(pmRun, 'groom', { key, complexity: 'S', area: 'frontend' }), /research runs read and file proposals/);
   const emRun = fakeRun('manager', 'groom', key);
+  await assert.rejects(sched.deskAction(emRun, 'groom', { key, complexity: 'M', area: 'frontend', body: 'spec' }), /awaits its independent second review/);
+  const rr = await import('../src/research-review.js');
+  rr.waive(key, 'owner checked it'); assert.equal(store.getTicket(key).research_review, 'waived');
   await sched.deskAction(emRun, 'groom', { key, complexity: 'M', area: 'frontend', body: 'spec' });
   const t = store.getTicket(key);
   assert.equal(t.status, 'todo');

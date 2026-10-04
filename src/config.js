@@ -142,6 +142,19 @@ const DEFAULTS = {
     persona: 'a quant trader and 0-5 DTE options scalper who uses this product every day',
     competitors: ['Unusual Whales', 'Cheddar Flow', 'FlowAlgo', 'Market Chameleon', 'SpotGamma', 'OptionStrat', 'Bookmap', 'TradingView', 'thinkorswim'],
   },
+  // Research programs: who researches, how often, in which market window, with which sources and connectors, and who
+  // must review a proposal before the manager may groom it. The default "product-discovery" program is built from
+  // pm.* above; programs here add to or override it by id. Saved UI edits (settings.research_programs) win over this.
+  research: {
+    marketHours: { timezone: 'America/New_York', days: [1, 2, 3, 4, 5], start: '09:30', end: '16:00' },
+    // Owner-defined MCP connectors seeded as *proposed*: nothing is usable until it has a written case, an independent
+    // assessment and the owner's approval (Settings → Research → Connectors). Shape per name:
+    // { purpose, case (markdown, see docs/research-programs.md), binding: { type: 'stdio'|'http', command, args, url }, tools: ['tool', …] }
+    connectors: {},
+    programs: [],
+    // Default second-person review policy for research proposals (a program may override).
+    review: { minReviewers: 1, reviewers: ['trading-advisor', 'quant-research', 'principal-be'] },
+  },
   sandbox: {
     enabled: true,
     allowedDomains: [], // network hosts agent shells may reach (package registries etc.). Empty = none.
@@ -293,6 +306,15 @@ export function validateConfig(c = config) {
   if (!(px.prepareDeadlineSeconds >= 5 && px.prepareDeadlineSeconds <= 300)) problems.push('engines.perplexity.prepareDeadlineSeconds must be between 5 and 300');
   if (!(Number.isInteger(px.followupRounds) && px.followupRounds >= 0 && px.followupRounds <= 3)) problems.push('engines.perplexity.followupRounds must be 0-3');
   if (typeof px.councilEnabled !== 'boolean') problems.push('engines.perplexity.councilEnabled must be true or false');
+  const rs = c.research || {};
+  const hhmm = (v) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v));
+  const tzOk = (tz) => { try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; } };
+  const mh = rs.marketHours || {};
+  if (!tzOk(mh.timezone) || !Array.isArray(mh.days) || !mh.days.every((d) => Number.isInteger(d) && d >= 0 && d <= 6) || !hhmm(mh.start) || !hhmm(mh.end) || mh.start >= mh.end)
+    problems.push('research.marketHours needs a valid timezone, days 0-6, and HH:MM start before end on the same day');
+  if (!Array.isArray(rs.programs) || !rs.programs.every((p) => p && typeof p.id === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(p.id))) problems.push('research.programs must be a list of programs with kebab-case ids');
+  if (!rs.connectors || typeof rs.connectors !== 'object' || Array.isArray(rs.connectors) || !Object.keys(rs.connectors).every((k) => /^[a-z0-9][a-z0-9-]{0,39}$/.test(k))) problems.push('research.connectors must map kebab-case names to connector definitions');
+  if (!(Number.isInteger(rs.review?.minReviewers) && rs.review.minReviewers >= 1 && rs.review.minReviewers <= 3) || !Array.isArray(rs.review?.reviewers)) problems.push('research.review needs minReviewers 1-3 and a reviewers list');
   const modelList = (v) => Array.isArray(v) && v.every((id) => typeof id === 'string' && /^[\w.:-]{1,80}$/.test(id));
   for (const id of ['claude', 'codex', 'perplexity']) if (!modelList(c.engines[id]?.models)) problems.push(`engines.${id}.models must be a list of model ids`);
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');

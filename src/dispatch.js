@@ -61,7 +61,15 @@ export function reviewSelection(agentId, profile) {
   if (!health?.ready) return { seat: null, reason: health?.reason || 'Provider unavailable' };
   return { seat: { ...agentById[agentId], engine: engine.id, model: profile.model || health.default_model, effort: profile.effort, role: 'Council Reviewer' }, fallback: false };
 }
-export function selectionFor(agentId, now = Date.now()) {
+// Job requirements a provider must carry (research programs): web tools and approved MCP connectors. Fallback may
+// never pick an engine that would silently drop them; the run is refused instead.
+export function meetsRequirements(engine, requirements) {
+  if (!requirements) return true;
+  if (requirements.connectors?.length && engine !== 'claude') return false;
+  if (requirements.web && engine === 'codex') return false;
+  return true;
+}
+export function selectionFor(agentId, now = Date.now(), requirements = null) {
   const seat = agentById[agentId];
   if (!seat || seat.enabled === false) return { seat: null, reason: 'Seat disabled' };
   const preferred = seat.engine || 'claude';
@@ -70,10 +78,11 @@ export function selectionFor(agentId, now = Date.now()) {
   const resolveSeat = (s) => ({ ...s, model: s.engine === 'codex' && !s.model ? availability.codex?.defaultModel || '' : s.model });
   const ready = (engine) => {
     const p = health.find(e => e.id === engine);
-    return p?.ready && supportsSeat(agentId, engine)
+    return p?.ready && supportsSeat(agentId, engine) && meetsRequirements(engine, requirements)
       && (engine !== 'perplexity' || health.find(e => e.id === 'claude')?.ready);
   };
-  const reason = preferred === 'perplexity' && primary?.ready && !ready(preferred) ? 'Perplexity needs an available Claude relay' : primary?.reason;
+  const reason = preferred === 'perplexity' && primary?.ready && !ready(preferred) ? 'Perplexity needs an available Claude relay'
+    : primary?.ready && !meetsRequirements(preferred, requirements) ? (requirements.connectors?.length ? 'Research connectors need a Claude Code seat' : 'Web research needs a Claude or Perplexity seat') : primary?.reason;
   if (ready(preferred)) return { seat: resolveSeat(seat), fallback: false };
   if (store.getSettings().auto_fallback === 'true') {
     const alternatives = seat.fallbacks ?? health.filter(e => e.id !== preferred && ENGINES[e.id]?.autoFallback !== false)

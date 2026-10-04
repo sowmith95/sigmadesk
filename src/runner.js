@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { config, publisherPath } from './config.js';
-import { agentById, charterFor, productReviewCharter, permissionsFor, promptFor, DENY_RULES } from './team.js';
+import { agentById, charterFor, productReviewCharter, researchCharter, readOnlyReviewCharter, permissionsFor, promptFor, DENY_RULES, READ_ONLY_KINDS } from './team.js';
+import * as connectors from './connectors.js';
 import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
 import { selectionFor, reviewSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
@@ -303,10 +304,10 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
       failIfUnavailable: config.sandbox.enabled,
       // The OS sandbox is the boundary, so sandboxed shell commands run without per-command allowlisting
       // (deny rules still apply). The support bot keeps the strict allowlist: it only ever needs `desk`.
-      autoAllowBashIfSandboxed: config.sandbox.enabled && !['triage','product_review'].includes(kind),
+      autoAllowBashIfSandboxed: config.sandbox.enabled && kind !== 'triage' && !READ_ONLY_KINDS.has(kind),
       network: { allowedDomains: config.sandbox.allowedDomains, allowUnixSockets: [socketPath] },
       // readOnlyPaths and other seats' clones stay readable but are explicitly write-protected.
-      filesystem: { denyRead: deny, allowWrite: kind==='product_review'?[]:[cwd], denyWrite: [...config.project.readOnlyPaths, ...extraDirs, config.project.repoPath, ...(kind==='product_review'?[cwd]:[])].filter(Boolean) },
+      filesystem: { denyRead: deny, allowWrite: READ_ONLY_KINDS.has(kind) ? [] : [cwd], denyWrite: [...config.project.readOnlyPaths, ...extraDirs, config.project.repoPath, ...(READ_ONLY_KINDS.has(kind) ? [cwd] : [])].filter(Boolean) },
     },
     permissions: {
       deny: deny.flatMap((p) => [`Read(${asRule(p)})`, `Read(${asRule(p)}/**)`]),
@@ -330,10 +331,22 @@ function childEnv(token, engine) {
 
 export const engineOf = (seat) => ENGINES[seat?.engine || 'claude'] || ENGINES.claude;
 
-export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath } = {}) {
+// The run's server-owned job (research programs) decides web access, approved connectors and the charter block.
+const RESEARCH_KINDS = new Set(['research', 'research_revision']);
+export function jobPermissions(kind, job) {
+  if (RESEARCH_KINDS.has(kind)) return { web: job ? job.web !== false : true, mcpAllow: job?.connectors?.length ? connectors.allowRulesFor(job.connectors) : [] };
+  if (kind === 'research_review' || kind === 'connector_assessment') return { web: !!job?.web };
+  return {};
+}
+export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath, job = null } = {}) {
+  const charter = kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.'
+    : kind === 'product_review' ? productReviewCharter(agent.id)
+      : RESEARCH_KINDS.has(kind) ? researchCharter(agent.id, job)
+        : kind === 'research_review' || kind === 'connector_assessment' ? readOnlyReviewCharter(agent.id, kind) : charterFor(agent.id);
+  const mcpServers = RESEARCH_KINDS.has(kind) && job?.connectors?.length ? connectors.mcpServersFor(job.connectors) : undefined;
   const cmd = engineOf(agent).command({
-    seat: agent, kind, cwd, resume, fork, extraDirs,
-    perms: permissionsFor(kind, cwd), denyRules: DENY_RULES, charter: kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.' : kind==='product_review'?productReviewCharter(agent.id):charterFor(agent.id), settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
+    seat: agent, kind, cwd, resume, fork, extraDirs, mcpServers,
+    perms: permissionsFor(kind, cwd, jobPermissions(kind, job)), denyRules: DENY_RULES, charter, settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
   });
   // Conflict resolutions get their own hard spend cap (merge train, #3).
   const capAt = kind === 'resolve' ? cmd.args.indexOf('--max-budget-usd') : -1;
@@ -387,14 +400,17 @@ export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: St
  * Start one agent run. Resolves when the process exits with {run, result}.
  * The prompt goes over stdin so the variadic tool flags cannot swallow it.
  */
-export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null }) {
+export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null, job = null }) {
   if (fence != null && fence !== epoch) return Promise.resolve({ run: null, result: null, aborted: true });
   if (reviewProfile && (kind !== 'council_review' || track || resume)) throw new Error('Per-job review models are restricted to fresh, untracked council calls');
-  const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : selectionFor(agentId);
+  // A research job's requirements (web, connectors) travel into provider selection: fallback may not drop them.
+  const requirements = job && RESEARCH_KINDS.has(kind) ? { web: job.web !== false, connectors: (job.connectors || []).map((c) => c.name) } : null;
+  const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : selectionFor(agentId, Date.now(), requirements);
   if (!selected.seat) throw Object.assign(new Error(`${agentId}: ${selected.reason}`), { status: 409, providerUnavailable: true });
   const agent = selected.seat;
+  if (ENGINES[agent.engine || 'claude']?.supports && !ENGINES[agent.engine || 'claude'].supports(kind)) throw Object.assign(new Error(`${agentId}: ${ENGINES[agent.engine].label} cannot run ${kind}`), { status: 409 });
   const token = crypto.randomBytes(18).toString('hex');
-  const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId });
+  const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job });
   store.updateRun(run.id, { reserve_usd: engineOf(agent).budgetUsd(agent) });
   onStart?.(run);
   const ctx = { run, cwd, result: null, state: {}, presence: track };
@@ -446,7 +462,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   let sock, cmd, env;
   try {
     sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
-    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath });
+    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job });
     env = { ...childEnv(token, engine.id), ...cmd.env };
     if (kind === 'council_review') { delete env.DESK_RUN_TOKEN; delete env.DESK_SOCKET; }
     if (cmd.mailbox) env.DESK_MAILBOX = openMailbox(run.id, cwd);

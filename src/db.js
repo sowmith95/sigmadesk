@@ -254,6 +254,39 @@ CREATE TABLE IF NOT EXISTS conflict_jobs (
   UNIQUE(ticket_key, base_sha, head_sha)
 );
 CREATE INDEX IF NOT EXISTS conflict_jobs_status ON conflict_jobs(status, id);
+CREATE TABLE IF NOT EXISTS research_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  input_hash TEXT NOT NULL,
+  reviewer TEXT NOT NULL,
+  run_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  verdict TEXT,
+  report TEXT,
+  error TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ended_at TEXT
+);
+CREATE INDEX IF NOT EXISTS research_reviews_ticket ON research_reviews(ticket_key, generation);
+CREATE TABLE IF NOT EXISTS connectors (
+  name TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'proposed',
+  purpose TEXT DEFAULT '',
+  case_md TEXT DEFAULT '',
+  binding TEXT,
+  tools TEXT DEFAULT '[]',
+  proposed_by TEXT,
+  assessed_by TEXT,
+  assessment TEXT,
+  assessment_run INTEGER,
+  approved_by TEXT,
+  approved_at TEXT,
+  review_after TEXT,
+  decision_note TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -277,11 +310,16 @@ function migrate() {
       risk: 'TEXT', diff_risk: 'TEXT', designer: 'TEXT', qa_sha: 'TEXT', review_round: 'INTEGER DEFAULT 0', review_stage: 'TEXT',
       reviewer_context: 'TEXT', reviewer_independent: 'TEXT',
       // merge train (#3): original builder, approval time (queue order), scheduled/held merges, light re-confirm reviews
-      builder: 'TEXT', contributors: "TEXT DEFAULT '[]'", approved_at: 'TEXT', merge_after: 'TEXT', merge_hold: 'TEXT', reconfirm_from: 'TEXT', reconfirm_kind: 'TEXT', reconfirm_base: 'TEXT' },
+      builder: 'TEXT', contributors: "TEXT DEFAULT '[]'", approved_at: 'TEXT', merge_after: 'TEXT', merge_hold: 'TEXT', reconfirm_from: 'TEXT', reconfirm_kind: 'TEXT', reconfirm_base: 'TEXT',
+      // research programs: which program/run proposed it, the frozen review policy, the second-person review state
+      research_program: 'TEXT', research_run: 'INTEGER', research_policy: 'TEXT', research_review: 'TEXT', research_generation: 'INTEGER DEFAULT 0',
+      research_revisions: 'INTEGER DEFAULT 0', research_sources: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     pr_outbox: { next_attempt_at: 'TEXT' },
     runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT',
-      thread_id: 'TEXT', context_hash: 'TEXT', context_meta: 'TEXT', job_hash: 'TEXT' },
+      thread_id: 'TEXT', context_hash: 'TEXT', context_meta: 'TEXT', job_hash: 'TEXT',
+      // research programs: the program a run belongs to and its server-owned job metadata (allowances, connectors)
+      program: 'TEXT', job: 'TEXT' },
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -319,6 +357,8 @@ export function settingDefaults() {
     team: '{}', // per-seat {engine, model, effort, enabled} chosen in the UI
     team_confirmed: 'false', // the owner must confirm who runs on what before the first open
     auto_fallback: String(config.engines.autoFallback),
+    // '' = not configured: research programs derive from config.research + the legacy pm_* rows. Saved JSON wins.
+    research_programs: '',
   };
 }
 
@@ -327,6 +367,7 @@ export function getSettings() {
 }
 export function setSetting(key, value) {
   if (!(key in settingDefaults())) throw Object.assign(new Error(`unknown setting ${key}`), { status: 400 });
+  if (key === 'research_programs') throw Object.assign(new Error('research programs are edited through Settings → Research (validated as a whole)'), { status: 400 });
   const ranges = { max_concurrent: [1, 20], daily_budget_usd: [0, 100000], pm_interval_min: [1, 525600], max_open_proposals: [1, 100] };
   if (ranges[key]) {
     const n = Number(value), [min, max] = ranges[key];
@@ -335,6 +376,10 @@ export function setSetting(key, value) {
   }
   if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'draft_prs', 'team_confirmed', 'auto_fallback'].includes(key) && !['true', 'false'].includes(String(value)))
     throw Object.assign(new Error(`${key} must be true or false`), { status: 400 });
+  writeSetting(key, value);
+}
+// For modules that validated a structured setting themselves (research programs). Not reachable from /api/settings.
+export function writeSetting(key, value) {
   q('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value));
   announce({ type: 'settings', data: getSettings() });
 }
@@ -371,7 +416,8 @@ export function createTicket(t) {
 const TICKET_FIELDS = new Set(['title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
   'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key',
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
-  'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base']);
+  'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base',
+  'research_program', 'research_run', 'research_policy', 'research_review', 'research_generation', 'research_revisions', 'research_sources']);
 
 export function updateTicket(key, patch) {
   const cols = Object.keys(patch).filter((k) => TICKET_FIELDS.has(k));
@@ -457,8 +503,9 @@ export function updateAgent(id, patch) {
 // ---------- runs ----------
 const publicRun = (r) => { if (!r) return r; const { token, nonce, ...rest } = r; return rest; };
 export function createRun(r) {
-  const info = q('INSERT INTO runs(agent_id,ticket_key,kind,token,model,cwd,resumed_from,incident_id,nonce,provenance) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
-    r.agent_id, r.ticket_key ?? null, r.kind, r.token, r.model, r.cwd ?? null, r.resumed_from ?? null, r.incident_id ?? null, r.nonce ?? null, r.provenance ?? null);
+  const info = q('INSERT INTO runs(agent_id,ticket_key,kind,token,model,cwd,resumed_from,incident_id,nonce,provenance,program,job) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(
+    r.agent_id, r.ticket_key ?? null, r.kind, r.token, r.model, r.cwd ?? null, r.resumed_from ?? null, r.incident_id ?? null, r.nonce ?? null, r.provenance ?? null,
+    r.program ?? null, r.job ? JSON.stringify(r.job) : null);
   const run = getRun(info.lastInsertRowid);
   announce({ type: 'run', data: publicRun(run) });
   return run;
@@ -525,6 +572,59 @@ export function runCountFor(ticketKey, kind) {
 }
 export function lastRunOfKind(kind) {
   return q('SELECT * FROM runs WHERE kind=? ORDER BY id DESC LIMIT 1').get(kind) || null;
+}
+// Research cadence: the program's own runs; the default program also counts untagged legacy PM research runs.
+export function lastResearchRun(programId, { untagged = false } = {}) {
+  return (untagged
+    ? q("SELECT * FROM runs WHERE kind='research' AND (program=? OR program IS NULL) ORDER BY id DESC LIMIT 1").get(programId)
+    : q("SELECT * FROM runs WHERE kind='research' AND program=? ORDER BY id DESC LIMIT 1").get(programId)) || null;
+}
+export function runsOfProgram(programId, limit = 50) {
+  return q('SELECT * FROM runs WHERE program=? ORDER BY id DESC LIMIT ?').all(programId, limit).map(publicRun);
+}
+export function runsUsingConnector(name) {
+  return q("SELECT * FROM runs WHERE job IS NOT NULL AND instr(job, ?) > 0 ORDER BY id DESC").all(`"${name}"`).map(publicRun);
+}
+export function ticketsFromRuns(runIds) {
+  if (!runIds.length) return [];
+  return q(`SELECT * FROM tickets WHERE research_run IN (${runIds.map(() => '?').join(',')})`).all(...runIds);
+}
+
+// ---------- research reviews (second-person gate on research proposals) ----------
+const RR_FIELDS = new Set(['run_id', 'status', 'verdict', 'report', 'error', 'ended_at']);
+export function createResearchReview(r) {
+  const info = q('INSERT INTO research_reviews(ticket_key,generation,input_hash,reviewer,status) VALUES (?,?,?,?,?)').run(r.ticket_key, r.generation, r.input_hash, r.reviewer, r.status || 'pending');
+  const row = getResearchReview(info.lastInsertRowid);
+  announce({ type: 'research-review', data: row });
+  return row;
+}
+export function getResearchReview(id) { return q('SELECT * FROM research_reviews WHERE id=?').get(id) || null; }
+export function updateResearchReview(id, patch) {
+  const cols = Object.keys(patch).filter((k) => RR_FIELDS.has(k));
+  if (cols.length) q(`UPDATE research_reviews SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
+  const row = getResearchReview(id);
+  announce({ type: 'research-review', data: row });
+  return row;
+}
+export function listResearchReviews(ticketKey) { return q('SELECT * FROM research_reviews WHERE ticket_key=? ORDER BY id').all(ticketKey); }
+export function openResearchReviews() { return q("SELECT * FROM research_reviews WHERE status IN ('pending','running') ORDER BY id").all(); }
+
+// ---------- connectors (governed MCP servers for research seats) ----------
+const CONNECTOR_FIELDS = new Set(['status', 'purpose', 'case_md', 'binding', 'tools', 'proposed_by', 'assessed_by', 'assessment', 'assessment_run', 'approved_by', 'approved_at', 'review_after', 'decision_note']);
+export function getConnector(name) { return q('SELECT * FROM connectors WHERE name=?').get(name) || null; }
+export function listConnectors() { return q('SELECT * FROM connectors ORDER BY name').all(); }
+export function createConnector(c) {
+  q('INSERT INTO connectors(name,status,purpose,case_md,binding,tools,proposed_by) VALUES (?,?,?,?,?,?,?)').run(c.name, c.status || 'proposed', c.purpose || '', c.case_md || '', c.binding ? JSON.stringify(c.binding) : null, JSON.stringify(c.tools || []), c.proposed_by || 'owner');
+  const row = getConnector(c.name);
+  announce({ type: 'connector', data: row });
+  return row;
+}
+export function updateConnector(name, patch) {
+  const cols = Object.keys(patch).filter((k) => CONNECTOR_FIELDS.has(k));
+  if (cols.length) q(`UPDATE connectors SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE name=?`).run(...cols.map((c) => (patch[c] !== null && typeof patch[c] === 'object' ? JSON.stringify(patch[c]) : patch[c] ?? null)), now(), name);
+  const row = getConnector(name);
+  announce({ type: 'connector', data: row });
+  return row;
 }
 
 // ---------- incidents (watch desk) ----------
