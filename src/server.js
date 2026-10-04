@@ -554,7 +554,10 @@ export async function main() {
   setInterval(() => github.poll(importIssue), config.github.pollMinutes * 60_000);
   setTimeout(() => github.poll(importIssue), 10_000);
   // PRs: poll is the source of truth; the optional webhook only asks for an immediate reconcile.
-  const syncPrs = () => prsync.reconcile(sched.prActions).catch((err) => console.error('prsync:', err.message));
+  // Each PR sync also refreshes the deploy lock from GitHub: a finished deploy releases it (or a stuck one escalates)
+  // even when no merge is waiting to ask. Before, only a merge attempt refreshed it, so a green deploy could hold for hours.
+  const syncPrs = () => prsync.reconcile(sched.prActions).catch((err) => console.error('prsync:', err.message))
+    .then(() => mergetrain.deployLock()).catch((err) => console.error('deploy lock:', err.message));
   setInterval(syncPrs, prsync.pollSeconds() * 1000);
   setTimeout(syncPrs, 15_000);
   prsync.startWebhook((event) => { store.logEvent({ kind: 'github', agent_id: 'github', text: `webhook: ${event} → syncing PRs` }); syncPrs(); });

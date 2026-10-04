@@ -328,7 +328,8 @@ export async function mergeCheck(number, { inBusyWindow = false, halted = false 
   // The deploy hold (merge train): a deploying merge waits for the previous deploy; a failed or unconfirmed one can be
   // passed with the owner's reason, a running one cannot.
   const train = await import('./mergetrain.js');
-  const lock = train.deployState();
+  // Ask GitHub, not the stored lock: a deploy that finished since the last check releases here (Recheck shows it).
+  const lock = await train.deployLock();
   let deploy_hold = null;
   if (lock && !(lock.key && lock.key === key && lock.state === 'merging')) {
     let deploys = true;

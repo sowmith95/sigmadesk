@@ -845,3 +845,17 @@ test('the owner can merge past a failed or unconfirmed deploy hold with a reason
   assert.match(store.listComments(prev.key).at(-1).body, /Deploy hold overridden by the owner[\s\S]*UI tests failed/);
   assert.match(fs.readFileSync(ghLog, 'utf8'), /merging while the previous deploy is unverified/, 'the reason is posted on the PR');
 });
+
+test('the merge check asks GitHub: a deploy that finished green releases its lock instead of blocking for hours', async () => {
+  resetTrain();
+  const prs = await import('../src/prs.js');
+  store.kvSet('train:deploy', JSON.stringify({ key: 'M-9', merge_sha: '9'.repeat(40), at: new Date(Date.now() - 120 * 60_000).toISOString(), workflows: ['.github/workflows/deploy.yml'], state: 'running', id: 'old' }));
+  setGh(`runs-${'9'.repeat(40)}.json`, [{ path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success', id: 1 }]);
+  setGh('pr.json', { number: 78, title: 'hand-written PR', state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', headRefOid: 'd'.repeat(40), baseRefName: 'main', body: 'SigmaDesk', statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }] });
+  setGh('files.json', ['app/handmade.py']);
+  const check = await prs.mergeCheck(78);
+  assert.equal(check.deploy_hold, null, 'no hold: the deploy it waited for is done');
+  assert.ok(!check.blockers.some((b) => /still running/.test(b)));
+  assert.equal(lockNow(), null);
+  resetTrain();
+});
