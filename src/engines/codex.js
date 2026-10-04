@@ -14,7 +14,7 @@ const short = (s, n = 180) => { const t = String(s ?? '').replace(/\s+/g, ' ').t
 const unwrap = (cmd) => String(cmd || '').replace(/^\/bin\/(ba|z)?sh -l?c\s+(['"])([\s\S]*)\2$/, '$3');
 
 export function codexHome() {
-  const home = path.join(config.root, 'data', 'codex-home');
+  const home = path.join(config.home ? config.dataDir : path.join(config.root, 'data'), 'codex-home');
   fs.mkdirSync(home, { recursive: true });
   const userHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
   const auth = path.join(home, 'auth.json');

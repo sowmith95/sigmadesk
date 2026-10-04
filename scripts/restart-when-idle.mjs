@@ -1,7 +1,11 @@
 // Drain dispatch before restart, then restore the previous open/paused state.
 import { execFileSync } from 'node:child_process';
-import { config } from '../src/config.js';
-const [name = 'default', port = String(config.server.port), maxMinutes = '240'] = process.argv.slice(2);
+// A project desk: `--home <project home>` (or SIGMADESK_HOME) so the right config, token and port are loaded.
+const argv = process.argv.slice(2);
+const hi = argv.indexOf('--home');
+if (hi >= 0) { process.env.SIGMADESK_HOME = argv[hi + 1]; argv.splice(hi, 2); }
+const { config } = await import('../src/config.js');
+const [name = 'default', port = String(config.server.port), maxMinutes = '240'] = argv;
 if (!/^[a-z0-9][a-z0-9_-]*$/i.test(name) || !/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535 || !Number.isFinite(Number(maxMinutes)) || Number(maxMinutes) <= 0) throw new Error('Invalid service name, port or timeout');
 const endpoint = `http://127.0.0.1:${port}`;
 const api = async (p, method = 'GET') => {

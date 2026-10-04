@@ -88,7 +88,8 @@ store.bus.on('msg', (m) => {
 setInterval(() => { for (const res of clients) res.write(': ping\n\n'); }, 20_000).unref();
 
 // ---------------- owner auth (optional shared token → HttpOnly cookie) ----------------
-const COOKIE = 'sigmadesk_token';
+// One cookie per project: desks on the same host but different ports would otherwise overwrite each other's token.
+const COOKIE = config.projectId === 'legacy' ? 'sigmadesk_token' : `sigmadesk_token_${config.projectId}`;
 function ownerAuthed(req) {
   const tok = config.server.ownerToken;
   if (!tok) return true;
@@ -380,7 +381,7 @@ export function pollMailboxes() {
         try {
           if (!mailboxIsSafe(runId, dir)) return;
           // Write privately, then rename INTO the mailbox: rename replaces a planted symlink instead of following it.
-          const privateDir = path.join(config.root, 'run');
+          const privateDir = config.home ? config.runDir : path.join(config.root, 'run');
           fs.mkdirSync(privateDir, { recursive: true, mode: 0o700 });
           tmp = path.join(privateDir, `mbx-${runId}-${id}-${crypto.randomBytes(6).toString('hex')}.tmp`);
           fs.writeFileSync(tmp, JSON.stringify(obj), { flag: 'wx', mode: 0o644 });
@@ -430,12 +431,38 @@ const handler = (route) => (req, res) => {
 };
 
 // ---------------- main ----------------
+/**
+ * One running desk per project. Taken before the database opens: startup recovery stops processes recorded in the db,
+ * so a second copy must never reach it while the first is alive. The lock file holds the owner's pid.
+ */
+export function acquireInstanceLock(runDir = config.runDir) {
+  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
+  const file = path.join(runDir, 'desk.lock');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(file, String(process.pid), { flag: 'wx', mode: 0o600 });
+      const release = () => { try { if (fs.readFileSync(file, 'utf8') === String(process.pid)) fs.unlinkSync(file); } catch { /* gone */ } };
+      process.on('exit', release);
+      return { file, release };
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      const pid = Number(fs.readFileSync(file, 'utf8')) || 0;
+      let alive = false;
+      try { if (pid && pid !== process.pid) { process.kill(pid, 0); alive = true; } } catch (e) { alive = e.code === 'EPERM'; }
+      if (alive) throw Object.assign(new Error(`another SigmaDesk (pid ${pid}) is already running for this project (${runDir})`), { code: 'ELOCKED' });
+      fs.rmSync(file, { force: true }); // stale lock from a crashed desk
+    }
+  }
+  throw new Error(`could not take the desk lock in ${runDir}`);
+}
+
 export async function main() {
   const problems = validateConfig();
   if (problems.length) {
-    console.error(`SigmaDesk config problems (${config.configFile}):\n - ${problems.join('\n - ')}\nCopy sigmadesk.config.example.json to sigmadesk.config.json and edit it.`);
+    console.error(`SigmaDesk config problems (${config.configFile}):\n - ${problems.join('\n - ')}\n${config.home ? 'Edit the project config in its SigmaDesk folder.' : 'Copy sigmadesk.config.example.json to sigmadesk.config.json and edit it.'}`);
     process.exit(1);
   }
+  try { acquireInstanceLock(); } catch (err) { console.error(`SigmaDesk not started: ${err.message}`); process.exit(1); }
   store.openDb();
   try { applyTeamOverrides(JSON.parse(store.getSettings().team || '{}')); } catch { /* ignore bad JSON */ }
   connectors.seed(); // config-defined connectors start as proposed; nothing is usable until assessed and approved
@@ -450,7 +477,8 @@ export async function main() {
   setInterval(() => usage.refresh(), 120000).unref();
   for (const host of config.server.hosts) {
     const srv = http.createServer(handler(ownerRoute));
-    srv.on('error', (err) => console.error(`listen ${host}:${config.server.port} failed: ${err.message}`));
+    // A desk that cannot listen is not running: exit so the service manager reports it, instead of a silent half-desk.
+    srv.on('error', (err) => { console.error(`listen ${host}:${config.server.port} failed: ${err.message}`); process.exit(1); });
     srv.listen(config.server.port, host, () => console.log(`SigmaDesk UI on http://${host}:${config.server.port}`));
   }
   // One unix socket per run, created on spawn and closed on exit (see runner.setSocketFactory).
@@ -465,7 +493,7 @@ export async function main() {
     return { path: p, close: () => { srv.close(); try { fs.unlinkSync(p); } catch { /* gone */ } } };
   });
 
-  store.logEvent({ kind: 'system', text: `Desk online for ${config.project.name} (${store.getSettings().paused === 'true' ? 'halted' : 'open'})` });
+  store.logEvent({ kind: 'system', text: `Desk online for ${config.project.name}${config.home ? ` (project ${config.projectId})` : ''} (${store.getSettings().paused === 'true' ? 'halted' : 'open'})` });
   github.ensureLabels().catch(() => {});
   setInterval(() => sched.tick(), 15_000);
   setInterval(pollMailboxes, 400);

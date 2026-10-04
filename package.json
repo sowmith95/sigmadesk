@@ -17,7 +17,8 @@
     "dev:ui": "vite --config vite.config.js",
     "check:ui": "node scripts/ui-stamp.mjs --check",
     "typecheck": "tsc --noEmit",
-    "ui:shots": "node --disable-warning=ExperimentalWarning scripts/ui-shots.mjs"
+    "ui:shots": "node --disable-warning=ExperimentalWarning scripts/ui-shots.mjs",
+    "project": "node --disable-warning=ExperimentalWarning scripts/project.mjs"
   },
   "engines": {
     "node": ">=22.13"

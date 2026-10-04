@@ -46,7 +46,7 @@ export const MODELS = [
 
 // data/perplexity-models.json: the raw models_list payload plus fetched_at, written atomically by the refresh script.
 // Read defensively: a missing, partial or reshaped file never breaks the engine, it just adds nothing.
-export const catalogPath = () => path.join(config.root, 'data', 'perplexity-models.json');
+export const catalogPath = () => path.join(config.home ? config.dataDir : path.join(config.root, 'data'), 'perplexity-models.json');
 let catalogCache = null; // { at, value }
 export function readCatalog() {
   if (catalogCache && Date.now() - catalogCache.at < 30_000) return catalogCache.value;

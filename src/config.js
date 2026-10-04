@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { deskPaths } from './app-paths.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -227,7 +228,9 @@ function findInNodeManagers(bin) {
 
 const expandHome = (p) => (p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
 
-export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT, 'sigmadesk.config.json')) {
+// SIGMADESK_HOME selects a project home in the per-user application folder (see app-paths.js); unset = legacy layout.
+const homeOf = (env) => (env.SIGMADESK_HOME ? path.resolve(expandHome(env.SIGMADESK_HOME)) : null);
+export function loadConfig(file = deskPaths({ home: homeOf(process.env), legacyRoot: ROOT }).configFile) {
   let fromFile = {};
   if (fs.existsSync(file)) fromFile = JSON.parse(fs.readFileSync(file, 'utf8'));
   const c = deepMerge(DEFAULTS, fromFile);
@@ -239,7 +242,10 @@ export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT
   if (env.SIGMADESK_GITHUB_REPO) c.project.githubRepo = env.SIGMADESK_GITHUB_REPO;
 
   c.project.repoPath = expandHome(c.project.repoPath);
-  c.project.playbook = path.isAbsolute(expandHome(c.project.playbook)) ? expandHome(c.project.playbook) : path.join(ROOT, c.project.playbook);
+  const home = homeOf(env);
+  // A relative playbook resolves inside the project home first (new projects keep their playbook there), then the checkout.
+  const rel = expandHome(c.project.playbook);
+  c.project.playbook = path.isAbsolute(rel) ? rel : home && fs.existsSync(path.join(home, rel)) ? path.join(home, rel) : path.join(ROOT, rel);
   c.project.readOnlyPaths = c.project.readOnlyPaths.map(expandHome);
   c.advisors.keyFile = expandHome(c.advisors.keyFile);
   const pathClaude = which('claude');
@@ -256,13 +262,16 @@ export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT
   if (!c.github.trustedAuthors.length && c.project.githubOwner) c.github.trustedAuthors = [c.project.githubOwner];
 
   c.root = ROOT;
-  c.dataDir = env.SIGMADESK_DATA || path.join(ROOT, 'data'); // desk-owned state: publisher repo, context packs
-  c.dbPath = env.SIGMADESK_DB || path.join(c.dataDir, 'sigmadesk.db');
-  // Agents talk to the desk over this unix socket (the sandbox allowlists it; the TCP UI port stays unreachable).
-  // Real path matters: the sandbox matches resolved paths. macOS caps socket paths at 104 bytes.
-  c.socketPath = env.SIGMADESK_SOCKET || path.join(fs.realpathSync(ROOT), 'run', 'agent.sock');
-  if (c.socketPath.length > 100) c.socketPath = path.join(fs.realpathSync(os.tmpdir()), `sigmadesk-${c.server.port}.sock`);
-  c.workspaceRoot = env.SIGMADESK_WORKSPACES || path.join(fs.realpathSync(ROOT), 'workspaces');
+  // Agents talk to the desk over a unix socket (the sandbox allowlists it; the TCP UI port stays unreachable). Real
+  // paths matter: the sandbox matches resolved paths.
+  const p = deskPaths({ home, legacyRoot: fs.realpathSync(ROOT), env, port: c.server.port });
+  c.projectId = p.id; c.home = p.home; c.appRoot = p.appRoot;
+  c.dataDir = p.dataDir; // desk-owned state: db, publisher repo, context packs, desk Codex home
+  c.dbPath = p.dbPath;
+  c.runDir = p.runDir;
+  c.socketPath = p.socketPath;
+  c.workspaceRoot = p.workspaceRoot;
+  c.logDir = p.logDir;
   c.configFile = file;
   return c;
 }
