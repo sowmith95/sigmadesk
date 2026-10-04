@@ -10,6 +10,7 @@ import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
 import { selectionFor, reviewSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
 import * as store from './db.js';
+import * as context from './context.js';
 
 const pexec = promisify(execFile);
 const children = new Map(); // runId -> ChildProcess
@@ -79,6 +80,12 @@ export function applyEvents(events, ctx) {
         store.kvSet(`quota:${e.engine}`, JSON.stringify(q));
         store.bus.emit('msg', { type: 'quota', data: q });
         if (q.status && q.status !== 'allowed') store.logEvent({ ...base, kind: 'system', text: `plan limit: ${q.status} until ${q.resets_at || '?'}` });
+        break;
+      }
+      case 'pplx': {
+        if (e.threadId && e.threadId !== ctx.state.threadSaved) { ctx.state.threadSaved = e.threadId; store.updateRun(run.id, { thread_id: e.threadId }); }
+        if (ctx.state.pack) store.updateRun(run.id, { context_meta: JSON.stringify(ctx.state.pack.meta) });
+        if (e.note) store.logEvent({ ...base, kind: e.error ? 'error' : 'system', text: e.note });
         break;
       }
       case 'result': ctx.result = { is_error: !e.ok, subtype: e.subtype, total_cost_usd: e.costUsd || 0, cost_known: e.costKnown !== false, num_turns: e.turns ?? null, errors: e.errors || [], result: e.text || ctx.state.lastSay || '', usage: e.usage }; break;
@@ -377,6 +384,32 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     text: `Automatic fallback: ${agentById[agentId].engine || 'claude'} → ${agent.engine} (${selected.reason}). Saved seat preference retained.` });
 
   const engine = engineOf(agent);
+  // Perplexity thinking seats: the desk builds the context (not the relay), writes it under the clone's .git, and
+  // appends it to the relay's instructions; the engine's parser then verifies it went out verbatim.
+  const pplx = engine.id === 'perplexity' && engine.supports?.(kind);
+  const px = context.packSettings();
+  if (pplx) try {
+    const pack = context.prepareRun({ runId: run.id, kind, cwd, ticketKey, incidentId, secrets: [token, nonce].filter(Boolean) });
+    const live = context.liveFor(run.id);
+    let resumeThread = null;
+    const prev = pack.text ? store.lastThreadRun({ ticket_key: ticketKey, agent_id: agentId, kind, incident_id: incidentId }) : null;
+    const prevMeta = context.metaFor(prev);
+    // A retry of the same job with the same pack resumes the pending thread instead of asking again.
+    if (prev && prev.context_hash === pack.meta.hash && prevMeta?.delivered && Date.now() - Date.parse(prev.started_at) < 2 * 3600_000) {
+      resumeThread = prev.thread_id;
+      Object.assign(live.meta, { delivered: true, threadId: prev.thread_id, deliveredThread: prev.thread_id, resumedFrom: prev.id, fetched: [...(prevMeta.fetched || [])] });
+      ctx.state.threadSaved = prev.thread_id;
+    }
+    store.updateRun(run.id, { context_hash: pack.meta.hash || null, context_meta: JSON.stringify(live.meta), ...(resumeThread ? { thread_id: resumeThread } : {}) });
+    store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: pack.text ? 'system' : 'error',
+      text: pack.text ? `Context pack for Perplexity: ${pack.meta.chars} chars, sha256 ${pack.meta.hash.slice(0, 12)}${pack.meta.omittedChanged.length ? `, ${pack.meta.omittedChanged.length} changed file(s) omitted for size` : ''}${pack.meta.omitted.length ? `, ${pack.meta.omitted.length} item(s) listed as omitted` : ''}${resumeThread ? ` · resuming thread from run #${prev.id}` : ''}`
+        : `Context pack could not be built: ${pack.meta.error}` });
+    prompt = `${prompt}${context.promptAppendix(pack, { resumeThread, settings: px })}`;
+    ctx.state.pack = live;
+  } catch (err) {
+    // Fail soft: the run proceeds without a pack, which the accept gate treats as an incomplete review.
+    store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `Context pack setup failed: ${store.redact(err.message).slice(0, 200)}` });
+  }
   let sock, cmd, env;
   try {
     sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
@@ -401,7 +434,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
 
   let buf = '';
   let lastOutput = Date.now();
-  const idleMin = config.limits.idleTimeoutMin;
+  // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
+  const idleMin = pplx && config.limits.idleTimeoutMin ? Math.max(config.limits.idleTimeoutMin, px.remoteWaitMinutes + 2) : config.limits.idleTimeoutMin;
   const idleTimer = idleMin ? setInterval(() => {
     if (Date.now() - lastOutput > idleMin * 60_000) {
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `no activity for ${idleMin} min — stopping the seat` });
@@ -423,7 +457,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   let stderr = '';
   child.stderr.on('data', (d) => { lastOutput = Date.now(); stderr = (stderr + d).slice(-4000); });
 
-  const timeoutMin = config.limits.runTimeoutMin[kind] ?? 30;
+  const timeoutMin = Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.remoteWaitMinutes * (1 + px.followupRounds) + 10 : 0);
   const timer = setTimeout(() => {
     store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `timed out after ${timeoutMin} min — stopping` });
     killRun(run.id, 'timeout');
@@ -441,6 +475,12 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       setTimeout(() => evidence.delete(run.id), 60_000).unref();
       sock?.close();
       if (buf.trim()) applyEvents(engine.parse(buf, cwd, ctx.state), ctx);
+      if (ctx.state.pack) {
+        const m = ctx.state.pack.meta;
+        if (!m.delivered && !ctx.state.pplxAsked && !m.error) store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: 'Perplexity did not receive the full context: the relay never called Perplexity' });
+        store.updateRun(run.id, { context_meta: JSON.stringify(m) });
+        context.release(run.id);
+      }
       const r = ctx.result;
       const prev = store.getRun(run.id);
       const status = prev.status === 'killed' ? 'killed' : r && !r.is_error && code === 0 ? 'success' : 'error';

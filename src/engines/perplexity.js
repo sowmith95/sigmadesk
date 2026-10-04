@@ -5,6 +5,7 @@
 import { execFileSync } from 'node:child_process';
 import { config } from '../config.js';
 import { claude } from './claude.js';
+import * as context from '../context.js';
 
 const SERVER = 'perplexity-computer';
 const MCP = JSON.stringify({ mcpServers: { [SERVER]: { type: 'http', url: 'https://www.perplexity.ai/rest/computer/mcp' } } });
@@ -12,7 +13,9 @@ const T = (name) => `mcp__${SERVER}__${name}`;
 const ALLOW = [T('call_perplexity_computer'), T('read_thread'), T('answer_question'), T('confirm_action_deny'), T('models_list')];
 // Computer can act in the world (connected apps, files): the desk never lets a seat approve those actions.
 const BLOCK = [T('confirm_action_approve'), T('create_attachment_upload'), T('create_asset_download'), T('projects_list'), T('notify_connected')];
-export const THINK_KINDS = ['research', 'groom', 'design', 'consult', 'review', 'triage', 'investigate'];
+// owner_discussion is the manager's design discussion (scheduler.launchDiscussion); without it here, a manager seat on
+// Perplexity silently ran those on local Claude.
+export const THINK_KINDS = ['research', 'groom', 'design', 'consult', 'review', 'triage', 'investigate', 'owner_discussion'];
 
 // From models.list on the owner's account (2026-10-03). Ids are passed straight to call_perplexity_computer.
 export const MODELS = [
@@ -49,14 +52,15 @@ function relayCharter(seat) {
 
 # You are the hands of ${labelOf(model)} (Perplexity)
 Your judgment comes from ${labelOf(model)}, reached with ${T('call_perplexity_computer')}. You do not decide yourself.
-1. Gather the local context the decision needs (read the relevant files, run \`desk show\` / \`desk list\`).
-2. Call ${T('call_perplexity_computer')} ONCE with model="${model}", effort="${seat.effort || 'medium'}" (do not pass mode — Computer rejects mode+model together),
-   and a message containing: your seat role and rules above, the exact task, and every relevant code excerpt with file
-   paths. Tell it to answer read-only: no connected apps, no files, no accounts, nothing outside this conversation.
+1. Read your task. The desk has already gathered the context (the context pack at the end of your instructions); read
+   more files only if something specific is missing, and add those excerpts after the pack, never inside it.
+2. Call ${T('call_perplexity_computer')} ONCE with model="${model}", effort="${seat.effort || 'medium'}" (do not pass mode — Computer rejects mode+model together).
+   Tell it to answer read-only: no connected apps, no files, no accounts, nothing outside this conversation.
 3. Act on its answer by running the desk commands it decides, quoting its reasoning where useful. For a follow-up, call
    again with the same thread_id.
 4. Never approve a Computer action (only ${T('confirm_action_deny')}). If Perplexity fails or times out, say so with
-   \`desk comment\` and stop — do not substitute your own judgment.`;
+   \`desk comment\` and stop — do not substitute your own judgment.
+${context.relayRules()}`;
 }
 
 export const perplexity = {
@@ -96,11 +100,15 @@ export const perplexity = {
     const i = cmd.args.indexOf('--mcp-config');
     if (i >= 0) cmd.args[i + 1] = MCP; // the only MCP server a seat ever gets
     cmd.args[cmd.args.indexOf('--max-budget-usd') + 1] = String(config.engines?.perplexity?.relayBudgetUsd ?? 1);
+    // A Computer task can take minutes: the MCP call must be allowed to wait as long as the desk does.
+    cmd.env = { ...cmd.env, MCP_TOOL_TIMEOUT: String(context.packSettings().remoteWaitMinutes * 60_000) };
     return cmd;
   },
 
+  // Claude's normalized events, plus the desk's checks on what actually went to Perplexity: did the outgoing message
+  // carry the context pack verbatim, which requested files followed, and which thread_id to resume on a retry.
   parse(line, cwd, state) {
-    return claude.parse(line, cwd, state).map((e) => {
+    const base = claude.parse(line, cwd, state).map((e) => {
       if (e.type !== 'tool' || !e.text.startsWith(T(''))) return e;
       if (e.text.startsWith(T('call_perplexity_computer'))) {
         const model = e.text.match(/"model":"([^"]+)"/)?.[1];
@@ -108,5 +116,28 @@ export const perplexity = {
       }
       return { ...e, text: e.text.replace(`mcp__${SERVER}__`, 'Perplexity · ').slice(0, 120) };
     });
+    let ev;
+    try { ev = JSON.parse(line); } catch { return base; }
+    const extra = [];
+    state.pplxTools ||= {};
+    if (ev.type === 'assistant' && Array.isArray(ev.message?.content)) {
+      for (const b of ev.message.content) {
+        if (b.type !== 'tool_use' || ![T('call_perplexity_computer'), T('read_thread')].includes(b.name)) continue;
+        state.pplxTools[b.id] = b.name;
+        if (b.input?.thread_id) { extra.push({ type: 'pplx', threadId: String(b.input.thread_id) }); context.recordThread(state.pack, String(b.input.thread_id)); }
+        if (b.name === T('call_perplexity_computer')) {
+          state.pplxAsked = true;
+          extra.push(...context.recordSend(state.pack, b.input || {}));
+        }
+      }
+    } else if (ev.type === 'user' && Array.isArray(ev.message?.content)) {
+      for (const b of ev.message.content) {
+        if (b.type !== 'tool_result' || !state.pplxTools[b.tool_use_id]) continue;
+        const text = Array.isArray(b.content) ? b.content.map((c) => c.text || '').join('\n') : String(b.content ?? '');
+        const id = context.extractThreadId(text);
+        if (id) { context.recordThread(state.pack, id); extra.push({ type: 'pplx', threadId: id }); }
+      }
+    }
+    return [...base, ...extra];
   },
 };
