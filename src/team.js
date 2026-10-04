@@ -178,7 +178,9 @@ Then exactly one outcome:
   desk groom <KEY> --complexity <S|M|L|XL> --area <backend|frontend|db|fullstack|infra> --priority <P0-P3> --risk <high|low> [--assign <seat>] <<'EOF'
   <refined spec: scope, files likely touched, acceptance criteria, test plan>
   EOF
-  desk create-task --parent <KEY> --title "..." --complexity .. --area .. <<'EOF' ... EOF   (split; then reject the parent "split into ...")
+  desk create-task --parent <KEY> --title "..." --complexity .. --area .. [--after <earlier task KEY>] <<'EOF' ... EOF
+  desk split <KEY> "<one-line summary>"   (after creating the tasks: the parent stays open and closes when its tasks are done)
+  Use --after whenever a task must wait for another to merge first; describing the order in text does not enforce it.
   desk reject <KEY> "<reason>"   (duplicates, low value, ideas the playbook marks as dead)
 Routing when you don't --assign: db→dba; S→junior; M→senior (backend/frontend by area); L/XL or --risk high→principal,
 who designs it and slices it into S/M tasks for seniors and juniors (principals do not write code).

@@ -84,10 +84,22 @@ export function setStatus(key, status, extra = {}) {
 }
 researchReview.hooks.setStatus = setStatus; // holds, waivers and owner decisions on research proposals go through the same door
 
-// An epic (a principal's delegated ticket) tracks its slices: progress rolls up; it closes when every slice is settled.
+// The manager split a ticket into tasks: the parent stays open as an epic that tracks them and closes when they settle.
+function splitParent(ticket, agentId, summary, ev) {
+  const kids = store.childrenOf(ticket.key);
+  need(kids.length > 0, 'create the tasks first (desk create-task --parent KEY)');
+  store.addComment(ticket.key, agentId, `🧭 **Split** into ${kids.map((k) => `${k.key}${k.after_key ? ` (after ${k.after_key})` : ''}`).join(', ')}\n\n${summary || ''}`.trim());
+  setStatus(ticket.key, 'in_progress', { assignee: 'manager', progress: 0, progress_msg: `0/${kids.length} tasks merged` });
+  ev(`split ${ticket.key} into ${kids.length} task${kids.length === 1 ? '' : 's'}; it closes when they are done`);
+  github.flushComments();
+  return `Split recorded. ${ticket.key} stays open and closes when its ${kids.length} task(s) are done. Your run is complete — stop now.`;
+}
+
+// An epic (a principal's delegated ticket, or a ticket the manager split) tracks its tasks: progress rolls up; it closes
+// when every task is settled. A parent a builder is implementing itself is not an epic.
 export function rollupParent(parentKey) {
   const p = store.getTicket(parentKey);
-  if (!p || p.status !== 'in_progress' || !PRINCIPALS.includes(p.assignee)) return;
+  if (!p || p.status !== 'in_progress' || (p.assignee && p.assignee !== 'manager' && !PRINCIPALS.includes(p.assignee))) return;
   const kids = store.childrenOf(parentKey);
   if (!kids.length) return;
   const merged = kids.filter((k) => k.status === 'done').length;
@@ -99,7 +111,7 @@ export function rollupParent(parentKey) {
   if (settled === kids.length) {
     store.updateTicket(parentKey, { status: merged ? 'done' : 'wontdo', progress: 100, progress_msg: msg });
     github.syncIssueState(parentKey);
-    store.logEvent({ agent_id: p.assignee, ticket_key: parentKey, kind: 'done', text: `epic ${parentKey} closed: ${msg}` });
+    store.logEvent({ agent_id: p.assignee || 'system', ticket_key: parentKey, kind: 'done', text: `epic ${parentKey} closed: ${msg}` });
   } else {
     store.updateTicket(parentKey, { progress: Math.min(99, progress), progress_msg: msg });
   }
@@ -721,7 +733,7 @@ export function recoverOrphans() {
 // Thinking seats may propose a connector (a case, never a binding); the owner approves. Builders, QA and support cannot.
 const THINKERS = Object.keys(agentById).filter((id) => !BUILDERS.includes(id) && !['qa', 'support'].includes(id));
 const PERMS = {
-  groom: ['manager'], 'create-task': ['manager', ...PRINCIPALS], reject: ['manager'], consult: ['manager'], 'connector-propose': THINKERS,
+  groom: ['manager'], split: ['manager'], 'create-task': ['manager', ...PRINCIPALS], reject: ['manager'], consult: ['manager'], 'connector-propose': THINKERS,
   design: PRINCIPALS, delegate: PRINCIPALS, 'peer-review': ['manager', ...PRINCIPALS], council: ['manager', ...PRINCIPALS],
   route: ['support'], submit: ENGINEERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
@@ -897,11 +909,14 @@ export async function deskAction(run, cmd, body = {}) {
         return `created ${slice.key} → ${slice.assignee}`;
       }
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
+      const parentKey = body.parent || key;
+      // A split's order is enforced, not just described: --after must name an earlier task under the same parent.
+      if (body.after) need(store.getTicket(body.after)?.parent_key === parentKey, '--after must name an earlier task of the same parent');
       const t = store.createTicket({ title: body.title, description: body.body, type: body.type || 'task', status: 'todo', area: body.area,
-        complexity: body.complexity, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', assignee, reporter: agentId, source: 'agent', parent_key: body.parent || key });
-      const parentRisk = store.getTicket(body.parent || key)?.risk;
-      store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null });
-      ev(`created task ${t.key} for ${agentById[assignee].role}`, t.key);
+        complexity: body.complexity, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', assignee, reporter: agentId, source: 'agent', parent_key: parentKey });
+      const parentRisk = store.getTicket(parentKey)?.risk;
+      store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null, ...(body.after ? { after_key: body.after } : {}) });
+      ev(`created task ${t.key} for ${agentById[assignee].role}${body.after ? ` after ${body.after}` : ''}`, t.key);
       github.createIssue(t.key);
       return `created ${t.key} assigned to ${assignee}`;
     }
@@ -923,9 +938,16 @@ export async function deskAction(run, cmd, body = {}) {
       github.flushComments();
       return 'Delegated. Your run is complete — stop now.';
     }
+    case 'split': {
+      need(ticket && ticket.key === run.ticket_key && run.kind === 'groom', 'split only the ticket you are grooming');
+      need(['proposed', 'todo'].includes(ticket.status), 'only proposed/todo tickets can be split');
+      return splitParent(ticket, agentId, body.body, ev);
+    }
     case 'reject':
       need(ticket && (ticket.key === run.ticket_key || ticket.parent_key === run.ticket_key) && run.kind === 'groom', 'you can only reject the ticket you are grooming');
       need(['proposed', 'todo'].includes(ticket.status), 'only proposed/todo tickets can be rejected');
+      // The old instruction was "split, then reject the parent". A parent with open tasks is an epic, not a rejection.
+      if (ticket.key === run.ticket_key && store.childrenOf(ticket.key).some((k) => !['done', 'wontdo'].includes(k.status))) return splitParent(ticket, agentId, body.body, ev);
       store.addComment(ticket.key, agentId, `Closed: ${body.body || 'no reason given'}`);
       setStatus(ticket.key, 'wontdo');
       ev(`rejected ${ticket.key}: ${String(body.body || '').slice(0, 120)}`);
@@ -1332,6 +1354,15 @@ export function ownerPatch(key, patch) {
   if (patch.assignee !== undefined) { need(!patch.assignee || ENGINEERS.includes(patch.assignee), 'bad assignee'); p.assignee = patch.assignee || null; }
   if (patch.complexity) { need(COMPLEXITIES.includes(patch.complexity), 'bad complexity'); p.complexity = patch.complexity; }
   if (patch.area) { need(AREAS.includes(patch.area), 'bad area'); p.area = patch.area; }
+  if (patch.after_key !== undefined) {
+    // The owner orders a task after a sibling (same parent); no self-reference and no cycles.
+    if (patch.after_key) {
+      const before = store.getTicket(patch.after_key);
+      need(t.parent_key && before?.parent_key === t.parent_key && before.key !== key, 'a task can only start after another task of the same parent');
+      for (let k = before, seen = 0; k && seen < 50; k = k.after_key ? store.getTicket(k.after_key) : null, seen++) need(k.key !== key, 'that order would make a loop');
+    }
+    p.after_key = patch.after_key || null;
+  }
   if (p.status && ['todo', 'in_progress', 'qa', 'review'].includes(p.status) && researchReview.blocks(t)) need(false, 'this research proposal is waiting on its second review; waive the review or wait for it before moving the ticket');
   if (p.status && t.active_run > 0 && p.status !== t.status) runner.killRun(t.active_run, 'owner moved the ticket');
   if (p.status === 'qa' && !t.head_sha) need(false, 'only submitted work can go to QA');
