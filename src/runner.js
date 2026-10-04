@@ -407,6 +407,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     } catch (err) { failed = err; } finally { preparing.delete(run.id); clearTimeout(prepTimer); }
     const now = store.getRun(run.id);
     if (now.status === 'killed') return endBeforeSpawn('killed', now.result_text || 'stopped while preparing');
+    // The circuit breaker may have tripped while the pack was being built: re-check the fence right before spawning.
+    if (fence != null && fence !== epoch) return endBeforeSpawn('killed', 'stopped by stop-all while preparing');
     if (failed) return endBeforeSpawn('error', `Run refused: the context pack could not be built — ${store.redact(failed.message).slice(0, 300)}`);
     return spawnChild();
   })();
@@ -534,8 +536,9 @@ async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, in
   // Same job, same task, same seat contract, same pack, delivered and not invalid: poll that thread, do not re-ask.
   if (prev && prevMeta?.delivered && prevMeta.packThread && !prevMeta.invalid && prevMeta.remote?.status !== 'error' && Date.now() - Date.parse(prev.started_at) < 2 * 3600_000) {
     resumeThread = prevMeta.packThread;
-    Object.assign(live.meta, { delivered: true, packThread: resumeThread, resumedFrom: prev.id, remote: prevMeta.remote || null,
-      fetched: [...(prevMeta.fetched || [])], fetchedPages: { ...(prevMeta.fetchedPages || {}) }, servedPages: { ...(prevMeta.servedPages || {}) } });
+    // Remote state carries over for display, but a completion must be observed again in this run (seq resets).
+    Object.assign(live.meta, { delivered: true, packThread: resumeThread, resumedFrom: prev.id, remote: prevMeta.remote ? { ...prevMeta.remote, seq: 0 } : null,
+      fetched: [...(prevMeta.fetched || [])], fetchedPages: prevMeta.fetchedPages, servedPages: prevMeta.servedPages });
     ctx.state.threadSaved = resumeThread;
   }
   store.updateRun(run.id, { job_hash: jobHash, context_hash: pack.hash, context_meta: JSON.stringify(live.meta), ...(resumeThread ? { thread_id: resumeThread } : {}) });
@@ -563,6 +566,7 @@ export function killRun(runId, reason = 'killed') {
 export function killAll(reason) {
   epoch += 1;
   for (const id of [...children.keys()]) killRun(id, reason);
+  for (const id of [...preparing.keys()]) killRun(id, reason); // runs still building their Perplexity pack
 }
 
 // Terminate every child process group and wait (SIGTERM, then SIGKILL) before the desk exits.
