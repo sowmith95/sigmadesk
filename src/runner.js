@@ -538,7 +538,7 @@ async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, in
   if (prev && prevMeta?.delivered && prevMeta.packThread && !prevMeta.invalid && prevMeta.remote?.status !== 'error' && Date.now() - Date.parse(prev.started_at) < 2 * 3600_000) {
     resumeThread = prevMeta.packThread;
     // Remote state carries over for display, but a completion must be observed again in this run (seq resets).
-    Object.assign(live.meta, { delivered: true, packThread: resumeThread, resumedFrom: prev.id, remote: prevMeta.remote ? { ...prevMeta.remote, seq: 0 } : null,
+    Object.assign(live.meta, { delivered: true, packThread: resumeThread, resumedFrom: prev.id, remote: prevMeta.remote ? { ...prevMeta.remote, seq: 0, source: 'resumed' } : null,
       fetched: [...(prevMeta.fetched || [])], fetchedPages: prevMeta.fetchedPages, servedPages: prevMeta.servedPages });
     ctx.state.threadSaved = resumeThread;
   }

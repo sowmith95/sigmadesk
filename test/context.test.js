@@ -597,3 +597,37 @@ test('PR reconciliation reads the publisher repo under a custom data dir', async
   const t = ticketFor({ status: 'ready_for_human', head_sha: s2 });
   assert.deepEqual(await prsync.stackBaseFor(store.getTicket(t.key)), { key: u.key, branch: 'sigmadesk/stack-1', pr: 7 });
 });
+
+test('overlapping reads: completion counts only from a read issued after the last send was acknowledged', async () => {
+  const DONE = '{"thread_status":"idle","web_state":{"thread_status":"idle","entries":[{"status":"WORKFLOW_COMPLETED"}]}}';
+  const RUNNING = '{"thread_id":"thread-A-0001","thread_status":"running","web_state":{"thread_status":"running","entries":[{"status":"WORKFLOW_COMPLETED"},{"status":"RUNNING"}]}}';
+  const { live, run, pack } = await packFor('groom', ticketFor());
+  call(live, { message: pack.text });
+  read(live, 'thread-A-0001', DONE);
+  assert.equal(ctx.acceptBlockers(live.meta), null);
+  // Exact repro: follow-up issued, read issued concurrently, read returns the old completion, then the follow-up's
+  // own result reports RUNNING.
+  const followup = id();
+  ctx.recordSend(live, followup, 'call', { message: 'Also check the callers', thread_id: 'thread-A-0001' });
+  const concurrent = id();
+  ctx.recordSend(live, concurrent, 'read', { thread_id: 'thread-A-0001' });
+  ctx.recordResult(live, concurrent, { text: DONE });
+  assert.match(ctx.acceptBlockers(live.meta), /still in flight/, 'an unacknowledged send blocks');
+  ctx.recordResult(live, followup, { text: RUNNING });
+  assert.equal(live.meta.remote.status, 'pending', "the send's own RUNNING state is applied, not discarded");
+  assert.match(ctx.acceptBlockers(live.meta), /No completed Perplexity answer/);
+  // A read issued before the acknowledgement but returning after it is ignored.
+  const beforeAck = id();
+  const followup2 = id();
+  ctx.recordSend(live, followup2, 'call', { message: 'One more', thread_id: 'thread-A-0001' });
+  ctx.recordSend(live, beforeAck, 'read', { thread_id: 'thread-A-0001' });
+  ctx.recordResult(live, followup2, { text: '{"thread_id":"thread-A-0001"}' });
+  ctx.recordResult(live, beforeAck, { text: DONE });
+  assert.match(ctx.acceptBlockers(live.meta), /No completed Perplexity answer/);
+  // A completion inside a send's own result is not enough either: it must come from a later read.
+  call(live, { message: 'Final note', thread_id: 'thread-A-0001' }, { text: DONE });
+  assert.match(ctx.acceptBlockers(live.meta), /No completed Perplexity answer/);
+  read(live, 'thread-A-0001', DONE);
+  assert.equal(ctx.acceptBlockers(live.meta), null);
+  ctx.release(run.id);
+});

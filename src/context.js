@@ -610,7 +610,7 @@ export async function buildPack({ kind, baseSha, headSha, cloneDir = '', inputs 
     text, hash,
     meta: { kind, hash, chars: text.length, baseSha, headSha, mergeBase, changed: changed.map((f) => f.path), withheld: [...hidden],
       omittedChanged: [...new Set(omissions.filter((o) => o.changed).map((o) => o.path))], omitted: omissions.map((o) => o.path), rejected,
-      fetched: [], fetchedPages: dict(), servedPages: dict(), delivered: false, packThread: null, remote: null, sends: 0, followups: 0, pageRounds: 0, inflight: 0, lastSendSeq: 0 },
+      fetched: [], fetchedPages: dict(), servedPages: dict(), delivered: false, packThread: null, remote: null, sends: 0, followups: 0, pageRounds: 0, inflight: 0, lastAckSeq: 0 },
   };
 }
 
@@ -726,7 +726,6 @@ export function recordSend(live, toolUseId, name, input = {}, settings = packSet
   const blocks = [...live.served.entries()].filter(([, blk]) => msg.includes(blk)).map(([k]) => k);
   if (thread && thread === meta.packThread) {
     meta.inflight = (meta.inflight || 0) + 1;
-    meta.lastSendSeq = live.seq; // issued now: only state requested after this point can show it answered
     if (blocks.length) {
       meta.pageRounds = (meta.pageRounds || 0) + 1;
       if (meta.pageRounds > settings.pageRounds) out.push({ type: 'pplx', error: true, note: `Relay sent ${meta.pageRounds} file-page follow-ups; the limit is ${settings.pageRounds}` });
@@ -753,6 +752,8 @@ export function recordResult(live, toolUseId, { isError = false, text = '' } = {
   const thread = send.thread || extractThreadId(text);
   if (thread) out.push({ type: 'pplx', threadId: thread });
   const onPack = () => !!thread && thread === meta.packThread;
+  // Acknowledgement of a send on the pack thread (success or failure): only reads ISSUED after this can vouch for it.
+  if (send.name !== 'read' && thread && (thread === meta.packThread || (send.hasPack && ok && !meta.delivered))) meta.lastAckSeq = live.seq;
   if (!ok) {
     if (send.name !== 'read') {
       out.push({ type: 'pplx', error: true, note: `Perplexity call failed${send.hasPack ? '; the context pack was NOT delivered' : ''}: ${String(text).slice(0, 160)}` });
@@ -770,7 +771,7 @@ export function recordResult(live, toolUseId, { isError = false, text = '' } = {
       } else out.push({ type: 'pplx', note: `Context pack delivered to Perplexity verbatim (${meta.chars} chars, sha256 ${meta.hash.slice(0, 12)}, thread ${thread})` });
       meta.delivered = true;
       meta.packThread = thread;
-      meta.lastSendSeq = send.seq; // the delivering call itself was issued at send.seq
+      meta.lastAckSeq = live.seq;
     }
     const covered = [];
     for (const key of send.blocks || []) {
@@ -785,11 +786,12 @@ export function recordResult(live, toolUseId, { isError = false, text = '' } = {
   }
   if (onPack()) {
     const state = remoteState(text);
-    // State is dated by when it was REQUESTED: a read issued before the last send cannot vouch for it, even if its
-    // response arrives later. A call's own result reflects that call (hence +0.5), and older snapshots never win.
-    const asOf = send.seq + (send.name === 'read' ? 0 : 0.5);
+    // A read's state is dated by when it was REQUESTED; a send's own result (RUNNING etc.) is the newest state at its
+    // acknowledgement and is never discarded. Older snapshots never overwrite newer ones. Only a read issued after the
+    // last acknowledgement can show completion (see acceptBlockers).
+    const asOf = send.name === 'read' ? send.seq : live.seq;
     if (state && asOf >= (meta.remote?.thread === thread ? meta.remote.seq || 0 : 0)) {
-      meta.remote = { thread, status: state, seq: asOf, at: new Date().toISOString() };
+      meta.remote = { thread, status: state, seq: asOf, source: send.name === 'read' ? 'read' : 'send', at: new Date().toISOString() };
       if (state === 'error') out.push({ type: 'pplx', error: true, note: 'Perplexity reported the task failed or was cancelled' });
     }
   }
@@ -853,7 +855,7 @@ export function acceptBlockers(meta) {
   if (meta.inflight > 0) return `A message to thread ${meta.packThread} is still in flight; wait for it and poll read_thread before deciding.`;
   const r = meta.remote;
   if (r?.status === 'error') return `Perplexity reported the task on thread ${meta.packThread} failed or was cancelled, so the pass is refused.`;
-  if (!(r?.status === 'completed' && r.thread === meta.packThread && r.seq > (meta.lastSendSeq || 0))) return `No completed Perplexity answer on thread ${meta.packThread} after the last message (read_thread must show the latest entry as WORKFLOW_COMPLETED); poll before deciding.`;
+  if (!(r?.status === 'completed' && r.source === 'read' && r.thread === meta.packThread && r.seq > (meta.lastAckSeq || 0))) return `No completed Perplexity answer on thread ${meta.packThread} after the last message (read_thread must show the latest entry as WORKFLOW_COMPLETED); poll before deciding.`;
   return null;
 }
 
