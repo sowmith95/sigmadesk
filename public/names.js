@@ -14,7 +14,7 @@ const codeLike = (w) => /[./=<>]/.test(w) || /^\d+$/.test(w);
 const clean = (w) => w.replace(/\(\)$/, '').replace(/[?!]+$/, '');
 
 export function shortName(title, maxWords = 4) {
-  let s = String(title || '').replace(/^\s*\[[^\]]+\]\s*/, '').replace(/^(bug|feature|task|chore|regression)\s*[:\-–]\s*/i, '').trim();
+  let s = String(title || '').replace(/^\s*\[[^\]]+\]\s*/, '').replace(/^[A-Z][A-Z0-9]{0,5}-\d+[a-z]?\s*[:\-–]\s*/, '').replace(/^(bug|feature|task|chore|regression)\s*[:\-–]\s*/i, '').trim();
   // "Fix DST bug: helpers hardcode UTC-5" → the part before the colon usually is the name.
   const head = s.split(/\s*[:—–]\s+/)[0];
   if (head && head !== s && head.split(/\s+/).length >= 2 && head.split(/\s+/).length <= 6) s = head;

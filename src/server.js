@@ -21,7 +21,7 @@ import * as usage from './usage.js';
 
 const PUBLIC = path.join(config.root, 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
-  '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json', '.webmanifest': 'application/manifest+json' };
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.woff2': 'font/woff2' };
 const KEY = '([A-Z][A-Z0-9]*-\\d+)';
 
 function send(res, code, body, type = 'application/json', headers = {}) {
@@ -60,7 +60,7 @@ export function snapshot() {
       quota: JSON.parse(store.kvGet('quota:claude') || 'null'), plan_hold_at: config.limits.planHoldAt,
       providers: dispatch.providerHealth(), scheduler: sched.health(), advisors: advisors.status(), council: council.status(), background: runtime.status(), usage: usage.status(),
       routing: Object.fromEntries(AGENTS.map((a) => { const s = dispatch.selectionFor(a.id); return [a.id, { engine: s.seat?.engine, model: s.seat?.model, effort: s.seat?.effort, tier: SEAT_TIER[a.id], fallback: s.fallback || false, reason: s.reason }]; })),
-      engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
+      decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
   };
 }
@@ -161,7 +161,7 @@ async function ownerRoute(req, res) {
     store.bus.emit('msg', { type: 'ticket', data: withName(store.getTicket(t.key)) });
     return send(res, 200, withName(store.getTicket(t.key)));
   }
-  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode)); }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode, { expected_updated_at: b.expected_updated_at })); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
   // ---- PR console (owner only; agents have no route to these) ----

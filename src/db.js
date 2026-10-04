@@ -522,6 +522,8 @@ export function createDiscussion(ticketKey, question) {
 }
 export const getDiscussion = (id) => q('SELECT * FROM owner_discussions WHERE id=?').get(id) || null;
 export const pendingDiscussions = () => q("SELECT * FROM owner_discussions WHERE status IN ('queued','running') ORDER BY id").all();
+// Finished design recommendations still waiting for the owner (Inbox cards).
+export const pendingProposals = () => q("SELECT id, ticket_key FROM owner_discussions WHERE status='complete' ORDER BY id DESC LIMIT 50").all();
 export const ticketDiscussions = (key) => q('SELECT * FROM owner_discussions WHERE ticket_key=? ORDER BY id DESC LIMIT 20').all(key);
 export function updateDiscussion(id, patch) {
   const cols = Object.keys(patch).filter((k) => ['status', 'response', 'error', 'run_id', 'ended_at'].includes(k));

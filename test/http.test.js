@@ -28,7 +28,9 @@ test('isolated HTTP desk: UI, live events, settings, ticket decisions and deskto
   assert.equal(observed.meta.usage.perplexity_desktop.credits_remaining, 44985);
   assert.equal((await fetch(`${url}/api/settings`, { method: 'POST', body: '{}' })).status, 415);
   assert.equal((await request('POST', '/api/settings', { key: 'max_concurrent', value: '0' })).status, 400);
-  const html = await fetch(url); assert.match(html.headers.get('content-security-policy'), /default-src 'self'/); assert.match(await html.text(), /Reliability/);
+  const html = await fetch(url); assert.match(html.headers.get('content-security-policy'), /default-src 'self'/); assert.match(await html.text(), /\/v2\.js/);
+  assert.match(await (await fetch(`${url}/classic.html`)).text(), /Reliability/);
+  assert.equal((await fetch(`${url}/fonts/ibm-plex-sans-latin-400-normal.woff2`)).headers.get('content-type'), 'font/woff2');
   const abort = new AbortController(); const stream = await fetch(url + '/api/stream', { signal: abort.signal });
   const reader = stream.body.getReader(); await reader.read();
   const created = await request('POST', '/api/tickets', { title: 'HTTP acceptance fixture', description: 'Verify owner decisions', type: 'bug', priority: 'P1' }); assert.equal(created.status, 201);

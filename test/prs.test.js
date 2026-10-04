@@ -102,3 +102,11 @@ test('UI filters: active by default, by seat, tag and search', () => {
   assert.deepEqual(ui.filterRows(rows, { state: 'all', q: 'q-2' }).map((r) => r.number), [2]);
   assert.equal(ui.stateOf(rows[2]), 'approved');
 });
+
+test('PR console links only to https github.com', async () => {
+  const { safeGithubUrl } = await import('../public/prs.js');
+  assert.equal(safeGithubUrl('https://github.com/o/r/pull/1'), 'https://github.com/o/r/pull/1');
+  assert.equal(safeGithubUrl('javascript:alert(1)'), null);
+  assert.equal(safeGithubUrl('https://github.com.evil.io/o/r/pull/1'), null);
+  assert.equal(safeGithubUrl('http://github.com/o/r/pull/1'), null);
+});

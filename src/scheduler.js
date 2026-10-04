@@ -406,9 +406,11 @@ export function health() {
     queued: queued.length, discussions: store.pendingDiscussions().length, waiting: queued.filter((t) => !t.active_run).map((t) => {
       const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa' : t.status === 'review' ? requesterOf(t) : t.assignee || routeTicket(t);
       const chosen = selectionFor(seat);
-      const why = settings.paused === 'true' ? 'Desk paused' : t.after_key && store.getTicket(t.after_key)?.status !== 'done' ? `Waiting for ${t.after_key} to merge`
-        : !chosen.seat ? chosen.reason : setupHold(seat) ? `Setup retry after ${setupHold(seat).until}` : !agentIdle(seat) ? 'Seat busy' : budgetHeadroom(settings) < runner.runBudget(seat) ? 'Daily budget reached' : 'Ready for next scheduler tick';
-      return { key: t.key, seat, reason: why, engine: chosen.seat?.engine, fallback: chosen.fallback || false };
+      // `code` is the structured reason the UI classifies on; `reason` stays human-readable.
+      const [code, why] = settings.paused === 'true' ? ['paused', 'Desk paused'] : t.after_key && store.getTicket(t.after_key)?.status !== 'done' ? ['dependency', `Waiting for ${t.after_key} to merge`]
+        : !chosen.seat ? ['provider_hold', chosen.reason] : setupHold(seat) ? ['setup_retry', `Setup retry after ${setupHold(seat).until}`] : !agentIdle(seat) ? ['seat_busy', 'Seat busy']
+          : budgetHeadroom(settings) < runner.runBudget(seat) ? ['budget', 'Daily budget reached'] : ['tick', 'Ready for next scheduler tick'];
+      return { key: t.key, seat, code, reason: why, engine: chosen.seat?.engine, fallback: chosen.fallback || false };
     }) };
 }
 
@@ -915,7 +917,7 @@ export function ownerCreate(body) {
     priority: PRIORITY.test(body.priority) ? body.priority : 'P2', reporter: 'owner', source: 'human' });
 }
 
-export function ownerReply(key, text, mode = 'auto') {
+export function ownerReply(key, text, mode = 'auto', { expected_updated_at } = {}) {
   const t = store.getTicket(key);
   need(t, 'no such ticket');
   need(typeof text === 'string' && text.trim(), 'empty reply');
@@ -923,6 +925,9 @@ export function ownerReply(key, text, mode = 'auto') {
   need(['auto', 'discussion', 'answer', 'comment'].includes(mode), 'invalid message destination');
   const discussion = mode === 'discussion' || mode === 'auto' && /\b(discuss|debate|design review|architecture review)\b/i.test(text) && /\b(manager|principal|principals|team)\b/i.test(text);
   if (discussion) need(store.pendingDiscussions().length < 20, 'discussion queue is full');
+  // An answer resumes whatever hold the ticket is in now: it must be the hold the owner read (same stale guard as decisions).
+  if (!discussion && mode !== 'comment' && expected_updated_at && expected_updated_at !== t.updated_at)
+    throw Object.assign(new Error('The question changed. Read the latest ticket before answering.'), { status: 409 });
   store.addComment(key, 'owner', text);
   let request;
   if (discussion) {
@@ -984,7 +989,12 @@ export function ownerPatch(key, patch) {
   const t = store.getTicket(key);
   need(t, 'no such ticket');
   const p = {};
-  if (patch.status) { need(STATUSES.includes(patch.status), 'bad status'); p.status = patch.status; }
+  if (patch.status) {
+    need(STATUSES.includes(patch.status), 'bad status');
+    // Shipping is recorded by the merge (PR sync), never by a generic edit.
+    if (patch.status === 'done' && t.status !== 'done') throw Object.assign(new Error('Tickets become done when their PR merges; merge it from the PR console.'), { status: 409 });
+    p.status = patch.status;
+  }
   if (patch.priority) { need(PRIORITY.test(patch.priority), 'bad priority'); p.priority = patch.priority; }
   if (patch.assignee !== undefined) { need(!patch.assignee || ENGINEERS.includes(patch.assignee), 'bad assignee'); p.assignee = patch.assignee || null; }
   if (patch.complexity) { need(COMPLEXITIES.includes(patch.complexity), 'bad complexity'); p.complexity = patch.complexity; }

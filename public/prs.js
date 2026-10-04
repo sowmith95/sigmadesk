@@ -5,6 +5,11 @@ const st = {
   rows: null, meta: {}, loading: false, error: '', loadedAt: 0,
   f: JSON.parse((typeof globalThis.localStorage?.getItem === 'function' && localStorage.getItem('sd.prs.filters')) || '{"q":"","state":"active","seat":"","requester":"","tag":""}'),
 };
+/** Only https links to github.com are rendered as PR links. */
+export function safeGithubUrl(u) {
+  try { const x = new URL(String(u)); return x.protocol === 'https:' && x.hostname === 'github.com' ? x.href : null; } catch { return null; }
+}
+const drafts = {}; // per-PR field drafts survive the live refreshes that rebuild the sheet
 const saveFilters = () => typeof globalThis.localStorage?.setItem === 'function' && localStorage.setItem('sd.prs.filters', JSON.stringify(st.f));
 
 const STATE_LABEL = { draft: 'Draft', open: 'Open', approved: 'Approved', merged: 'Merged', closed: 'Closed' };
@@ -111,11 +116,14 @@ export function renderSheet(ctx) {
   const s = stateOf(p);
   const open = p.state === 'OPEN';
   const run = (path, body, ok) => act(async () => { await api('POST', `/api/prs/${p.number}/${path}`, body || {}); await load(ctx, true); }, ok);
-  const method = h('select', { 'aria-label': 'Merge method' }, ['squash', 'merge', 'rebase'].map((m) => h('option', { value: m }, m)));
-  const override = st.meta.busy_window ? h('input', { type: 'text', placeholder: `type: ${st.meta.override_phrase}`, 'aria-label': 'Market-hours override' }) : null;
-  const closeNote = h('input', { type: 'text', placeholder: 'Why close? (posted on the PR)', 'aria-label': 'Close comment' });
-  const reviewer = h('input', { type: 'text', placeholder: 'GitHub login or org/team', 'aria-label': 'Reviewer' });
-  const tagIn = h('input', { type: 'text', placeholder: 'add tag…', 'aria-label': 'Add tag' });
+  const d = drafts[p.number] ||= {};
+  const keep = (el, k) => { if (d[k] != null) el.value = d[k]; el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', () => { d[k] = el.value; }); return el; };
+  const method = keep(h('select', { 'aria-label': 'Merge method' }, ['squash', 'merge', 'rebase'].map((m) => h('option', { value: m }, m))), 'method');
+  const override = st.meta.busy_window ? keep(h('input', { type: 'text', placeholder: `type: ${st.meta.override_phrase}`, 'aria-label': 'Market-hours override' }), 'override') : null;
+  const closeNote = keep(h('input', { type: 'text', placeholder: 'Why close? (posted on the PR)', 'aria-label': 'Close comment' }), 'close');
+  const reviewer = keep(h('input', { type: 'text', placeholder: 'GitHub login or org/team', 'aria-label': 'Reviewer' }), 'reviewer');
+  const tagIn = keep(h('input', { type: 'text', placeholder: 'add tag…', 'aria-label': 'Add tag' }), 'tag');
+  const href = safeGithubUrl(p.url);
   const blockers = [p.mergeable === 'CONFLICTING' && 'conflicts with base', p.checks === 'failing' && 'CI failing', p.checks === 'pending' && 'CI running'].filter(Boolean);
   const body = [
     sh.banner ? h('div', { class: 'ask' }, h('b', {}, sh.banner.error ? `Approved on the desk, but GitHub said: ${sh.banner.error}` : '👍 Approved'),
@@ -130,10 +138,10 @@ export function renderSheet(ctx) {
       h('div', {}, h('span', {}, 'Requested by'), nameOf(p.requester)),
       h('div', {}, h('span', {}, 'Ticket'), p.key ? h('button', { class: 'linkish', type: 'button', title: p.key, onclick: () => openTicket(p.key) }, `${ctx.nameOf ? ctx.nameOf(p.key) : p.key} · ${p.key}`) : '—'),
       h('div', {}, h('span', {}, 'Reviews'), [...p.reviews.map((r) => `${r.who}: ${r.state.toLowerCase()}`), ...p.reviewers.map((r) => `${r}: requested`)].join(', ') || '—')),
-    h('div', { class: 'row-actions' }, h('a', { class: 'btn small', href: p.url, target: '_blank', rel: 'noopener' }, 'Open on GitHub ↗')),
+    href ? h('div', { class: 'row-actions' }, h('a', { class: 'btn small', href, target: '_blank', rel: 'noopener noreferrer' }, 'Open on GitHub ↗')) : null,
     h('div', { class: 'section-title' }, 'Tags'),
     h('div', { class: 'tags-edit' }, p.tags.map((t) => h('span', { class: 'chip-tag' }, `#${t} `, h('button', { class: 'linkish', type: 'button', 'aria-label': `remove ${t}`, onclick: run('tags', { remove: [t] }, 'tag removed') }, '×'))),
-      tagIn, h('button', { class: 'btn small', type: 'button', onclick: act(async () => { if (!tagIn.value.trim()) return; await api('POST', `/api/prs/${p.number}/tags`, { add: tagIn.value.split(',') }); await load(ctx, true); }, 'tagged') }, 'Add')),
+      tagIn, h('button', { class: 'btn small', type: 'button', onclick: act(async () => { if (!tagIn.value.trim()) return false; await api('POST', `/api/prs/${p.number}/tags`, { add: tagIn.value.split(',') }); d.tag = ''; await load(ctx, true); }, 'tagged') }, 'Add')),
     open ? [
       h('div', { class: 'section-title' }, 'Decide'),
       h('div', { class: 'pr-actions' },
@@ -143,14 +151,16 @@ export function renderSheet(ctx) {
         h('div', { class: 'warn' }, `⚠ Merging into ${st.meta.base || 'main'} deploys production.${blockers.length ? ` Blocked: ${blockers.join(', ')}.` : ''}`),
         h('div', { class: 'row-actions' }, method, override,
           h('button', { class: 'btn danger', type: 'button', disabled: blockers.length > 0, onclick: act(async () => {
-            if (!confirm(`Merge #${p.number} into ${st.meta.base || 'main'} (${method.value})? This deploys production.`)) return;
+            if (!confirm(`Merge #${p.number} into ${st.meta.base || 'main'} (${method.value})? This deploys production.`)) return false;
             await api('POST', `/api/prs/${p.number}/merge`, { method: method.value, override: override?.value || '' });
+            d.override = '';
             await load(ctx, true);
           }, 'merged') }, '🔀 Merge'))),
-      h('div', { class: 'row-actions' }, reviewer, h('button', { class: 'btn', type: 'button', onclick: act(async () => { if (!reviewer.value.trim()) return; await api('POST', `/api/prs/${p.number}/reviewer`, { login: reviewer.value.trim() }); await load(ctx, true); }, 'review requested') }, '👥 Add reviewer')),
+      h('div', { class: 'row-actions' }, reviewer, h('button', { class: 'btn', type: 'button', onclick: act(async () => { if (!reviewer.value.trim()) return false; await api('POST', `/api/prs/${p.number}/reviewer`, { login: reviewer.value.trim() }); d.reviewer = ''; await load(ctx, true); }, 'review requested') }, '👥 Add reviewer')),
       h('div', { class: 'row-actions' }, closeNote, h('button', { class: 'btn', type: 'button', onclick: act(async () => {
-        if (!confirm(`Close #${p.number} without merging?`)) return;
+        if (!confirm(`Close #${p.number} without merging?`)) return false;
         await api('POST', `/api/prs/${p.number}/close`, { comment: closeNote.value });
+        d.close = '';
         await load(ctx, true);
       }, 'closed') }, '🚫 Close PR')),
     ] : h('div', { class: 'empty' }, s === 'merged' ? `Merged ${p.merged_at ? new Date(p.merged_at).toLocaleString() : ''}` : 'Closed without merging.'),
