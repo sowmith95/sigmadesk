@@ -5,6 +5,7 @@ import * as store from './db.js';
 import * as advisors from './advisors.js';
 import * as council from './council.js';
 import * as runner from './runner.js';
+import * as packs from './context.js';
 import * as github from './github.js';
 import * as watch from './watch.js';
 import { notify } from './notify.js';
@@ -559,7 +560,7 @@ export async function deskAction(run, cmd, body = {}) {
   const agentId = run.agent_id;
   if (run.kind === 'council_review') need(false, 'council calls cannot invoke desk commands');
   if (run.kind === 'owner_discussion') {
-    need(['list', 'show', 'comment', 'consult', 'discussion-result'].includes(cmd), 'design discussions can only read, consult and respond');
+    need(['list', 'show', 'comment', 'consult', 'discussion-result', 'context-file'].includes(cmd), 'design discussions can only read, consult and respond');
     need(!body.key || body.key === run.ticket_key, 'discussion belongs to its original ticket');
   }
   if (PERMS[cmd]) need(PERMS[cmd].includes(agentId), `${agentById[agentId].role} cannot run "${cmd}"`);
@@ -594,6 +595,13 @@ export async function deskAction(run, cmd, body = {}) {
         const done = await advisors.runReview(r.id);
         return done.result || `Peer review failed: ${done.error}. Continue using the design evidence; do not retry this run.`;
       } catch (err) { return `Review brief #${r.id} saved; ${err.message}. Continue without another attempt this run.`; }
+    }
+    case 'context-file': {
+      // Perplexity seats: a file the model asked for, produced by the desk so the follow-up can be verified.
+      need(body.path || body.body, 'desk context-file <path>');
+      const out = packs.serveFile(run.id, run.cwd, String(body.path || body.body).trim());
+      ev(`fetched ${String(body.path || body.body).slice(0, 120)} for Perplexity`);
+      return out;
     }
     case 'show':
       need(ticket, 'no such ticket');
@@ -799,6 +807,12 @@ export async function deskAction(run, cmd, body = {}) {
         ev(`requested changes on ${ticket.key}`);
         github.flushComments();
         return 'Recorded. Stop now.';
+      }
+      // A Perplexity review only counts if the model saw the whole change (the desk checked what was sent).
+      if (String(run.model || '').startsWith('perplexity:')) {
+        const blocked = packs.acceptBlockers(packs.metaFor(run));
+        if (blocked) ev(`pass refused: ${blocked.slice(0, 200)}`);
+        need(!blocked, blocked);
       }
       const sha = await runner.headSha(runner.workspaceDir(ticket.key));
       need(!ticket.head_sha || sha === ticket.head_sha, 'HEAD moved since QA; reviewers must not commit');
