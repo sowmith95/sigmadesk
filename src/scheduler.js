@@ -1,7 +1,9 @@
 import * as productReview from './product-review.js';
 import crypto from 'node:crypto';
 import { config } from './config.js';
-import { agentById, ENGINEERS, PRINCIPALS, BUILDERS, AREAS, COMPLEXITIES, STATUSES, routeTicket, routeSlice, promptFor } from './team.js';
+import { agentById, ENGINEERS, PRINCIPALS, BUILDERS, AREAS, COMPLEXITIES, STATUSES, routeTicket, routeSlice, builderCandidates, promptFor } from './team.js';
+import * as assign from './assign.js';
+import * as teamStats from './team-stats.js';
 import * as store from './db.js';
 import * as advisors from './advisors.js';
 import * as council from './council.js';
@@ -23,7 +25,7 @@ import * as epicReview from './epic-review.js';
 import * as flow from '../public/flow.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
-import { selectionFor, pinnedSelection } from './dispatch.js';
+import { selectionFor, pinnedSelection, providerHealth } from './dispatch.js';
 
 // ---------------- publish guard ----------------
 import { globToRegExp } from './reviews.js';
@@ -73,6 +75,39 @@ export function requesterOf(t) {
 }
 
 const agentIdle = (id) => agentById[id]?.enabled !== false && store.getAgentState(id)?.status !== 'working';
+
+// ---------------- assignment ----------------
+// An explicit seat (--assign, owner edit) pins the task to it. A principal named for small or medium work that is not
+// high risk is routed to a builder instead: principals design and slice, they do not build.
+function explicitSeat(body) {
+  if (!body.assign || !ENGINEERS.includes(body.assign)) return null;
+  if (PRINCIPALS.includes(body.assign) && ['S', 'M'].includes(body.complexity) && body.risk !== 'high') return { seat: routeTicket({ ...body, risk: body.risk }), rerouted: body.assign };
+  return { seat: body.assign, pinned: true };
+}
+/** Who built this task and so keeps its rework (QA fixes, a branch with commits). */
+export const authorOf = (t) => t.builder || (t.head_sha || t.branch || t.qa_loops > 0 ? t.assignee : null);
+const balancedMode = (s = store.getSettings()) => s.assign_mode !== 'fixed';
+/** The seat a design or legacy pickup uses: the planned assignee if it can still work, else the routing rule. */
+const plannedSeat = (t) => (t.assignee && ENGINEERS.includes(t.assignee) && agentById[t.assignee].enabled !== false ? t.assignee : routeTicket(t));
+/** Launchable for a build: idle, its build engine available, no setup hold. Budget is checked by admission (go). */
+const launchableFor = (id) => agentIdle(id) && !!selectionFor(id, Date.now(), null, 'implement').seat && !setupHold(id);
+/**
+ * Balanced build decision for a todo task (src/assign.js decides; this gathers the facts). `overlay` carries the
+ * picks made earlier in the same tick so one tick does not hand every task to the same "least used" seat.
+ */
+export function buildDecision(t, { stats = teamStats.current(), overlay = {}, taken = new Set() } = {}) {
+  const wrote = authorOf(t);
+  const author = wrote && agentById[wrote]?.enabled !== false ? wrote : null; // a switched-off author hands rework back to the team
+  const candidates = builderCandidates(t);
+  const pool = [...new Set([...candidates, t.assignee, author].filter(Boolean))];
+  const launchable = new Set(pool.filter((id) => !taken.has(id) && launchableFor(id)));
+  const usage = Object.fromEntries(providerHealth().map((p) => [p.id, Math.max(Number(p.quota?.five_hour) || 0, 0)]));
+  const quota = Object.fromEntries(candidates.map((id) => [id, usage[selectionFor(id, Date.now(), null, 'implement').seat?.engine] || 0]));
+  const siblings = new Set(t.parent_key ? store.childrenOf(t.parent_key).filter((k) => k.key !== t.key && authorOf(k)).map(authorOf) : []);
+  const recent = Object.fromEntries(candidates.map((id) => [id, (stats.seats[id]?.builds_14d || 0) + (overlay[id] || 0)]));
+  return { candidates, author, ...assign.pick(t, { candidates, launchable, stats: stats.seats, team: stats.team, quota, siblings, author, recent,
+    names: Object.fromEntries(pool.map((id) => [id, agentById[id]?.name || id])) }) };
+}
 
 export function setStatus(key, status, extra = {}) {
   const before = store.getTicket(key)?.status;
@@ -306,7 +341,7 @@ function orphanedSlice(t) {
 function stillWanted(key, status, agentId) {
   const now = store.getTicket(key);
   const blocked = status === 'in_progress' && now && (now.owner_task || ancestorWaits(now) || (now.after_key && store.getTicket(now.after_key)?.status !== 'done'));
-  if (now?.status === status && !blocked && (!now.assignee || now.assignee === agentId || status !== 'in_progress')) return true;
+  if (now?.status === status && !blocked && (now.assignee === agentId || status !== 'in_progress')) return true;
   store.updateAgent(agentId, { status: 'idle', current_ticket: null, current_run: null });
   if (blocked && now.status === status) setStatus(key, 'todo', { active_run: null, progress_msg: now.owner_task ? 'your task' : 'waiting for its prerequisite' });
   else if (now?.active_run === -1) store.updateTicket(key, { active_run: null });
@@ -314,10 +349,10 @@ function stillWanted(key, status, agentId) {
   return false;
 }
 
-async function launchImplement(ticket, agentId, fence) {
+async function launchImplement(ticket, agentId, fence, reason = null) {
   store.updateAgent(agentId, { status: 'working', current_ticket: ticket.key, last_action: 'cloning workspace', last_action_at: store.now() });
-  store.logEvent({ agent_id: agentId, ticket_key: ticket.key, kind: 'pickup', text: `${agentById[agentId].role} picked up ${ticket.key}` });
-  setStatus(ticket.key, 'in_progress', { assignee: agentId, active_run: -1, progress: Math.max(2, ticket.progress || 0), progress_msg: 'cloning workspace' });
+  store.logEvent({ agent_id: agentId, ticket_key: ticket.key, kind: 'pickup', text: `${agentById[agentId].role} picked up ${ticket.key}${reason ? ` (${reason})` : ''}` });
+  setStatus(ticket.key, 'in_progress', { assignee: agentId, active_run: -1, ...(reason ? { assign_reason: reason } : {}), progress: Math.max(2, ticket.progress || 0), progress_msg: 'cloning workspace' });
   store.addContributor(ticket.key, agentId); // recorded at pickup: even an interrupted author never reviews this ticket
   let ws;
   try {
@@ -613,8 +648,12 @@ export function health() {
       if (researchReview.blocks(t)) return { key: t.key, code: 'research_review', reason: researchReview.reasonFor(t) };
       const review = productReview.current(t.key) || (t.parent_key && productReview.current(t.parent_key));
       if (review && (review.stale || review.status !== 'approved')) return { key: t.key, code: review.status === 'reviewing' && !review.stale ? 'product_review' : 'review_decision', reason: review.stale ? 'Product/design review is stale' : `Product/design review: ${review.status}` };
+      // A balanced build waits only when no fitting seat can take it: say for whom. Otherwise it names the seat that will.
+      const build = t.status === 'todo' && balancedMode(settings) && !PRINCIPALS.includes(plannedSeat(t)) && !t.owner_task ? buildDecision(t) : null;
       const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa'
-        : t.status === 'review' ? (t.review_stage === 'resolving' ? store.conflictJobsFor(t.key).at(-1)?.seat : reviews.enabled() ? reviews.jobFor(t)?.seat : requesterOf(t)) : t.assignee || routeTicket(t);
+        : t.status === 'review' ? (t.review_stage === 'resolving' ? store.conflictJobsFor(t.key).at(-1)?.seat : reviews.enabled() ? reviews.jobFor(t)?.seat : requesterOf(t)) : build?.order[0] || t.assignee || routeTicket(t);
+      if (build && !build.order.length && !(t.after_key && store.getTicket(t.after_key)?.status !== 'done') && !ancestorWaits(t) && settings.paused !== 'true')
+        return { key: t.key, seat: build.author || build.candidates[0] || null, code: build.candidates.length || build.author ? 'seat_busy' : 'no_seat', reason: build.reason };
       const chosen = selectionFor(seat);
       // `code` is the structured reason the UI classifies on; `reason` stays human-readable.
       const held = ancestorWaits(t);
@@ -754,7 +793,18 @@ export async function tick() {
     // 3. Engineers pick up groomed work by routing (area × complexity × risk).
     council.pump();
     slots = capacity(s) - workCount(); headroom = budgetHeadroom(s);
-    for (const t of store.ticketsByStatus('todo')) {
+    const balanced = balancedMode(s);
+    const stats = balanced ? teamStats.current() : null;
+    const overlay = {}, taken = new Set();
+    let todo = store.ticketsByStatus('todo');
+    // Balanced: within a priority, tasks only a few seats can build go first, so a flexible task does not take the
+    // one seat a specialist task needs (ticketsByStatus is already priority-then-age; the sort is stable).
+    if (balanced) {
+      const width = new Map(todo.map((t) => [t.key, builderCandidates(t).filter(agentIdle).length || 99]));
+      const pr = (t) => ({ P0: 0, P1: 1, P2: 2 }[t.priority] ?? 3);
+      todo = todo.map((t, i) => ({ t, i })).sort((a, b) => pr(a.t) - pr(b.t) || width.get(a.t.key) - width.get(b.t.key) || a.i - b.i).map((x) => x.t);
+    }
+    for (const t of todo) {
       if (slots <= 0) break;
       if (t.active_run) continue;
       if (features.holds(t)) continue; // a feature starts only through its approved plan
@@ -770,10 +820,21 @@ export async function tick() {
       if (productReview.required(t)) productReview.ensure(t);
       if (productReview.blocks(t)) continue;
       if (researchReview.blocks(t) || (parent && researchReview.blocks(parent))) continue; // a research proposal needs its second review first
-      const who = t.assignee && ENGINEERS.includes(t.assignee) && agentById[t.assignee].enabled !== false ? t.assignee : routeTicket(t);
-      if (!agentIdle(who)) continue;
-      if (PRINCIPALS.includes(who)) go(who, (f) => launchDesign(t, who, f), null, 'design');
-      else go(who, (f) => launchImplement(t, who, f), null, 'implement');
+      const who = plannedSeat(t);
+      // Design stays with the planned principal; fixed mode is the legacy rule: one seat, wait for it.
+      if (!balanced || PRINCIPALS.includes(who)) {
+        if (!agentIdle(who)) continue;
+        if (PRINCIPALS.includes(who)) go(who, (f) => launchDesign(t, who, f), null, 'design');
+        else go(who, (f) => launchImplement(t, who, f), null, 'implement');
+        continue;
+      }
+      // Balanced build: the best launchable seat; if admission refuses it (budget, provider), the next one.
+      const d = buildDecision(t, { stats, overlay, taken });
+      for (const seat of d.order) {
+        if (!go(seat, (f) => launchImplement(t, seat, f, d.reason), null, 'implement')) continue;
+        taken.add(seat); overlay[seat] = (overlay[seat] || 0) + 1;
+        break;
+      }
     }
     // 4. Manager grooms proposals (consulting principals inside the run); research proposals wait for their second review.
     const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run && !researchReview.blocks(t) && !features.holds(t));
@@ -970,10 +1031,12 @@ export async function deskAction(run, cmd, body = {}) {
       need(!researchReview.blocks(ticket), 'this research proposal awaits its independent second review; it cannot be groomed yet');
       need(COMPLEXITIES.includes(body.complexity), 'complexity S|M|L|XL required');
       need(AREAS.includes(body.area), `area one of ${AREAS.join('|')}`);
-      const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
+      const explicit = explicitSeat(body);
+      const assignee = explicit?.seat || routeTicket(body);
       const description = body.body ? `${ticket.description}\n\n## Groomed spec (Engineering Manager)\n${body.body}` : ticket.description;
       setStatus(ticket.key, 'todo', { complexity: body.complexity, area: body.area, priority: PRIORITY.test(body.priority) ? body.priority : ticket.priority,
-        assignee, description, risk: ['high', 'low'].includes(body.risk) ? body.risk : null, ...(body.title ? { title: body.title } : {}) });
+        assignee, assign_pinned: explicit?.pinned ? 1 : 0, description, risk: ['high', 'low'].includes(body.risk) ? body.risk : null, ...(body.title ? { title: body.title } : {}) });
+      if (explicit?.rerouted) store.addComment(ticket.key, 'system', `Principals design and slice; this ${body.complexity} task goes to ${agentById[assignee].name} instead of ${agentById[explicit.rerouted].name}.`);
       ev(`groomed ${ticket.key} → ${body.complexity}/${body.area}${body.risk === 'high' ? '/high-risk' : ''}, staffed ${agentById[assignee].role}`);
       github.createIssue(ticket.key);
       return `groomed; assigned to ${assignee}`;
@@ -1018,20 +1081,22 @@ export async function deskAction(run, cmd, body = {}) {
         const slice = store.createTicket({ title: body.title, description: body.body, type: parent.type === 'bug' ? 'bug' : 'task', status: 'todo', area: body.area,
           complexity: body.complexity, priority: parent.priority, assignee: body.assign || routeSlice(body), reporter: agentId, source: 'agent', parent_key: run.ticket_key });
         // The slicer is the context reviewer later; slices inherit the parent's risk.
-        store.updateTicket(slice.key, { designer: agentId, risk: parent.risk || null, ...(body.after ? { after_key: body.after } : {}) });
+        store.updateTicket(slice.key, { designer: agentId, risk: parent.risk || null, assign_pinned: body.assign ? 1 : 0, ...(body.after ? { after_key: body.after } : {}) });
         asOwnerTask(slice.key);
         ev(`sliced ${slice.key} (${body.complexity}) for ${ownerWhy ? 'the owner' : agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
         github.createIssue(slice.key);
         return `created ${slice.key} → ${ownerWhy ? 'owner' : slice.assignee}${gateNote}`;
       }
-      const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
+      const explicit = explicitSeat(body);
+      const assignee = explicit?.seat || routeTicket(body);
       const parentKey = body.parent || key;
       // A split's order is enforced, not just described: --after must name another task of the same feature.
       if (body.after) need(store.getTicket(body.after)?.parent_key && sameTree(body.after, parentKey) && body.after !== parentKey, '--after must name another task of the same feature');
       const t = store.createTicket({ title: body.title, description: body.body, type: body.type || 'task', status: 'todo', area: body.area,
         complexity: body.complexity, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', assignee, reporter: agentId, source: 'agent', parent_key: parentKey });
       const parentRisk = store.getTicket(parentKey)?.risk;
-      store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null, ...(body.after ? { after_key: body.after } : {}) });
+      store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null, assign_pinned: explicit?.pinned ? 1 : 0, ...(body.after ? { after_key: body.after } : {}) });
+      if (explicit?.rerouted) store.addComment(t.key, 'system', `Principals design and slice; this ${body.complexity} task goes to ${agentById[assignee].name} instead of ${agentById[explicit.rerouted].name}.`);
       asOwnerTask(t.key);
       ev(`created task ${t.key} for ${ownerWhy ? 'the owner' : agentById[assignee].role}${body.after ? ` after ${body.after}` : ''}`, t.key);
       github.createIssue(t.key);
@@ -1134,7 +1199,7 @@ export async function deskAction(run, cmd, body = {}) {
         store.addComment(ticket.key, agentId, `❌ **QA failed** (round ${loops})\n\n${body.body || ''}`);
         if (loops > config.limits.maxQaLoops) setStatus(ticket.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'QA failed repeatedly' });
         else setStatus(ticket.key, 'todo', { qa_loops: loops, progress: 50, progress_msg: 'fixing QA findings' });
-        ev(`QA failed ${ticket.key}`);
+        ev(`QA failed ${ticket.key}`); teamStats.invalidate();
         github.flushComments();
         return 'Recorded. Stop now.';
       }
@@ -1150,7 +1215,7 @@ export async function deskAction(run, cmd, body = {}) {
       need(!ticket.head_sha || sha === ticket.head_sha, `HEAD moved since submission (${sha.slice(0, 7)} ≠ ${String(ticket.head_sha).slice(0, 7)}); QA must not commit`);
       refresh.recordQa(ticket.key, sha);
       store.addComment(ticket.key, agentId, `✅ **QA passed** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
-      ev(`QA passed ${ticket.key}`);
+      ev(`QA passed ${ticket.key}`); teamStats.invalidate();
       const seat = requesterOf(ticket);
       if (reviews.enabled()) {
         // Publish the draft PR now (guard unchanged), then two sequential code reviews on this exact commit.
@@ -1510,7 +1575,13 @@ export function ownerPatch(key, patch) {
     p.status = patch.status;
   }
   if (patch.priority) { need(PRIORITY.test(patch.priority), 'bad priority'); p.priority = patch.priority; }
-  if (patch.assignee !== undefined) { need(!patch.assignee || ENGINEERS.includes(patch.assignee), 'bad assignee'); p.assignee = patch.assignee || null; }
+  if (patch.assignee !== undefined) {
+    need(!patch.assignee || ENGINEERS.includes(patch.assignee), 'bad assignee');
+    // Reassigning work that is running would leave two seats on one branch: stop it first (or wait).
+    if ((patch.assignee || null) !== t.assignee && t.active_run) throw Object.assign(new Error('This task is being worked on; wait for the run to finish before reassigning it'), { status: 409 });
+    p.assignee = patch.assignee || null;
+    p.assign_pinned = patch.assignee ? 1 : 0; // the owner chose this seat; clearing it lets the desk choose again
+  }
   if (patch.complexity) { need(COMPLEXITIES.includes(patch.complexity), 'bad complexity'); p.complexity = patch.complexity; }
   if (patch.area) { need(AREAS.includes(patch.area), 'bad area'); p.area = patch.area; }
   if (patch.title !== undefined || patch.description !== undefined) {

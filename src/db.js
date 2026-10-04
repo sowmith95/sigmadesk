@@ -315,7 +315,9 @@ function migrate() {
       research_program: 'TEXT', research_run: 'INTEGER', research_policy: 'TEXT', research_review: 'TEXT', research_generation: 'INTEGER DEFAULT 0',
       research_revisions: 'INTEGER DEFAULT 0', research_sources: 'TEXT',
       // a task only the owner can do (access no seat has): never dispatched to a seat
-      owner_task: 'INTEGER DEFAULT 0' },
+      owner_task: 'INTEGER DEFAULT 0',
+      // assignment: pinned to one seat (explicit --assign / owner edit), and why the desk picked the seat it did
+      assign_pinned: 'INTEGER DEFAULT 0', assign_reason: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     pr_outbox: { next_attempt_at: 'TEXT' },
@@ -331,6 +333,16 @@ function migrate() {
 }
 
 export const now = () => new Date().toISOString();
+/** Raw facts for team stats (src/team-stats.js): build runs since a date, every ticket's outcome, first merge per ticket. */
+export function assignmentFacts(since) {
+  return {
+    runs: db.prepare(`SELECT agent_id, ticket_key, kind, status, cost_usd, cost_estimated, started_at, ended_at FROM runs WHERE started_at >= ? AND agent_id IS NOT NULL`).all(since),
+    tickets: db.prepare(`SELECT key, status, builder, assignee, parent_key, area, complexity, risk, owner_task FROM tickets`).all(),
+    // The first QA verdict per ticket, as recorded by the QA seat ("QA passed KEY" / "QA failed KEY").
+    qa: db.prepare(`SELECT ticket_key, text, MIN(id) id FROM events WHERE kind = 'action' AND agent_id = 'qa' AND (text LIKE 'QA passed %' OR text LIKE 'QA failed %') AND ticket_key IS NOT NULL GROUP BY ticket_key`).all(),
+    merged: db.prepare(`SELECT ticket_key, MIN(ts) ts FROM events WHERE ticket_key IS NOT NULL AND kind = 'github' AND (text LIKE 'PR merged%' OR text LIKE '%Merged #%') GROUP BY ticket_key`).all(),
+  };
+}
 const q = (sql) => db.prepare(sql);
 export function transaction(fn) {
   if (transactionMessages) return fn(); // nested: part of the enclosing transaction (commits or rolls back with it)
@@ -362,6 +374,8 @@ export function settingDefaults() {
     auto_fallback: String(config.engines.autoFallback),
     // Which engine the Engineering Manager grooms on: 'codex' (default) or 'seat' (the manager seat's own engine).
     groom_engine: 'codex',
+    // How todo work finds a seat: 'balanced' (any idle seat that fits, scored by track record) or 'fixed' (one seat by rule).
+    assign_mode: 'balanced',
     // '' = not configured: research programs derive from config.research + the legacy pm_* rows. Saved JSON wins.
     research_programs: '',
   };
@@ -379,6 +393,7 @@ export function setSetting(key, value) {
     if (!String(value).trim() || !Number.isFinite(n) || n < min || n > max || (key !== 'daily_budget_usd' && !Number.isInteger(n)))
       throw Object.assign(new Error(`${key} must be ${key === 'daily_budget_usd' ? 'a number' : 'an integer'} from ${min} to ${max}`), { status: 400 });
   }
+  if (key === 'assign_mode' && !['balanced', 'fixed'].includes(String(value))) throw Object.assign(new Error('assign_mode must be balanced or fixed'), { status: 400 });
   if (key === 'groom_engine' && !['codex', 'seat'].includes(String(value))) throw Object.assign(new Error('groom_engine must be codex or seat'), { status: 400 });
   if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'draft_prs', 'team_confirmed', 'auto_fallback'].includes(key) && !['true', 'false'].includes(String(value)))
     throw Object.assign(new Error(`${key} must be true or false`), { status: 400 });
@@ -419,7 +434,7 @@ export function createTicket(t) {
   return ticket;
 }
 
-const TICKET_FIELDS = new Set(['owner_task', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
+const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
   'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key',
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
   'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base',

@@ -66,6 +66,22 @@ export function routeSlice({ area, complexity }) {
   return area === 'frontend' ? 'senior-fe' : 'senior-be';
 }
 
+/**
+ * Builders who can build a task, best fit first (balanced assignment). Builders only: principals design, never build,
+ * and risk never escalates here (a principal's slices inherit high risk and must stay buildable). Disabled seats are
+ * dropped; an empty list means nobody can build it right now (the task waits, never on a disabled seat).
+ */
+export function builderCandidates({ area, complexity, risk }) {
+  const enabled = (id) => agentById[id]?.enabled !== false;
+  const small = complexity === 'S', medium = complexity === 'M' || !complexity;
+  const juniorToo = small || (medium && risk === 'low');
+  let list;
+  if (area === 'db') list = ['dba', 'senior-be'];
+  else if (area === 'fullstack') list = [...(small ? ['junior'] : []), 'senior-be', 'senior-fe', ...(!small && juniorToo ? ['junior'] : [])];
+  else { const senior = area === 'frontend' ? 'senior-fe' : 'senior-be'; list = small ? ['junior', senior] : [senior, ...(juniorToo ? ['junior'] : [])]; }
+  return list.filter(enabled);
+}
+
 export function routeTicket({ area, complexity, risk }) {
   const enabled = (id) => agentById[id]?.enabled !== false;
   const pick = (...ids) => ids.find(enabled) || ids[ids.length - 1];

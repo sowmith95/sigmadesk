@@ -4,7 +4,7 @@ export interface Agent { id: string; name: string; role: string; bio?: string; s
 export interface Ticket { key: string; title: string; name?: string; description?: string; status: string; type?: string; priority?: string; area?: string | null; complexity?: string | null;
   assignee?: string | null; reporter?: string; source?: string; parent_key?: string | null; branch?: string | null; pr_url?: string | null; head_sha?: string | null; active_run?: number | null;
   updated_at?: string; created_at?: string; progress_msg?: string | null; issue_number?: number | null; qa_loops?: number; research_review?: string | null; research_program?: string | null;
-  research_generation?: number; after_key?: string | null; risk?: string | null; [k: string]: unknown }
+  research_generation?: number; after_key?: string | null; risk?: string | null; assign_pinned?: number; assign_reason?: string | null; [k: string]: unknown }
 export interface Run { id: number; agent_id: string; kind: string; model?: string; status?: string; ticket_key?: string | null; reserve_usd?: number; cost_usd?: number; started_at?: string; [k: string]: unknown }
 export interface DeskEvent { id: number; ts: string; kind: string; text: string; agent_id?: string | null; ticket_key?: string | null; run_id?: number | null; [k: string]: unknown }
 export interface Comment { id: number; ticket_key: string; author: string; body: string; ts: string }
