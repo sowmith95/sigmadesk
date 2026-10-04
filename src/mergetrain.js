@@ -290,16 +290,22 @@ export function resolverFor(t) {
 const RESOLVABLE = new Set(['review', 'ready_for_human']);
 /** An owner-triggered branch refresh that has not been published yet owns the branch (refresh.js). */
 const refreshPending = (key) => { const r = refresh.current(key); return !!r && r.status !== 'published'; };
-export async function onConflict(t, base, head, mt) {
+export async function onConflict(t, base, head, mt, { reservation = null } = {}) {
   if (!t || !RESOLVABLE.has(t.status)) return null; // in progress / QA / owner: checked again next cycle
-  if (refreshPending(t.key)) return null; // the owner's refresh is handling this branch
+  // The conflict job holds the ticket reservation until it is resolved: taken over from the caller's desk merge, kept
+  // from an earlier conflict job, or reserved now — synchronously, before any await.
+  const held = store.reservationOf(t.key);
+  let token = null;
+  if (reservation && held?.token === reservation) { store.transferReservation(t.key, reservation, 'train-resolve', 'merge-train conflict resolution'); token = reservation; }
+  else if (held?.kind === 'train-resolve') token = held.token;
+  else { const r = store.reserve(t.key, 'train-resolve', 'merge-train conflict resolution'); if (!r.ok) return null; token = r.token; }
+  const giveBack = () => { if (!reservation) store.releaseReservation(t.key, token, 'train-resolve'); else store.transferReservation(t.key, token, 'desk-merge', 'merge train'); };
+  if (refreshPending(t.key)) { giveBack(); return null; } // the owner's refresh is handling this branch
   const jobs = store.conflictJobsFor(t.key);
-  if (jobs.some((j) => j.status === 'running')) return null; // finish the current resolution first
+  if (jobs.some((j) => j.status === 'running')) return null; // finish the current resolution first (it holds the reservation)
   const files = mt.conflicts.map((c) => ({ path: c.path, kind: c.kind, stages: c.stages, messages: c.messages.slice(0, 3) }));
   const incoming = await incomingFor(base, head, files.map((f) => f.path)).catch(() => []);
   const seat = resolverFor(t) || t.builder || t.assignee; // nobody capped: the job waits (nextResolveJobs re-picks)
-  const claim = store.claimBranchUpdate(t.key, 'train', 'merge-train conflict resolution');
-  if (!claim.ok) return null; // someone else is rewriting this branch right now
   const { job, created } = store.createConflictJob({ ticket_key: t.key, pr_number: prNumber(t.pr_url), base_sha: base, head_sha: head, seat, files, incoming });
   if (!created) return job;
   for (const j of jobs) if (['pending', 'needs_owner'].includes(j.status)) store.updateConflictJob(j.id, { status: 'superseded' });
@@ -414,7 +420,8 @@ export async function finishResolution(t, job, head, dir, how) {
     store.updateConflictJob(job.id, { status: 'resolved', result_sha: head, note: how });
     store.addContributor(t.key, job.seat); // the resolver wrote code: they can never review this ticket
     store.supersedeReviews(t.key, null);
-    store.releaseBranchUpdate(t.key, 'train');
+    const held = store.reservationOf(t.key);
+    if (held?.kind === 'train-resolve') store.releaseReservation(t.key, held.token, 'train-resolve');
     say(t, `resolved:${job.id}`, `✅ **${nameOf(job.seat)} resolved the conflict** with ${describeIncoming(incoming)} (now \`${short(head)}\`): ${how}\n\nQA re-checks it next, then both reviewers re-confirm the resolution.`, head, job.seat);
     setStatus(t.key, 'qa', { head_sha: head, review_stage: null, reconfirm_from: job.head_sha, reconfirm_kind: 'resolution', reconfirm_base: job.base_sha,
       progress: 90, progress_msg: 'conflict resolved — QA re-checking' });
@@ -424,6 +431,13 @@ export async function finishResolution(t, job, head, dir, how) {
 }
 
 export function recover() {
+  // After a restart no merge call is in flight: a merge reservation without its persisted intent is released (an
+  // intent left behind is reconciled with GitHub, which then releases its reservation). Refresh and conflict
+  // reservations are durable on purpose.
+  const i = intentGet();
+  for (const r of store.listReservations()) {
+    if (['desk-merge', 'owner-merge', 'train-update'].includes(r.kind) && r.token !== i?.reservation && !journalGet(r.ticket_key)) store.releaseReservation(r.ticket_key, r.token);
+  }
   for (const j of store.openConflictJobs()) if (j.status === 'running') store.updateConflictJob(j.id, { status: 'pending', run_id: null });
 }
 
@@ -444,14 +458,23 @@ async function completeUpdate(t, j) {
     setStatus(t.key, 'qa', { head_sha: j.new, review_stage: null, reconfirm_from: j.old, reconfirm_kind: 'rebase', reconfirm_base: j.base,
       progress: 92, progress_msg: `updated onto ${config.project.baseBranch} — QA re-checking before merge` });
     journalSet(t.key, null);
-    store.releaseBranchUpdate(t.key, 'train');
   });
   github.flushOutbox();
   return { action: 'updated', head: j.new };
 }
 
 /** Bring a clean-but-behind PR up to date (rebase; squash-merged parent → rebase --onto). Head changes ⇒ QA + re-confirm. */
-export async function lazyUpdate(t, snap, { epoch = runner.currentEpoch() } = {}) {
+export async function lazyUpdate(t, snap, { epoch = runner.currentEpoch(), reservation = null } = {}) {
+  let own = null;
+  if (!reservation) { // standalone: reserve synchronously, before any await, and release when done
+    const r = store.reserve(t.key, 'train-update', 'merge-train update onto the base');
+    if (!r.ok) return { action: 'skip', reason: `another operation holds this PR (${r.holder.note || r.holder.kind})` };
+    own = r.token;
+  } else if (store.reservationOf(t.key)?.token !== reservation) return { action: 'skip', reason: 'the reservation for this PR was lost' };
+  try { return await lazyUpdateHeld(t, snap, epoch, own || reservation); }
+  finally { if (own) store.releaseReservation(t.key, own, 'train-update'); }
+}
+async function lazyUpdateHeld(t, snap, epoch, reservation) {
   const head = snap.heads.find((h) => h.t.key === t.key)?.head;
   if (!head) return { action: 'skip', reason: 'the PR branch is not on GitHub' };
   const j = journalGet(t.key);
@@ -466,11 +489,8 @@ export async function lazyUpdate(t, snap, { epoch = runner.currentEpoch() } = {}
   if (refreshPending(t.key)) return { action: 'skip', reason: 'an owner branch refresh is in progress' };
   if (config.mergeTrain?.updateWhenBehind === false) return { action: 'behind', reason: `the branch is behind ${config.project.baseBranch}; update it (CI must run on the combined code)` };
   const mt = await mergeTree(snap.base, head);
-  if (mt.status === 'conflict') { await onConflict(t, snap.base, head, mt); return { action: 'conflict' }; }
+  if (mt.status === 'conflict') { await onConflict(t, snap.base, head, mt, { reservation }); return { action: 'conflict' }; }
   if (mt.status === 'error') return { action: 'skip', reason: mt.error };
-  const claim = store.claimBranchUpdate(t.key, 'train', 'merge-train update onto the base');
-  if (!claim.ok) return { action: 'skip', reason: `another update of this branch is in progress (${claim.holder.note || claim.holder.who})` };
-  let pushed = false;
   const parent = t.after_key ? store.getTicket(t.after_key) : null;
   const dir = await runner.scratchClone(`update-${t.key}`, [`+${head}:refs/heads/work`, `+${snap.base}:refs/heads/sigmadesk-base`,
     ...(parent?.head_sha ? [`+${parent.head_sha}:refs/heads/sigmadesk-parent`] : [])]);
@@ -499,16 +519,14 @@ export async function lazyUpdate(t, snap, { epoch = runner.currentEpoch() } = {}
     const journal = { old: head, new: newHead, base: snap.base, how, incoming, at: store.now() };
     journalSet(t.key, journal);
     // The same lease push the owner's branch refresh uses: GitHub refuses it if the branch moved since we looked.
-    try { await runner.pushBranch(t.key, t.branch, newHead, { lease: head }); pushed = true; } catch (err) {
+    if (store.reservationOf(t.key)?.token !== reservation) return { action: 'stopped', reason: 'the reservation for this PR was lost' };
+    try { await runner.pushBranch(t.key, t.branch, newHead, { lease: head }); } catch (err) {
       journalSet(t.key, null);
       store.logEvent({ kind: 'github', ticket_key: t.key, text: `update push refused (the branch moved?): ${String(err.stderr || err.message).slice(0, 200)}` });
       return { action: 'raced' };
     }
     return await completeUpdate(t, journal);
-  } finally {
-    runner.removeScratch(`update-${t.key}`);
-    if (!pushed && !journalGet(t.key)) store.releaseBranchUpdate(t.key, 'train'); // nothing rewritten: free the claim
-  }
+  } finally { runner.removeScratch(`update-${t.key}`); }
 }
 
 // ---------------- the queue ----------------
@@ -545,6 +563,7 @@ export async function authorizeMerge(key, intent, ctx = {}) {
   const t = store.getTicket(key);
   const mine = intentGet();
   if (!mine || mine.at !== intent.at) fail('this merge is no longer the active merge intent');
+  if (!intent.reservation || store.reservationOf(key)?.token !== intent.reservation) fail('this merge does not hold the PR\'s reservation (another operation owns it)');
   if (ctx.expectedSha && intent.head && ctx.expectedSha !== intent.head) fail('the requested commit is not the one this merge was started for');
   if (t) {
     // Every merge of a desk ticket (owner too): the branch must not be in the middle of a rewrite, and the commit must
@@ -552,8 +571,6 @@ export async function authorizeMerge(key, intent, ctx = {}) {
     if (TERMINAL.has(t.status)) fail(`the ticket is ${t.status}`);
     const r = refresh.current(key);
     if (r && r.status !== 'published') fail('an owner branch refresh of this PR is in progress');
-    const claim = store.branchUpdateOf(key);
-    if (claim) fail(`the branch is being rewritten (${claim.note || claim.who})`);
     if (!t.head_sha || t.head_sha !== intent.head) fail('the ticket\'s commit changed since this merge started');
     if (store.inReviewFlow(key) && !(ctx.overridden || []).length) {
       if (t.qa_sha !== intent.head) fail('QA has not passed this exact commit');
@@ -582,12 +599,13 @@ export async function authorizeMerge(key, intent, ctx = {}) {
 export const activeIntentFor = (key) => { const i = intentGet(); return i && i.key === key ? i : null; };
 
 /** Persist the intent, the ticket's "merging" stage and (for deploying changes) the deploy lock in ONE transaction. */
-function beginMerge(key, n, head, dep, by, base, epoch = runner.currentEpoch()) {
+function beginMerge(key, n, head, dep, by, base, epoch = runner.currentEpoch(), reservation = null) {
   const at = new Date().toISOString();
-  const intent = { key, pr: n, head, base, deploys: !!dep?.deploys, by, at, epoch, token: crypto.randomBytes(6).toString('hex'),
+  const intent = { key, pr: n, head, base, deploys: !!dep?.deploys, by, at, epoch, token: crypto.randomBytes(6).toString('hex'), reservation,
     workflows: (dep?.workflows || []).map((w) => w.file) };
   store.transaction(() => {
     if (intentGet()) throw Object.assign(new Error('Not merged: another merge is still being confirmed with GitHub.'), { status: 409 });
+    if (!reservation || store.reservationOf(key)?.token !== reservation) throw Object.assign(new Error('Not merged: this PR is reserved by another operation.'), { status: 409 });
     if (intent.deploys) {
       const l = lockGet();
       if (l) throw Object.assign(new Error(`Not merged: the deploy of ${l.key || short(l.merge_sha)} is ${['running', 'merging'].includes(l.state) ? 'still running' : `${l.state} — clear the deploy hold after checking it`}.`), { status: 409 });
@@ -600,6 +618,7 @@ function beginMerge(key, n, head, dep, by, base, epoch = runner.currentEpoch()) 
 }
 function abortMerge(intent) {
   store.transaction(() => {
+    if (intent.reservation) store.releaseReservation(intent.key, intent.reservation);
     const l = lockGet();
     if (l && l.key === intent.key && l.state === 'merging' && l.intent_at === intent.at) lockSet(null);
     intentSet(null);
@@ -618,6 +637,7 @@ function mergedOk(intent, mergeSha) {
       else if (l.merge_sha !== mergeSha) store.kvSet('train:deploy-pending', JSON.stringify([...pendingDeploys(), entry].slice(-50)));
     }
     intentSet(null);
+    if (intent.reservation) store.releaseReservation(intent.key, intent.reservation);
   });
 }
 /** The merge call failed AFTER dispatch: GitHub may have merged. Keep the lock, mark unknown, reconcile later. */
@@ -670,8 +690,21 @@ function askOwnerForChecks() {
   store.updateTicket(t.key, { resume_status: 'done' });
 }
 
-/** Decide one approved ticket. allowMerge=false once this sweep already merged/updated something (serialized train). */
-export async function consider(t, { now = new Date(), snap = null, allowMerge = true, epoch = runner.currentEpoch() } = {}) {
+/**
+ * Decide one approved ticket. allowMerge=false once this sweep already merged/updated something (serialized train).
+ * The ticket reservation is taken synchronously as the very first step and held for the whole decision; an uncertain
+ * merge outcome keeps it until reconciliation, a conflict hands it to the resolution job.
+ */
+export async function consider(t, opts = {}) {
+  const r = store.reserve(t.key, 'desk-merge', 'merge train');
+  if (!r.ok) return { action: 'busy', reason: `${r.holder.note || r.holder.kind} in progress` };
+  try { return await considerHeld(t, { ...opts, reservation: r.token }); }
+  finally {
+    const i = intentGet();
+    if (!(i?.reservation === r.token && i.state === 'unknown')) store.releaseReservation(t.key, r.token, 'desk-merge');
+  }
+}
+async function considerHeld(t, { now = new Date(), snap = null, allowMerge = true, epoch = runner.currentEpoch(), reservation } = {}) {
   const ap = store.approvalsAt(t.key, t.head_sha);
   if (!ap.ok) return { action: 'skip', reason: 'approvals are not at the current commit (or a reviewer contributed code)' };
   const names = `${nameOf(ap.context.seat)} and ${nameOf(ap.independent.seat)}`;
@@ -702,7 +735,7 @@ export async function consider(t, { now = new Date(), snap = null, allowMerge = 
   // Integration evidence (fail closed): we must have just seen the base, and the head must already contain it, so the
   // CI we read ran on exactly what lands. Base movement after this point is caught by authorizeMerge's live check.
   if (!snap) return wait(`auto-merge waiting: no fresh view of ${config.project.baseBranch}`, 'queued');
-  const u = await lazyUpdate(t, snap, { epoch });
+  const u = await lazyUpdate(t, snap, { epoch, reservation });
   if (u.action !== 'current') return u.action === 'updated' ? { action: 'updated' } : wait(`auto-merge waiting: ${u.reason || u.action}`, u.action);
   const mt = await mergeTree(snap.base, t.head_sha);
   store.kvSet(`train:evidence:${t.key}`, JSON.stringify({ head: t.head_sha, base: snap.base, tree: mt.tree || null, at: now.toISOString() }));
@@ -710,7 +743,7 @@ export async function consider(t, { now = new Date(), snap = null, allowMerge = 
   if (!req.names.length && !(await prs.repoHasNoWorkflows())) { askOwnerForChecks(); return wait('auto-merge is off until you confirm which CI checks it must wait for', 'owner'); }
   const n = prNumber(t.pr_url);
   let intent;
-  try { intent = beginMerge(t.key, n, t.head_sha, dep, 'desk', snap.base, epoch); }
+  try { intent = beginMerge(t.key, n, t.head_sha, dep, 'desk', snap.base, epoch, reservation); }
   catch (err) { return wait(`auto-merge waiting: ${String(err.message).replace(/^Not merged: /, '').replace(/\.$/, '')}`, 'queued'); }
   const am = config.review.autoMerge || {};
   try {
@@ -738,6 +771,17 @@ export async function consider(t, { now = new Date(), snap = null, allowMerge = 
 export async function ownerMerge(number, opts, now = new Date()) {
   const n = Number(number);
   const t = store.listTickets().find((x) => prNumber(x.pr_url) === n && !TERMINAL.has(x.status));
+  // The ticket reservation comes first, synchronously, before any await: no refresh or train update can start
+  // between here and the end of this merge (or its reconciliation).
+  const key = t?.key || `PR#${n}`;
+  const res = store.reserve(key, 'owner-merge', 'owner merge');
+  if (!res.ok) throw Object.assign(new Error(`Not merged: this PR is busy (${res.holder.note || res.holder.kind}); wait for it to finish.`), { status: 409 });
+  let keep = false;
+  try { const out = await ownerMergeHeld(n, t, key, opts, now, res.token); return out; }
+  catch (err) { keep = intentGet()?.reservation === res.token && intentGet()?.state === 'unknown'; throw err; }
+  finally { if (!keep) store.releaseReservation(key, res.token, 'owner-merge'); }
+}
+async function ownerMergeHeld(n, t, key, opts, now, reservation) {
   let dep;
   if (t) dep = await deployInfo(t);
   else {
@@ -747,10 +791,9 @@ export async function ownerMerge(number, opts, now = new Date()) {
       : { deploys: true, workflows: [] };
   }
   const busy = !!dep.deploys && inBusyWindow(now);
-  const key = t?.key || `PR#${n}`;
   if (dep.deploys) await deployLock();
   // The intent is recorded for the whole call even for non-deploying merges: a branch refresh is refused meanwhile.
-  const intent = beginMerge(key, n, t?.head_sha || null, dep, 'owner', null);
+  const intent = beginMerge(key, n, t?.head_sha || null, dep, 'owner', null, runner.currentEpoch(), reservation);
   try {
     const out = await dispatch(intent, () => prs.merge(n, { ...opts, inBusyWindow: busy, actor: 'owner', preflight: (ctx) => authorizeMerge(key, intent, ctx) }));
     let mergeSha = null;
@@ -781,46 +824,31 @@ async function observeExternal(prev, next) {
 }
 
 /**
- * Learn required checks from a base-branch commit: SUCCESS check runs whose workflow also runs on pull requests (a
- * push-only deploy job never reports on a PR, so it must not become "required"), plus SUCCESS commit statuses and
- * checks from apps that are not Actions workflows. Each base commit is read once.
+ * Required checks are learned from PRESENCE on base-branch commits, not success: every check name reported on the
+ * last few base commits by a workflow that also runs on pull requests (plus commit-status contexts), whatever its
+ * state or conclusion — a suite that failed, was cancelled or is still running is still a suite a PR must pass.
+ * Push-only deploy jobs never report on a PR and are excluded. The last N base commits are re-read on every poll
+ * (re-runs add names); the set only grows; shrinking it is an owner edit.
  */
-export async function learnFromBase(sha, now = Date.now()) {
+export const LEARN_BASES = 5;
+export async function learnFromBase(sha) {
   if (!sha) return null;
-  // The last few base commits are re-polled (at most every 10 min each) until ALL their checks have completed; only
-  // then are their passing checks learned. A commit with anything pending/queued teaches nothing yet. Growth only.
-  const known = kvJsonList('ci:bases');
-  const bases = known.some((b) => b.sha === sha) ? known : [...known, { sha, polled: 0 }].slice(-5);
-  const out = [];
-  for (const b of bases) {
-    if (b.done || now - (b.polled || 0) < 10 * 60_000) continue;
-    b.polled = now;
-    const r = await learnCommit(b.sha);
-    if (r.complete) b.done = true;
-    out.push({ sha: b.sha, ...r });
-  }
+  const bases = [...kvList('ci:bases').filter((b) => b !== sha), sha].slice(-LEARN_BASES);
   store.kvSet('ci:bases', JSON.stringify(bases));
-  return out;
+  const learned = [];
+  for (const b of bases) learned.push(...await namesOnCommit(b));
+  prs.learnChecks(learned);
+  return [...new Set(learned)];
 }
-const kvJsonList = (k) => { try { return JSON.parse(store.kvGet(k) || '[]') || []; } catch { return []; } };
-async function learnCommit(sha) {
+async function namesOnCommit(sha) {
   const [{ runs, statuses }, wfRuns, wfs] = await Promise.all([prs.checksForCommit(sha), prs.runsForCommit(sha), workflowsAtBase().catch(() => null)]);
-  const pending = runs.some((r) => String(r.status || '').toLowerCase() !== 'completed')
-    || wfRuns.some((r) => String(r.status || '').toLowerCase() !== 'completed')
-    || statuses.some((x) => ['pending', 'expected'].includes(String(x.state).toLowerCase()));
-  if (pending) return { complete: false, learned: [] };
   const prWorkflow = (file) => {
     const text = wfs?.find((w) => w.file === file)?.text;
     const on = text ? workflows.parseWorkflow(text)?.on : null;
     return !on || 'pull_request' in on || 'pull_request_target' in on; // unknown = keep (fail closed)
   };
   const suiteFile = new Map(wfRuns.map((r) => [r.suite, r.path]));
-  const names = [
-    ...runs.filter((r) => String(r.conclusion).toUpperCase() === 'SUCCESS' && (!suiteFile.has(r.suite) || prWorkflow(suiteFile.get(r.suite)))).map((r) => r.name),
-    ...statuses.filter((x) => String(x.state).toUpperCase() === 'SUCCESS').map((x) => x.context),
-  ];
-  prs.learnChecks(names);
-  return { complete: true, learned: names };
+  return [...runs.filter((r) => !suiteFile.has(r.suite) || prWorkflow(suiteFile.get(r.suite))).map((r) => r.name), ...statuses.map((x) => x.context)].filter(Boolean);
 }
 
 let sweeping = null;

@@ -36,7 +36,8 @@ export function validationBlockers(key, head, base) {
     ? ['branch refresh requires fresh QA on this exact head and current base'] : [];
 }
 export function published(key, head) {
-  store.releaseBranchUpdate(key, 'refresh'); // the merge train may update this branch again
+  const r = current(key);
+  if (r?.reservation) store.releaseReservation(key, r.reservation, 'refresh'); // the branch is free for the merge train again
   return save(key, { status: 'published', published_head: head, remote_head: head });
 }
 
@@ -107,17 +108,30 @@ async function settle(key) {
     head: (await git(dir, ['rev-parse', 'HEAD'])).stdout.trim() });
 }
 
-export async function prepare(ticket) {
+/**
+ * `reservation`: the ticket reservation the caller took synchronously as its first step (ownerRefreshBase). Called
+ * without one (standalone/tests), prepare takes it itself before any await. It is held until the refreshed branch is
+ * published, or released here if preparation fails before any refresh state was saved.
+ */
+export async function prepare(ticket, { reservation = null } = {}) {
   if (!/^[A-Z][A-Z0-9]*-\d+$/.test(ticket.key) || !SHA.test(ticket.head_sha) || !ticket.branch || ticket.branch.startsWith('-')) fail('A submitted branch is required');
   const previous = current(ticket.key);
   if (previous && !['published', 'rebased'].includes(previous.status)) fail('A refresh is already pending; finish or inspect its preserved recovery clone');
-  // One branch rewriter at a time: the merge train's update/resolution and this refresh share a per-ticket claim.
-  const claim = store.claimBranchUpdate(ticket.key, 'refresh', 'owner branch refresh');
-  if (!claim.ok) fail(`The merge train is already updating this branch (${claim.holder.note || claim.holder.who}); wait for it to finish`);
-  try { return await prepareClaimed(ticket, previous); }
-  catch (err) { if (!['preparing', 'conflicts', 'rebased'].includes(current(ticket.key)?.status) || current(ticket.key)?.original_head !== ticket.head_sha) store.releaseBranchUpdate(ticket.key, 'refresh'); throw err; }
+  let token = reservation;
+  if (token) { if (store.reservationOf(ticket.key)?.token !== token) fail('The refresh no longer holds this ticket\'s reservation'); }
+  else {
+    const r = store.reserve(ticket.key, 'refresh', 'owner branch refresh');
+    if (!r.ok) fail(`This branch is busy (${r.holder.note || r.holder.kind}); wait for it to finish`);
+    token = r.token;
+  }
+  try { return await prepareClaimed(ticket, previous, token); }
+  catch (err) {
+    const st = current(ticket.key);
+    if (!(['preparing', 'conflicts', 'rebased'].includes(st?.status) && st?.reservation === token)) store.releaseReservation(ticket.key, token);
+    throw err;
+  }
 }
-async function prepareClaimed(ticket, previous) {
+async function prepareClaimed(ticket, previous, reservation) {
   // stageApproved extracts the exact submitted objects into the trusted publisher.
   await stageApproved(ticket.key, workspaceDir(ticket.key), ticket.head_sha);
   return withGitLock(async () => {
@@ -141,7 +155,7 @@ async function prepareClaimed(ticket, previous) {
     const manifest = Object.fromEntries(names.map((n) => [n, fingerprint(ws, n)]));
     const dirty = (await git(dir, [`--work-tree=${ws}`, 'diff', '--name-only', ticket.head_sha, '--'])).stdout.trim();
     if (dirty) fail(`Commit or preserve local edits before refresh: ${dirty.slice(0, 240)}`);
-    save(key, { status: 'preparing', original_head: ticket.head_sha, remote_head, base, branch: ticket.branch, conflicts: [], manifest, head: null, published_head: null });
+    save(key, { status: 'preparing', original_head: ticket.head_sha, remote_head, base, branch: ticket.branch, conflicts: [], manifest, head: null, published_head: null, reservation });
     store.kvSet(`refresh-qa:${key}`, 'null');
     try {
       await git(dir, ['branch', 'desk-original', ticket.head_sha]);

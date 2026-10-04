@@ -292,6 +292,7 @@ function migrate() {
 export const now = () => new Date().toISOString();
 const q = (sql) => db.prepare(sql);
 export function transaction(fn) {
+  if (transactionMessages) return fn(); // nested: part of the enclosing transaction (commits or rolls back with it)
   db.exec('BEGIN IMMEDIATE');
   transactionMessages = [];
   let result, messages;
@@ -715,22 +716,45 @@ export function updateConflictJob(id, patch) {
   const row = getConflictJob(id); announce({ type: 'conflict-job', data: row }); return row;
 }
 
-// ---------- per-ticket branch-update ownership ----------
-// Only one actor may rewrite a ticket's PR branch at a time: the owner's branch refresh (refresh.js) or the merge
-// train's lazy update / conflict resolution (mergetrain.js). Durable, so a restart keeps the claim.
-export function branchUpdateOf(key) { try { return JSON.parse(kvGet(`branch-update:${key}`) || 'null'); } catch { return null; } }
-export function claimBranchUpdate(key, who, note = '') {
+// ---------- ONE per-ticket reservation for every branch-mutating or merging operation ----------
+// Owner branch refresh, merge-train rebase / conflict resolution, owner merge and desk merge all take the SAME
+// reservation, synchronously, as their very first step (compare-and-set in one transaction), and hold it until they
+// have fully finished or rolled back. The merge dispatch gate only accepts a caller holding it.
+export function reservationOf(key) { try { return JSON.parse(kvGet(`reserve:${key}`) || 'null'); } catch { return null; } }
+export function reserve(key, kind, note = '') {
   return transaction(() => {
-    const cur = branchUpdateOf(key);
-    if (cur && cur.who !== who) return { ok: false, holder: cur };
-    kvSet(`branch-update:${key}`, JSON.stringify({ who, note, at: cur?.at || now() }));
-    return { ok: true };
+    const cur = reservationOf(key);
+    if (cur) return { ok: false, holder: cur };
+    const token = `${kind}:${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    kvSet(`reserve:${key}`, JSON.stringify({ token, kind, note, at: now() }));
+    return { ok: true, token };
   });
 }
-export function releaseBranchUpdate(key, who) {
-  const cur = branchUpdateOf(key);
-  if (cur && (!who || cur.who === who)) kvSet(`branch-update:${key}`, 'null');
+/** Hand a held reservation to another stage of the same operation (e.g. desk merge → conflict resolution). */
+export function transferReservation(key, token, kind, note = '') {
+  return transaction(() => {
+    const cur = reservationOf(key);
+    if (cur?.token !== token) return false;
+    kvSet(`reserve:${key}`, JSON.stringify({ ...cur, kind, note }));
+    return true;
+  });
 }
+export function releaseReservation(key, token, kind = null) {
+  return transaction(() => {
+    const cur = reservationOf(key);
+    if (!cur || cur.token !== token || (kind && cur.kind !== kind)) return false;
+    kvSet(`reserve:${key}`, 'null');
+    return true;
+  });
+}
+export function listReservations() {
+  db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
+  return q("SELECT key, value FROM kv WHERE key LIKE 'reserve:%' AND value <> 'null'").all()
+    .map((r) => { try { return { ticket_key: r.key.slice(8), ...JSON.parse(r.value) }; } catch { return null; } }).filter(Boolean);
+}
+/** A closed ticket (done/wontdo) can hold nothing. */
+export function clearReservation(key) { kvSet(`reserve:${key}`, 'null'); }
+export const branchUpdateOf = reservationOf; // back-compat name used by older call sites/tests
 
 // ---------- small durable key/value store (watch cursors etc.) ----------
 export function createDiscussion(ticketKey, question) {

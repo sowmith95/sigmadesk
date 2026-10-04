@@ -83,6 +83,7 @@ export function setStatus(key, status, extra = {}) {
   if (status !== before && status === 'needs_human') notify('needs_human', t, 'needs you');
   if (status !== before && status === 'ready_for_human') notify('ready_for_human', t, 'ready for your review');
   if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key); // clones are full copies now; free the disk
+  if (['done', 'wontdo'].includes(status)) store.clearReservation(key);
   if (t.parent_key) rollupParent(t.parent_key);
   return t;
 }
@@ -1106,10 +1107,13 @@ export async function ownerRefreshBase(key, { expected_updated_at } = {}) {
   if (t.active_run || store.unfinishedRuns().some((r) => r.ticket_key === key)) throw Object.assign(new Error('Wait for this ticket’s workers to finish before refreshing.'), { status: 409 });
   need(!['merging', 'merge_unknown'].includes(t.review_stage) && !mergetrain.activeIntentFor(key), 'A merge of this PR is in progress or being confirmed with GitHub; wait for it to settle');
   need(!store.conflictJobsFor(key).some((j) => ['pending', 'running'].includes(j.status)), 'The builder is resolving a merge conflict on this branch; wait for it to finish');
+  // The ticket reservation is taken before anything else (and before any await): no merge can start meanwhile.
+  const res = store.reserve(key, 'refresh', 'owner branch refresh');
+  if (!res.ok) throw Object.assign(new Error(`This PR is busy (${res.holder.note || res.holder.kind}); wait for it to finish.`), { status: 409 });
   store.updateTicket(key, { active_run: -1, status: 'needs_human', progress_msg: 'desk refreshing remote base' });
   try {
     if (store.getSettings().github_sync === 'true') await prs.assertRefreshable(prNumberOf(t.pr_url), t);
-    const r = await refresh.prepare(t);
+    const r = await refresh.prepare(t, { reservation: res.token });
     store.kvSet(`guard:${key}`, '');
     store.addComment(key, 'owner', `Approved desk-owned branch refresh. Original commit \`${r.original_head}\` preserved; remote lease \`${r.remote_head}\`; refreshed base \`${r.base}\`. Previous QA is historical. Final merge still requires owner review.`);
     store.addComment(key, 'system', refresh.instructions(r));
@@ -1127,6 +1131,7 @@ export async function ownerRefreshBase(key, { expected_updated_at } = {}) {
     github.flushComments();
     return { ticket: store.getTicket(key), refresh: refresh.publicState(key) };
   } catch (err) {
+    if (refresh.current(key)?.reservation !== res.token) store.releaseReservation(key, res.token); // nothing to keep
     store.updateTicket(key, { active_run: null, status: t.status, progress_msg: `Branch refresh held: ${store.redact(err.message).slice(0, 160)}` });
     throw err;
   }

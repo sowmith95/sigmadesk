@@ -45,6 +45,7 @@ const a = process.argv.slice(2); const d = ${JSON.stringify(ghDir)};
 fs.appendFileSync(${JSON.stringify(ghLog)}, JSON.stringify(a) + '\\n');
 const read = (f, def) => { try { return JSON.parse(fs.readFileSync(d + '/' + f, 'utf8')); } catch { return def; } };
 const out = (x) => { process.stdout.write(typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
+if (a[0] === 'pr' && a[1] === 'view' && !a.join(' ').includes('mergeCommit') && !a.includes('files') && fs.existsSync(d + '/slow-view')) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 900);
 if (a[0] === 'pr' && a[1] === 'view' && a.includes('files')) out(read('files.json', []));
 if (a[0] === 'pr' && a[1] === 'ready' && fs.existsSync(d + '/slow-ready')) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 900);
 if (a[0] === 'pr' && a[1] === 'merge') {
@@ -383,8 +384,9 @@ test('live gate right before dispatch: halt, Hold, risk, stop-all fence and a mo
   assert.match(r.reason, /stopped \(circuit breaker\)/);
   assert.equal(store.getTicket(t.key).review_stage, 'approved', 'rolled back to the queue');
   // each live condition re-read by authorizeMerge
-  const intent = { key: t.key, head: t.head_sha, by: 'desk', deploys: false, epoch: runner.currentEpoch(), at: 'x', base: snap.base };
-  store.kvSet('train:intent', JSON.stringify(intent)); // the gate only accepts the active intent
+  const held = store.reserve(t.key, 'desk-merge', 'test');
+  const intent = { key: t.key, head: t.head_sha, by: 'desk', deploys: false, epoch: runner.currentEpoch(), at: 'x', base: snap.base, reservation: held.token };
+  store.kvSet('train:intent', JSON.stringify(intent)); // the gate only accepts the active intent holding the reservation
   store.updateTicket(t.key, { review_stage: 'merging' });
   store.setSetting('paused', 'true');
   await assert.rejects(train.authorizeMerge(t.key, intent), /paused/);
@@ -399,7 +401,7 @@ test('live gate right before dispatch: halt, Hold, risk, stop-all fence and a mo
   landOnMain('notes/moved.txt', 'm\n', 'base moves after the CI was read');
   await assert.rejects(train.authorizeMerge(t.key, intent), /moved since its CI was read/);
   store.updateTicket(t.key, { review_stage: 'approved' });
-  store.kvSet('train:intent', 'null');
+  store.kvSet('train:intent', 'null'); store.releaseReservation(t.key, held.token);
   // without a fresh base snapshot the train fails closed
   r = await train.consider(store.getTicket(t.key), { now: SAT, snap: null });
   assert.match(r.reason, /no fresh view of main/);
@@ -521,7 +523,8 @@ test('the live gate re-checks halt AFTER its only await, right before dispatch',
   const t = await approvedPr('docs/late-halt.md');
   const snap = await train.watchBase();
   store.updateTicket(t.key, { review_stage: 'merging' });
-  const intent = { key: t.key, head: t.head_sha, by: 'desk', deploys: false, epoch: runner.currentEpoch(), at: 'y', base: snap.base };
+  const held = store.reserve(t.key, 'desk-merge', 'test');
+  const intent = { key: t.key, head: t.head_sha, by: 'desk', deploys: false, epoch: runner.currentEpoch(), at: 'y', base: snap.base, reservation: held.token };
   store.kvSet('train:intent', JSON.stringify(intent));
   const pending = train.authorizeMerge(t.key, intent); // now awaiting the remote base lookup
   store.setSetting('paused', 'true'); // halt lands during that await
@@ -531,7 +534,7 @@ test('the live gate re-checks halt AFTER its only await, right before dispatch',
   store.updateTicket(t.key, { merge_hold: 'late hold' });
   await assert.rejects(again, /on hold/);
   store.updateTicket(t.key, { merge_hold: null, review_stage: 'approved' });
-  store.kvSet('train:intent', 'null');
+  store.kvSet('train:intent', 'null'); store.releaseReservation(t.key, held.token);
 });
 
 test('required checks: a missing suite blocks; the auto list only grows; none ⇒ owner asked', async () => {
@@ -681,13 +684,13 @@ test('required checks are learned from base commits only (pull-request workflows
     { name: 'flaky', status: 'completed', conclusion: 'failure', suite: 11 }]);
   setGh('status.json', [{ context: 'ci/legacy', state: 'success' }]);
   await train.learnFromBase(snap.base);
-  assert.deepEqual(prs.requiredChecks().names.sort(), ['ci/legacy', 'unit-tests'], 'push-only deploy jobs and failures are not learned');
+  assert.deepEqual(prs.requiredChecks().names.sort(), ['ci/legacy', 'flaky', 'unit-tests'], 'push-only deploy jobs are not learned; a failing PR suite still is');
   // an owner merge that only ran lint teaches nothing
   const t = await approvedPr('docs/owner-lint.md');
   store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
-  prFor(t, { statusCheckRollup: [{ name: 'lint', conclusion: 'SUCCESS' }, { name: 'unit-tests', conclusion: 'SUCCESS' }, { name: 'ci/legacy', conclusion: 'SUCCESS' }] });
+  prFor(t, { statusCheckRollup: [{ name: 'lint', conclusion: 'SUCCESS' }, { name: 'unit-tests', conclusion: 'SUCCESS' }, { name: 'flaky', conclusion: 'SUCCESS' }, { name: 'ci/legacy', conclusion: 'SUCCESS' }] });
   await train.ownerMerge(7, { expectedSha: t.head_sha }, SAT);
-  assert.deepEqual(prs.requiredChecks().names.sort(), ['ci/legacy', 'unit-tests']);
+  assert.deepEqual(prs.requiredChecks().names.sort(), ['ci/legacy', 'flaky', 'unit-tests']);
   fs.rmSync(path.join(ghDir, `runs-${snap.base}.json`));
   prs.setRequiredChecks(['tests'], 'owner');
 });
@@ -699,14 +702,16 @@ test('owner branch refresh and the merge train never rewrite the same branch at 
   const t = await approvedPr('notes/claim.txt');
   landOnMain('notes/claim-other.txt', 'x\n', 'moves main (#395)');
   // the train holds the branch → a refresh is refused
-  assert.equal(store.claimBranchUpdate(t.key, 'train', 'merge-train update').ok, true);
-  await assert.rejects(refresh.prepare(store.getTicket(t.key)), /merge train is already updating this branch/);
-  store.releaseBranchUpdate(t.key, 'train');
-  // a refresh holds the branch → the train's lazy update and conflict jobs stay away
-  assert.equal(store.claimBranchUpdate(t.key, 'refresh', 'owner branch refresh').ok, true);
+  const a = store.reserve(t.key, 'train-update', 'merge-train update');
+  assert.equal(a.ok, true);
+  await assert.rejects(refresh.prepare(store.getTicket(t.key)), /branch is busy \(merge-train update\)/);
+  store.releaseReservation(t.key, a.token);
+  // a refresh holds the branch → the train's lazy update, conflict jobs and merges stay away
+  const b = store.reserve(t.key, 'refresh', 'owner branch refresh');
   const u = await train.lazyUpdate(store.getTicket(t.key), await train.watchBase());
-  assert.equal(u.action, 'skip'); assert.match(u.reason, /another update of this branch/);
-  store.releaseBranchUpdate(t.key, 'refresh');
+  assert.equal(u.action, 'skip'); assert.match(u.reason, /another operation holds this PR/);
+  assert.equal((await train.consider(store.getTicket(t.key), { now: SAT, snap: await train.watchBase() })).action, 'busy');
+  store.releaseReservation(t.key, b.token);
 });
 
 test('an owner-triggered refresh voids QA and both approvals exactly like a desk update', async () => {
@@ -721,7 +726,7 @@ test('an owner-triggered refresh voids QA and both approvals exactly like a desk
   const after = store.getTicket(t.key);
   assert.equal(after.status, 'todo'); assert.equal(after.head_sha, null); assert.equal(after.review_stage, null); assert.equal(after.qa_sha, null);
   assert.ok(store.listPrReviews(t.key).every((r) => r.state === 'superseded'), 'both approvals void');
-  assert.equal(store.branchUpdateOf(t.key).who, 'refresh', 'the refresh owns the branch until it is published');
+  assert.equal(store.reservationOf(t.key).kind, 'refresh', 'the refresh holds the PR reservation until it is published');
   assert.match(store.listOutbox(t.key).at(-1).body, /owner refreshed this branch.*approvals no longer count/s);
 });
 
@@ -760,32 +765,61 @@ test('owner merge vs refresh: no refresh during an owner merge, and a branch rew
   flag('slow-ready', true);
   p = train.ownerMerge(7, { expectedSha: u.head_sha }, SAT);
   await new Promise((r) => setTimeout(r, 300));
-  store.claimBranchUpdate(u.key, 'refresh', 'owner branch refresh');
+  assert.equal(store.reserve(u.key, 'refresh', 'owner branch refresh').ok, false, 'no refresh can reserve the PR during the merge call');
   store.supersedeReviews(u.key, null);
   store.updateTicket(u.key, { head_sha: null, qa_sha: null, status: 'todo' });
   await assert.rejects(p, /Not merged: (an owner branch refresh|the branch is being rewritten|the ticket's commit changed|QA has not passed)/);
   flag('slow-ready', false);
   assert.equal(merges().length, before + 1, 'the old commit was not dispatched');
   assert.equal(train.activeIntentFor(u.key), null, 'the intent was rolled back');
-  store.releaseBranchUpdate(u.key, 'refresh');
 });
 
-test('CI learning waits until every check on a base commit has completed, then adds what passed', async () => {
+test('required checks are learned by presence: a failed or cancelled suite that later passes is required; lint-only PRs are refused', async () => {
   const prs = await prsMod();
   prs.setRequiredChecks([], 'auto'); store.kvSet('ci:bases', '[]');
   const snap = await train.watchBase();
-  setGh(`runs-${snap.base}.json`, [{ path: '.github/workflows/pr.yml', status: 'in_progress', conclusion: null, id: 1, suite: 11 }]);
-  setGh('check-runs.json', [{ name: 'lint', status: 'completed', conclusion: 'success', suite: 11 }, { name: 'tests', status: 'in_progress', conclusion: null, suite: 11 }]);
+  setGh(`runs-${snap.base}.json`, [{ path: '.github/workflows/pr.yml', status: 'completed', conclusion: 'failure', id: 1, suite: 11 }]);
+  setGh('check-runs.json', [{ name: 'lint', status: 'completed', conclusion: 'success', suite: 11 }, { name: 'tests', status: 'completed', conclusion: 'failure', suite: 11 }]);
   setGh('status.json', []);
-  const t0 = Date.now();
-  await train.learnFromBase(snap.base, t0);
-  assert.deepEqual(prs.requiredChecks().names, [], 'nothing learned while tests are still running');
-  setGh(`runs-${snap.base}.json`, [{ path: '.github/workflows/pr.yml', status: 'completed', conclusion: 'success', id: 1, suite: 11 }]);
-  setGh('check-runs.json', [{ name: 'lint', status: 'completed', conclusion: 'success', suite: 11 }, { name: 'tests', status: 'completed', conclusion: 'success', suite: 11 }]);
-  await train.learnFromBase(snap.base, t0 + 60_000);
-  assert.deepEqual(prs.requiredChecks().names, [], 'not re-polled within 10 minutes');
-  await train.learnFromBase(snap.base, t0 + 11 * 60_000);
-  assert.deepEqual(prs.requiredChecks().names.sort(), ['lint', 'tests'], 'both learned once complete');
+  await train.learnFromBase(snap.base);
+  assert.deepEqual(prs.requiredChecks().names.sort(), ['lint', 'tests'], 'a failed suite is still a required suite');
+  setGh('check-runs.json', [{ name: 'lint', status: 'completed', conclusion: 'success', suite: 11 }, { name: 'tests', status: 'completed', conclusion: 'cancelled', suite: 11 }, { name: 'e2e', status: 'queued', conclusion: null, suite: 11 }]);
+  await train.learnFromBase(snap.base); // re-read every poll: the re-run adds e2e, nothing is ever removed
+  setGh('check-runs.json', [{ name: 'lint', status: 'completed', conclusion: 'success', suite: 11 }]);
+  await train.learnFromBase(snap.base);
+  assert.deepEqual(prs.requiredChecks().names.sort(), ['e2e', 'lint', 'tests']);
+  const sha = 'a'.repeat(40);
+  const lintOnly = { state: 'OPEN', headRefOid: sha, baseRefName: 'main', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'lint', conclusion: 'SUCCESS' }] };
+  assert.match(prs.authorizeMerge(lintOnly, { expectedSha: sha, required: prs.requiredChecks().names }).blockers.join(' '), /required checks tests, e2e have not passed.*never reported/);
   fs.rmSync(path.join(ghDir, `runs-${snap.base}.json`));
   prs.setRequiredChecks(['tests'], 'owner');
 });
+
+// ---------------- fifth verification round: one reservation for every branch-mutating or merging operation ----------------
+for (const file of ['docs/r5-docs.md', 'app/r5-app.py']) {
+  test(`round-5 repro (${file.startsWith('app/') ? 'deploying' : 'non-deploying'}): a failed owner merge, then a refresh; owner and desk retries during refresh's PR validation are refused`, async () => {
+    resetTrain();
+    const t = await approvedPr(file);
+    store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
+    for (const r of store.unfinishedRuns().filter((x) => x.ticket_key === t.key)) store.updateRun(r.id, { status: 'success', ended_at: store.now(), token: null });
+    const pr = { number: 7, title: `[${t.key}] x`, state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', headRefOid: t.head_sha, headRefName: t.branch, baseRefName: 'main', body: 'SigmaDesk', statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }] };
+    // an owner merge that fails before dispatch rolls back its intent and reservation
+    setGh('pr.json', { ...pr, mergeable: 'CONFLICTING' });
+    await assert.rejects(train.ownerMerge(7, { expectedSha: t.head_sha }, SAT), /conflicts/);
+    assert.equal(store.reservationOf(t.key), null);
+    // the refresh starts immediately and pauses inside its PR validation (gh pr view)
+    setGh('pr.json', pr);
+    landOnMain(`notes/${file.replace(/\W/g, '-')}-main.txt`, 'm\n', 'moves main');
+    flag('slow-view', true);
+    const refreshing = sched.ownerRefreshBase(t.key, {});
+    assert.equal(store.reservationOf(t.key).kind, 'refresh', 'reserved synchronously, before its first await');
+    await new Promise((r) => setTimeout(r, 200));
+    const before = merges().length;
+    await assert.rejects(train.ownerMerge(7, { expectedSha: t.head_sha }, SAT), /busy \(owner branch refresh\)/);
+    assert.equal((await train.consider(store.getTicket(t.key), { now: SAT, snap: null })).action, 'busy');
+    await refreshing;
+    flag('slow-view', false);
+    assert.equal(merges().length, before, 'nothing was dispatched');
+    assert.equal(store.reservationOf(t.key).kind, 'refresh', 'held until the refreshed branch is published');
+  });
+}
