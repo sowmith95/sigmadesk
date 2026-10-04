@@ -24,7 +24,7 @@ export function filterToRegExp(pattern) {
     }
     re += c.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
   }
-  return new RegExp(`^${re}$`);
+  return new RegExp(`^${re}$`, 's'); // dotAll: a path may contain a newline
 }
 
 /** Ordered evaluation: a later `!pattern` excludes what earlier patterns included, and a later pattern can re-include. */

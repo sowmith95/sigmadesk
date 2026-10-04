@@ -33,7 +33,7 @@ export function globToRegExp(glob) {
     else if (c === '?') re += '[^/]';
     else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
   }
-  return new RegExp(`^${re}$`);
+  return new RegExp(`^${re}$`, 's'); // dotAll: a path may contain a newline
 }
 
 /** Deterministic: a diff touching any configured trading/deploy path is high-risk. No file list = unknown. */

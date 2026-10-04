@@ -218,6 +218,7 @@ async function launchImplement(ticket, agentId, fence) {
   store.updateAgent(agentId, { status: 'working', current_ticket: ticket.key, last_action: 'cloning workspace', last_action_at: store.now() });
   store.logEvent({ agent_id: agentId, ticket_key: ticket.key, kind: 'pickup', text: `${agentById[agentId].role} picked up ${ticket.key}` });
   setStatus(ticket.key, 'in_progress', { assignee: agentId, active_run: -1, progress: Math.max(2, ticket.progress || 0), progress_msg: 'cloning workspace' });
+  store.addContributor(ticket.key, agentId); // recorded at pickup: even an interrupted author never reviews this ticket
   let ws;
   try {
     ws = await runner.ensureWorkspace(store.getTicket(ticket.key));
@@ -329,6 +330,7 @@ async function launchPrReview(job, fence) {
 async function launchRespond(job, fence) {
   const { seat } = job;
   store.updateAgent(seat, { status: 'working', current_ticket: job.key, last_action: 'reading the review', last_action_at: store.now() });
+  store.addContributor(job.key, seat);
   store.updateTicket(job.key, { active_run: -1 });
   let ws;
   try { ws = await runner.ensureWorkspace(store.getTicket(job.key)); } catch (err) {
@@ -353,7 +355,6 @@ async function launchResolve(job, fence) {
   if (!stillWanted(job.key, 'review', seat)) return;
   const t = store.getTicket(job.key);
   const j = store.getConflictJob(job.job.id);
-  if (!mergetrain.cappedSeat(seat)) { idle(); return; } // its engine switched (fallback) to one without a hard spend cap
   if (t.review_stage !== 'resolving' || j.status !== 'pending') { idle(); return; }
   if (prepared.clean) { // git merged it without help after all: no model run needed
     idle();
@@ -374,8 +375,16 @@ async function launchResolve(job, fence) {
   const prev = store.lastRunFor(t.key, seat, 'implement');
   if (mergetrain.shouldResume(prev, pack)) store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'system', text: 'resume estimated cheaper, but sessions are tied to the builder clone; using a fresh run in the isolated clone' });
   store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is resolving a merge conflict on ${t.key}` });
+  // Synchronous from this check to the run start (launch → startRun selects the provider without awaiting): the seat's
+  // engine must enforce the hard spend cap right now; onStart re-verifies the engine the run actually got.
+  if (!mergetrain.cappedSeat(seat)) { idle(); return; }
+  store.addContributor(t.key, seat);
   await launch({ fence, agentId: seat, kind: 'resolve', ticket: t, cwd: prepared.dir, prompt: mergetrain.resolvePrompt(t, j, pack),
-    onStart: (run) => store.updateConflictJob(j.id, { status: 'running', run_id: run.id, attempts }),
+    onStart: (run) => {
+      const [engine, ...m] = String(run.model || '').split(':');
+      if (!runner.capsSpend({ ...agentById[seat], engine, model: m.join(':') })) { runner.killRun(run.id, 'resolve needs an engine with a hard spend cap'); return; }
+      store.updateConflictJob(j.id, { status: 'running', run_id: run.id, attempts });
+    },
     outcome: () => store.getConflictJob(j.id).status !== 'running' });
   const after = store.getConflictJob(j.id);
   if (after.status === 'running') store.updateConflictJob(j.id, { status: 'pending', run_id: null }); // no outcome: retried (attempts counted)

@@ -27,12 +27,16 @@ export function parseEnv(text) {
 /** Secret values (≥ 8 chars), longest first so a value containing another is replaced whole. */
 export function secretValues() {
   const files = envFiles();
-  const sig = files.map((f) => { try { return `${f}:${fs.statSync(f).mtimeMs}`; } catch { return f; } }).join('|');
+  const sig = files.map((f) => { try { return `${f}:${fs.statSync(f).mtimeMs}`; } catch { return f; } }).join('|') + JSON.stringify(config.project?.env || {}).length;
   if (sig === cache.sig && Date.now() - cache.at < 60_000) return cache.values;
   const vals = new Set();
+  // Value-based: every value of 8+ characters in the target repo's .env files and in project.env (the env the desk
+  // gives agents) is treated as secret, whatever its name; plain numbers and booleans are skipped.
+  const consider = (v) => { const x = String(v ?? ''); if (x.length >= 8 && !/^(\d+(\.\d+)?|true|false)$/i.test(x)) vals.add(x); };
   for (const f of files) {
-    try { for (const [k, v] of parseEnv(fs.readFileSync(f, 'utf8'))) if (SECRET_NAME.test(k) && v.length >= 8) vals.add(v); } catch { /* unreadable: skip */ }
+    try { for (const [, v] of parseEnv(fs.readFileSync(f, 'utf8'))) consider(v); } catch { /* unreadable: skip */ }
   }
+  for (const v of Object.values(config.project?.env || {})) consider(v);
   for (const [k, v] of Object.entries(process.env)) if (SECRET_NAME.test(k) && v && v.length >= 8) vals.add(v);
   cache = { at: Date.now(), sig, values: [...vals].sort((a, b) => b.length - a.length) };
   return cache.values;

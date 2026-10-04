@@ -125,7 +125,9 @@ export function flushOutbox() {
         sent += 1;
       } catch (err) {
         const why = String(err.stderr || err.message).slice(0, 300);
-        const tries = store.listOutbox(o.ticket_key).find((x) => x.id === o.id)?.attempts || o.attempts + 1;
+        // Every failed try counts, including the duplicate-lookup step, so a broken lookup also backs off and escalates.
+        const tries = Math.max(store.listOutbox(o.ticket_key).find((x) => x.id === o.id)?.attempts || 0, o.attempts + 1);
+        store.updateOutbox(o.id, { attempts: tries });
         if (tries >= OUTBOX_MAX_ATTEMPTS) {
           store.updateOutbox(o.id, { status: 'dead', last_error: why });
           store.addComment(o.ticket_key, 'system', `🚨 A review comment could not be posted to the PR after ${tries} tries (${why.slice(0, 160)}). Merging stays blocked until it is on the PR; reply here to retry, or merge with an override reason.`);

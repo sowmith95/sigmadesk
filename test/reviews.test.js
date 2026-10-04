@@ -32,6 +32,7 @@ if (a[0] === 'api' && a[1] === '-X' && a[2] === 'POST') {
   process.stdout.write(String(id)); process.exit(0);
 }
 if (a[0] === 'api' && /issues\\/\\d+\\/comments$/.test(a[1])) {
+  if (fs.existsSync(d + '/fail-get')) { process.stderr.write('HTTP 500'); process.exit(1); }
   const marker = a[a.indexOf('--jq') + 1].match(/contains\\((".*")\\)/)[1];
   process.stdout.write(read('comments.json', []).filter((c) => c.body.includes(JSON.parse(marker))).map((c) => c.id).join('\\n')); process.exit(0);
 }
@@ -427,11 +428,13 @@ test('quoted file names (tabs, newlines) are classified on the real path', async
 test('broker credentials and configured secret values never reach a PR comment', () => {
   const out = store.sanitizeForGithub('APCA_API_SECRET_KEY=abcd1234efgh ALPACA_KEY: PKABCDEFGHIJKLMNOPQR POLYGON_API_KEY="zzzz9999yyyy" key PK1234567890ABCDEFGH');
   for (const leak of ['abcd1234efgh', 'PKABCDEFGHIJKLMNOPQR', 'zzzz9999yyyy', 'PK1234567890ABCDEFGH']) assert.ok(!out.includes(leak), leak);
-  fs.writeFileSync(path.join(repo, '.env'), 'MASSIVE_API_KEY=very-private-value-42\nPLAIN=not-secret-at-all\n');
+  fs.writeFileSync(path.join(repo, '.env'), 'MASSIVE_API_KEY=very-private-value-42\nBARE=bare-value-no-secret-name\nPLAIN=short\nPORT=12345678\n');
   const t = store.createTicket({ title: 'Secret check', status: 'review' });
-  const row = store.enqueueOutbox(t.key, `${t.key}:secret`, 'the reviewer quoted very-private-value-42 from the logs; not-secret-at-all stays');
-  assert.ok(!row.body.includes('very-private-value-42'));
-  assert.ok(row.body.includes('not-secret-at-all'));
+  config.project.env = { SESSION_HINT: 'env-given-to-agents-xyz' };
+  const row = store.enqueueOutbox(t.key, `${t.key}:secret`, 'quoted very-private-value-42, bare-value-no-secret-name and env-given-to-agents-xyz; short and 12345678 stay');
+  for (const v of ['very-private-value-42', 'bare-value-no-secret-name', 'env-given-to-agents-xyz']) assert.ok(!row.body.includes(v), v);
+  assert.ok(row.body.includes('short and 12345678 stay'), 'values are matched by value; short ones and plain numbers stay');
+  config.project.env = {};
   fs.rmSync(path.join(repo, '.env'));
 });
 
@@ -468,4 +471,24 @@ test('outbox: permanent failures escalate without starving other comments; an ow
   assert.equal(store.listOutbox(a.key)[0].status, 'pending');
   await github.flushOutbox();
   assert.equal(store.listOutbox(a.key)[0].status, 'sent');
+});
+
+test('paths containing newlines are matched by the risk, guard and workflow globs', async () => {
+  const wf = await import('../src/workflows.js');
+  assert.equal(reviews.classifyDiff(['.github/workflows/de\nploy.yml']).risk, 'high');
+  assert.ok(sched.guardReasons(['.github/workflows/de\nploy.yml'], 1, 'S').length);
+  assert.ok(wf.matchesFilters('app/a\nb.py', ['app/**']));
+  assert.equal(wf.deploysFor({ files: ['app/x\ny.py'], branch: 'main', workflows: [{ file: 'd.yml', text: 'on:\n  push:\n    paths: ["app/**"]\n' }] }).deploys, true);
+});
+
+test('outbox: a failed duplicate lookup counts as an attempt and backs off', async () => {
+  const t = store.createTicket({ title: 'Lookup fails', status: 'review' });
+  store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/13' });
+  const o = store.enqueueOutbox(t.key, `${t.key}:look`, 'x');
+  store.updateOutbox(o.id, { attempts: 1, status: 'failed' }); // a retry: the desk first looks for an earlier post
+  fs.writeFileSync(path.join(ghDir, 'fail-get'), '1');
+  await github.flushOutbox();
+  fs.rmSync(path.join(ghDir, 'fail-get'));
+  const row = store.listOutbox(t.key)[0];
+  assert.equal(row.attempts, 2); assert.ok(row.next_attempt_at > store.now());
 });
