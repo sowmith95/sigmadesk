@@ -17,6 +17,7 @@ import { Field } from '@/components/desk/Fields';
 import { Tag, Key, Empty, Section, SeatAvatar, type Tone } from '@/components/desk/Bits';
 import { Markdown } from '@/components/desk/Markdown';
 import { STAGE_LABEL } from '@/components/desk/Work';
+import { EpicTree, EpicProgress } from '@/components/desk/Epic';
 import { cn } from '@/lib/utils';
 import type { FeaturePlan, PlanTask, Ticket } from '@/types';
 
@@ -35,21 +36,6 @@ function standOf(t: Ticket, p: FeaturePlan | null): { stand: Stand; label: strin
   return { stand: 'unplanned', label: p?.status === 'discarded' ? 'Plan set aside' : 'Not planned yet', tone: 'neutral' };
 }
 
-function Progress({ keys }: { keys: string[] }) {
-  const kids = keys.map((k) => S.tickets.find((x: Ticket) => x.key === k)).filter(Boolean) as Ticket[];
-  if (!kids.length) return null;
-  const done = kids.filter((k) => k.status === 'done').length;
-  const closed = kids.filter((k) => k.status === 'wontdo').length;
-  const pct = Math.round(((done + closed) / kids.length) * 100);
-  return (
-    <div className="grid gap-1.5">
-      <div className="h-1.5 overflow-hidden rounded-full bg-secondary" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100} aria-label="Tasks settled">
-        <div className="h-full rounded-full bg-shipped transition-[width]" style={{ width: `${pct}%` }} /></div>
-      <span className="text-[13px] text-muted-foreground">{done} of {plural(kids.length, 'task')} shipped{closed ? `, ${closed} not doing` : ''}</span>
-    </div>
-  );
-}
-
 function FeatureCard({ t }: { t: Ticket }) {
   const p = planFor(t.key) as FeaturePlan | null;
   const s = standOf(t, p);
@@ -63,7 +49,7 @@ function FeatureCard({ t }: { t: Ticket }) {
         <span className="text-[13px] text-muted-foreground">{ago(t.updated_at)}</span></div>
       <h3 className="text-[17px] font-semibold leading-snug"><button type="button" className="text-left hover:underline" onClick={() => openFeature(t.key)}>{t.title}</button></h3>
       <p className="line-clamp-2 text-muted-foreground">{line.replace(/[#*`]/g, '')}</p>
-      {kids.length > 0 && <Progress keys={kids.map((k) => k.key)} />}
+      {kids.length > 0 && <EpicProgress epic={t.key} />}
       {people.length > 0 && <div className="flex items-center gap-1">{people.slice(0, 6).map((id) => <SeatAvatar key={id} id={id} />)}</div>}
     </article>
   );
@@ -151,6 +137,7 @@ function PlanTasks({ p, edits, setEdits, editable }: { p: FeaturePlan; edits: Re
               {x.after && <span className="text-muted-foreground">after “{titleOf(x.after)}”</span>}
               {k && <><span className="flex-1" />{k.assignee && <SeatAvatar id={k.assignee} />}<Tag tone={k.status === 'done' ? 'shipped' : k.status === 'needs_human' ? 'needs' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag><Key k={k.key} /></>}
             </div>
+            {k && S.tickets.some((c: Ticket) => c.parent_key === k.key) && <div className="pl-6"><EpicTree root={k.key} depth={1} /></div>}
             <details className="pl-8 text-[15px]"><summary className="cursor-pointer text-sm text-muted-foreground">What to build and how to check it</summary>
               <div className="mt-2 grid gap-2"><Markdown text={x.description} />{x.acceptance.length > 0 && <Bullets items={x.acceptance} />}</div></details>
           </li>
@@ -242,7 +229,7 @@ function FeatureDoc({ fkey }: { fkey: string }) {
           {t.issue_number && repo && <a className="inline-flex items-center gap-1 text-sm text-primary hover:underline" href={`https://github.com/${repo}/issues/${t.issue_number}`} target="_blank" rel="noopener noreferrer">GitHub #{t.issue_number}<ExternalLink className="size-3.5" aria-hidden /></a>}
           <span className="flex-1" /><Button variant="ghost" size="sm" onClick={() => openTicket(t.key)}>Conversation and details</Button></div>
         <h2 className="text-2xl font-semibold leading-tight md:text-[28px]">{t.title}</h2>
-        {kids.length > 0 && <div className="max-w-md"><Progress keys={kids.map((k) => k.key)} /></div>}
+        {kids.length > 0 && <EpicProgress epic={t.key} className="max-w-md" />}
       </div>
       <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         <article className="grid min-w-0 max-w-[72ch] gap-6 text-[16px] leading-relaxed">
@@ -260,7 +247,8 @@ function FeatureDoc({ fkey }: { fkey: string }) {
               <PlanTasks p={p!} edits={edits} setEdits={setEdits} editable={p?.status === 'ready'} />
             </DocSection>
           </>}
-          {extra.length > 0 && <DocSection title={plan ? 'Other tasks' : 'Tasks'}><ul className="grid gap-1.5">{extra.map((k) => <li key={k.key} className="flex items-center gap-2"><button type="button" className="min-w-0 flex-1 text-left hover:underline" onClick={() => openTicket(k.key)}>{nameOf(k)}</button>
+          {!plan && kids.length > 0 && <DocSection title="Tasks"><EpicTree root={t.key} /></DocSection>}
+          {plan && extra.length > 0 && <DocSection title="Other tasks"><ul className="grid gap-1.5">{extra.map((k) => <li key={k.key} className="flex items-center gap-2"><button type="button" className="min-w-0 flex-1 text-left hover:underline" onClick={() => openTicket(k.key)}>{nameOf(k)}</button>
             {k.after_key && <span className="text-xs text-muted-foreground">after {k.after_key}</span>}<Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag></li>)}</ul></DocSection>}
         </article>
         <Session t={t} p={p} history={(fd?.data?.history || []) as FeaturePlan[]} edits={edits} />

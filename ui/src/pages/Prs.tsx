@@ -11,6 +11,7 @@ import { AsyncButton } from '@/components/desk/AsyncButton';
 import { Panel } from '@/components/desk/Panel';
 import { ChoiceChips } from '@/components/desk/Choices';
 import { Tag, SeatAvatar, Empty } from '@/components/desk/Bits';
+import { Lineage } from '@/components/desk/Epic';
 import { cn } from '@/lib/utils';
 
 type Pr = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -60,7 +61,7 @@ export default function PrsPage() {
             <button key={p.number} type="button" onClick={() => openSheet({ type: 'pr', number: p.number })} className="grid w-full gap-1.5 px-4 py-3 text-left hover:bg-secondary md:grid-cols-[72px_96px_1fr_auto] md:items-center md:gap-4">
               <span className="font-mono text-sm text-muted-foreground">#{p.number}</span>
               <span><Tag tone={STATE_TONE[s]}>{STATE_LABEL[s]}</Tag></span>
-              <span className="grid min-w-0 gap-0.5">{p.key && <b className="truncate">{tname(p.key)}</b>}<span className="truncate text-sm text-muted-foreground">{p.title}</span>
+              <span className="grid min-w-0 gap-0.5">{p.key && <Lineage t={ticketByKey(p.key)} link={false} />}{p.key && <b className="truncate">{tname(p.key)}</b>}<span className="truncate text-sm text-muted-foreground">{p.title}</span>
                 {p.tags.length > 0 && <span className="flex flex-wrap gap-1">{p.tags.map((t: string) => <Tag key={t}>#{t}</Tag>)}</span>}</span>
               <span className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
                 {p.seat && <span className="inline-flex items-center gap-1.5"><SeatAvatar id={p.seat} />{names[p.seat] || p.seat}</span>}
@@ -104,6 +105,7 @@ export function PrPanel() {
       <dl className="grid grid-cols-[120px_1fr] gap-x-4 gap-y-2 rounded-lg border bg-card p-4 text-sm">
         <Fact k="CI">{p.checks}</Fact><Fact k="Mergeable">{p.mergeable || 'unknown'}</Fact><Fact k="Size"><span className="font-mono">+{p.additions} −{p.deletions}</span> in {p.files} files</Fact>
         <Fact k="Built by">{p.seat ? <span className="inline-flex items-center gap-1.5"><SeatAvatar id={p.seat} />{who(p.seat)}</span> : 'unknown'}</Fact><Fact k="Requested by">{who(p.requester)}</Fact>
+        {p.key && ticketByKey(p.key)?.parent_key && <Fact k="Part of"><Lineage t={ticketByKey(p.key)} /></Fact>}
         <Fact k="Ticket">{p.key ? <button type="button" className="text-primary hover:underline" onClick={() => openTicket(p.key)}>{tname(p.key)}</button> : 'none'}</Fact>
         {deskReviews && <Fact k="Desk review">{deskReviews}</Fact>}{mergeLabel && <Fact k="Auto-merge">{mergeLabel}</Fact>}
         <Fact k="GitHub reviews">{[...p.reviews.map((r: Pr) => `${r.who}: ${r.state.toLowerCase()}`), ...p.reviewers.map((r: string) => `${r}: requested`)].join(', ') || 'none'}</Fact>

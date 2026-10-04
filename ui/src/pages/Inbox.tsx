@@ -3,6 +3,7 @@ import { ago, clean, waited } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
 import { Tag, Key, SeatAvatar, Empty, Section } from '@/components/desk/Bits';
 import { KIND_LABEL, CiTag, Reviews, prReviewsOf, NowLine, cardFor, Clamp, DecisionButton, firstName, reasonText, WorkerLine } from '@/components/desk/Work';
+import { Lineage } from '@/components/desk/Epic';
 import { cn } from '@/lib/utils';
 import type { Board, BoardItem } from '@/types';
 
@@ -18,6 +19,7 @@ function DecisionCard({ it }: { it: BoardItem }) {
       <div className="flex flex-wrap items-center gap-2"><Tag tone="needs">{KIND_LABEL[it.kind || ''] || 'Needs you'}</Tag>
         {it.proposal_id && <Tag>Proposal #{it.proposal_id}</Tag>}{it.council_id && <Tag>Council #{it.council_id}</Tag>}{t && <Key k={t.key} />}
         <span className="flex-1" /><span className="text-[13px] text-muted-foreground">{waited(t?.updated_at || it.incident?.last_seen)}</span></div>
+      {t && <Lineage t={t} />}
       <h3 className="text-[17px] font-semibold leading-snug">{t ? <button type="button" className="text-left hover:underline" onClick={open}>{it.verb}</button> : it.verb}</h3>
       <div className="max-w-[68ch]"><Clamp id={`reason-${it.id}`} text={clean(reason)} /></div>
       <div className="flex flex-wrap items-center gap-2">
@@ -36,6 +38,7 @@ function MergeList({ items }: { items: BoardItem[] }) {
       {items.map((it) => { const t = it.ticket!; return (
         <article key={it.id} data-key={it.id} className="flex items-center gap-3 px-4 py-3">
           <div className="grid min-w-0 flex-1 gap-1.5">
+            <Lineage t={t} />
             <button type="button" className="text-left font-semibold hover:underline [overflow-wrap:anywhere]" onClick={() => openTicket(t.key, { decision: it.id })}>{it.name}</button>
             <div className="flex flex-wrap items-center gap-2 text-sm">{t.assignee && <span className="inline-flex items-center gap-1.5 text-muted-foreground"><SeatAvatar id={t.assignee} />{firstName(t.assignee)}</span>}
               <CiTag t={t} /><Reviews raw={prReviewsOf(t)} compact /><span className="text-muted-foreground">{ago(t.updated_at)}</span></div>
@@ -51,6 +54,7 @@ export function WorkingRow({ it }: { it: BoardItem }) {
   const card = cardFor(t);
   return (
     <button type="button" data-key={it.id} onClick={() => openTicket(t.key)} className="grid w-full gap-1.5 rounded-lg border bg-card p-3 text-left hover:bg-secondary">
+      <Lineage t={t} link={false} />
       <div className="flex items-center gap-2"><b className="min-w-0 flex-1 truncate">{it.name}</b>{it.stage && <Tag>{it.stage}</Tag>}</div>
       <WorkerLine it={it} card={card} />
       <NowLine card={card} compact />

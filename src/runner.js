@@ -407,7 +407,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   // A research job's requirements (web, connectors) travel into provider selection: fallback may not drop them.
   const requirements = job && RESEARCH_KINDS.has(kind) ? { web: job.web !== false, connectors: (job.connectors || []).map((c) => c.name) } : null;
   if (pinEngine && !['groom', 'feature_groom'].includes(kind)) throw new Error('Only grooming pins an engine per job');
-  const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : pinEngine ? pinnedSelection(agentId, pinEngine, kind) : selectionFor(agentId, Date.now(), requirements);
+  const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : pinEngine ? pinnedSelection(agentId, pinEngine, kind) : selectionFor(agentId, Date.now(), requirements, kind);
   if (!selected.seat) throw Object.assign(new Error(`${agentId}: ${selected.reason}`), { status: 409, providerUnavailable: true });
   const agent = selected.seat;
   if (ENGINES[agent.engine || 'claude']?.supports && !ENGINES[agent.engine || 'claude'].supports(kind)) throw Object.assign(new Error(`${agentId}: ${ENGINES[agent.engine].label} cannot run ${kind}`), { status: 409 });

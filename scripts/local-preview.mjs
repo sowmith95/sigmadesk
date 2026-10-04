@@ -85,6 +85,12 @@ for (const [status, title, assignee, priority, area, complexity] of tickets) {
   const ready = groomed(b.key, 'equity fill');
   const { tasks } = features.approve(b.key, { expected_revision: ready.revision });
   store.updateTicket(tasks[0], { status: 'done' });
+  // A principal split the writer task into slices: a nested epic, the second slice ordered after the first.
+  store.updateTicket(tasks[1], { status: 'in_progress', assignee: 'principal-be' });
+  const s1 = store.createTicket({ title: 'Normalize equity fills into the journal contract', status: 'needs_human', type: 'task', area: 'backend', complexity: 'M', assignee: 'senior-be', reporter: 'principal-be', source: 'agent', parent_key: tasks[1] });
+  store.updateTicket(s1.key, { resume_status: 'todo' }); store.addComment(s1.key, 'senior-be', '❓ **Question for the owner:** Should odd-lot fills be journaled, or skipped like the options journal?');
+  const s2 = store.createTicket({ title: 'Replay yesterday’s equity fills into the journal', status: 'todo', type: 'task', area: 'backend', complexity: 'S', assignee: 'junior', reporter: 'principal-be', source: 'agent', parent_key: tasks[1] });
+  store.updateTicket(s2.key, { after_key: s1.key });
 }
 store.logEvent({ kind: 'system', text: 'Isolated demo: all execution seats disabled. No production state or credentials are used.' });
 console.log(`Preview fixture: ${tmp}`);

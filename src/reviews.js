@@ -61,7 +61,7 @@ export function autoMergePolicy(t) {
 
 // ---------------- reviewer selection (frozen at assignment) ----------------
 const seatOn = (id) => !!agentById[id] && agentById[id].enabled !== false;
-const engineOfSeat = (id) => { try { return selectionFor(id).seat?.engine || agentById[id]?.engine || 'claude'; } catch { return agentById[id]?.engine || 'claude'; } };
+const engineOfSeat = (id) => { try { return selectionFor(id, Date.now(), null, 'pr_review').seat?.engine || agentById[id]?.engine || 'claude'; } catch { return agentById[id]?.engine || 'claude'; } };
 const AREA_SEATS = { frontend: ['principal-fe', 'senior-fe'], db: ['dba', 'principal-be'], backend: ['principal-be', 'senior-be', 'dba'], infra: ['principal-be', 'senior-be'] };
 
 /**

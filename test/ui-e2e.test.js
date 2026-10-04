@@ -186,3 +186,31 @@ test('features: a new feature is described in a dialog and lands on its page wai
   assert.deepEqual(errors, []);
   await page.close();
 });
+
+test('epics and tasks link both ways: crumbs on a task, a Tasks tab on its epic, and Work grouped by epic', { skip, timeout: 90_000 }, async () => {
+  const st = (await api('GET', '/api/state')).body;
+  const slice = st.tickets.find((t) => t.title.startsWith('Normalize equity'));
+  const sub = st.tickets.find((t) => t.key === slice.parent_key);
+  const root = st.tickets.find((t) => t.key === sub.parent_key);
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 1280, height: 900 });
+  const card = page.locator(`article[data-ticket="${slice.key}"]`);
+  assert.match(await card.getByLabel(/^Part of /).textContent(), /Equity fill-cost journal.*Write fills/, 'the Inbox card names its epic');
+  await card.locator('h3 button').click();
+  await page.waitForSelector('[data-panel]');
+  const crumbs = page.locator('[data-panel]').getByLabel(/^Part of /);
+  await crumbs.getByRole('button', { name: /Write fills/ }).click();
+  await page.waitForSelector(`[data-panel] [data-epic-tree="${sub.key}"]`);
+  assert.equal(await page.locator('[data-panel]').getByRole('tab', { name: /Tasks/ }).getAttribute('data-state'), 'active', 'an epic opens on its tasks');
+  assert.ok(await page.locator(`[data-panel] [data-task="${slice.key}"]`).count());
+  assert.match(await page.locator('[data-panel] [data-epic-tree]').first().textContent(), /waits for/);
+  await page.keyboard.press('Escape'); await page.waitForSelector('[data-panel]', { state: 'detached' });
+  await page.evaluate(() => { location.hash = '#/work'; });
+  await page.getByRole('radio', { name: 'By epic' }).click();
+  const epic = page.locator(`[data-epic="${root.key}"]`);
+  await epic.waitFor();
+  assert.ok(await epic.locator(`[data-task="${slice.key}"]`).count(), 'the nested slice appears inside its top-level epic');
+  assert.match(await epic.textContent(), /1 of 4 tasks shipped/);
+  assert.equal(await page.evaluate(() => localStorage.getItem('sd2.workGroup')), 'epic');
+  assert.deepEqual(errors, []);
+  await page.close();
+});
