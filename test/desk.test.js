@@ -273,7 +273,7 @@ test('security: QA verdicts need the per-run code; seats cannot act on tickets t
   const qaRun = fakeRun('qa', 'qa', t.key, { nonce: 'c0ffee1234' });
   await assert.rejects(sched.deskAction(qaRun, 'qa', { verdict: 'fail', body: 'x' }), /--code/);
   await assert.rejects(sched.deskAction(qaRun, 'qa', { verdict: 'fail', code: 'nope', body: 'x' }), /--code/);
-  await sched.deskAction(qaRun, 'qa', { verdict: 'fail', code: 'c0ffee1234', body: '1. broken' });
+  await sched.deskAction(qaRun, 'qa', { verdict: 'fail', code: 'c0ffee1234', reason: 'bug', body: '1. broken' });
   assert.equal(store.getTicket(t.key).status, 'todo');
   const a = store.createTicket({ title: 'a', status: 'triage' });
   const b = store.createTicket({ title: 'b', status: 'triage' });

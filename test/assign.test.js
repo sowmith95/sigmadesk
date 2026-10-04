@@ -157,12 +157,12 @@ test('the facts come from the real records: a GitHub merge counts as shipped, th
   const t = store.createTicket({ title: 'Merged on GitHub', type: 'bug', status: 'qa', area: 'backend', complexity: 'S', assignee: 'junior' });
   const run = store.createRun({ agent_id: 'junior', ticket_key: t.key, kind: 'implement', token: 'facts', model: 'claude:fixture' });
   store.updateRun(run.id, { status: 'success', cost_usd: 1.5, ended_at: store.now() });
-  store.logEvent({ kind: 'action', agent_id: 'qa', ticket_key: t.key, text: `QA failed ${t.key}` });
-  store.logEvent({ kind: 'action', agent_id: 'qa', ticket_key: t.key, text: `QA passed ${t.key}` });
+  store.recordQaVerdict({ ticket_key: t.key, verdict: 'fail', reason: 'bug', builder: 'junior' });
+  store.recordQaVerdict({ ticket_key: t.key, verdict: 'pass', builder: 'junior' });
   store.updateTicket(t.key, { pr_url: 'https://github.com/x/y/pull/9' });
   sched.prActions.merged(store.getTicket(t.key), { at: '2026-10-04T12:00:00Z' });
   const facts = store.assignmentFacts('2000-01-01');
-  assert.equal(facts.qa.find((q) => q.ticket_key === t.key).text, `QA failed ${t.key}`, 'the first verdict, not the latest');
+  assert.equal(facts.qa.find((q) => q.ticket_key === t.key).verdict, 'fail', 'the first verdict, not the latest');
   assert.equal(facts.merged.filter((m) => m.ticket_key === t.key).length, 1, 'one merge per ticket');
   const s = stats.current();
   assert.ok(s.seats.junior.S.shipped >= 1);
