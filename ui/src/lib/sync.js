@@ -51,6 +51,7 @@ export function applyDelta(S, m) {
       out.feature = m.data.ticket_key;
       break;
     }
+    case 'lessons': out.meta = true; break; // a lesson was proposed or decided: refresh the snapshot
     case 'epic-review': {
       const list = (S.meta.epic_reviews ||= []);
       const i = list.findIndex((r) => r.key === m.data.key);

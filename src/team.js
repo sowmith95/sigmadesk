@@ -388,14 +388,18 @@ Optional: --type bug|feature|task --priority P0-P3. Be fast; do not investigate 
 - Start with \`desk progress 5 "reading code"\` and report at each milestone (or keep a TodoWrite list).
 - Run only the tests relevant to your change (the playbook says how).
 - Commit as you go (git add / git commit). Do not push.
-- Finish with: desk submit "<summary: what changed, how you tested it, risks>". If QA failed before, fix every QA note.`;
+- Finish with: desk submit "<summary: what changed, how you tested it, risks>". If QA failed before, fix every QA note.
+- Fixing QA notes? If the mistake is one the team should not repeat, propose one sentence: desk lesson "<lesson>".`;
     case 'qa':
       return `${head}\nYou are the independent risk check for branch ${t.branch} (cwd is its clone, at the submitted commit).
 Review \`git log origin/${config.project.baseBranch}..HEAD\` and \`git diff origin/${config.project.baseBranch}...HEAD\`.
 Run the relevant tests (see playbook). Check each acceptance criterion. Do not modify or commit code.
 Verdict, exactly one (the --code proves the verdict comes from you, not from code you ran — never write it to a file):
   desk qa pass --code ${extra} "<what you verified, with test evidence>"
-  desk qa fail --code ${extra} "<numbered, actionable defects>"`;
+  desk qa fail --code ${extra} --reason bug|tests|spec|base|flaky [--lesson ID] "<numbered, actionable defects>"
+--reason is required on a fail: bug (the change is wrong), tests (missing or failing tests), spec (the ticket itself was
+unclear or contradictory; quote it), base (the base branch is broken, not this change), flaky (a test fails
+intermittently; say how you confirmed it). Pick bug when in doubt.`;
     case 'design':
       return `${head}\nDesign and delegate this ticket. Do NOT write or edit code (you have read-only tools).
 For a consequential or uncertain design, you may request ONE independent Architecture Review Board consultation:
@@ -475,7 +479,8 @@ For each point, exactly one:
 Push back when the reviewer is wrong or the change is out of scope; do not fix things just to end the conversation.
 Do not push, rebase or amend. When every blocking point has an answer, finish with:
   desk respond done "<one-paragraph summary for the reviewers>"
-If you committed fixes, QA re-checks them and both reviewers look again; if you only pushed back, the reviewer replies.`;
+If you committed fixes, QA re-checks them and both reviewers look again; if you only pushed back, the reviewer replies.
+If a fix you made is a mistake the team should not repeat, propose one sentence: desk lesson "<lesson>".`;
     }
     case 'resolve': {
       const x = extra; // { pack, base }

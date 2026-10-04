@@ -55,3 +55,25 @@ ones with newer or different models, make ratings transparent, and let the team 
 - Gaming: agents never see grades; QA reasons are given by QA (independent), not the builder.
 - Trials split work and lower throughput briefly; capped share and duration.
 - Model catalogs may not expose release dates; detection falls back to "model id not seen before".
+
+## Revision after independent Fable and Codex reviews (2026-10-04) — this release
+Both reviews: measure outcomes properly first; "inconclusive"/"too early", never a fake "in line"; compare with the
+rest of the team; lessons in prompts (not charters/provenance), owner-managed, measured by recurrence; defer trials
+(need a durable per-task execution profile), automatic proposals, capacity, newer-model detection, retro runs.
+
+Release A (now):
+1. **Structured QA verdicts** — table `qa_verdicts` (ticket, run, sha, verdict, reason, lesson_id, builder, model,
+   complexity, area, ts), written in the same step as the verdict. `desk qa fail --reason bug|tests|spec|base|flaky`
+   required for new failures; history backfilled from events as `unknown`. `--lesson ID` marks a repeat of an active
+   lesson. Attributable failures: bug, tests, unknown. spec/base/flaky are shown but excluded from the seat's rate.
+2. **Report cards** — per builder and size group: attributable first-try QA with n and Wilson 80% interval; band vs
+   the rest of the team (difference interval, Newcombe): "too early" under 15, "above"/"below" only when the
+   difference interval excludes 0, else "inconclusive"; excluded failures by reason; per model the seat ran on.
+   Assignment scoring uses the attributable rate. Builders only (other roles need their own measures).
+3. **Lessons v1** — table `lessons` (+ `lesson_exposures`). A builder proposes during a fix run:
+   `desk lesson "<≤300 chars>"` (max 2 per ticket, deduped). The owner approves/edits/rejects/retires on the Team
+   page (no Inbox item per lesson). Active lessons (≤5: same area first, then general; most-repeated first) are
+   appended to build prompts in ONE place (runner, for implement/respond/resolve), not the charter, with the author's
+   name; QA sees active lessons with ids to cite. Exposures recorded per run; repeats counted from QA `--lesson`.
+Release B (queued, needs its own review): owner-started model trials with durable per-task allocation and a
+per-job execution profile; monthly manager team note; queue-wait instrumentation before any capacity advice.

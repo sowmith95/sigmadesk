@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { config, publisherPath } from './config.js';
 import { agentById, charterFor, featureGroomCharter, epicReviewCharter, productReviewCharter, researchCharter, readOnlyReviewCharter, permissionsFor, promptFor, DENY_RULES, READ_ONLY_KINDS } from './team.js';
 import * as connectors from './connectors.js';
+import * as lessons from './lessons.js';
 import { ENGINES } from './engines/index.js';
 import { describeToolUse } from './engines/claude.js';
 import { selectionFor, reviewSelection, pinnedSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
@@ -422,6 +423,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   if (ENGINES[agent.engine || 'claude']?.supports && !ENGINES[agent.engine || 'claude'].supports(kind)) throw Object.assign(new Error(`${agentId}: ${ENGINES[agent.engine].label} cannot run ${kind}`), { status: 409 });
   const token = crypto.randomBytes(18).toString('hex');
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job });
+  // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
+  if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id });
   store.updateRun(run.id, { reserve_usd: engineOf(agent).budgetUsd(agent) });
   onStart?.(run);
   const ctx = { run, cwd, result: null, state: {}, presence: track };

@@ -6,6 +6,7 @@ import { Tag, SeatAvatar } from '@/components/desk/Bits';
 import { SwitchRow } from '@/components/desk/Fields';
 import { toast } from '@/store.js';
 import { TeamStats } from '@/components/desk/TeamStats';
+import { Lessons } from '@/components/desk/Lessons';
 import type { Agent, Run } from '@/types';
 
 export function TeamPage() {
@@ -21,6 +22,7 @@ export function TeamPage() {
           onChange={async (on) => { try { await api('POST', '/api/settings', { key: 'auto_fallback', value: String(on) }); await loadSnapshot(); toast('Fallback policy updated'); } catch (e) { toast((e as Error).message, true); } }} /></div>
       </div>
       <TeamStats />
+      <Lessons />
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
         {ordered.map((a) => {
           const route = S.meta.routing?.[a.id] || {};

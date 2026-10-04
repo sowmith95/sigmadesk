@@ -16,6 +16,7 @@ const USAGE = `usage:
   desk connector-propose --name N   (connector case on stdin; thinking seats; owner approval required)
   desk groom KEY --complexity S|M|L|XL --area A [--priority P] [--risk high] [--assign SEAT] [--title T]   (spec on stdin)
   desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT] [--after KEY|none] [--owner "<why only the owner can do it>"]   (body on stdin)
+  desk lesson "<one sentence the team should remember>"   (builders, while fixing their own work; the owner approves it)
   desk split KEY "<summary>"   (manager, after create-task: the parent stays open until its tasks are done)
   desk design   (design doc on stdin; principals)
   desk discussion-result   (response on stdin; manager in an owner discussion)
@@ -78,6 +79,7 @@ switch (cmd) {
   case 'respond': case 'resolve': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'incident': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'context-file': body.path = pos.join(' '); break;
+  case 'lesson': body.body = pos.join(' '); break;
   case 'groom': case 'reject': case 'split': case 'comment': case 'needs-human': case 'revise': takeKey(); body.body = pos.join(' '); break;
   default: body.body = pos.join(' ');
 }

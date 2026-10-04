@@ -287,6 +287,43 @@ CREATE TABLE IF NOT EXISTS connectors (
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- Every QA verdict as a fact: who built the change, on which model, what failed and why (report cards, assignment).
+CREATE TABLE IF NOT EXISTS qa_verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT NOT NULL,
+  run_id INTEGER,
+  sha TEXT,
+  verdict TEXT NOT NULL,          -- pass | fail
+  reason TEXT,                    -- fail: bug | tests | spec | base | flaky | unknown (history)
+  lesson_id INTEGER,              -- fail that repeats an active lesson
+  builder TEXT,
+  model TEXT,
+  complexity TEXT,
+  area TEXT,
+  ts TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS qa_verdicts_ticket ON qa_verdicts(ticket_key, id);
+-- Team lessons: a builder proposes one after a setback, the owner approves it, build prompts carry it.
+CREATE TABLE IF NOT EXISTS lessons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  area TEXT,                      -- null: every area
+  text TEXT NOT NULL,
+  source_ticket TEXT,
+  proposed_by TEXT,
+  status TEXT NOT NULL DEFAULT 'proposed', -- proposed | active | rejected | retired
+  decided_by TEXT,
+  decided_at TEXT,
+  note TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS lesson_exposures (
+  run_id INTEGER NOT NULL,
+  lesson_id INTEGER NOT NULL,
+  ticket_key TEXT,
+  ts TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (run_id, lesson_id)
+);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -300,6 +337,20 @@ export function openDb(file = config.dbPath) {
   const insSetting = db.prepare('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)');
   for (const [k, v] of Object.entries(settingDefaults())) insSetting.run(k, v);
   return db;
+}
+
+// QA verdicts before the qa_verdicts table existed: rebuilt once from the QA seat's events, reason unknown.
+export function backfillQaVerdicts() {
+  if (db.prepare('SELECT 1 FROM qa_verdicts LIMIT 1').get()) return;
+  const rows = db.prepare(`SELECT e.ticket_key, e.text, e.run_id, e.ts, t.builder, t.complexity, t.area FROM events e LEFT JOIN tickets t ON t.key = e.ticket_key
+    WHERE e.kind = 'action' AND e.agent_id = 'qa' AND (e.text LIKE 'QA passed %' OR e.text LIKE 'QA failed %') AND e.ticket_key IS NOT NULL ORDER BY e.id`).all();
+  const firstBuild = db.prepare("SELECT agent_id, model FROM runs WHERE ticket_key = ? AND kind = 'implement' AND started_at <= ? ORDER BY id DESC LIMIT 1");
+  const ins = db.prepare('INSERT INTO qa_verdicts(ticket_key, run_id, verdict, reason, builder, model, complexity, area, ts) VALUES (?,?,?,?,?,?,?,?,?)');
+  for (const r of rows) {
+    const b = firstBuild.get(r.ticket_key, r.ts);
+    const pass = /^QA passed/.test(r.text);
+    ins.run(r.ticket_key, r.run_id ?? null, pass ? 'pass' : 'fail', pass ? null : 'unknown', r.builder || b?.agent_id || null, b?.model || null, r.complexity ?? null, r.area ?? null, r.ts);
+  }
 }
 
 // Additive migrations for databases created by older versions.
@@ -330,20 +381,49 @@ function migrate() {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
     for (const [col, type] of Object.entries(cols)) if (!have.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
   }
+  backfillQaVerdicts();
 }
 
 export const now = () => new Date().toISOString();
+// ---------------- QA verdicts and lessons ----------------
+export const QA_REASONS = ['bug', 'tests', 'spec', 'base', 'flaky'];
+export function recordQaVerdict(v) {
+  return db.prepare('INSERT INTO qa_verdicts(ticket_key, run_id, sha, verdict, reason, lesson_id, builder, model, complexity, area) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run(v.ticket_key, v.run_id ?? null, v.sha ?? null, v.verdict, v.reason ?? null, v.lesson_id ?? null, v.builder ?? null, v.model ?? null, v.complexity ?? null, v.area ?? null);
+}
+/** The run that produced what QA judged: the builder's latest implement/respond run on the ticket. */
+export const lastBuildRun = (ticketKey, agentId) => db.prepare("SELECT * FROM runs WHERE ticket_key = ? AND agent_id = ? AND kind IN ('implement','respond','resolve') ORDER BY id DESC LIMIT 1").get(ticketKey, agentId) || null;
+export const qaVerdicts = (ticketKey) => db.prepare('SELECT * FROM qa_verdicts WHERE ticket_key = ? ORDER BY id').all(ticketKey);
+export const getLesson = (id) => db.prepare('SELECT * FROM lessons WHERE id = ?').get(id) || null;
+export function listLessons() {
+  return db.prepare(`SELECT l.*, (SELECT COUNT(*) FROM qa_verdicts v WHERE v.lesson_id = l.id) repeats,
+    (SELECT COUNT(DISTINCT ticket_key) FROM lesson_exposures x WHERE x.lesson_id = l.id) tasks FROM lessons l ORDER BY l.id DESC`).all();
+}
+export function insertLesson(l) {
+  const r = db.prepare('INSERT INTO lessons(area, text, source_ticket, proposed_by) VALUES (?,?,?,?)').run(l.area ?? null, l.text, l.source_ticket ?? null, l.proposed_by ?? null);
+  return getLesson(Number(r.lastInsertRowid));
+}
+export function updateLesson(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['area', 'text', 'status', 'decided_by', 'decided_at', 'note'].includes(k));
+  if (cols.length) db.prepare(`UPDATE lessons SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = ? WHERE id = ?`).run(...cols.map((c) => patch[c]), now(), id);
+  return getLesson(id);
+}
+export function recordExposures(runId, ticketKey, ids) {
+  const ins = db.prepare('INSERT OR IGNORE INTO lesson_exposures(run_id, lesson_id, ticket_key) VALUES (?,?,?)');
+  for (const id of ids) ins.run(runId, id, ticketKey ?? null);
+}
+
 /** Raw facts for team stats (src/team-stats.js): build runs since a date, every ticket's outcome, first merge per ticket. */
 export function assignmentFacts(since) {
   return {
     // Every run of each task touched in the window (a task's early runs count toward its cost and cycle time), plus
     // the window's own runs for busy time.
-    runs: db.prepare(`SELECT agent_id, ticket_key, kind, status, cost_usd, cost_estimated, started_at, ended_at FROM runs WHERE agent_id IS NOT NULL
+    runs: db.prepare(`SELECT agent_id, ticket_key, kind, status, model, cost_usd, cost_estimated, started_at, ended_at FROM runs WHERE agent_id IS NOT NULL
       AND (started_at >= ? OR ticket_key IN (SELECT DISTINCT ticket_key FROM runs WHERE started_at >= ? AND ticket_key IS NOT NULL))`).all(since, since),
     tickets: db.prepare(`SELECT key, status, builder, assignee, parent_key, area, complexity, risk, owner_task FROM tickets`).all(),
     // The first QA verdict per ticket, as recorded by the QA seat ("QA passed KEY" / "QA failed KEY").
-    qa: db.prepare(`SELECT e.ticket_key, e.text FROM events e JOIN (SELECT ticket_key, MIN(id) id FROM events WHERE kind = 'action' AND agent_id = 'qa'
-      AND (text LIKE 'QA passed %' OR text LIKE 'QA failed %') AND ticket_key IS NOT NULL GROUP BY ticket_key) f ON e.id = f.id`).all(),
+    // The first QA verdict per ticket (structured: reason, who built it and on which model).
+    qa: db.prepare(`SELECT v.* FROM qa_verdicts v JOIN (SELECT ticket_key, MIN(id) id FROM qa_verdicts GROUP BY ticket_key) f ON v.id = f.id`).all(),
     // A merge: on GitHub (PR sync), from the PR console, or by the merge train. A done ticket with a PR and no merge
     // event (older history) counts as shipped when it last changed.
     merged: db.prepare(`SELECT ticket_key, MIN(ts) ts FROM events WHERE ticket_key IS NOT NULL AND kind = 'github'

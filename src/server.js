@@ -2,6 +2,7 @@ import * as productReview from './product-review.js';
 import * as features from './features.js';
 import * as epicReview from './epic-review.js';
 import * as teamStats from './team-stats.js';
+import * as lessons from './lessons.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -77,6 +78,7 @@ export function snapshot() {
       feature_plans: features.summaries(),
       epic_reviews: epicReview.summaries(),
       team_stats: teamStats.current(),
+      lessons: store.listLessons(),
       groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
       research: research.status(settings), research_reviews: researchReview.summaries(),
       decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
@@ -178,6 +180,8 @@ async function ownerRoute(req, res) {
     return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), research_reviews: researchReview.forTicket(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'GET' && p === '/api/team/stats') return send(res, 200, teamStats.current());
+  if (req.method === 'GET' && p === '/api/lessons') return send(res, 200, store.listLessons());
+  if (req.method === 'POST' && (mm = m('^/api/lessons/(\\d+)$'))) return send(res, 200, lessons.decide(mm[1], await readBody(req)));
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)/events$'))) return send(res, 200, store.recentEvents({ agent_id: mm[1], limit: 300 }));
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)$'))) {
     // One meaning of "first-try QA" and "cost per shipped" everywhere: the team stats' (first QA verdict, measured cost).

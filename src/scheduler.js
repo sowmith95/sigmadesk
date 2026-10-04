@@ -4,6 +4,7 @@ import { config } from './config.js';
 import { agentById, ENGINEERS, PRINCIPALS, BUILDERS, AREAS, COMPLEXITIES, STATUSES, routeTicket, routeSlice, builderCandidates, promptFor } from './team.js';
 import * as assign from './assign.js';
 import * as teamStats from './team-stats.js';
+import * as lessons from './lessons.js';
 import * as store from './db.js';
 import * as advisors from './advisors.js';
 import * as council from './council.js';
@@ -921,7 +922,7 @@ const THINKERS = Object.keys(agentById).filter((id) => !BUILDERS.includes(id) &&
 const PERMS = {
   groom: ['manager'], split: ['manager'], 'create-task': ['manager', ...PRINCIPALS], reject: ['manager'], consult: ['manager'], 'connector-propose': THINKERS,
   design: PRINCIPALS, delegate: PRINCIPALS, 'peer-review': ['manager', ...PRINCIPALS], council: ['manager', ...PRINCIPALS],
-  route: ['support'], submit: ENGINEERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
+  route: ['support'], submit: ENGINEERS, lesson: BUILDERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
   review: ['manager', ...ENGINEERS], respond: ENGINEERS, resolve: ENGINEERS,
   'continue-rebase': BUILDERS,
@@ -960,6 +961,10 @@ export async function deskAction(run, cmd, body = {}) {
   const ev = (text, k = key) => store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: k, kind: 'action', text });
 
   switch (cmd) {
+    case 'lesson': {
+      need(BUILDERS.includes(agentId), 'builders propose lessons from their own work');
+      return lessons.propose({ run, ticket: store.getTicket(run.ticket_key), text: body.body });
+    }
     case 'continue-rebase': {
       need(run.kind === 'implement' && ticket?.key === run.ticket_key && ticket.status === 'in_progress', 'only the current implementer can finish a rebase');
       const r = await refresh.continueRebase(ticket.key);
@@ -1235,9 +1240,16 @@ export async function deskAction(run, cmd, body = {}) {
       need(ticket && ticket.key === run.ticket_key && ticket.status === 'qa' && run.kind === 'qa', 'ticket is not in QA');
       need(run.nonce && body.code === run.nonce, 'missing or wrong --code (it is in your instructions)');
       need(['pass', 'fail'].includes(body.verdict), 'verdict pass|fail');
+      // The verdict is also a fact for report cards: who built the change, on which model, and why it failed.
+      const builder = ticket.builder || ticket.assignee;
+      const fact = { ticket_key: ticket.key, run_id: run.id, sha: ticket.head_sha, builder, model: store.lastBuildRun(ticket.key, builder)?.model || null, complexity: ticket.complexity, area: ticket.area };
       if (body.verdict === 'fail') {
+        need(store.QA_REASONS.includes(body.reason), `--reason ${store.QA_REASONS.join('|')} required: bug (the change is wrong), tests (missing or failing tests), spec (the ticket was unclear), base (the base branch is broken), flaky (a test fails intermittently; say how you know)`);
+        const lesson = body.lesson ? store.getLesson(Number(String(body.lesson).replace(/^#/, ''))) : null;
+        need(!body.lesson || lesson?.status === 'active', `--lesson must name an active lesson id`);
+        store.recordQaVerdict({ ...fact, verdict: 'fail', reason: body.reason, lesson_id: lesson?.id ?? null });
         const loops = (ticket.qa_loops || 0) + 1;
-        store.addComment(ticket.key, agentId, `❌ **QA failed** (round ${loops})\n\n${body.body || ''}`);
+        store.addComment(ticket.key, agentId, `❌ **QA failed** (round ${loops}, ${body.reason}${lesson ? `, repeats lesson #${lesson.id}` : ''})\n\n${body.body || ''}`);
         if (loops > config.limits.maxQaLoops) setStatus(ticket.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'QA failed repeatedly' });
         else setStatus(ticket.key, 'todo', { qa_loops: loops, progress: 50, progress_msg: 'fixing QA findings' });
         ev(`QA failed ${ticket.key}`); teamStats.invalidate();
@@ -1255,6 +1267,7 @@ export async function deskAction(run, cmd, body = {}) {
       const sha = await runner.headSha(runner.workspaceDir(ticket.key));
       need(!ticket.head_sha || sha === ticket.head_sha, `HEAD moved since submission (${sha.slice(0, 7)} ≠ ${String(ticket.head_sha).slice(0, 7)}); QA must not commit`);
       refresh.recordQa(ticket.key, sha);
+      store.recordQaVerdict({ ...fact, sha, verdict: 'pass' });
       store.addComment(ticket.key, agentId, `✅ **QA passed** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
       ev(`QA passed ${ticket.key}`); teamStats.invalidate();
       const seat = requesterOf(ticket);
