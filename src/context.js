@@ -26,7 +26,9 @@ export function packSettings(c = config) {
   return {
     maxChars, // the whole outgoing message: pack + task + relay additions (violations kill the run)
     packChars,
-    pageChars: Math.max(2_000, packChars - 1_500), // one `desk context-file` page
+    // Hard cap on one `desk context-file` block (attributes and labels included).
+    pageChars: Math.max(2_000, Math.min(Number(p.pageChars) || packChars, packChars)),
+    pageRounds: Number(p.pageRounds) || 6, // follow-ups that only carry requested file pages
     remoteWaitMinutes: Number(p.remoteWaitMinutes) || 8,
     followupRounds: Number.isFinite(Number(p.followupRounds)) ? Number(p.followupRounds) : 1,
     deadlineSeconds: Number(p.prepareDeadlineSeconds) || 45,
@@ -124,14 +126,45 @@ const SCRUBBERS = [
   [/\bhttps:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks)\/\S+/g, () => '[redacted webhook]'],
   [/(\b[a-z][\w+.-]*:\/\/[^\s:/@]+:)([^@\s/]+)(@)/gi, (m, a, v, b) => (keep(v) ? m : `${a}[redacted]${b}`)],
 ];
+// High-confidence secrets: the ONLY content (besides this run's exact token/nonce) that stops a run. Generic credential
+// assignments are redacted from packs but never kill (`token = getToken()` is ordinary code). Public keys (pk_*) excluded.
+const HIGH_CONFIDENCE = [
+  /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[ \t]*\r?\n(?:[+ -]?[ \t]*[A-Za-z0-9+/=]{16,}[ \t]*\r?\n)+[+ -]?[ \t]*[A-Za-z0-9+/=]*[ \t]*\r?\n?[+ -]?[ \t]*-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----/g,
+  /\bsk-ant-[A-Za-z0-9_-]{20,}/g, /\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}/g, /\bgh[pousr]_[A-Za-z0-9]{36,}/g, /\bgithub_pat_[A-Za-z0-9_]{50,}/g,
+  /\bAKIA[0-9A-Z]{16}\b/g, /\bxox[baprs]-[A-Za-z0-9-]{10,}/g, /\bAIza[0-9A-Za-z_-]{35}\b/g, /\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{20,}/g,
+  /\bglpat-[A-Za-z0-9_-]{20}\b/g, /\bnpm_[A-Za-z0-9]{36}\b/g, /\bSG\.[\w-]{22}\.[\w-]{43}\b/g, /\bhf_[A-Za-z0-9]{34,}\b/g,
+];
+let configured = null;
+// Project formats (e.g. a broker's secret key shape) from engines.perplexity.secretPatterns, plus the exact values of
+// secret-named variables in the desk's own environment.
+function configuredSecrets() {
+  if (configured) return configured;
+  const patterns = [];
+  for (const src of config.engines?.perplexity?.secretPatterns || []) { try { patterns.push(new RegExp(src, 'g')); } catch { /* invalid: ignored */ } }
+  const values = Object.entries(process.env).filter(([k, v]) => /(_TOKEN|_SECRET|_KEY|PASSWORD|_DSN)$/i.test(k) && v && v.length >= 16).map(([, v]) => v);
+  configured = { patterns, values };
+  return configured;
+}
+export function resetSecretCache() { configured = null; }
+export function killReason(text, secrets = []) {
+  const t = String(text ?? '');
+  if (secrets.some((s) => s && String(s).length >= 6 && t.includes(String(s)))) return 'it contained this run\'s token or verdict code';
+  const c = configuredSecrets();
+  for (const re of [...HIGH_CONFIDENCE, ...c.patterns]) { re.lastIndex = 0; if (re.test(t)) { re.lastIndex = 0; return 'it contained a recognised private key or provider secret'; } }
+  if (c.values.some((v) => t.includes(v))) return 'it contained the value of one of the desk\'s secret environment variables';
+  return null;
+}
+
 export function scrub(text, secrets = []) {
   let t = String(text ?? '');
+  const c = configuredSecrets();
+  for (const re of [...HIGH_CONFIDENCE, ...c.patterns]) { re.lastIndex = 0; t = t.replace(re, '[redacted]'); }
+  for (const v of c.values) t = t.split(v).join('[redacted]');
   for (const [re, fn] of SCRUBBERS) t = t.replace(re, fn);
   t = store.redact(t);
   for (const w of secrets) if (w && String(w).length >= 6) t = t.split(String(w)).join('[redacted]');
   return t;
 }
-export const hasSecret = (text, secrets = []) => scrub(text, secrets) !== String(text ?? '');
 
 // ---------------- path policy ----------------
 const SECRET_FILE = /(^|\/)(\.env[^/]*|[^/]*secret[^/]*|[^/]*credential[^/]*|id_(rsa|dsa|ecdsa|ed25519)[^/]*|\.netrc|\.npmrc|\.pypirc|\.git-credentials|[^/]*\.(pem|key|p12|pfx|jks|keystore|kdbx|asc|gpg))$/i;
@@ -206,6 +239,9 @@ function capText(text, n, what) {
   return t.length > n ? `${t.slice(0, n)}\n[${what} cut here: ${t.length - n} more chars — not shown]` : t;
 }
 const isBinary = (s) => s.slice(0, 8000).includes('\0');
+// Null-prototype dictionaries: file names like `constructor` or `__proto__` are ordinary keys.
+const dict = (from) => Object.assign(Object.create(null), from || {});
+const own = (o, k) => (o && Object.hasOwn(o, k) ? o[k] : undefined);
 
 // ---------------- pack inputs ----------------
 const DECISION = /^(📐|💬|🗣|🚀|❌|✅|🔁|🤝|❓|🧭|🛑|⚠️|Closed:|Routed)/u;
@@ -282,9 +318,11 @@ export function splitHunks(patch) {
   return { header: lines.slice(0, first).join('\n'), hunks };
 }
 
-// Deterministic pages of at most `size` chars: whole hunks (or whole lines) where they fit; a unit larger than a page
-// is split on line boundaries and labelled, a single giant line is split and labelled. Nothing is dropped.
+// Deterministic pages of at most `size` chars each, labels included: whole hunks (or lines) where they fit; a larger
+// unit is split on line boundaries and a giant line into labelled chunks. Nothing is dropped.
 export function paginate(text, size, { diff = false } = {}) {
+  const unitMax = size - 60;
+  const chunk = unitMax - 80;
   const units = [];
   if (diff) {
     const { header, hunks } = splitHunks(text);
@@ -293,25 +331,31 @@ export function paginate(text, size, { diff = false } = {}) {
   } else units.push(...String(text).split('\n'));
   const pieces = [];
   for (const u of units) {
-    if (u.length <= size) { pieces.push(u); continue; }
-    const lines = u.split('\n');
+    if (u.length <= unitMax) { pieces.push(u); continue; }
+    const parts = [];
     let cur = [];
     let n = 0;
-    const parts = [];
-    for (let l of lines) {
-      while (l.length > size - 200) { parts.push([...cur, `${l.slice(0, size - 260)} [line continues in the next part]`].join('\n')); cur = []; n = 0; l = l.slice(size - 260); }
-      if (n + l.length + 1 > size - 120 && cur.length) { parts.push(cur.join('\n')); cur = []; n = 0; }
-      cur.push(l); n += l.length + 1;
+    const flush = () => { if (cur.length) { parts.push(cur.join('\n')); cur = []; n = 0; } };
+    for (const l of u.split('\n')) {
+      const segs = [];
+      if (l.length <= chunk) segs.push(l);
+      else for (let i = 0; i < l.length; i += chunk) segs.push(`${l.slice(i, i + chunk)}${i + chunk < l.length ? ' [line continues]' : ''}`);
+      for (const seg of segs) {
+        if (cur.length && n + seg.length + 1 > chunk) flush();
+        cur.push(seg);
+        n += seg.length + 1;
+      }
     }
-    if (cur.length) parts.push(cur.join('\n'));
-    parts.forEach((p, i) => pieces.push(`${p}\n[${diff ? 'hunk' : 'block'} part ${i + 1} of ${parts.length}]`));
+    flush();
+    parts.forEach((part, i) => pieces.push(`${part}\n[${diff ? 'hunk' : 'block'} part ${i + 1} of ${parts.length}]`));
   }
   const pages = [];
   let cur = [];
   let n = 0;
-  for (const p of pieces) {
-    if (n + p.length + 1 > size && cur.length) { pages.push(cur.join('\n')); cur = []; n = 0; }
-    cur.push(p); n += p.length + 1;
+  for (const piece of pieces) {
+    if (cur.length && n + piece.length + 1 > size) { pages.push(cur.join('\n')); cur = []; n = 0; }
+    cur.push(piece);
+    n += piece.length + 1;
   }
   if (cur.length || !pages.length) pages.push(cur.join('\n'));
   return pages;
@@ -331,7 +375,7 @@ function searchTerms(p, content) {
   }
   return [...new Set([...terms, ...names])];
 }
-async function references(sha, p, content, tree, hidden, cap, signal) {
+async function references(sha, p, content, tree, hidden, cap, signal, S) {
   const terms = searchTerms(p, content);
   const out = await tgit(['grep', '-n', '-I', '--no-color', '-F', '-w', ...terms.flatMap((t) => ['-e', t]), sha, '--'], { signal, allowFail: true }) || '';
   const hits = [];
@@ -345,16 +389,16 @@ async function references(sha, p, content, tree, hidden, cap, signal) {
   }
   const tests = [...new Set(hits.filter((h) => isTest(h.path)).map((h) => h.path))];
   return [`terms searched: ${terms.join(', ')}`,
-    ...hits.slice(0, cap).map((h) => `${h.path}:${h.line}: ${clipLine(h.text.trim(), 200)}`),
+    ...hits.slice(0, cap).map((h) => `${h.path}:${h.line}: ${clipLine(S(h.text.trim()), 200)}`),
     hits.length > cap ? `(showing ${cap} of ${hits.length} hits; the rest are not shown)` : `(${hits.length} hit${hits.length === 1 ? '' : 's'})`,
     withheld ? `(${withheld} hit(s) in secret, withheld or symlinked paths not shown)` : '',
     `tests that mention it: ${tests.length ? tests.join(', ') : 'none found'}`].filter(Boolean).join('\n');
 }
 
 const blob = (sha, p, signal) => tgit(['cat-file', 'blob', `${sha}:${p}`], { signal, allowFail: true });
-function excerpt(content, p, { line = null, symbols = [] } = {}) {
+function excerpt(content, p, { line = null, symbols = [] } = {}, S = (x) => x) {
   if (isBinary(content)) return `### ${p}\nbinary file — not shown`;
-  const lines = content.split('\n');
+  const lines = S(content).split('\n');
   let center = line;
   if (!center) for (const s of symbols) { const i = lines.findIndex((l) => l.includes(s)); if (i >= 0) { center = i + 1; break; } }
   const from = center ? Math.max(1, center - 40) : 1;
@@ -404,7 +448,7 @@ export async function buildPack({ kind, baseSha, headSha, cloneDir = '', inputs 
     review ? `head: ${headSha} (the QA-passed commit under review; diff = ${mergeBase.slice(0, 12)}…${headSha.slice(0, 12)})` : `head: ${headSha} (the base branch)`,
   ].join('\n')]);
   const rules = fs.existsSync(config.project.playbook) ? fs.readFileSync(config.project.playbook, 'utf8') : '';
-  if (rules.trim()) required.push(['Project rules (playbook)', capText(rules.trim(), 6000, 'playbook')]);
+  if (rules.trim()) required.push(['Project rules (playbook)', capText(S(rules.trim()), 6000, 'playbook')]);
   required.push(['Protected paths (a change here is held for the owner before publishing)', (config.project.protectedPaths || []).join('  ')]);
 
   // ---- changed files (review): withholding covers both sides of a rename ----
@@ -420,18 +464,18 @@ export async function buildPack({ kind, baseSha, headSha, cloneDir = '', inputs 
     const acc = acceptanceOf(ticket.description);
     required.push([`Ticket ${ticket.key} [${ticket.status}] ${ticket.title}`, [
       `type=${ticket.type} priority=${ticket.priority} area=${ticket.area || '-'} complexity=${ticket.complexity || '-'} assignee=${ticket.assignee || '-'} reporter=${ticket.reporter || '-'} branch=${ticket.branch || '-'} (frozen text sha256 ${sha256(`${ticket.title}\n${ticket.description}`).slice(0, 12)})`,
-      `\n#### Acceptance criteria\n${acc ? capText(acc, 4000, 'acceptance criteria') : '(none written as a separate section; judge against the description)'}`,
-      `\n#### Description\n${capText(ticket.description, 12000, 'description')}`,
+      `\n#### Acceptance criteria\n${acc ? capText(S(acc), 4000, 'acceptance criteria') : '(none written as a separate section; judge against the description)'}`,
+      `\n#### Description\n${capText(S(ticket.description), 12000, 'description')}`,
     ].join('\n')]);
     named.push(...namedRefs(`${ticket.title}\n${ticket.description}`));
     comments.forEach((c, i) => {
       const decision = DECISION.test(c.body) || c.author === 'owner';
-      items.push({ section: SECTIONS[0], order: i, prio: (decision ? 20 : 60) + i / 1000, text: `--- ${c.author} · ${c.ts}\n${capText(c.body, 3000, 'comment')}`, omit: { path: `comment by ${c.author} at ${c.ts}`, reason: 'over budget' } });
+      items.push({ section: SECTIONS[0], order: i, prio: (decision ? 20 : 60) + i / 1000, text: `--- ${c.author} · ${c.ts}\n${capText(S(c.body), 3000, 'comment')}`, omit: { path: `comment by ${c.author} at ${c.ts}`, reason: 'over budget' } });
       if (decision) named.push(...namedRefs(c.body));
     });
     if (parent) {
-      items.push({ section: SECTIONS[1], order: 0, prio: 25, text: `Parent ${fmtTicketLine(parent)}\n${capText(parent.description, 4000, 'parent description')}`, omit: { path: `parent ${parent.key}`, reason: 'over budget' } });
-      parentComments.filter((c) => /^(📐|🧭)/u.test(c.body)).forEach((c, i) => items.push({ section: SECTIONS[1], order: 1 + i, prio: 22, text: `Parent design — ${c.author}:\n${capText(c.body, 6000, 'parent design')}`, omit: { path: `parent ${parent.key} design`, reason: 'over budget' } }));
+      items.push({ section: SECTIONS[1], order: 0, prio: 25, text: `Parent ${fmtTicketLine(parent)}\n${capText(S(parent.description), 4000, 'parent description')}`, omit: { path: `parent ${parent.key}`, reason: 'over budget' } });
+      parentComments.filter((c) => /^(📐|🧭)/u.test(c.body)).forEach((c, i) => items.push({ section: SECTIONS[1], order: 1 + i, prio: 22, text: `Parent design — ${c.author}:\n${capText(S(c.body), 6000, 'parent design')}`, omit: { path: `parent ${parent.key} design`, reason: 'over budget' } }));
     }
     const rel = [prerequisite ? `Prerequisite (must merge first): ${fmtTicketLine(prerequisite)}` : '', ...siblings.map((s) => `Sibling: ${fmtTicketLine(s)}`), ...children.map((s) => `Child: ${fmtTicketLine(s)}`)].filter(Boolean);
     if (rel.length) items.push({ section: SECTIONS[1], order: 50, prio: 24, text: rel.join('\n'), omit: { path: 'related ticket list', reason: 'over budget' } });
@@ -441,7 +485,7 @@ export async function buildPack({ kind, baseSha, headSha, cloneDir = '', inputs 
     const samples = (() => { try { return JSON.parse(incident.samples || '[]'); } catch { return []; } })();
     required.push([`Incident #${incident.id} (${incident.label})`, [
       `signature ${incident.signature} · project ${incident.project} · seen ${incident.count}× · first ${incident.first_seen} · last ${incident.last_seen}`,
-      `normalized: ${incident.normalized}`, 'log samples (untrusted data):', ...samples.slice(-8).map((s) => `  [${s.ts}] ${clipLine(String(s.line), 400)}`),
+      `normalized: ${incident.normalized}`, 'log samples (untrusted data):', ...samples.slice(-8).map((s) => `  [${s.ts}] ${clipLine(S(String(s.line)), 400)}`),
     ].join('\n')]);
     named.push(...namedRefs(`${incident.normalized}\n${samples.map((s) => s.line).join('\n')}`));
   }
@@ -473,11 +517,11 @@ export async function buildPack({ kind, baseSha, headSha, cloneDir = '', inputs 
   for (const [i, p] of inScope.slice(0, settings.maxScopeFiles).entries()) {
     const content = await blob(headSha, p, signal);
     if (content == null) continue;
-    items.push({ section: SECTIONS[4], order: i, prio: 40 + i / 1000, text: `#### ${p}\n${await references(headSha, p, isBinary(content) ? '' : content, tree, hidden, settings.maxRefHits, signal)}`, omit: { path: `${p} (references)`, reason: 'over budget' } });
+    items.push({ section: SECTIONS[4], order: i, prio: 40 + i / 1000, text: `#### ${p}\n${await references(headSha, p, isBinary(content) ? '' : content, tree, hidden, settings.maxRefHits, signal, S)}`, omit: { path: `${p} (references)`, reason: 'over budget' } });
   }
   if (inScope.length > settings.maxScopeFiles) omissions.push({ path: `${inScope.length - settings.maxScopeFiles} more in-scope files`, reason: `reference search capped at ${settings.maxScopeFiles} files` });
   for (const [i, [p, s]] of [...scope.entries()].filter(([p]) => !changedPaths.includes(p)).entries()) {
-    items.push({ section: SECTIONS[5], order: i, prio: 50 + i / 1000, est: 3000, load: async () => excerpt(await blob(headSha, p, signal) ?? '', p, { line: s.line, symbols }), omit: { path: p, reason: 'excerpt over budget' } });
+    items.push({ section: SECTIONS[5], order: i, prio: 50 + i / 1000, est: 3000, load: async () => excerpt(await blob(headSha, p, signal) ?? '', p, { line: s.line, symbols }, S), omit: { path: p, reason: 'excerpt over budget' } });
   }
 
   if ((!ticket && !incident) || kind === 'research') {
@@ -485,7 +529,7 @@ export async function buildPack({ kind, baseSha, headSha, cloneDir = '', inputs 
     for (const p of tree.keys()) { const top = p.includes('/') ? `${p.split('/')[0]}/` : '(root files)'; dirs.set(top, (dirs.get(top) || 0) + 1); }
     required.push([`Repository map (${tree.size} tracked files)`, [...dirs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 60).map(([d, n]) => `${d}  ${n} files`).join('\n')]);
     const readme = [...tree.keys()].find((p) => /^readme(\.md|\.rst|\.txt)?$/i.test(p));
-    if (readme) items.push({ section: SECTIONS[5], order: -1, prio: 45, est: 3000, load: async () => excerpt(await blob(headSha, readme, signal) ?? '', readme), omit: { path: readme, reason: 'over budget' } });
+    if (readme) items.push({ section: SECTIONS[5], order: -1, prio: 45, est: 3000, load: async () => excerpt(await blob(headSha, readme, signal) ?? '', readme, {}, S), omit: { path: readme, reason: 'over budget' } });
     items.push({ section: SECTIONS[2], order: 0, prio: 35, est: 1500, load: async () => (await tgit(['log', '--no-show-signature', '-n', '20', '--no-color', '--format=%h %ad %s', '--date=short', headSha], { signal, allowFail: true }) || '').trim(), omit: { path: 'recent commits', reason: 'over budget' } });
   }
 
@@ -552,7 +596,7 @@ export async function buildPack({ kind, baseSha, headSha, cloneDir = '', inputs 
     text, hash,
     meta: { kind, hash, chars: text.length, baseSha, headSha, mergeBase, changed: changed.map((f) => f.path), withheld: [...hidden],
       omittedChanged: [...new Set(omissions.filter((o) => o.changed).map((o) => o.path))], omitted: omissions.map((o) => o.path), rejected,
-      fetched: [], fetchedPages: {}, servedPages: {}, delivered: false, packThread: null, remote: null, sends: 0, followups: 0 },
+      fetched: [], fetchedPages: dict(), servedPages: dict(), delivered: false, packThread: null, remote: null, sends: 0, followups: 0, pageRounds: 0, inflight: 0, lastSendSeq: 0 },
   };
 }
 
@@ -575,7 +619,8 @@ function writePackFile(runId, text) {
 }
 
 // ---------------- per-run registry ----------------
-const active = new Map(); // runId -> { meta, norm, served: {key: normalizedBlock}, pending: {toolUseId: send}, secrets, seq, cloneDir, pages }
+const active = new Map(); // runId -> { meta, norm, served: Map, pending: Map, pages: Map, secrets, seq, cloneDir }
+const liveEntry = (meta, text, secrets, cloneDir) => ({ meta, norm: text ? normalize(text) : null, served: new Map(), pending: new Map(), pages: new Map(), secrets, seq: 0, cloneDir });
 
 // Freeze base (and review head), build, store and register the pack. Throws PackError: the caller refuses the run.
 export async function prepareRun({ runId, kind, cwd, ticketKey = null, incidentId = null, secrets = [], settings = packSettings(), signal }) {
@@ -587,7 +632,7 @@ export async function prepareRun({ runId, kind, cwd, ticketKey = null, incidentI
     const headSha = kind === 'review' ? await importHead(runId, cwd, inputs.ticket?.head_sha, { signal: sig }) : baseSha;
     const pack = await buildPack({ kind, baseSha, headSha, cloneDir: cwd, inputs, secrets, settings, signal: sig });
     pack.meta.file = writePackFile(runId, pack.text);
-    active.set(runId, { meta: pack.meta, norm: normalize(pack.text), served: {}, pending: {}, secrets, seq: 0, cloneDir: cwd, pages: {} });
+    active.set(runId, liveEntry(pack.meta, pack.text, secrets, cwd));
     return pack;
   } catch (err) {
     await dropRefs(runId).catch(() => {});
@@ -597,11 +642,16 @@ export async function prepareRun({ runId, kind, cwd, ticketKey = null, incidentI
 }
 
 export const liveFor = (runId) => active.get(runId) || null;
+// Persisted metadata comes back with null-prototype path dictionaries.
+export function reviveMeta(m) {
+  if (!m) return m;
+  return { ...m, fetchedPages: dict(m.fetchedPages), servedPages: dict(m.servedPages) };
+}
 export function metaFor(run) {
   if (!run) return null;
   const live = active.get(run.id);
   if (live) return live.meta;
-  try { return run.context_meta ? JSON.parse(run.context_meta) : null; } catch { return null; }
+  try { return run.context_meta ? reviveMeta(JSON.parse(run.context_meta)) : null; } catch { return null; }
 }
 export function release(runId) {
   active.delete(runId);
@@ -614,51 +664,85 @@ export function jobIdentity({ provenance, agentId, kind, ticketKey = null, incid
 }
 
 // ---------------- outgoing / incoming checks ----------------
-const TERMINAL_OK = /WORKFLOW_COMPLETED/;
-const TERMINAL_BAD = /WORKFLOW_(ERROR|CANCELED|CANCELLED)/;
+const TERMINAL_BAD = /^WORKFLOW_(ERROR|CANCELED|CANCELLED)$/;
 const looksFailed = (text) => /^\s*(\{\s*"(error|isError)"\s*:\s*(true|")|Error:|MCP error|Tool .* failed)/i.test(String(text));
 
-// An outgoing call: violations fail closed (the runner kills the run); delivery only counts once the result succeeds.
+// Remote state from a structured Computer result (read_thread's thread_status + web_state entries/steps). Only the
+// LATEST entry decides: completed iff it is WORKFLOW_COMPLETED and the thread is not still running. A text mention of
+// a status is not a state. Returns null when the result carries no structured state.
+export function remoteState(text) {
+  let j;
+  try { j = JSON.parse(String(text)); } catch { return null; }
+  if (!j || typeof j !== 'object') return null;
+  const ws = j.web_state && typeof j.web_state === 'object' ? j.web_state : {};
+  const thread = String(ws.thread_status ?? j.thread_status ?? j.status ?? '').toLowerCase();
+  const entries = Array.isArray(ws.entries) ? ws.entries : Array.isArray(j.entries) ? j.entries : [];
+  if (!thread && !entries.length) return null;
+  if (/error|fail|cancel/.test(thread)) return 'error';
+  const last = entries.at(-1);
+  if (!last || typeof last !== 'object') return 'pending';
+  const steps = Array.isArray(last.steps) ? last.steps.map((x) => String(x?.status ?? '')) : [];
+  const status = String(last.status ?? steps.at(-1) ?? '');
+  if (TERMINAL_BAD.test(status) || steps.some((x) => TERMINAL_BAD.test(x))) return 'error';
+  if (status === 'WORKFLOW_COMPLETED' && !steps.some((x) => x && x !== 'WORKFLOW_COMPLETED' && !/^(done|completed|success)$/i.test(x)) && !/running|queued|pending|stream|wait/.test(thread)) return 'completed';
+  return 'pending';
+}
+
+// An outgoing call. Kill only on this run's exact token/nonce or a high-confidence secret format (fail closed);
+// generic credential-looking text is not a kill reason. Delivery only counts once the result succeeds.
 export function recordSend(live, toolUseId, name, input = {}, settings = packSettings()) {
   if (!live) return [];
   const { meta } = live;
   live.seq += 1;
   const thread = input.thread_id ? String(input.thread_id) : null;
-  if (name === 'read') { live.pending[toolUseId] = { name, thread, seq: live.seq }; return []; }
+  if (name === 'read') { live.pending.set(toolUseId, { name, thread, seq: live.seq }); return []; }
   const raw = String(input.message ?? '');
   const msg = normalize(raw);
   const out = [];
   meta.sends = (meta.sends || 0) + 1;
   const kill = (why) => { meta.invalid = why; out.push({ type: 'pplx', kill: why, error: true, note: `Perplexity message blocked: ${why}. The run is stopped and its outcome is invalid.` }); };
-  if (live.secrets.some((s) => s && String(s).length >= 6 && raw.includes(String(s)))) kill('it contained this run\'s token or verdict code');
-  else if (hasSecret(raw)) kill('it contained secret-looking content');
+  const secret = killReason(raw, live.secrets);
+  if (secret) kill(secret);
   else if (raw.length > settings.maxChars) kill(`it was ${raw.length} chars, over the ${settings.maxChars}-char cap`);
   const hasPack = !!live.norm && msg.includes(live.norm);
   if (!hasPack && !thread && live.norm) {
     const why = msg.includes(`sha256="${meta.hash}"`) ? 'the pack header was sent but its body was edited or cut' : 'the desk context pack was missing';
     out.push({ type: 'pplx', error: true, note: `Perplexity did not receive the full context: ${why} (${raw.length} chars sent, pack is ${meta.chars} chars). ${meta.kind === 'review' ? 'This review cannot pass until the pack is delivered.' : 'Its answer was made without the desk context.'}` });
   }
-  if (thread && thread === meta.packThread) meta.followups = (meta.followups || 0) + 1;
-  if (meta.followups > settings.followupRounds) out.push({ type: 'pplx', error: true, note: `Relay sent ${meta.followups} follow-ups; the limit is ${settings.followupRounds}` });
-  const blocks = Object.entries(live.served).filter(([, blk]) => msg.includes(blk)).map(([k]) => k);
-  live.pending[toolUseId] = { name, thread, hasPack, blocks, seq: live.seq };
+  const blocks = [...live.served.entries()].filter(([, blk]) => msg.includes(blk)).map(([k]) => k);
+  if (thread && thread === meta.packThread) {
+    meta.inflight = (meta.inflight || 0) + 1;
+    if (blocks.length) {
+      meta.pageRounds = (meta.pageRounds || 0) + 1;
+      if (meta.pageRounds > settings.pageRounds) out.push({ type: 'pplx', error: true, note: `Relay sent ${meta.pageRounds} file-page follow-ups; the limit is ${settings.pageRounds}` });
+    } else {
+      meta.followups = (meta.followups || 0) + 1;
+      if (meta.followups > settings.followupRounds) out.push({ type: 'pplx', error: true, note: `Relay sent ${meta.followups} follow-ups; the limit is ${settings.followupRounds}` });
+    }
+  }
+  live.pending.set(toolUseId, { name, thread, hasPack, blocks, seq: live.seq, counted: !!(thread && thread === meta.packThread) });
   return out;
 }
 
-// A tool result: only a successful, correlated result delivers the pack, covers a file page, or ends the wait.
+// A tool result: only a successful, correlated result delivers the pack, covers a page, or changes remote state.
 export function recordResult(live, toolUseId, { isError = false, text = '' } = {}) {
   if (!live) return [];
-  const send = live.pending[toolUseId];
+  const send = live.pending.get(toolUseId);
   if (!send) return [];
-  delete live.pending[toolUseId];
+  live.pending.delete(toolUseId);
   const { meta } = live;
   live.seq += 1;
+  if (send.counted) meta.inflight = Math.max(0, (meta.inflight || 0) - 1);
   const out = [];
   const ok = !isError && !looksFailed(text);
   const thread = send.thread || extractThreadId(text);
   if (thread) out.push({ type: 'pplx', threadId: thread });
+  const onPack = () => !!thread && thread === meta.packThread;
   if (!ok) {
-    if (send.name !== 'read') out.push({ type: 'pplx', error: true, note: `Perplexity call failed${send.hasPack ? '; the context pack was NOT delivered' : ''}: ${String(text).slice(0, 160)}` });
+    if (send.name !== 'read') {
+      if (onPack()) meta.lastSendSeq = live.seq; // a failed follow-up: any earlier completion no longer covers it
+      out.push({ type: 'pplx', error: true, note: `Perplexity call failed${send.hasPack ? '; the context pack was NOT delivered' : ''}: ${String(text).slice(0, 160)}` });
+    }
     return out;
   }
   if (send.name !== 'read') {
@@ -667,22 +751,24 @@ export function recordResult(live, toolUseId, { isError = false, text = '' } = {
       meta.packThread = thread;
       out.push({ type: 'pplx', note: `Context pack delivered to Perplexity verbatim (${meta.chars} chars, sha256 ${meta.hash.slice(0, 12)}, thread ${thread})` });
     }
-    if (thread && thread === meta.packThread) meta.lastSendSeq = live.seq;
+    if (onPack()) meta.lastSendSeq = live.seq;
     const covered = [];
     for (const key of send.blocks || []) {
       const [p, page] = key.split('\u0000');
-      if (!thread || thread !== meta.packThread) { out.push({ type: 'pplx', error: true, note: `${p} page ${page} was sent on another thread; it does not count` }); continue; }
-      const got = new Set(meta.fetchedPages[p] || []);
+      if (!onPack()) { out.push({ type: 'pplx', error: true, note: `${p} page ${page} was sent on another thread; it does not count` }); continue; }
+      const got = new Set(own(meta.fetchedPages, p) || []);
       got.add(Number(page));
       meta.fetchedPages[p] = [...got].sort((a, b) => a - b);
-      if (got.size >= (meta.servedPages[p] || Infinity) && !meta.fetched.includes(p)) { meta.fetched.push(p); covered.push(p); }
+      if (got.size >= (own(meta.servedPages, p) || Infinity) && !meta.fetched.includes(p)) { meta.fetched.push(p); covered.push(p); }
     }
     if (covered.length) out.push({ type: 'pplx', note: `Perplexity now has the complete ${covered.join(', ')}` });
   }
-  if (thread && thread === meta.packThread) {
-    if (TERMINAL_BAD.test(text)) { meta.remote = { thread, status: 'error', at: new Date().toISOString() }; out.push({ type: 'pplx', error: true, note: 'Perplexity reported the task failed or was cancelled' }); }
-    else if (TERMINAL_OK.test(text)) { meta.terminalSeq = live.seq; meta.remote = { thread, status: 'completed', at: new Date().toISOString() }; }
-    else meta.remote = { thread, status: 'pending', at: new Date().toISOString() };
+  if (onPack()) {
+    const state = remoteState(text);
+    if (state) {
+      meta.remote = { thread, status: state, seq: live.seq, at: new Date().toISOString() };
+      if (state === 'error') out.push({ type: 'pplx', error: true, note: 'Perplexity reported the task failed or was cancelled' });
+    }
   }
   return out;
 }
@@ -702,7 +788,7 @@ export async function serveFile(runId, rawPath, page = 1, settings = packSetting
   const required = (meta.omittedChanged || []).includes(p);
   const extras = Object.keys(meta.servedPages).filter((x) => !(meta.omittedChanged || []).includes(x));
   if (!required && !extras.includes(p) && extras.length >= settings.maxServedFiles) throw Object.assign(new Error(`at most ${settings.maxServedFiles} extra files per run (files the pack omitted are always available)`), { status: 400 });
-  if (!live.pages[p]) {
+  if (!live.pages.has(p)) {
     let full;
     let diff = false;
     if (meta.kind === 'review' && (meta.changed || []).includes(p)) {
@@ -712,29 +798,33 @@ export async function serveFile(runId, rawPath, page = 1, settings = packSetting
       diff = true;
     } else {
       const content = await blob(meta.headSha, p) ?? '';
-      full = isBinary(content) ? '(binary file — not shown)' : scrub(content.split('\n').map((l, i) => `${String(i + 1).padStart(5)}  ${l}`).join('\n'), live.secrets);
+      full = isBinary(content) ? '(binary file — not shown)' : scrub(content, live.secrets).split('\n').map((l, i) => `${String(i + 1).padStart(5)}  ${l}`).join('\n');
     }
-    live.pages[p] = paginate(normalize(full), settings.pageChars, { diff });
+    // Room for the block's tag line, closing tag and the next-page note.
+    live.pages.set(p, paginate(normalize(full), settings.pageChars - 300 - 2 * p.length, { diff }));
   }
-  const pages = live.pages[p];
+  const pages = live.pages.get(p);
   const n = Math.trunc(Number(page) || 1);
   if (n < 1 || n > pages.length) throw Object.assign(new Error(`${p} has ${pages.length} page(s)`), { status: 400 });
-  const inner = normalize(scrub(pages[n - 1], live.secrets));
+  const inner = normalize(pages[n - 1]);
   const block = `<sigmadesk-file path="${p}" page="${n}" pages="${pages.length}" sha256="${sha256(inner)}">\n${inner}\n</sigmadesk-file>`;
-  live.served[`${p}\u0000${n}`] = normalize(block);
+  live.served.set(`${p}\u0000${n}`, normalize(block));
   meta.servedPages[p] = pages.length;
   return `${block}${n < pages.length ? `\n(${pages.length - n} more page(s): desk context-file ${p} --page ${n + 1})` : ''}`;
 }
 
-// Accept gate for Perplexity-backed reviews: a verdict without the complete change and a finished answer is not one.
+// Accept gate for Perplexity-backed reviews: the complete change, delivered and answered, or no pass.
 export function acceptBlockers(meta) {
   if (!meta) return 'This Perplexity review has no desk context pack, so the pass is refused. Request changes, or ask the owner.';
   if (meta.error) return `The desk could not build the context pack (${meta.error}), so the pass is refused.`;
   if (meta.invalid) return `This run's Perplexity exchange is invalid (${meta.invalid}), so the pass is refused.`;
   if (!meta.delivered || !meta.packThread) return 'Perplexity did not receive the full context pack (a successful call carrying it verbatim), so the pass is refused.';
   const missing = (meta.omittedChanged || []).filter((p) => !(meta.fetched || []).includes(p));
-  if (missing.length) return `The pack omitted changed files that were never fully sent to Perplexity on the pack's thread: ${missing.slice(0, 20).join(', ')}${missing.length > 20 ? ` (+${missing.length - 20} more)` : ''}. Run \`desk context-file <path> [--page N]\` for every page, send the output verbatim on thread ${meta.packThread}, then decide.`;
-  if (!(meta.terminalSeq != null && meta.terminalSeq >= (meta.lastSendSeq || 0))) return `No completed Perplexity answer (WORKFLOW_COMPLETED) on thread ${meta.packThread} after the last message; poll read_thread before deciding.`;
+  if (missing.length) return `The pack omitted changed files that were never fully sent to Perplexity on the pack's thread: ${missing.slice(0, 20).join(', ')}${missing.length > 20 ? ` (+${missing.length - 20} more)` : ''}. Run \`desk context-file <path> [--page N]\` for every page, send them verbatim on thread ${meta.packThread} (several follow-ups are fine), then decide.`;
+  if (meta.inflight > 0) return `A message to thread ${meta.packThread} is still in flight; wait for it and poll read_thread before deciding.`;
+  const r = meta.remote;
+  if (r?.status === 'error') return `Perplexity reported the task on thread ${meta.packThread} failed or was cancelled, so the pass is refused.`;
+  if (!(r?.status === 'completed' && r.thread === meta.packThread && r.seq > (meta.lastSendSeq || 0))) return `No completed Perplexity answer on thread ${meta.packThread} after the last message (read_thread must show the latest entry as WORKFLOW_COMPLETED); poll before deciding.`;
   return null;
 }
 
@@ -744,15 +834,17 @@ export function relayRules(settings = packSettings()) {
 Your instructions end with a block from <sigmadesk-context …> to </sigmadesk-context>, built by the desk.
 - Your FIRST call_perplexity_computer message = one short paragraph (your seat role, the exact task, the answer format) +
   that whole block copied VERBATIM (every character, both tags) + optionally "## Relay additions" with extra excerpts you
-  read yourself. Never summarize, shorten, reorder or edit the block. The whole message must stay under
-  ${settings.maxChars} characters and must never contain a --code value, run token, credentials or anything from
-  .env/secret files: the desk stops the run immediately if it does.
+  read yourself. Never summarize, shorten, reorder or edit the block. Every message must stay under
+  ${settings.maxChars} characters and must never contain a --code value, run token, private key or provider secret:
+  the desk stops the run immediately if it does.
 - The desk checks every message and result. The pack only counts once that call succeeds.
 - Ask Perplexity to end with "NEED FILES: <path>, …" if anything it needs was omitted. If it does, run
-  \`desk context-file <path>\` (and \`--page N\` for every further page it reports) and send the outputs verbatim in ONE
-  follow-up on the SAME thread_id (at most ${settings.followupRounds} follow-up round${settings.followupRounds === 1 ? '' : 's'}). Pages sent on another thread do not count.
-- If a call returns before the answer is final, poll read_thread with that thread_id until a step shows WORKFLOW_COMPLETED
-  (or WORKFLOW_ERROR / WORKFLOW_CANCELED), for up to ${settings.remoteWaitMinutes} minutes. Never start a second thread to re-ask.`;
+  \`desk context-file <path>\` (and \`--page N\` for every further page it reports) and send the outputs verbatim on the
+  SAME thread_id, as many follow-ups as the size cap requires (at most ${settings.pageRounds} page follow-ups, plus
+  ${settings.followupRounds} other follow-up${settings.followupRounds === 1 ? '' : 's'}). Pages sent on another thread do not count.
+- After your last message, poll read_thread with that thread_id until the latest entry is WORKFLOW_COMPLETED (or
+  WORKFLOW_ERROR / WORKFLOW_CANCELED), for up to ${settings.remoteWaitMinutes} minutes. The desk reads the structured state; a
+  decision before the latest entry is completed does not count. Never start a second thread to re-ask.`;
 }
 
 export function promptAppendix(pack, { resumeThread = null, settings = packSettings() } = {}) {

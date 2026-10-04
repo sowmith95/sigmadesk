@@ -124,6 +124,9 @@ const DEFAULTS = {
       remoteWaitMinutes: 8, // how long the relay polls a pending thread; run watchdogs are raised above it
       followupRounds: 1, // follow-ups on the same thread with files the model asked for
       prepareDeadlineSeconds: 45, // total time to build a pack (git work is cancelled after this; the run is refused)
+      pageChars: 0, // max size of one `desk context-file` page; 0 = contextMaxChars - relayReserveChars
+      pageRounds: 6, // follow-ups that only carry requested file pages
+      secretPatterns: [], // extra high-confidence secret formats (regex strings) that stop a run, e.g. a broker's key shape
     },
   },
   advisors: {
@@ -234,6 +237,9 @@ export function validateConfig(c = config) {
   const px = c.engines.perplexity || {};
   if (!(px.contextMaxChars >= 10000 && px.contextMaxChars <= 400000)) problems.push('engines.perplexity.contextMaxChars must be between 10000 and 400000');
   if (!(px.remoteWaitMinutes >= 1 && px.remoteWaitMinutes <= 60)) problems.push('engines.perplexity.remoteWaitMinutes must be between 1 and 60');
+  if (!(Number.isInteger(px.pageRounds) && px.pageRounds >= 1 && px.pageRounds <= 20)) problems.push('engines.perplexity.pageRounds must be 1-20');
+  if (!(px.pageChars === 0 || (px.pageChars >= 2000 && px.pageChars <= px.contextMaxChars))) problems.push('engines.perplexity.pageChars must be 0 or between 2000 and contextMaxChars');
+  for (const src of px.secretPatterns || []) { try { new RegExp(src); } catch { problems.push(`engines.perplexity.secretPatterns: invalid regex ${src}`); } }
   if (!(px.prepareDeadlineSeconds >= 5 && px.prepareDeadlineSeconds <= 300)) problems.push('engines.perplexity.prepareDeadlineSeconds must be between 5 and 300');
   if (!(Number.isInteger(px.followupRounds) && px.followupRounds >= 0 && px.followupRounds <= 3)) problems.push('engines.perplexity.followupRounds must be 0-3');
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');
