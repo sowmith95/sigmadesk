@@ -139,10 +139,10 @@ export const MIN_OVERRIDE_REASON = 10;
 const checkName = (c) => c.name || c.context || c.workflowName || '';
 
 // ---------------- required checks: names that MUST be present and SUCCESS ----------------
-// review.requiredChecks: an explicit list, or "auto": the checks that reported SUCCESS on every one of the last few
-// merges (persisted in kv, editable by the owner). Reported-only CI is not enough: a suite that never reports would
-// otherwise let lint alone authorize a merge.
-const HISTORY = 5;
+// review.requiredChecks: an explicit list, or "auto": learned from the BASE branch's own commits — the union of
+// pull-request checks that passed on recent main commits (persisted, owner-editable). The learned set only grows;
+// shrinking it needs the owner. Owner merges never teach it (a lint-only merge must not define "required").
+// Reported-only CI is not enough: a suite that never reports would otherwise let lint alone authorize a merge.
 const kvJson = (k, d) => { try { return JSON.parse(store.kvGet(k) || 'null') ?? d; } catch { return d; } };
 export function requiredChecks() {
   const c = config.review?.requiredChecks;
@@ -155,17 +155,24 @@ export function setRequiredChecks(names, source = 'owner') {
   store.logEvent({ kind: 'action', agent_id: source === 'owner' ? 'owner' : 'github', text: `required CI checks set (${source}): ${clean.join(', ') || '(none)'}` });
   return requiredChecks();
 }
-/** Learn from a merge that passed: auto mode = checks that succeeded on every recent merge. */
-export function learnChecks(rollup = []) {
-  const ok = [...new Set(rollup.filter((c) => (c.conclusion || c.state) === 'SUCCESS').map(checkName).filter(Boolean))];
+/** Auto mode: add check names that passed on a base-branch commit. Growth only — never removes a name. */
+export function learnChecks(names = []) {
+  const ok = [...new Set(names.map(String).filter(Boolean))];
   if (!ok.length) return requiredChecks();
-  const hist = [...kvJson('ci:history', []), ok].slice(-HISTORY);
-  store.kvSet('ci:history', JSON.stringify(hist));
+  store.kvSet('ci:history', JSON.stringify([...kvJson('ci:history', []), ok].slice(-20)));
   const cur = requiredChecks();
-  if (cur.source !== 'auto') return cur;
-  const names = hist.reduce((acc, set) => acc.filter((n) => set.includes(n)), hist[0]);
-  if (names.join('|') !== cur.names.join('|')) setRequiredChecks(names, 'auto');
+  if (cur.source !== 'auto') return cur; // explicit (config/owner) lists are never changed automatically
+  const grown = [...new Set([...cur.names, ...ok])];
+  if (grown.length !== cur.names.length) setRequiredChecks(grown, 'auto');
   return requiredChecks();
+}
+/** Check runs (with their check suite) and commit statuses GitHub recorded for a commit. */
+export async function checksForCommit(sha) {
+  const runs = JSON.parse(await gh(['api', `repos/${repo()}/commits/${encodeURIComponent(String(sha))}/check-runs?per_page=100`,
+    '--jq', '[.check_runs[] | {name, conclusion, suite: .check_suite.id}]']) || '[]');
+  const statuses = JSON.parse(await gh(['api', `repos/${repo()}/commits/${encodeURIComponent(String(sha))}/status`,
+    '--jq', '[.statuses[] | {context, state}]']) || '[]');
+  return { runs, statuses };
 }
 export const keyOfTitle = (title) => String(title || '').match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1] || null;
 const seatName = (seat) => (seat ? `${agentById[seat]?.name || seat}` : '?');
@@ -257,7 +264,6 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   // "unknown" (GitHub may have merged before the error/timeout reached us): callers must reconcile, never roll back.
   try { await gh(['pr', 'merge', String(p.number), '-R', repo(), `--${method}`, '--delete-branch', '--match-head-commit', expectedSha]); }
   catch (err) { throw Object.assign(err, { dispatched: true }); }
-  learnChecks(p.statusCheckRollup || []);
   if (actor === 'owner') note(p, `🔀 **Merged #${p.number}** (${method}) from SigmaDesk${inBusyWindow ? ' — market-hours override' : ''}${overridden.length ? ` — review override: ${String(overrideReason).trim()}` : ''}.`);
   else store.logEvent({ kind: 'github', agent_id: 'github', ticket_key: key, text: `auto-merged #${p.number} (${method}) at ${expectedSha.slice(0, 7)}` });
   bust();
@@ -271,7 +277,7 @@ export async function mergeInfo(number) {
 /** Workflow runs GitHub started for a commit, identified by workflow FILE path (display names can collide). */
 export async function runsForCommit(sha) {
   const out = JSON.parse(await gh(['api', `repos/${repo()}/actions/runs?head_sha=${encodeURIComponent(String(sha))}&per_page=100`,
-    '--jq', '[.workflow_runs[] | {path, name, status, conclusion, id}]']) || '[]');
+    '--jq', '[.workflow_runs[] | {path, name, status, conclusion, id, suite: .check_suite_id}]']) || '[]');
   return out.map((r) => ({ ...r, path: String(r.path || '').replace(/@.*$/, '') }));
 }
 /** Paths a PR changes (for owner merges of PRs the desk did not open). */

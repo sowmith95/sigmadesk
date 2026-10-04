@@ -5,6 +5,7 @@ import path from 'node:path';
 import { config } from './config.js';
 
 const SECRET_NAME = /(SECRET|_KEY|KEY_ID|^KEY$|TOKEN|PASSWORD|PASSWD|_PASS$|_DSN$|^DSN$|PRIVATE|CREDENTIAL|^APCA_|^ALPACA_|^POLYGON_|^MASSIVE_|^IBKR_|WEBHOOK)/i;
+const SECRET_LIKE = /(KEY|SECRET|TOKEN|PASSWORD|PASSWD|PIN|ACCOUNT)/i;
 let cache = { at: 0, sig: '', values: [] };
 
 function envFiles() {
@@ -32,12 +33,18 @@ export function secretValues() {
   const vals = new Set();
   // Value-based: every value of 8+ characters in the target repo's .env files and in project.env (the env the desk
   // gives agents) is treated as secret, whatever its name; plain numbers and booleans are skipped.
-  const consider = (v) => { const x = String(v ?? ''); if (x.length >= 8 && !/^(\d+(\.\d+)?|true|false)$/i.test(x)) vals.add(x); };
+  // Numeric-only values (PINs, account numbers) count too when the NAME looks secret, from 6 characters.
+  const consider = (k, v) => {
+    const x = String(v ?? '');
+    if (/^(true|false)$/i.test(x)) return;
+    if (/^\d+(\.\d+)?$/.test(x)) { if (x.length >= 6 && SECRET_LIKE.test(k)) vals.add(x); return; }
+    if (x.length >= 8 || (x.length >= 6 && SECRET_LIKE.test(k))) vals.add(x);
+  };
   for (const f of files) {
-    try { for (const [, v] of parseEnv(fs.readFileSync(f, 'utf8'))) consider(v); } catch { /* unreadable: skip */ }
+    try { for (const [k, v] of parseEnv(fs.readFileSync(f, 'utf8'))) consider(k, v); } catch { /* unreadable: skip */ }
   }
-  for (const v of Object.values(config.project?.env || {})) consider(v);
-  for (const [k, v] of Object.entries(process.env)) if (SECRET_NAME.test(k) && v && v.length >= 8) vals.add(v);
+  for (const [k, v] of Object.entries(config.project?.env || {})) consider(k, v);
+  for (const [k, v] of Object.entries(process.env)) if (SECRET_NAME.test(k) && v && (v.length >= 8 || (v.length >= 6 && SECRET_LIKE.test(k)))) vals.add(v);
   cache = { at: Date.now(), sig, values: [...vals].sort((a, b) => b.length - a.length) };
   return cache.values;
 }

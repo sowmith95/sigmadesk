@@ -492,3 +492,12 @@ test('outbox: a failed duplicate lookup counts as an attempt and backs off', asy
   const row = store.listOutbox(t.key)[0];
   assert.equal(row.attempts, 2); assert.ok(row.next_attempt_at > store.now());
 });
+
+test('numeric secret values are scrubbed when the variable name is secret-like', () => {
+  fs.writeFileSync(path.join(repo, '.env'), 'ALPACA_ACCOUNT_NUMBER=87654321\nBROKER_PIN=482913\nPORT=12345678\nRETRIES=123456\n');
+  const t = store.createTicket({ title: 'Numeric secrets', status: 'review' });
+  const row = store.enqueueOutbox(t.key, `${t.key}:numeric`, 'account 87654321, pin 482913, port 12345678, retries 123456');
+  assert.ok(!row.body.includes('87654321')); assert.ok(!row.body.includes('482913'));
+  assert.ok(row.body.includes('port 12345678') && row.body.includes('retries 123456'), 'numbers under ordinary names stay');
+  fs.rmSync(path.join(repo, '.env'));
+});

@@ -53,7 +53,9 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 if (a[0] === 'pr' && a[1] === 'view') out(a.join(' ').includes('mergeCommit') ? read('merge.json', {}) : read('pr.json', {}));
 if (a[0] === 'pr' && a[1] === 'list') out('[]');
 if (a[0] === 'pr' && a[1] === 'create') out('https://github.com/owner/demo/pull/55');
-if (a[0] === 'api' && /actions\\/runs/.test(a[1])) out(read('runs.json', []));
+if (a[0] === 'api' && /actions\\/runs/.test(a[1])) { const sha = (a[1].match(/head_sha=([0-9a-f]+)/) || [])[1]; out(fs.existsSync(d + '/runs-' + sha + '.json') ? read('runs-' + sha + '.json', []) : read('runs.json', [])); }
+if (a[0] === 'api' && /check-runs/.test(a[1])) out(read('check-runs.json', []));
+if (a[0] === 'api' && /commits\\/[0-9a-f]+\\/status/.test(a[1])) out(read('status.json', []));
 if (a[0] === 'api' && /actions\\/workflows/.test(a[1])) out('2');
 if (a[0] === 'api' && a[1] === '-X') { const c = read('comments.json', []); c.push({ id: 1000 + c.length, body: a[a.indexOf('-f') + 1].slice(5) }); fs.writeFileSync(d + '/comments.json', JSON.stringify(c)); out(String(999 + c.length)); }
 if (a[0] === 'api') out('');
@@ -527,16 +529,17 @@ test('the live gate re-checks halt AFTER its only await, right before dispatch',
   store.updateTicket(t.key, { merge_hold: null, review_stage: 'approved' });
 });
 
-test('required checks: a missing suite blocks; auto list = checks that passed on every recent merge; none ⇒ owner asked', async () => {
+test('required checks: a missing suite blocks; the auto list only grows; none ⇒ owner asked', async () => {
   const prs = await prsMod();
   const sha = 'a'.repeat(40);
   const p = { state: 'OPEN', headRefOid: sha, baseRefName: 'main', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'lint', conclusion: 'SUCCESS' }] };
   assert.match(prs.authorizeMerge(p, { expectedSha: sha, required: ['tests', 'lint'] }).blockers[0], /required check tests has not passed.*never reported/);
   assert.deepEqual(prs.authorizeMerge({ ...p, statusCheckRollup: [{ name: 'lint', conclusion: 'SUCCESS' }, { name: 'tests', conclusion: 'SUCCESS' }] }, { expectedSha: sha, required: ['tests', 'lint'] }).blockers, []);
   store.kvSet('ci:history', '[]'); prs.setRequiredChecks([], 'auto');
-  prs.learnChecks([{ name: 'tests', conclusion: 'SUCCESS' }, { name: 'lint', conclusion: 'SUCCESS' }, { name: 'docs-only', conclusion: 'SUCCESS' }]);
-  prs.learnChecks([{ name: 'tests', conclusion: 'SUCCESS' }, { name: 'lint', conclusion: 'SUCCESS' }]);
-  assert.deepEqual(prs.requiredChecks(), { ...prs.requiredChecks(), names: ['tests', 'lint'], source: 'auto' });
+  prs.learnChecks(['tests', 'lint']);
+  prs.learnChecks(['lint']); // a later commit that only ran lint never shrinks the learned set
+  assert.deepEqual(prs.requiredChecks().names, ['tests', 'lint']);
+  assert.equal(prs.requiredChecks().source, 'auto');
   // nothing learned and the repo has workflows: the desk does not auto-merge and asks the owner once
   store.kvSet('ci:history', '[]'); prs.setRequiredChecks([], 'auto'); store.kvSet('ci:asked', '0');
   resetTrain();
@@ -626,4 +629,60 @@ test('a ticket left "merging" without an intent goes back to the queue', async (
   store.updateTicket(t.key, { review_stage: 'merging' });
   await train.reconcileIntent();
   assert.equal(store.getTicket(t.key).review_stage, 'approved');
+});
+
+// ---------------- third verification round ----------------
+test('concurrent lock refreshes: a stale poll for deploy A can never release deploy B', async () => {
+  resetTrain(); store.kvSet('train:deploy-pending', '[]'); store.kvSet('train:deploy-released', '[]');
+  const A = 'a1'.repeat(20); const B = 'b2'.repeat(20);
+  const at = new Date(SAT.getTime() - 5 * 60_000).toISOString();
+  train.queueDeploy({ key: 'A', merge_sha: A, at, state: 'running', workflows: ['.github/workflows/deploy.yml'] });
+  train.queueDeploy({ key: 'B', merge_sha: B, at, state: 'running', workflows: ['.github/workflows/deploy.yml'] });
+  const staleA = lockNow().id;
+  setGh(`runs-${A}.json`, [{ path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success', id: 1 }]);
+  setGh(`runs-${B}.json`, [{ path: '.github/workflows/deploy.yml', status: 'in_progress', conclusion: null, id: 2 }]);
+  // owner merge and sweep refresh at the same moment
+  const [x, y] = await Promise.all([train.deployLock(SAT), train.deployLock(SAT)]);
+  assert.equal(x.merge_sha, B); assert.equal(y.merge_sha, B);
+  assert.equal(lockNow().merge_sha, B, 'B is still locked while its deploy runs');
+  // the exact stale interleaving: a release computed for A arrives after B took the lock
+  assert.equal(train.releaseLock(staleA), false);
+  assert.equal(train.casLock(staleA, null), false);
+  assert.equal(lockNow().merge_sha, B);
+  resetTrain();
+});
+
+test('market-window boundary: a sweep that started at 09:29:59 ET cannot dispatch a deploying merge at 09:30', async () => {
+  resetTrain();
+  const t = await approvedPr('app/boundary.py'); prFor(t);
+  const startedAt = new Date('2026-09-30T13:29:59Z'); // Wednesday 09:29:59 EDT
+  train.clock.now = () => new Date('2026-09-30T13:30:01Z');
+  const before = merges().length;
+  try {
+    const r = await train.consider(t, { now: startedAt, snap: await train.watchBase() });
+    assert.match(r.reason, /busy window has started/);
+    assert.equal(merges().length, before);
+    assert.equal(lockNow(), null, 'the lock taken for the attempt is released');
+  } finally { train.clock.now = () => new Date(); }
+});
+
+test('required checks are learned from base commits only (pull-request workflows), never from owner merges', async () => {
+  const prs = await prsMod();
+  prs.setRequiredChecks([], 'auto'); store.kvSet('ci:learned', '[]');
+  const snap = await train.watchBase();
+  setGh(`runs-${snap.base}.json`, [{ path: '.github/workflows/pr.yml', status: 'completed', conclusion: 'success', id: 1, suite: 11 },
+    { path: '.github/workflows/deploy.yml', status: 'completed', conclusion: 'success', id: 2, suite: 22 }]);
+  setGh('check-runs.json', [{ name: 'unit-tests', conclusion: 'success', suite: 11 }, { name: 'deploy-job', conclusion: 'success', suite: 22 },
+    { name: 'flaky', conclusion: 'failure', suite: 11 }]);
+  setGh('status.json', [{ context: 'ci/legacy', state: 'success' }]);
+  await train.learnFromBase(snap.base);
+  assert.deepEqual(prs.requiredChecks().names.sort(), ['ci/legacy', 'unit-tests'], 'push-only deploy jobs and failures are not learned');
+  // an owner merge that only ran lint teaches nothing
+  const t = await approvedPr('docs/owner-lint.md');
+  store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
+  prFor(t, { statusCheckRollup: [{ name: 'lint', conclusion: 'SUCCESS' }, { name: 'unit-tests', conclusion: 'SUCCESS' }, { name: 'ci/legacy', conclusion: 'SUCCESS' }] });
+  await train.ownerMerge(7, { expectedSha: t.head_sha }, SAT);
+  assert.deepEqual(prs.requiredChecks().names.sort(), ['ci/legacy', 'unit-tests']);
+  fs.rmSync(path.join(ghDir, `runs-${snap.base}.json`));
+  prs.setRequiredChecks(['tests'], 'owner');
 });
