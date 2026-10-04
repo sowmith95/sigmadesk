@@ -258,5 +258,5 @@ Branch `research-programs`, merged to main. Owner decisions: keep the SigmaDesk 
 when approved (env-scrubbed, tool-allowlisted); default quorum 1 from trading-advisor / quant-research / principal-be;
 no GitHub issue. New modules `src/research.js`, `src/research-review.js`, `src/connectors.js`; schema additions in
 `src/db.js`; scheduler, runner, dispatch, team, engines, server, desk CLI, both UIs and the attention model updated.
-Tests: 251 pass (227 before + 24 new across research, connectors, research-review and http). Not exercised live: a real
+Tests: 250 pass (227 before + 23 new across research, connectors, research-review and http). Not exercised live: a real
 reviewer run end to end (structured output parsing is covered by tests; the run path mirrors product review).
