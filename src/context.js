@@ -12,12 +12,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { config } from './config.js';
+import { config, publisherPath } from './config.js';
 import * as store from './db.js';
 
 const pexec = promisify(execFile);
 
 // ---------------- knobs ----------------
+// Run time must cover the first answer plus every follow-up and page round. If maxRunMinutes is lower than that, the
+// relay is allowed fewer page rounds (and told so) instead of being killed mid-recovery.
+function runBudget(p) {
+  const wait = Number(p.remoteWaitMinutes) || 8;
+  const follow = Number.isFinite(Number(p.followupRounds)) ? Number(p.followupRounds) : 1;
+  const wanted = Number(p.pageRounds) || 6;
+  const cap = Number(p.maxRunMinutes) || 90;
+  const affordable = Math.max(0, Math.floor((cap - 10) / wait) - 1 - follow);
+  const pageRounds = Math.min(wanted, affordable);
+  return { pageRounds, pageRoundsCapped: pageRounds < wanted, runMinutes: Math.min(cap, wait * (1 + follow + pageRounds) + 10), maxRunMinutes: cap };
+}
 export function packSettings(c = config) {
   const p = c.engines?.perplexity || {};
   const maxChars = Number(p.contextMaxChars) || 60_000;
@@ -28,7 +39,7 @@ export function packSettings(c = config) {
     packChars,
     // Hard cap on one `desk context-file` block (attributes and labels included).
     pageChars: Math.max(2_000, Math.min(Number(p.pageChars) || packChars, packChars)),
-    pageRounds: Number(p.pageRounds) || 6, // follow-ups that only carry requested file pages
+    ...runBudget(p),
     remoteWaitMinutes: Number(p.remoteWaitMinutes) || 8,
     followupRounds: Number.isFinite(Number(p.followupRounds)) ? Number(p.followupRounds) : 1,
     deadlineSeconds: Number(p.prepareDeadlineSeconds) || 45,
@@ -52,7 +63,7 @@ function gitEnv({ ownerGlobal = false } = {}) {
   for (const k of ['GIT_EXTERNAL_DIFF', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT']) delete env[k];
   return env;
 }
-export const trustedRepo = () => path.join(config.dataDir, 'publisher.git');
+export const trustedRepo = () => publisherPath();
 const gitBin = () => config.bins.git || 'git';
 function aborted(signal) { return Object.assign(new PackError('context pack preparation was cancelled or ran past its deadline'), { cancelled: true }); }
 
@@ -320,9 +331,12 @@ export function splitHunks(patch) {
 
 // Deterministic pages of at most `size` chars each, labels included: whole hunks (or lines) where they fit; a larger
 // unit is split on line boundaries and a giant line into labelled chunks. Nothing is dropped.
+export const MIN_PAGE_BODY = 200;
 export function paginate(text, size, { diff = false } = {}) {
+  if (!(size >= MIN_PAGE_BODY)) throw new PackError(`page body budget ${size} is below ${MIN_PAGE_BODY} chars`);
   const unitMax = size - 60;
   const chunk = unitMax - 80;
+  if (!(chunk > 0)) throw new PackError('page body budget leaves no room for content');
   const units = [];
   if (diff) {
     const { header, hunks } = splitHunks(text);
@@ -712,6 +726,7 @@ export function recordSend(live, toolUseId, name, input = {}, settings = packSet
   const blocks = [...live.served.entries()].filter(([, blk]) => msg.includes(blk)).map(([k]) => k);
   if (thread && thread === meta.packThread) {
     meta.inflight = (meta.inflight || 0) + 1;
+    meta.lastSendSeq = live.seq; // issued now: only state requested after this point can show it answered
     if (blocks.length) {
       meta.pageRounds = (meta.pageRounds || 0) + 1;
       if (meta.pageRounds > settings.pageRounds) out.push({ type: 'pplx', error: true, note: `Relay sent ${meta.pageRounds} file-page follow-ups; the limit is ${settings.pageRounds}` });
@@ -740,18 +755,23 @@ export function recordResult(live, toolUseId, { isError = false, text = '' } = {
   const onPack = () => !!thread && thread === meta.packThread;
   if (!ok) {
     if (send.name !== 'read') {
-      if (onPack()) meta.lastSendSeq = live.seq; // a failed follow-up: any earlier completion no longer covers it
       out.push({ type: 'pplx', error: true, note: `Perplexity call failed${send.hasPack ? '; the context pack was NOT delivered' : ''}: ${String(text).slice(0, 160)}` });
     }
     return out;
   }
   if (send.name !== 'read') {
-    if (send.hasPack && !meta.delivered && thread) {
+    // First delivery, or a permitted replacement after the pack thread failed: the new thread becomes the pack thread
+    // and completion and coverage start over on it.
+    const replacing = meta.delivered && meta.remote?.status === 'error' && !send.thread && thread && thread !== meta.packThread;
+    if (send.hasPack && thread && (!meta.delivered || replacing)) {
+      if (replacing) {
+        out.push({ type: 'pplx', note: `Thread ${meta.packThread} failed; the pack was re-sent on ${thread}, which now carries the review (coverage and completion start over)` });
+        Object.assign(meta, { fetched: [], fetchedPages: dict(), remote: null, followups: 0, pageRounds: 0, inflight: 0 });
+      } else out.push({ type: 'pplx', note: `Context pack delivered to Perplexity verbatim (${meta.chars} chars, sha256 ${meta.hash.slice(0, 12)}, thread ${thread})` });
       meta.delivered = true;
       meta.packThread = thread;
-      out.push({ type: 'pplx', note: `Context pack delivered to Perplexity verbatim (${meta.chars} chars, sha256 ${meta.hash.slice(0, 12)}, thread ${thread})` });
+      meta.lastSendSeq = send.seq; // the delivering call itself was issued at send.seq
     }
-    if (onPack()) meta.lastSendSeq = live.seq;
     const covered = [];
     for (const key of send.blocks || []) {
       const [p, page] = key.split('\u0000');
@@ -765,13 +785,19 @@ export function recordResult(live, toolUseId, { isError = false, text = '' } = {
   }
   if (onPack()) {
     const state = remoteState(text);
-    if (state) {
-      meta.remote = { thread, status: state, seq: live.seq, at: new Date().toISOString() };
+    // State is dated by when it was REQUESTED: a read issued before the last send cannot vouch for it, even if its
+    // response arrives later. A call's own result reflects that call (hence +0.5), and older snapshots never win.
+    const asOf = send.seq + (send.name === 'read' ? 0 : 0.5);
+    if (state && asOf >= (meta.remote?.thread === thread ? meta.remote.seq || 0 : 0)) {
+      meta.remote = { thread, status: state, seq: asOf, at: new Date().toISOString() };
       if (state === 'error') out.push({ type: 'pplx', error: true, note: 'Perplexity reported the task failed or was cancelled' });
     }
   }
   return out;
 }
+
+// Long paths are shortened in labels (the full path is identified by its hash) so they cannot eat a page's budget.
+const labelOf = (p) => (p.length <= 160 ? p : `${p.slice(0, 70)}…${p.slice(-70)}`);
 
 // `desk context-file <path> [--page N]`: desk-built, scrubbed, paginated, so coverage can be verified.
 export async function serveFile(runId, rawPath, page = 1, settings = packSettings()) {
@@ -800,17 +826,20 @@ export async function serveFile(runId, rawPath, page = 1, settings = packSetting
       const content = await blob(meta.headSha, p) ?? '';
       full = isBinary(content) ? '(binary file — not shown)' : scrub(content, live.secrets).split('\n').map((l, i) => `${String(i + 1).padStart(5)}  ${l}`).join('\n');
     }
-    // Room for the block's tag line, closing tag and the next-page note.
-    live.pages.set(p, paginate(normalize(full), settings.pageChars - 300 - 2 * p.length, { diff }));
+    // The body budget is what is left after the tag line, closing tag and next-page note (path shown twice).
+    const body = settings.pageChars - 300 - 2 * labelOf(p).length;
+    if (body < MIN_PAGE_BODY) throw Object.assign(new Error(`pageChars ${settings.pageChars} leaves no room for ${p.slice(0, 60)}…'s content`), { status: 400 });
+    live.pages.set(p, paginate(normalize(full), body, { diff }));
   }
   const pages = live.pages.get(p);
   const n = Math.trunc(Number(page) || 1);
   if (n < 1 || n > pages.length) throw Object.assign(new Error(`${p} has ${pages.length} page(s)`), { status: 400 });
   const inner = normalize(pages[n - 1]);
-  const block = `<sigmadesk-file path="${p}" page="${n}" pages="${pages.length}" sha256="${sha256(inner)}">\n${inner}\n</sigmadesk-file>`;
+  const label = labelOf(p);
+  const block = `<sigmadesk-file path="${label}"${label !== p ? ` path-sha256="${sha256(p)}"` : ''} page="${n}" pages="${pages.length}" sha256="${sha256(inner)}">\n${inner}\n</sigmadesk-file>`;
   live.served.set(`${p}\u0000${n}`, normalize(block));
   meta.servedPages[p] = pages.length;
-  return `${block}${n < pages.length ? `\n(${pages.length - n} more page(s): desk context-file ${p} --page ${n + 1})` : ''}`;
+  return `${block}${n < pages.length ? `\n(${pages.length - n} more page(s): desk context-file ${label === p ? p : `<same path>`} --page ${n + 1})` : ''}`;
 }
 
 // Accept gate for Perplexity-backed reviews: the complete change, delivered and answered, or no pass.
@@ -840,7 +869,7 @@ Your instructions end with a block from <sigmadesk-context …> to </sigmadesk-c
 - The desk checks every message and result. The pack only counts once that call succeeds.
 - Ask Perplexity to end with "NEED FILES: <path>, …" if anything it needs was omitted. If it does, run
   \`desk context-file <path>\` (and \`--page N\` for every further page it reports) and send the outputs verbatim on the
-  SAME thread_id, as many follow-ups as the size cap requires (at most ${settings.pageRounds} page follow-ups, plus
+  SAME thread_id, as many follow-ups as the size cap requires (at most ${settings.pageRounds} page follow-ups${settings.pageRoundsCapped ? `, limited by the ${settings.maxRunMinutes}-minute run cap` : ''}, plus
   ${settings.followupRounds} other follow-up${settings.followupRounds === 1 ? '' : 's'}). Pages sent on another thread do not count.
 - After your last message, poll read_thread with that thread_id until the latest entry is WORKFLOW_COMPLETED (or
   WORKFLOW_ERROR / WORKFLOW_CANCELED), for up to ${settings.remoteWaitMinutes} minutes. The desk reads the structured state; a
