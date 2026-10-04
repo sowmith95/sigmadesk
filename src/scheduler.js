@@ -84,6 +84,15 @@ export function setStatus(key, status, extra = {}) {
 }
 researchReview.hooks.setStatus = setStatus; // holds, waivers and owner decisions on research proposals go through the same door
 
+// Order may cross sub-epics within one feature (a slice of SD-30 may wait for SD-29, a task of the parent SD-28): two
+// tickets can be ordered when they share the same top-level ancestor.
+export function rootOf(key) {
+  let t = store.getTicket(key);
+  for (let i = 0; t?.parent_key && i < 20; i++) t = store.getTicket(t.parent_key);
+  return t?.key || null;
+}
+const sameTree = (a, b) => !!a && !!b && rootOf(a) === rootOf(b);
+
 // The manager split a ticket into tasks: the parent stays open as an epic that tracks them and closes when they settle.
 function splitParent(ticket, agentId, summary, ev) {
   const kids = store.childrenOf(ticket.key);
@@ -898,7 +907,7 @@ export async function deskAction(run, cmd, body = {}) {
         need(['S', 'M'].includes(body.complexity), 'slices must be S or M — split further');
         need(store.childrenOf(run.ticket_key).length < 4, 'at most 4 slices per ticket');
         need(!body.assign || BUILDERS.includes(body.assign), `assign to one of ${BUILDERS.join(', ')}`);
-        if (body.after) need(store.getTicket(body.after)?.parent_key === run.ticket_key, '--after must name an earlier slice of this ticket');
+        if (body.after) need(store.getTicket(body.after)?.parent_key && sameTree(body.after, run.ticket_key) && body.after !== run.ticket_key, '--after must name another task of the same feature');
         const parent = store.getTicket(run.ticket_key);
         const slice = store.createTicket({ title: body.title, description: body.body, type: parent.type === 'bug' ? 'bug' : 'task', status: 'todo', area: body.area,
           complexity: body.complexity, priority: parent.priority, assignee: body.assign || routeSlice(body), reporter: agentId, source: 'agent', parent_key: run.ticket_key });
@@ -910,8 +919,8 @@ export async function deskAction(run, cmd, body = {}) {
       }
       const assignee = body.assign && ENGINEERS.includes(body.assign) ? body.assign : routeTicket(body);
       const parentKey = body.parent || key;
-      // A split's order is enforced, not just described: --after must name an earlier task under the same parent.
-      if (body.after) need(store.getTicket(body.after)?.parent_key === parentKey, '--after must name an earlier task of the same parent');
+      // A split's order is enforced, not just described: --after must name another task of the same feature.
+      if (body.after) need(store.getTicket(body.after)?.parent_key && sameTree(body.after, parentKey) && body.after !== parentKey, '--after must name another task of the same feature');
       const t = store.createTicket({ title: body.title, description: body.body, type: body.type || 'task', status: 'todo', area: body.area,
         complexity: body.complexity, priority: PRIORITY.test(body.priority) ? body.priority : 'P2', assignee, reporter: agentId, source: 'agent', parent_key: parentKey });
       const parentRisk = store.getTicket(parentKey)?.risk;
@@ -1355,10 +1364,10 @@ export function ownerPatch(key, patch) {
   if (patch.complexity) { need(COMPLEXITIES.includes(patch.complexity), 'bad complexity'); p.complexity = patch.complexity; }
   if (patch.area) { need(AREAS.includes(patch.area), 'bad area'); p.area = patch.area; }
   if (patch.after_key !== undefined) {
-    // The owner orders a task after a sibling (same parent); no self-reference and no cycles.
+    // The owner orders a task after another task of the same feature; no self-reference and no cycles.
     if (patch.after_key) {
       const before = store.getTicket(patch.after_key);
-      need(t.parent_key && before?.parent_key === t.parent_key && before.key !== key, 'a task can only start after another task of the same parent');
+      need(t.parent_key && before?.parent_key && before.key !== key && sameTree(before.key, key), 'a task can only start after another task of the same feature');
       for (let k = before, seen = 0; k && seen < 50; k = k.after_key ? store.getTicket(k.after_key) : null, seen++) need(k.key !== key, 'that order would make a loop');
     }
     p.after_key = patch.after_key || null;
