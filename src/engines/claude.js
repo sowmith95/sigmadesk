@@ -1,8 +1,5 @@
 // Claude Code engine: `claude -p --output-format stream-json`, OS sandbox via --settings.
 import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { config, wrapperProblem } from '../config.js';
 
 const short = (s, n = 160) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
@@ -34,32 +31,12 @@ export const claude = {
   costNote: 'USD per run reported by Claude Code (notional on a subscription).',
   canFork: true,
   usesSocket: true,
-  models: () => {
-    const base = [
-      { id: 'fable', tier: 'frontier', note: 'most capable' },
-      { id: 'opus', tier: 'strong', note: 'strong all-rounder' },
-      { id: 'sonnet', tier: 'fast', note: 'fast, cheaper' },
-      { id: 'haiku', tier: 'cheap', note: 'cheapest, triage' },
-    ];
-    let cache = {};
-    try {
-      const cachePath = path.join(process.env.CLAUDE_HOME || path.join(os.homedir(), '.claude'), 'models_cache.json');
-      cache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-    } catch { /* use base catalog */ }
-    const choices = (cache.models || []).map((x) => ({
-      id: x.slug || x.id,
-      tier: x.tier || 'strong',
-      note: `Local Claude catalog${cache.fetched_at ? ` · ${cache.fetched_at}` : ''}; access checked on use`,
-    }));
-    const combined = [...base];
-    for (const m of choices) {
-      if (!combined.some((x) => x.id === m.id)) combined.push(m);
-    }
-    for (const id of config.engines?.claude?.models || []) {
-      if (!combined.some((x) => x.id === id)) combined.push({ id, tier: 'strong', note: 'Configured model; access checked on use' });
-    }
-    return combined;
-  },
+  models: () => [
+    { id: 'fable', tier: 'frontier', note: 'most capable' },
+    { id: 'opus', tier: 'strong', note: 'strong all-rounder' },
+    { id: 'sonnet', tier: 'fast', note: 'fast, cheaper' },
+    { id: 'haiku', tier: 'cheap', note: 'cheapest, triage' },
+  ],
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
   suggest(tier) {
     return { frontier: { model: 'fable', effort: 'high' }, strong: { model: 'opus', effort: 'high' }, fast: { model: 'sonnet', effort: 'medium' }, cheap: { model: 'haiku', effort: 'low' } }[tier];
@@ -86,7 +63,7 @@ export const claude = {
         '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
         '--permission-mode', 'dontAsk',
         '--tools', perms.tools.join(','),
-        '--allowedTools', ...perms.allow,
+        ...(perms.allow.length ? ['--allowedTools', ...perms.allow] : []),
         '--disallowedTools', ...denyRules,
       ],
       promptViaStdin: true,
