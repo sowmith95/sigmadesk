@@ -4,6 +4,7 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { SwitchRow } from '@/components/desk/Fields';
 import { SeatAvatar, Section } from '@/components/desk/Bits';
+import { ChoiceChips } from '@/components/desk/Choices';
 
 function NumberSetting({ k, label, hint, step = 1 }: { k: string; label: string; hint: string; step?: number }) {
   const [v, setV] = useState<string>(S.settings[k] ?? '');
@@ -33,6 +34,14 @@ export default function SettingsPage() {
         <NumberSetting k="daily_budget_usd" label="Daily spend limit (USD)" hint="Notional model spend per day." step={5} />
         <NumberSetting k="max_concurrent" label="Seats at once" hint="A market-hours window in the config can lower this." />
         <Bool k="auto_fallback" label="Provider fallback" hint="When one provider is low or down, seats use another. Limits and gates still apply." />
+      </Group></Section>
+      <Section title="Grooming"><Group>
+        <div className="grid gap-3 py-3">
+          <div className="grid gap-0.5"><b className="font-medium">Morgan grooms on</b><span className="text-[13px] text-muted-foreground">Grooming reads the repository and turns requests into tasks. Codex reads the code directly; the seat's own engine is whatever Models per seat sets for Morgan.</span></div>
+          <ChoiceChips label="Grooming engine" hideLabel value={S.settings.groom_engine === 'seat' ? 'seat' : 'codex'}
+            options={[{ value: 'codex', label: 'Codex' }, { value: 'seat', label: "Morgan's own engine" }]}
+            onChange={async (v) => { try { await api('POST', '/api/settings', { key: 'groom_engine', value: v }); toast('Saved'); } catch (e) { toast((e as Error).message, true); } }} />
+        </div>
       </Group></Section>
       <Section title="Research"><Group>
         <div className="flex items-center justify-between gap-4 py-3"><div className="grid gap-0.5"><b className="font-medium">Research programs</b><span className="text-[13px] text-muted-foreground">{progs.length ? `${progs.filter((p: { enabled: boolean }) => p.enabled).length} of ${progs.length} running.` : 'None yet.'} Who researches, how often, and who checks their work.</span></div>

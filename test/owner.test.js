@@ -115,3 +115,32 @@ test('scheduler waiting entries carry a structured code', () => {
   assert.ok(w.length > 0);
   for (const x of w) assert.ok(['paused', 'dependency', 'provider_hold', 'setup_retry', 'seat_busy', 'budget', 'tick'].includes(x.code), x.code);
 });
+
+test('grooming is pinned to Codex by default and only grooming may pin an engine', async () => {
+  assert.equal(store.getSettings().groom_engine ?? 'codex', 'codex');
+  assert.equal(sched.groomEngine(), 'codex');
+  const pinned = dispatch.pinnedSelection('manager', 'codex', 'groom');
+  assert.equal(pinned.seat.engine, 'codex'); assert.equal(pinned.seat.name, 'Morgan'); assert.equal(pinned.fallback, false);
+  dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: false }]);
+  assert.equal(dispatch.pinnedSelection('manager', 'codex', 'groom').seat, null, 'no silent fallback when Codex is down');
+  dispatch.setAvailability([{ id: 'claude', available: false }, { id: 'codex', available: true }]);
+  store.setSetting('groom_engine', 'seat'); assert.equal(sched.groomEngine(), null);
+  assert.throws(() => store.setSetting('groom_engine', 'perplexity'), /codex or seat/);
+  store.setSetting('groom_engine', 'codex');
+  const runner = await import('../src/runner.js');
+  assert.throws(() => runner.startRun({ agentId: 'manager', kind: 'implement', prompt: 'x', cwd: tmp, pinEngine: 'codex' }), /Only grooming/);
+});
+
+test('a failed design discussion can be retried, a queued one cancelled, and both are visible in the ticket thread', () => {
+  const t = blocked();
+  const d = sched.ownerReply(t.key, 'Talk it through with the manager', 'discussion').discussion;
+  assert.throws(() => sched.ownerDiscussion(d.id, 'retry'), /only a failed/);
+  assert.equal(sched.ownerDiscussion(d.id, 'cancel').status, 'cancelled');
+  assert.throws(() => sched.ownerDiscussion(d.id, 'cancel'), /not started/);
+  const e = sched.ownerReply(t.key, 'Second try', 'discussion').discussion;
+  store.updateDiscussion(e.id, { status: 'failed', error: 'provider unavailable', attempts: 3 });
+  const again = sched.ownerDiscussion(e.id, 'retry');
+  assert.equal(again.status, 'queued'); assert.equal(again.attempts, 0);
+  const routed = store.recentEvents({ ticket_key: t.key, limit: 50 }).find((x) => /Sent to the Engineering Manager/.test(x.text));
+  assert.equal(routed.agent_id, 'system', 'desk routing notes are not attributed to Morgan');
+});

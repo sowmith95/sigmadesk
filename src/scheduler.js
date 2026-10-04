@@ -20,7 +20,7 @@ import * as researchReview from './research-review.js';
 import * as connectors from './connectors.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
-import { selectionFor } from './dispatch.js';
+import { selectionFor, pinnedSelection } from './dispatch.js';
 
 // ---------------- publish guard ----------------
 import { globToRegExp } from './reviews.js';
@@ -109,7 +109,7 @@ function stall(ticket, reason) {
   const stalls = (ticket.stalls || 0) + 1;
   const resume = ticket.status === 'in_progress' ? 'todo' : ticket.status;
   if (stalls >= 2) {
-    store.addComment(ticket.key, 'system', `Stalled twice (${reason}). Parked for the owner — reply on the board to resume.`);
+    store.addComment(ticket.key, 'system', `Stalled twice (${reason}). Parked for you: answer on the ticket to resume.`);
     setStatus(ticket.key, 'needs_human', { stalls, active_run: null, resume_status: resume });
   } else {
     store.logEvent({ ticket_key: ticket.key, kind: 'system', text: `no outcome (${reason}); will retry once` });
@@ -118,9 +118,9 @@ function stall(ticket, reason) {
 }
 
 // ---------------- job launchers ----------------
-async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [], nonce = null, fence = runner.currentEpoch(), onStart = null, outcome = null, job = null }) {
+async function launch({ agentId, kind, ticket, cwd, prompt, resume = null, fork = false, extraDirs = [], nonce = null, fence = runner.currentEpoch(), onStart = null, outcome = null, job = null, pinEngine = null }) {
   const before = ticket?.status;
-  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs, nonce, fence, onStart, job });
+  const p = runner.startRun({ agentId, kind, ticketKey: ticket?.key, prompt, cwd, resume, fork, extraDirs, nonce, fence, onStart, job, pinEngine });
   if (ticket) store.updateTicket(ticket.key, { active_run: store.getAgentState(agentId).current_run });
   const { run, aborted, failure } = await p;
   if (aborted) {
@@ -166,13 +166,25 @@ async function launchTriage(t, fence) {
   await launch({ fence, agentId: 'support', kind: 'triage', ticket: t, cwd, prompt: promptFor('triage', { ticket: t, comments: store.listComments(t.key) }) });
 }
 
+// Grooming runs on Codex unless the owner chose the manager seat's own engine (Settings). Perplexity relays could not
+// carry the groom context pack verbatim and left threads pending, so grooming is pinned to an engine that reads the repo.
+export const groomEngine = () => (store.getSettings().groom_engine === 'seat' ? null : 'codex');
 async function launchGroom(t, fence) {
   const { cwd } = await readonlyJob('manager', t);
-  await launch({ fence, agentId: 'manager', kind: 'groom', ticket: t, cwd, prompt: promptFor('groom', { ticket: t, comments: store.listComments(t.key) }) });
+  await launch({ fence, agentId: 'manager', kind: 'groom', ticket: t, cwd, pinEngine: groomEngine(), prompt: promptFor('groom', { ticket: t, comments: store.listComments(t.key) }) });
 }
 
+// A discussion is retried after interruptions at most this many times, then fails visibly with a Retry for the owner.
+export const DISCUSSION_ATTEMPTS = 3;
+function requeueDiscussion(id, why) {
+  const d = store.getDiscussion(id);
+  const failed = (d.attempts || 0) >= DISCUSSION_ATTEMPTS;
+  store.updateDiscussion(id, failed ? { status: 'failed', run_id: null, error: why, ended_at: store.now() } : { status: 'queued', run_id: null, error: why });
+  store.logEvent({ ticket_key: d.ticket_key, agent_id: 'system', kind: failed ? 'error' : 'system',
+    text: failed ? `Design discussion #${id} failed after ${d.attempts} attempts (${why}). Retry it from the ticket.` : `Design discussion #${id} interrupted (${why}); it will run again.` });
+}
 export async function launchDiscussion(d, fence) {
-  store.updateDiscussion(d.id, { status: 'running', error: null });
+  store.updateDiscussion(d.id, { status: 'running', error: null, attempts: (store.getDiscussion(d.id)?.attempts || 0) + 1 });
   try {
     const { cwd } = await readonlyJob('manager', null);
     store.updateAgent('manager', { current_ticket: d.ticket_key, last_action: 'interpreting the owner’s design request' });
@@ -181,10 +193,13 @@ export async function launchDiscussion(d, fence) {
     store.updateDiscussion(d.id, { run_id: store.getAgentState('manager').current_run });
     const { run, aborted, failure } = await p;
     if (store.getDiscussion(d.id).status !== 'running') return;
-    if (aborted || failure || run.status === 'killed') { store.updateDiscussion(d.id, { status: 'queued', run_id: null }); return; }
+    if (aborted || failure || run.status === 'killed') { requeueDiscussion(d.id, aborted ? 'stopped' : failure ? 'provider unavailable' : 'run stopped'); return; }
     if (run.status === 'success' && run.result_text?.trim()) completeDiscussion(d.id, run.result_text);
-    else store.updateDiscussion(d.id, { status: 'failed', error: 'Manager ended without a design response', ended_at: store.now() });
-  } catch (err) { store.updateDiscussion(d.id, { status: 'queued', run_id: null, error: store.redact(err.message).slice(0, 240) }); throw err; }
+    else {
+      store.updateDiscussion(d.id, { status: 'failed', error: 'The manager ended without a design response', ended_at: store.now() });
+      store.logEvent({ ticket_key: d.ticket_key, agent_id: 'system', kind: 'error', text: `Design discussion #${d.id} ended without a response. Retry it from the ticket.` });
+    }
+  } catch (err) { if (store.getDiscussion(d.id)?.status === 'running') requeueDiscussion(d.id, store.redact(err.message).slice(0, 240)); throw err; }
   finally { consultTargets.delete(store.getDiscussion(d.id)?.run_id); }
 }
 function completeDiscussion(id, response) {
@@ -545,8 +560,8 @@ export async function tick() {
     // Seats are flipped to "working" synchronously when a job starts, so this counts jobs still in setup too.
     let slots = capacity(s) - workCount();
     const fence = runner.currentEpoch();
-    const go = (agentId, fn) => {
-      if (!selectionFor(agentId).seat) return false;
+    const go = (agentId, fn, pin = null, pinKind = 'groom') => {
+      if (!(pin ? pinnedSelection(agentId, pin, pinKind) : selectionFor(agentId)).seat) return false;
       if (setupHold(agentId)) return false;
       const need = runner.runBudget(agentId);
       if (headroom < need) {
@@ -665,7 +680,7 @@ export async function tick() {
     }
     // 4. Manager grooms proposals (consulting principals inside the run); research proposals wait for their second review.
     const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run && !researchReview.blocks(t));
-    if (proposed && slots > 0 && agentIdle('manager')) go('manager', (f) => launchGroom(proposed, f));
+    if (proposed && slots > 0 && agentIdle('manager')) go('manager', (f) => launchGroom(proposed, f), groomEngine());
     // 5. Research programs on their own cadence and market window while the funnel is thin (oldest last run first).
     for (const p of research.due(s)) {
       if (slots <= 0 || researchAllowance(s) <= 0) break;
@@ -728,6 +743,7 @@ export async function deskAction(run, cmd, body = {}) {
   const agentId = run.agent_id;
   if (run.kind === 'product_review') need(['context-file'].includes(cmd), 'Product reviewers are read-only; return a structured report, not desk mutations');
   if (run.kind === 'council_review') need(false, 'council calls cannot invoke desk commands');
+  if (run.kind === 'feature_groom') need(false, 'a grooming session is read-only: return the plan JSON as your final answer');
   // Research kinds are authorized by the run, not the seat: proposals come from research runs that carry a program,
   // a revision run may only revise its own proposal, and reviewers/assessors are read-only.
   if (run.kind === 'research') need(['show', 'list', 'comment', 'needs-human', 'progress', 'propose', 'connector-propose', 'context-file'].includes(cmd), 'research runs read and file proposals; they do not groom, design or build');
@@ -1229,11 +1245,29 @@ export function ownerReply(key, text, mode = 'auto', { expected_updated_at } = {
   let request;
   if (discussion) {
     request = store.createDiscussion(key, String(text).slice(0, 8000));
-    store.logEvent({ ticket_key: key, agent_id: 'manager', kind: 'system', text: `Owner message routed to Engineering Manager for design discussion #${request.id}. Existing ticket state preserved.` });
+    store.logEvent({ ticket_key: key, agent_id: 'system', kind: 'system', text: `Sent to the Engineering Manager as design discussion #${request.id}. The ticket keeps its current state.` });
   } else if (mode !== 'comment' && t.status === 'needs_human' && researchReview.held(t)) researchReview.ownerDecide(t, 'correction', text); // an answer to a held proposal sends it back with these notes
   else if (mode !== 'comment' && t.status === 'needs_human') setStatus(key, t.resume_status || 'todo', { resume_status: null, stalls: 0 });
   github.flushComments();
   return { ...store.getTicket(key), message_route: discussion ? 'discussion' : mode === 'comment' ? 'comment' : 'answer', discussion: request || null };
+}
+
+// The owner retries a failed design discussion or cancels one that has not started.
+export function ownerDiscussion(id, action) {
+  const d = store.getDiscussion(Number(id));
+  need(d, 'no such discussion');
+  if (action === 'retry') {
+    need(d.status === 'failed', 'only a failed discussion can be retried');
+    need(store.pendingDiscussions().length < 20, 'discussion queue is full');
+    store.logEvent({ ticket_key: d.ticket_key, agent_id: 'owner', kind: 'system', text: `Retried design discussion #${d.id}.` });
+    return store.updateDiscussion(d.id, { status: 'queued', error: null, attempts: 0, ended_at: null, run_id: null });
+  }
+  if (action === 'cancel') {
+    need(d.status === 'queued', 'only a discussion that has not started can be cancelled');
+    store.logEvent({ ticket_key: d.ticket_key, agent_id: 'owner', kind: 'system', text: `Cancelled design discussion #${d.id}.` });
+    return store.updateDiscussion(d.id, { status: 'cancelled', ended_at: store.now() });
+  }
+  need(false, 'choose retry or cancel');
 }
 
 export async function ownerDecision(key, { decision, message = '', expected_updated_at, discussion_id } = {}) {

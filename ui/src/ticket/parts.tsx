@@ -1,7 +1,7 @@
 // Ticket panel sections. Behaviour is the v2/React-port behaviour; only presentation changed.
-import { useLayoutEffect, useRef, useState, type ReactNode, type MutableRefObject } from 'react';
+import { Fragment, useLayoutEffect, useRef, useState, type ReactNode, type MutableRefObject } from 'react';
 import { nameOf } from '../../../public/names.js';
-import { conversationItems, nearLatest } from '../../../public/conversation.js';
+import { conversationItems, nearLatest, dayLabel } from '../../../public/conversation.js';
 import { safeGithubUrl } from '../../../public/prs-model.js';
 import { S, api, agentMap, ticketByKey, openTicket, openSheet, loadDetail, loadSnapshot, prFor, councilFor, toast } from '@/store.js';
 import { clean, hhmm, outcome, prNumber, questionText } from '@/lib/format.js';
@@ -9,60 +9,115 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { AsyncButton } from '@/components/desk/AsyncButton';
 import { Tag, Named, SeatAvatar } from '@/components/desk/Bits';
+import { Markdown, Inline } from '@/components/desk/Markdown';
 import { cardFor, EvidenceList, CiTag, Disclose, STAGE_LABEL, firstName } from '@/components/desk/Work';
 import { cn } from '@/lib/utils';
 import type { BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
-export interface ConvState { agent: string; follow: boolean; top: number }
+export interface ConvState { agent: string; follow: boolean; top: number; seen?: number }
 
 export function Block({ title, children, tone, className }: { title?: ReactNode; children: ReactNode; tone?: 'needs'; className?: string }) {
   return <section className={cn('grid gap-3 rounded-lg border bg-card p-4', tone === 'needs' && 'border-l-[3px] border-l-needs', className)}>{title && <h3 className="font-semibold">{title}</h3>}{children}</section>;
 }
 const Row = ({ k, children }: { k: string; children: ReactNode }) => <div className="grid gap-1 border-t pt-3 first:border-t-0 first:pt-0 md:grid-cols-[132px_1fr] md:gap-4"><span className="text-sm text-muted-foreground">{k}</span><div className="grid min-w-0 gap-2">{children}</div></div>;
 
-export function Conversation({ d, live, tkey, state }: { d: Detail; live: boolean; tkey: string; state: MutableRefObject<ConvState> }) {
+type Item = { id: string; who: string; text: string; kind: string; ts: string; runId?: number; ask?: boolean; open?: boolean; raw?: string;
+  discussionId?: number; status?: string; error?: string | null; steps?: { id: string; ts: string; raw: string }[] };
+const EVENT_TONE: Record<string, string> = { error: 'text-blocked', done: 'text-shipped' };
+const FILTERS = [['', 'Everyone'], ['owner', 'You'], ['seats', 'Team'], ['desk', 'Desk & GitHub']] as const;
+const DISCUSSION_TONE: Record<string, 'needs' | 'blocked' | 'shipped' | 'neutral' | 'action'> = { queued: 'neutral', running: 'action', complete: 'needs', approved: 'shipped', failed: 'blocked', cancelled: 'neutral', rejected: 'neutral', changes_requested: 'neutral' };
+
+function DiscussionRow({ it, onChange }: { it: Item; onChange: () => void }) {
+  const act = (action: 'retry' | 'cancel') => async () => { await api('POST', `/api/discussions/${it.discussionId}/${action}`, {}); onChange(); };
+  return (
+    <div className="ml-11 flex flex-wrap items-center gap-2 rounded-md border border-dashed px-3 py-2 text-sm" data-discussion={it.discussionId}>
+      <Tag tone={DISCUSSION_TONE[it.status || ''] || 'neutral'}>{it.status === 'running' ? 'Working' : it.status === 'complete' ? 'Ready' : (it.status || '').replace('_', ' ')}</Tag>
+      <span className="min-w-0 flex-1">{it.text}{it.error && it.status === 'failed' ? <span className="text-muted-foreground">: {it.error}</span> : null}</span>
+      {it.status === 'failed' && <AsyncButton size="sm" variant="secondary" run={act('retry')} ok="Discussion queued again">Retry</AsyncButton>}
+      {it.status === 'queued' && <AsyncButton size="sm" variant="ghost" run={act('cancel')} ok="Discussion cancelled">Cancel</AsyncButton>}
+    </div>
+  );
+}
+
+function LongText({ id, text, self, className }: { id: string; text: string; self: string; className?: string }) {
+  const [open, setOpen] = useState(false);
+  const long = text.length > 1400;
+  const shown = long && !open ? `${text.slice(0, 900).replace(/\s+\S*$/, '')}…` : text;
+  return <div className={cn('grid gap-1', className)}><Markdown text={shown} self={self} />
+    {long && <button type="button" aria-expanded={open} aria-controls={id} className="justify-self-start text-sm text-primary hover:underline" onClick={() => setOpen(!open)}>{open ? 'Show less' : 'Show all'}</button>}</div>;
+}
+
+export function Conversation({ d, live, tkey, state, status }: { d: Detail; live: boolean; tkey: string; state: MutableRefObject<ConvState>; status?: string }) {
   const [, force] = useState(0);
   const log = useRef<HTMLDivElement>(null);
   const st = state.current;
   const amap = agentMap();
-  const items = conversationItems({ ...d, agent: st.agent });
-  const participants = [...new Set(conversationItems(d).map((i: { who: string }) => i.who))] as string[];
+  const all = conversationItems({ ...d, status }) as Item[];
+  const seat = (id: string) => !!amap[id];
+  const items = all.filter((i) => !st.agent || (st.agent === 'owner' ? i.who === 'owner' : st.agent === 'seats' ? seat(i.who) : st.agent === 'desk' ? !seat(i.who) && i.who !== 'owner' : i.who === st.agent));
   const whoName = (id: string) => amap[id]?.name || ({ owner: 'You', system: 'Desk', github: 'GitHub' } as Record<string, string>)[id] || id;
+  const unseen = st.follow ? 0 : Math.max(0, items.length - (st.seen ?? items.length));
+  if (st.follow || st.seen === undefined) st.seen = items.length;
   useLayoutEffect(() => { if (log.current) log.current.scrollTop = st.follow ? log.current.scrollHeight : st.top; });
+  const jump = () => { st.follow = true; st.seen = items.length; force((n) => n + 1); };
+  let lastDay = '';
+  let prev: Item | null = null;
   return (
     <section aria-label="Conversation" className="grid min-w-0 gap-3">
       <div className="flex flex-wrap items-center gap-2">
-        <label className="inline-flex items-center gap-2 text-sm text-muted-foreground">Show
-          <select aria-label="Conversation participant" value={st.agent} onChange={(e) => { st.agent = e.target.value; st.follow = true; st.top = 0; force((n) => n + 1); }}
-            className="h-9 rounded-md border border-input bg-background px-2 text-foreground"><option value="">Everyone</option>{participants.map((id) => <option key={id} value={id}>{whoName(id)}</option>)}</select></label>
-        <span className="text-sm text-muted-foreground" role="status">{!S.connected ? 'Reconnecting…' : live ? 'Live' : 'Up to date'}</span>
+        <div role="radiogroup" aria-label="Show messages from" className="flex flex-wrap gap-1.5">
+          {FILTERS.map(([v, label]) => <button key={v} type="button" role="radio" aria-checked={st.agent === v}
+            className={cn('h-8 rounded-full border px-3 text-sm', st.agent === v ? 'border-primary bg-primary/15 text-foreground' : 'text-muted-foreground hover:bg-secondary')}
+            onClick={() => { st.agent = v; st.follow = true; st.top = 0; st.seen = undefined; force((n) => n + 1); }}>{label}</button>)}
+        </div>
         <span className="flex-1" />
-        <Button variant="secondary" size="sm" disabled={st.follow} onClick={() => { st.follow = true; force((n) => n + 1); }}>{st.follow ? 'Following latest' : 'Jump to latest'}</Button>
+        <span className="text-sm text-muted-foreground" role="status">{!S.connected ? 'Reconnecting…' : live ? 'Live' : ''}</span>
       </div>
-      <div ref={log} role="region" aria-label="Task conversation" tabIndex={0} className="grid max-h-[58vh] min-h-48 content-start gap-3 overflow-y-auto overscroll-contain pr-1 [overflow-anchor:none]"
-        onScroll={(e) => { st.top = e.currentTarget.scrollTop; const f = nearLatest(e.currentTarget); if (f !== st.follow) { st.follow = f; force((n) => n + 1); } }}>
-        {items.length ? items.map((it: { id: string; who: string; text: string; kind: string; ts: string; runId?: number; steps?: { id: string; ts: string; raw: string }[] }) => {
-          const mine = it.who === 'owner';
-          const ask = String(it.text).startsWith('❓');
-          const who = whoName(it.who);
-          const run = S.runs.find((r: { id: number }) => r.id === it.runId);
-          const meta = [amap[it.who]?.role, run?.model?.replace(':', ', ')].filter(Boolean).join(', ');
-          if (it.kind === 'technical') return <div key={it.id} className="pl-11 text-[13px]"><Disclose id={`steps-${tkey}-${it.id}`} summary={`${who}: ${it.steps!.length} execution step${it.steps!.length === 1 ? '' : 's'}`}>
-            <div className="whitespace-pre-wrap rounded-md bg-background p-2 font-mono text-[13px] text-muted-foreground [overflow-wrap:anywhere]">{it.steps!.map((e) => <div key={e.id}><time dateTime={e.ts} className="opacity-70">{hhmm(e.ts)}</time> {e.raw}</div>)}</div></Disclose></div>;
-          const text = ask ? questionText(it.text) : clean(it.text);
-          const update = !['comment', 'say'].includes(it.kind);
-          return (
-            <article key={it.id} data-message={it.id} className={cn('flex items-start gap-2.5', mine && 'justify-end')}>
-              {!mine && <SeatAvatar id={it.who} size="md" />}
-              <div className={cn('grid min-w-0 gap-0.5 rounded-lg px-3 py-2', mine ? 'max-w-[88%] bg-primary/15' : 'flex-1 bg-secondary', ask && 'bg-needs/15', update && !ask && 'rounded-none border-l-2 border-muted-foreground bg-transparent py-1')}>
-                <div className="flex flex-wrap items-baseline gap-2"><b className="text-sm">{ask ? `${who} asks you` : who}</b><time className="text-xs text-muted-foreground" dateTime={it.ts} title={new Date(it.ts).toLocaleString()}>{hhmm(it.ts)}</time></div>
-                {meta && <p className="text-xs text-muted-foreground">{meta}</p>}
-                <div className="whitespace-pre-line [overflow-wrap:anywhere]">{text.length > 1200 ? <><Named text={`${text.slice(0, 800).trim()}…`} /> <Disclose id={`msg-${it.id}`} summary="Show all"><Named text={text} /></Disclose></> : <Named text={text} />}</div>
-              </div>
-            </article>
-          );
-        }) : <p className="text-muted-foreground">No recorded updates yet. Messages appear here as the team works.</p>}
+      <div className="relative">
+        <div ref={log} role="log" aria-label="Task conversation" tabIndex={0} className="grid max-h-[calc(100dvh-19rem)] min-h-56 content-start gap-2.5 overflow-y-auto overscroll-contain pr-1 [overflow-anchor:none] md:max-h-[64vh]"
+          onScroll={(e) => { st.top = e.currentTarget.scrollTop; const f = nearLatest(e.currentTarget); if (f !== st.follow) { st.follow = f; if (f) st.seen = items.length; force((n) => n + 1); } }}>
+          {items.length ? items.map((it) => {
+            const day = dayLabel(it.ts);
+            const sep = day && day !== lastDay ? <div key={`day-${it.id}`} className="my-1 flex items-center gap-3 text-xs text-muted-foreground"><span className="h-px flex-1 bg-border" />{day}<span className="h-px flex-1 bg-border" /></div> : null;
+            lastDay = day || lastDay;
+            const same = !sep && prev && prev.who === it.who && prev.kind === 'comment' && it.kind === 'comment' && Date.parse(it.ts) - Date.parse(prev.ts) < 10 * 60_000;
+            prev = it;
+            const who = whoName(it.who);
+            const time = <time className="text-xs text-muted-foreground" dateTime={it.ts} title={new Date(it.ts).toLocaleString()}>{hhmm(it.ts)}</time>;
+            let body: ReactNode;
+            if (it.kind === 'discussion') body = <DiscussionRow it={it} onChange={() => { loadDetail(); }} />;
+            else if (it.kind === 'technical') body = <div className="pl-11 text-[13px]"><Disclose id={`steps-${tkey}-${it.id}`} summary={`${who}: ${it.steps!.length} execution step${it.steps!.length === 1 ? '' : 's'}`}>
+              <div className="whitespace-pre-wrap rounded-md bg-background p-2 font-mono text-[13px] text-muted-foreground [overflow-wrap:anywhere]">{it.steps!.map((e) => <div key={e.id}><time dateTime={e.ts} className="opacity-70">{hhmm(e.ts)}</time> {e.raw}</div>)}</div></Disclose></div>;
+            else if (it.kind === 'say') body = (
+              <div className="flex items-start gap-2.5 text-[15px]" data-message={it.id}>
+                <SeatAvatar id={it.who} size="sm" className="mt-0.5 ml-1" />
+                <div className="grid min-w-0 flex-1 gap-0.5 text-muted-foreground"><div className="flex flex-wrap items-baseline gap-2"><span className="text-sm font-medium text-foreground/80">{who}</span>{time}</div>
+                  <LongText id={`msg-${it.id}`} text={it.text} self={tkey} /></div>
+              </div>);
+            else if (it.kind !== 'comment') body = (
+              <div className={cn('flex items-start gap-2.5 pl-1 text-sm', EVENT_TONE[it.kind] || 'text-muted-foreground')} data-message={it.id}>
+                <SeatAvatar id={it.who} size="sm" />
+                <p className="min-w-0 flex-1 pt-0.5"><span className="font-medium text-foreground/80">{who}</span> <Inline text={clean(it.text)} self={tkey} /> {time}</p>
+              </div>);
+            else {
+              const mine = it.who === 'owner';
+              const text = it.ask ? questionText(it.text) : it.text;
+              const meta = [amap[it.who]?.role, S.runs.find((r: { id: number }) => r.id === it.runId)?.model?.replace(':', ' · ')].filter(Boolean).join(' · ');
+              body = (
+                <article data-message={it.id} className={cn('flex items-start gap-2.5', mine && 'justify-end', same && 'mt-[-4px]')}>
+                  {!mine && (same ? <span className="w-8 shrink-0" /> : <SeatAvatar id={it.who} size="md" />)}
+                  <div className={cn('grid min-w-0 gap-1 rounded-xl px-3.5 py-2.5', mine ? 'max-w-[88%] rounded-tr-sm bg-primary/15' : 'flex-1 rounded-tl-sm bg-secondary', it.open && 'bg-needs/15 ring-1 ring-needs/40')}>
+                    {!same && <div className="flex flex-wrap items-baseline gap-x-2"><b className="text-sm">{it.open ? `${who} asks you` : it.ask ? `${who} asked` : who}</b>
+                      {meta && <span className="text-xs text-muted-foreground">{meta}</span>}{time}</div>}
+                    <LongText id={`msg-${it.id}`} text={text} self={tkey} />
+                  </div>
+                </article>);
+            }
+            return <Fragment key={it.id}>{sep}{body}</Fragment>;
+          }) : <p className="text-muted-foreground">{st.agent ? 'Nothing from them yet.' : 'No recorded updates yet. Messages appear here as the team works.'}</p>}
+        </div>
+        {!st.follow && <Button size="sm" className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-lg" onClick={jump}>{unseen ? `${unseen} new message${unseen === 1 ? '' : 's'}` : 'Jump to latest'}</Button>}
       </div>
     </section>
   );
@@ -111,8 +166,8 @@ export function Brief({ dec, t, d }: { dec: BoardItem; t: Ticket; d: Detail | nu
   return (
     <Block tone="needs">
       <Row k="Your decision"><p className="font-semibold">{dec.verb}</p>
-        {q && <p className="whitespace-pre-line rounded-md bg-needs/15 px-3 py-2"><Named text={clean(questionText(q.body))} /></p>}
-        {dec.kind === 'design' && (proposal ? <div className="whitespace-pre-line rounded-md bg-background p-3"><p className="mb-1 text-sm text-muted-foreground">Recommendation #{proposal.id}</p><Named text={clean(proposal.response)} /></div>
+        {q && <div className="rounded-md bg-needs/15 px-3 py-2"><Markdown text={questionText(q.body)} self={t.key} /></div>}
+        {dec.kind === 'design' && (proposal ? <div className="rounded-md bg-background p-3"><p className="mb-1 text-sm text-muted-foreground">Recommendation #{proposal.id}</p><Markdown text={proposal.response} self={t.key} /></div>
           : <p className="text-muted-foreground">Loading recommendation #{dec.proposal_id}…</p>)}
         {dec.kind === 'council' && <CouncilView c={councilFor(dec.council_id)} />}
         {!q && !['design', 'council'].includes(dec.kind || '') && <p><Named text={clean(dec.reason)} /></p>}</Row>
@@ -238,7 +293,7 @@ export function Details({ t, d }: { t: Ticket; d: Detail | null }) {
         <Fact k="Review rounds"><span className="font-mono">{String(t.qa_loops || 0)}</span></Fact>
       </Block>
       {kids.length > 0 && <Block title="Slices"><ul className="grid gap-1.5">{kids.map((k: Ticket) => <li key={k.key} className="flex items-center justify-between gap-2"><button type="button" className="text-left hover:underline max-md:min-h-11" onClick={() => openTicket(k.key)}>{nameOf(k)}</button><Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag></li>)}</ul></Block>}
-      {(d?.discussions || []).length > 0 && <Block title="Design discussions">{d!.discussions.slice(0, 4).map((x: Detail) => <p key={x.id} className="text-sm">#{x.id}: {x.status.replaceAll('_', ' ')}{x.error ? `, ${x.error}` : ''}</p>)}</Block>}
+      {(d?.discussions || []).length > 0 && <Block title="Design discussions">{[...d!.discussions].sort((a: Detail, b: Detail) => b.id - a.id).slice(0, 4).map((x: Detail) => <p key={x.id} className="text-sm">#{x.id}: {x.status.replaceAll('_', ' ')}{x.error ? `, ${x.error}` : ''}</p>)}</Block>}
       <div className="flex flex-wrap gap-2">
         <AsyncButton variant="secondary" run={async () => { const v = window.prompt('Short name for this ticket (2 to 5 words):', nameOf(t)); if (v == null) return false; await api('POST', `/api/tickets/${t.key}/name`, { name: v }); await loadSnapshot(); }} ok="Renamed">Rename</AsyncButton>
         <Button variant="ghost" asChild><a href={`/classic.html#${t.key}`}>Architecture review & council (Classic)</a></Button>

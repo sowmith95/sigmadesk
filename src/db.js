@@ -315,6 +315,7 @@ function migrate() {
       research_program: 'TEXT', research_run: 'INTEGER', research_policy: 'TEXT', research_review: 'TEXT', research_generation: 'INTEGER DEFAULT 0',
       research_revisions: 'INTEGER DEFAULT 0', research_sources: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
+    owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     pr_outbox: { next_attempt_at: 'TEXT' },
     runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT',
       thread_id: 'TEXT', context_hash: 'TEXT', context_meta: 'TEXT', job_hash: 'TEXT',
@@ -357,6 +358,8 @@ export function settingDefaults() {
     team: '{}', // per-seat {engine, model, effort, enabled} chosen in the UI
     team_confirmed: 'false', // the owner must confirm who runs on what before the first open
     auto_fallback: String(config.engines.autoFallback),
+    // Which engine the Engineering Manager grooms on: 'codex' (default) or 'seat' (the manager seat's own engine).
+    groom_engine: 'codex',
     // '' = not configured: research programs derive from config.research + the legacy pm_* rows. Saved JSON wins.
     research_programs: '',
   };
@@ -374,6 +377,7 @@ export function setSetting(key, value) {
     if (!String(value).trim() || !Number.isFinite(n) || n < min || n > max || (key !== 'daily_budget_usd' && !Number.isInteger(n)))
       throw Object.assign(new Error(`${key} must be ${key === 'daily_budget_usd' ? 'a number' : 'an integer'} from ${min} to ${max}`), { status: 400 });
   }
+  if (key === 'groom_engine' && !['codex', 'seat'].includes(String(value))) throw Object.assign(new Error('groom_engine must be codex or seat'), { status: 400 });
   if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'draft_prs', 'team_confirmed', 'auto_fallback'].includes(key) && !['true', 'false'].includes(String(value)))
     throw Object.assign(new Error(`${key} must be true or false`), { status: 400 });
   writeSetting(key, value);
@@ -867,7 +871,7 @@ export const pendingDiscussions = () => q("SELECT * FROM owner_discussions WHERE
 export const pendingProposals = () => q("SELECT id, ticket_key FROM owner_discussions WHERE status='complete' ORDER BY id DESC LIMIT 50").all();
 export const ticketDiscussions = (key) => q('SELECT * FROM owner_discussions WHERE ticket_key=? ORDER BY id DESC LIMIT 20').all(key);
 export function updateDiscussion(id, patch) {
-  const cols = Object.keys(patch).filter((k) => ['status', 'response', 'error', 'run_id', 'ended_at'].includes(k));
+  const cols = Object.keys(patch).filter((k) => ['status', 'response', 'error', 'run_id', 'ended_at', 'attempts'].includes(k));
   if (cols.length) q(`UPDATE owner_discussions SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
   const d = getDiscussion(id); announce({ type: 'discussion', data: d }); return d;
 }
