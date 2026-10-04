@@ -10,6 +10,8 @@ import { deskPaths } from './app-paths.js';
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const DEFAULTS = {
+  // Set by the setup wizard for a new project: what the owner already approved there (e.g. the team).
+  bootstrap: {},
   server: {
     port: 8790,
     // Loopback only by default. Add your Tailscale/LAN IP to reach it from a phone.

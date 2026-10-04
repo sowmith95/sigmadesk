@@ -17,11 +17,11 @@ function files(dir) {
 const OUT = path.join(ROOT, 'public', 'app');
 const rel = (f) => path.relative(ROOT, f).split(path.sep).join('/');
 const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
-/** public/*.js modules the UI imports (relative imports that leave ui/), found by scanning the sources. */
+/** public/*.js and src/*.js modules the UI imports (relative imports that leave ui/), found by scanning the sources. */
 export function sharedInputs() {
   const found = new Set();
   for (const f of files(path.join(ROOT, 'ui')).filter((x) => /\.(jsx?|mjs|tsx?)$/.test(x))) {
-    for (const m of fs.readFileSync(f, 'utf8').matchAll(/from\s+['"]((?:\.\.\/)+public\/[\w./-]+)['"]/g)) {
+    for (const m of fs.readFileSync(f, 'utf8').matchAll(/from\s+['"]((?:\.\.\/)+(?:public|src)\/[\w./-]+)['"]/g)) {
       const target = path.resolve(path.dirname(f), m[1]);
       if (fs.existsSync(target)) found.add(target);
     }
@@ -52,7 +52,7 @@ export function check() {
   const now = outputs(), want = stamp.outputs || {};
   const missing = Object.keys(want).filter((k) => !now[k]), extra = Object.keys(now).filter((k) => !want[k]), altered = Object.keys(want).filter((k) => now[k] && now[k] !== want[k]);
   if (missing.length || extra.length || altered.length) return { ok: false, reason: `bundle files differ from the stamp (missing: ${missing.join(', ') || 'none'}; extra: ${extra.join(', ') || 'none'}; altered: ${altered.join(', ') || 'none'})` };
-  if (!want['public/app/main.js'] || !want['public/app/main.css']) return { ok: false, reason: 'the stamp lists no main.js/main.css' };
+  if (!want['public/app/main.js'] || !want['public/app/main.css'] || !want['public/app/hub.js']) return { ok: false, reason: 'the stamp lists no main.js/main.css/hub.js' };
   return { ok: true, stamp };
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
