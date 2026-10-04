@@ -1106,13 +1106,14 @@ function renderModelSettings() {
     const engine=engines.find(e=>e.id===p.engine);
     const models=engine?.models || [];
     const health=(S.meta.providers || []).find(x=>x.id===p.engine);
+    const relayHeld=p.engine==='perplexity' && !(S.meta.providers || []).find(x=>x.id==='claude')?.ready;
     const efforts=models.find(m=>m.id===p.model)?.efforts || engine?.efforts || [];
     const field=(label,values,value,change)=>h('label',{class:'field'},h('span',{},label),h('select',{'aria-label':label,onchange:e=>{change(e.target.value);renderSheet();}}, values.map(([v,l])=>h('option',{value:v,selected:v===value},l))));
     return h('fieldset',{class:'model-profile'},h('legend',{},title),
       field(`${title} provider`,engines.map(e=>[e.id,`${e.label}${e.available?'':' · unavailable'}`]),p.engine,v=>{p.engine=v;Object.assign(p,catalog.seats.find(s=>s.id===a.id)?.suggestions[v] || {model:catalog.engines.find(e=>e.id===v)?.models[0]?.id || '',effort:'medium'});}),
       field(`${title} model`,models.map(m=>[m.id,m.label || m.id || m.note || 'Account default']),p.model,v=>{p.model=v;const e=models.find(m=>m.id===v)?.efforts || engine.efforts;if(!e.includes(p.effort))p.effort=e.includes('high')?'high':e[0];}),
       field(`${title} reasoning`,efforts.map(e=>[e,e]),p.effort,v=>p.effort=v),
-      h('p',{class:'small',role:'status'},health?.ready?'Provider ready':health?.reason || 'Provider status unavailable'),
+      h('p',{class:'small',role:'status'},health?.ready?(relayHeld?'Connected; waiting for an available Claude relay':'Provider ready'):health?.reason || 'Provider status unavailable'),
       h('p',{class:'muted small'},models.find(m=>m.id===p.model)?.note || engine?.costs || ''),
       p.engine==='perplexity'?h('p',{class:'muted small'},'Thinking roles only. Uses Perplexity credits plus a local Claude relay; both must be available.'):null);
   };

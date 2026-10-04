@@ -505,7 +505,7 @@ export async function tick() {
     // Bounded independent product/design reviews; preserve capacity for QA/SRE.
     let reviewSlots = 2 - store.listAgentStates().filter(a => a.status === 'working' && a.current_kind === 'product_review').length;
     for (const { r, m } of productReview.pending()) {
-      if (slots <= 1 || reviewSlots <= 0) break;
+      if (slots <= (capacity(s)>1?1:0) || reviewSlots <= 0) break;
       if (agentIdle(m.agent_id) && go(m.agent_id, f => productReview.launch(r, m, f))) reviewSlots--;
     }
     // 3. Engineers pick up groomed work by routing (area × complexity × risk).
