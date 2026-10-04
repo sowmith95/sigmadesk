@@ -13,10 +13,9 @@ import { agentById, PRINCIPALS, promptFor } from './team.js';
 import * as store from './db.js';
 import * as runner from './runner.js';
 import * as github from './github.js';
-import * as prs from './prs.js';
 import { selectionFor } from './dispatch.js';
 // Circular on purpose: only used at call time (function declarations are live bindings).
-import { setStatus, inBusyWindow } from './scheduler.js';
+import { setStatus } from './scheduler.js';
 
 export const enabled = () => Number(config.review.required) > 0;
 const NEVER_REVIEW = new Set(['pm', 'sre', 'support', 'qa']);
@@ -168,6 +167,7 @@ export async function afterQaPass(ticket, sha) {
   catch (err) { store.logEvent({ ticket_key: ticket.key, kind: 'error', text: `risk classifier could not read the diff: ${err.message}` }); }
   const c = classifyDiff(files);
   store.kvSet(`diff-risk:${ticket.key}`, JSON.stringify(c.hits.slice(0, 20)));
+  store.kvSet(`diff-files:${ticket.key}`, JSON.stringify(Array.isArray(files) ? files.slice(0, 2000) : null)); // deploy classification
   store.supersedeReviews(ticket.key, null); // a new QA-approved commit voids every earlier verdict
   setStatus(ticket.key, 'review', { head_sha: sha, qa_sha: sha, diff_risk: c.risk, review_stage: 'reviewing', progress: 95, progress_msg: 'QA passed — code review next' });
   const job = advance(ticket.key);
@@ -178,12 +178,13 @@ export async function afterQaPass(ticket, sha) {
 function approved(t, ctx, ind) {
   const names = `${nameOf(ctx.seat)} and ${nameOf(ind.seat)}`;
   const policy = autoMergePolicy(t);
-  const next = policy.eligible ? 'SigmaDesk will merge it once CI is green (outside market hours).' : `Waiting for the owner to merge: ${policy.reason}.`;
+  const next = policy.eligible ? 'SigmaDesk merges it next once CI is green (if it redeploys something during market hours, it is scheduled for the end of the window).' : `Waiting for the owner to merge: ${policy.reason}.`;
   const text = `✅ **Two approvals at \`${short(t.head_sha)}\`** — ${nameOf(ctx.seat)} (${roleOf(ctx.seat)}, ${whyContext(t, ctx.seat)}) and ${nameOf(ind.seat)} (${roleOf(ind.seat)}, independent). ${next}`;
   store.enqueueOutbox(t.key, `${t.key}:approved:${t.head_sha}`, `${text}${footer(t, t.head_sha)}`);
   store.addComment(t.key, 'system', text);
-  setStatus(t.key, 'ready_for_human', { review_stage: 'approved', progress: 100,
-    progress_msg: policy.eligible ? `Approved by ${names} — SigmaDesk will merge when CI is green` : `Approved by ${names} — waiting for your merge (${policy.reason})` });
+  setStatus(t.key, 'ready_for_human', { review_stage: 'approved', progress: 100, approved_at: t.approved_at || store.now(),
+    reconfirm_from: null, reconfirm_kind: null, reconfirm_base: null,
+    progress_msg: policy.eligible ? `Approved by ${names} — queued to merge` : `Approved by ${names} — waiting for your merge (${policy.reason})` });
   github.flushOutbox();
 }
 
@@ -257,7 +258,7 @@ export function reviewVerdict(run, t, body) {
     store.updatePrReview(row.id, { verdict: 'changes', body: summary, findings_json: JSON.stringify(findings) });
     for (const f of earlier) store.updateFinding(f.id, { resolution: 'superseded' });
     findings.forEach((f, i) => store.addFinding({ ...f, id: ids[i], review_id: row.id, ticket_key: t.key, seat: row.seat }));
-    store.updateTicket(t.key, { review_round: round, review_stage: 'responding' });
+    store.updateTicket(t.key, { review_round: round, review_stage: 'responding', reconfirm_from: null, reconfirm_kind: null, reconfirm_base: null }); // next look is a full review
   });
   const blocking = findings.filter((f) => f.blocking).length;
   const list = findings.map((f, i) => `${i + 1}. ${where(f)} — ${f.problem}${f.why ? `\n   *Why it matters:* ${f.why}` : ''}${f.fix ? `\n   *Suggested fix:* ${f.fix}` : ''}\n   <sub>${ids[i]} · ${f.blocking ? 'must be fixed or answered' : 'suggestion, optional'}</sub>`).join('\n');
@@ -340,10 +341,33 @@ export async function prepareSnapshot(t, seat) {
   await runner.stageApproved(t.key, runner.workspaceDir(t.key), t.head_sha); // publisher must hold the reviewed commit
   return runner.reviewSnapshot(t.key, seat, t.head_sha);
 }
-export function reviewPrompt(t, row, code) {
+export function reviewPrompt(t, row, code, reconfirm = null) {
   const why = row.role === 'context' ? whyContext(t, row.seat) : 'a senior/principal who neither built nor designed it';
   return promptFor('pr_review', { ticket: t, comments: store.listComments(t.key).slice(-12),
-    extra: { code, role: row.role, why, sha: row.sha, author: `${nameOf(t.assignee)} (${roleOf(t.assignee)})`, thread: threadFor(t.key) } });
+    extra: { code, role: row.role, why, sha: row.sha, author: `${nameOf(t.assignee)} (${roleOf(t.assignee)})`, thread: threadFor(t.key), reconfirm } });
+}
+const cut = (s, n) => (s.length > n ? `${s.slice(0, n)}\n… (truncated)` : s);
+/**
+ * Light re-confirm after the desk rebased the approved change or the builder resolved a conflict: what changed since
+ * the approved commit (range-diff; for a resolution also how the conflicts were resolved and what came in from base).
+ */
+export async function reconfirmContext(t) {
+  if (!t.reconfirm_from || !t.reconfirm_kind) return null;
+  return runner.withPublisher(async (pgit) => {
+    const from = t.reconfirm_from; const head = t.head_sha; const base = t.reconfirm_base;
+    const oldBase = (await pgit(['merge-base', from, base])).stdout.trim();
+    const newBase = (await pgit(['merge-base', head, base])).stdout.trim();
+    const range = oldBase && newBase ? (await pgit(['range-diff', '--no-color', `${oldBase}..${from}`, `${newBase}..${head}`])).stdout : '';
+    let resolution = ''; let incoming = '';
+    if (t.reconfirm_kind === 'resolution') {
+      resolution = (await pgit(['show', '--no-color', '--remerge-diff', '--format=%h %s', head])).stdout;
+      const files = (await pgit(['diff', '--name-only', oldBase, base])).stdout.split('\n').filter(Boolean);
+      const mine = new Set((await pgit(['diff', '--name-only', oldBase, from])).stdout.split('\n').filter(Boolean));
+      const overlap = files.filter((f) => mine.has(f));
+      if (overlap.length) incoming = (await pgit(['diff', '--no-color', oldBase, base, '--', ...overlap.slice(0, 30)])).stdout;
+    }
+    return { kind: t.reconfirm_kind, from, rangeDiff: cut(range, 10000) || '(no difference in the PR\'s own commits)', resolution: cut(resolution, 8000), incoming: cut(incoming, 6000) };
+  }).catch(() => null);
 }
 export function respondPrompt(t) {
   const open = openFindings(t.key);
@@ -372,48 +396,4 @@ export function summary(key) {
   };
 }
 
-// ---------------- outbox + auto-merge sweep ----------------
-export async function tryAutoMerge(t, { now = new Date() } = {}) {
-  const ap = store.approvalsAt(t.key, t.head_sha);
-  if (!ap.ok) return { merged: false, reason: 'approvals are not at the current commit' };
-  const names = `${nameOf(ap.context.seat)} and ${nameOf(ap.independent.seat)}`;
-  const policy = autoMergePolicy(t);
-  const wait = (reason) => {
-    const msg = `Approved by ${names} — ${policy.eligible ? `auto-merge waiting: ${reason}` : `waiting for your merge (${reason})`}`;
-    if (store.getTicket(t.key)?.progress_msg !== msg) store.updateTicket(t.key, { progress_msg: msg });
-    return { merged: false, reason };
-  };
-  if (!policy.eligible) return wait(policy.reason);
-  const am = config.review.autoMerge || {};
-  const busy = inBusyWindow(now);
-  if (am.outsideBusyWindowOnly !== false && busy) return wait('inside the market-hours window; it merges after the window closes');
-  const halted = store.getSettings().paused === 'true';
-  if (halted) return wait('the desk is paused');
-  if (ap.unpublished) return wait('the review comments are not on the PR yet');
-  try {
-    await prs.merge(prNumber(t.pr_url), { actor: 'desk', method: am.method || 'squash', expectedSha: t.head_sha, inBusyWindow: busy, halted });
-  } catch (err) {
-    return wait(String(err.message).replace(/^Not merged: /, '').replace(/\.$/, ''));
-  }
-  const text = `🔀 **Merged by SigmaDesk** after approvals from ${nameOf(ap.context.seat)} (${roleOf(ap.context.seat)}) and ${nameOf(ap.independent.seat)} (${roleOf(ap.independent.seat)}) at \`${short(t.head_sha)}\`. Low risk, CI green, outside market hours.`;
-  store.enqueueOutbox(t.key, `${t.key}:merged:${t.head_sha}`, `${text}${footer(t, t.head_sha)}`);
-  store.addComment(t.key, 'system', text);
-  store.updateTicket(t.key, { review_stage: 'merged', progress_msg: `Merged by SigmaDesk after approvals from ${names}` });
-  github.flushOutbox();
-  return { merged: true };
-}
-
-let sweeping = null;
-/** Every minute: post pending PR comments, then try auto-merge for approved tickets. */
-export function sweep() {
-  if (!enabled()) return Promise.resolve(null);
-  if (sweeping) return sweeping;
-  sweeping = (async () => {
-    await github.flushOutbox();
-    for (const t of store.ticketsByStatus('ready_for_human')) {
-      if (t.review_stage !== 'approved' || !t.pr_url) continue;
-      await tryAutoMerge(t).catch((err) => store.logEvent({ kind: 'error', ticket_key: t.key, text: `auto-merge check failed: ${err.message}` }));
-    }
-  })().finally(() => { sweeping = null; });
-  return sweeping;
-}
+// Auto-merge, scheduling and the conflict sweep live in mergetrain.js (#3).

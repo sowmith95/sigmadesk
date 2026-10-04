@@ -11,6 +11,7 @@ import { notify } from './notify.js';
 import * as prsync from './prsync.js';
 import * as prs from './prs.js';
 import * as reviews from './reviews.js';
+import * as mergetrain from './mergetrain.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 import { selectionFor } from './dispatch.js';
@@ -317,7 +318,8 @@ async function launchPrReview(job, fence) {
   if (row.verdict !== 'pending' || row.state !== 'active' || row.sha !== t.head_sha || t.review_stage !== 'reviewing') { idle(); return; }
   store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is reviewing ${t.key} at ${row.sha.slice(0, 7)} (${row.role} reviewer)` });
   const code = nonce();
-  await launch({ fence, agentId: seat, kind: 'pr_review', ticket: t, cwd, nonce: code, prompt: reviews.reviewPrompt(t, row, code),
+  const reconfirm = await reviews.reconfirmContext(t); // light re-confirm after a desk update or a conflict resolution
+  await launch({ fence, agentId: seat, kind: 'pr_review', ticket: t, cwd, nonce: code, prompt: reviews.reviewPrompt(t, row, code, reconfirm),
     onStart: (run) => store.updatePrReview(row.id, { nonce: code, run_id: run.id, round: t.review_round || 0 }),
     outcome: (after) => after.status !== 'review' || store.getPrReview(row.id).verdict !== 'pending' });
   runner.removeReviewSnapshot(t.key, seat); // every review starts from a fresh snapshot; free the disk
@@ -338,6 +340,44 @@ async function launchRespond(job, fence) {
   store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is answering the code review on ${t.key}` });
   await launch({ fence, agentId: seat, kind: 'respond', ticket: t, cwd: ws.dir, prompt: reviews.respondPrompt(t),
     outcome: (after) => after.status !== 'review' || after.review_stage !== 'responding' });
+}
+
+// Merge train (#3): the builder resolves a real conflict in a fresh desk-built clone with a compact conflict pack.
+async function launchResolve(job, fence) {
+  const { seat } = job;
+  const idle = () => { store.updateAgent(seat, { status: 'idle', current_ticket: null }); store.updateTicket(job.key, { active_run: null }); };
+  store.updateAgent(seat, { status: 'working', current_ticket: job.key, last_action: 'preparing the conflict', last_action_at: store.now() });
+  store.updateTicket(job.key, { active_run: -1 });
+  let prepared;
+  try { prepared = await mergetrain.prepareResolve(job.job); } catch (err) { idle(); throw err; }
+  if (!stillWanted(job.key, 'review', seat)) return;
+  const t = store.getTicket(job.key);
+  const j = store.getConflictJob(job.job.id);
+  if (t.review_stage !== 'resolving' || j.status !== 'pending') { idle(); return; }
+  if (prepared.clean) { // git merged it without help after all: no model run needed
+    idle();
+    const head = (await runner.scratchGit(prepared.dir, ['rev-parse', 'HEAD'])).stdout.trim();
+    store.updateConflictJob(j.id, { status: 'running' });
+    await mergetrain.finishResolution(t, j, head, prepared.dir, 'git merged it cleanly this time; no manual changes were needed.');
+    return;
+  }
+  const attempts = (j.attempts || 0) + 1;
+  if (attempts > (Number(config.resolve?.maxAttempts) || 2)) {
+    idle();
+    store.updateConflictJob(j.id, { status: 'needs_owner', note: 'resolution attempts exhausted' });
+    store.addComment(t.key, 'system', `🧭 ${agentById[seat].name} tried to resolve the conflict ${attempts - 1} times without finishing. Reply to let them try again, or resolve it yourself.`);
+    setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: 'conflict needs your call' });
+    return;
+  }
+  const pack = await mergetrain.conflictPack(j, t, prepared.dir);
+  const prev = store.lastRunFor(t.key, seat, 'implement');
+  if (mergetrain.shouldResume(prev, pack)) store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'system', text: 'resume estimated cheaper, but sessions are tied to the builder clone; using a fresh run in the isolated clone' });
+  store.logEvent({ agent_id: seat, ticket_key: t.key, kind: 'pickup', text: `${agentById[seat].role} is resolving a merge conflict on ${t.key}` });
+  await launch({ fence, agentId: seat, kind: 'resolve', ticket: t, cwd: prepared.dir, prompt: mergetrain.resolvePrompt(t, j, pack),
+    onStart: (run) => store.updateConflictJob(j.id, { status: 'running', run_id: run.id, attempts }),
+    outcome: () => store.getConflictJob(j.id).status !== 'running' });
+  const after = store.getConflictJob(j.id);
+  if (after.status === 'running') store.updateConflictJob(j.id, { status: 'pending', run_id: null }); // no outcome: retried (attempts counted)
 }
 
 // ---------------- watch desk ----------------
@@ -434,7 +474,8 @@ export function health() {
   const queued = store.listTickets().filter((t) => ['triage', 'proposed', 'todo', 'qa', 'review'].includes(t.status));
   return { last_tick: lastTick, last_error: lastError, paused: settings.paused === 'true', budget_headroom: budgetHeadroom(settings),
     queued: queued.length, discussions: store.pendingDiscussions().length, waiting: queued.filter((t) => !t.active_run).map((t) => {
-      const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa' : t.status === 'review' ? (reviews.enabled() ? reviews.jobFor(t)?.seat : requesterOf(t)) : t.assignee || routeTicket(t);
+      const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa'
+        : t.status === 'review' ? (t.review_stage === 'resolving' ? store.conflictJobsFor(t.key).at(-1)?.seat : reviews.enabled() ? reviews.jobFor(t)?.seat : requesterOf(t)) : t.assignee || routeTicket(t);
       const chosen = selectionFor(seat);
       const why = settings.paused === 'true' ? 'Desk paused' : t.after_key && store.getTicket(t.after_key)?.status !== 'done' ? `Waiting for ${t.after_key} to merge`
         : !chosen.seat ? chosen.reason : setupHold(seat) ? `Setup retry after ${setupHold(seat).until}` : !agentIdle(seat) ? 'Seat busy' : budgetHeadroom(settings) < runner.runBudget(seat) ? 'Daily budget reached' : 'Ready for next scheduler tick';
@@ -521,6 +562,11 @@ export async function tick() {
         if (!agentIdle(job.seat)) continue;
         go(job.seat, (f) => (job.kind === 'pr_review' ? launchPrReview(job, f) : launchRespond(job, f)));
       }
+      for (const job of mergetrain.enabled() ? mergetrain.nextResolveJobs() : []) {
+        if (slots <= 0) break;
+        if (!agentIdle(job.seat)) continue;
+        go(job.seat, (f) => launchResolve(job, f));
+      }
     } else {
       for (const t of store.ticketsByStatus('review')) {
         if (slots <= 0) break;
@@ -569,6 +615,7 @@ export function recoverOrphans() {
       cost_usd: run.cost_usd || runner.reservationFor(run), cost_estimated: run.cost_usd ? 0 : 1 });
     store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: 'run interrupted by a desk restart' });
   }
+  mergetrain.recover(); // interrupted conflict resolutions go back to pending (durable, keyed by PR/base/head)
   for (const a of store.listAgentStates()) store.updateAgent(a.id, { status: 'idle', current_ticket: null, current_run: null, current_kind: null, meeting: null });
   for (const t of store.listTickets()) {
     if (t.active_run) store.updateTicket(t.key, { active_run: null, ...(t.status === 'in_progress' ? { status: 'todo' } : {}) });
@@ -581,7 +628,7 @@ const PERMS = {
   design: PRINCIPALS, delegate: PRINCIPALS, 'peer-review': ['manager', ...PRINCIPALS], council: ['manager', ...PRINCIPALS],
   route: ['support'], submit: ENGINEERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
-  review: ['manager', ...ENGINEERS], respond: ENGINEERS,
+  review: ['manager', ...ENGINEERS], respond: ENGINEERS, resolve: ENGINEERS,
 };
 const PRIORITY = /^P[0-3]$/;
 const consultsByRun = new Map();
@@ -787,7 +834,7 @@ export async function deskAction(run, cmd, body = {}) {
       need(await runner.commitsAhead(dir) > 0, 'no commits on your branch yet — git add + git commit your work first');
       const sha = await runner.headSha(dir);
       store.addComment(ticket.key, agentId, `🚀 **Submitted for QA** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
-      setStatus(ticket.key, 'qa', { head_sha: sha, progress: 90, progress_msg: 'waiting for QA' });
+      setStatus(ticket.key, 'qa', { head_sha: sha, progress: 90, progress_msg: 'waiting for QA', builder: agentId });
       ev(`submitted ${ticket.key} for QA (${sha.slice(0, 7)})`);
       github.flushComments();
       return 'Submitted to QA. Your run is complete — stop now.';
@@ -858,6 +905,8 @@ export async function deskAction(run, cmd, body = {}) {
       return reviews.reviewVerdict(run, ticket, body);
     case 'respond':
       return reviews.respond(run, ticket, body);
+    case 'resolve':
+      return mergetrain.resolveCommand(run, ticket, body);
     case 'incident': {
       need(run.kind === 'investigate' && run.incident_id, 'incident commands only work inside an investigation');
       const inc = store.getIncident(run.incident_id);

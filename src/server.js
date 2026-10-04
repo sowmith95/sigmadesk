@@ -13,6 +13,7 @@ import * as watch from './watch.js';
 import * as prsync from './prsync.js';
 import * as prs from './prs.js';
 import * as reviews from './reviews.js';
+import * as mergetrain from './mergetrain.js';
 import { nameOf } from '../public/names.js';
 import * as dispatch from './dispatch.js';
 import * as advisors from './advisors.js';
@@ -143,7 +144,7 @@ async function ownerRoute(req, res) {
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
-    return send(res, 200, { ticket: t, comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
+    return send(res, 200, { ticket: t, comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)/events$'))) return send(res, 200, store.recentEvents({ agent_id: mm[1], limit: 300 }));
   if (req.method === 'GET' && (mm = m('^/api/agents/([\\w-]+)$'))) {
@@ -152,6 +153,8 @@ async function ownerRoute(req, res) {
   }
 
   if (req.method === 'POST' && p === '/api/tickets') return send(res, 201, sched.ownerCreate(await readBody(req)));
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/merge-hold$'))) { const b = await readBody(req); return send(res, 200, mergetrain.setHold(mm[1], b.hold !== false, b.reason)); }
+  if (req.method === 'POST' && p === '/api/merge-train/clear-deploy') return send(res, 200, { cleared: mergetrain.clearDeployLock('owner') });
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/approve-publish$'))) { await sched.ownerApprovePublish(mm[1]); return send(res, 200, { ok: true }); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/name$'))) {
     const t = store.getTicket(mm[1]);
@@ -167,7 +170,8 @@ async function ownerRoute(req, res) {
   if (req.method === 'PATCH' && (mm = m('^/api/tickets/KEY$'))) return send(res, 200, sched.ownerPatch(mm[1], await readBody(req)));
   // ---- PR console (owner only; agents have no route to these) ----
   if (req.method === 'GET' && p === '/api/prs') {
-    return send(res, 200, { prs: await prs.listPrs({ refresh: url.searchParams.get('refresh') === '1' }), busy_window: sched.inBusyWindow(),
+    const rows = (await prs.listPrs({ refresh: url.searchParams.get('refresh') === '1' })).map((r) => ({ ...r, merge_state: r.key ? mergetrain.mergeState(store.getTicket(r.key)) : null }));
+    return send(res, 200, { prs: rows, deploy_lock: mergetrain.deployState(), busy_window: sched.inBusyWindow(),
       override_phrase: prs.OVERRIDE_PHRASE, base: config.project.baseBranch, repo: config.project.githubRepo, last_sync: store.kvGet('prsync:last_ok') });
   }
   if (req.method === 'POST' && (mm = m('^/api/prs/(\\d+)/(approve|ready|merge|close|reviewer|tags)$'))) {
@@ -425,7 +429,7 @@ export async function main() {
   setTimeout(syncPrs, 15_000);
   prsync.startWebhook((event) => { store.logEvent({ kind: 'github', agent_id: 'github', text: `webhook: ${event} → syncing PRs` }); syncPrs(); });
   setInterval(() => github.flushComments(), 60_000);
-  setInterval(() => reviews.sweep().catch((err) => console.error('reviews:', err.message)), 60_000); // PR review comments + auto-merge
+  setInterval(() => mergetrain.sweep().catch((err) => console.error('merge train:', err.message)), 60_000); // PR comments, conflict check, merge train
   setInterval(() => sched.retryPublications(), 5 * 60_000);
   const shutdown = () => { council.cancelAll(); advisors.cancelAll(); runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
   process.on('SIGTERM', shutdown);

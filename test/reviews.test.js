@@ -66,8 +66,6 @@ after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 const ghCalls = () => (fs.existsSync(ghLog) ? fs.readFileSync(ghLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
 const setGh = (file, value) => fs.writeFileSync(path.join(ghDir, file), JSON.stringify(value));
-const SATURDAY = new Date('2026-10-03T15:00:00Z');
-const WEDNESDAY_11_ET = new Date('2026-09-30T15:00:00Z');
 let runSeq = 0;
 const run = (agent_id, kind, ticket_key, nonce = null) => store.createRun({ agent_id, kind, ticket_key, token: `tok-${++runSeq}-${Math.random()}`, model: 'claude:x', nonce });
 
@@ -165,7 +163,7 @@ test('happy path: QA pass → context approves → independent approves → read
   assert.equal(second.seat, t.reviewer_independent);
   t = store.getTicket(s.key);
   assert.equal(t.status, 'ready_for_human'); assert.equal(t.review_stage, 'approved');
-  assert.match(t.progress_msg, /^Approved by Rowan and \w+ — SigmaDesk will merge/);
+  assert.match(t.progress_msg, /^Approved by Rowan and \w+ — queued to merge/);
   assert.ok(store.approvalsAt(s.key, s.sha).ok);
   const bodies = store.listOutbox(s.key).map((o) => o.body);
   assert.match(bodies[0], /\*\*Rowan — Principal Backend Engineer \(designed this change\)\*\* · ✅ Approved/);
@@ -275,8 +273,8 @@ test('outbox: posts once with a marker, keeps failures pending, and adopts a com
   // drain anything earlier tests queued
   await github.flushOutbox();
   fs.writeFileSync(path.join(ghDir, 'fail-post'), '1');
-  const o = store.enqueueOutbox(t.key, `${t.key}:a`, 'hello reviewers');
-  assert.equal(store.enqueueOutbox(t.key, `${t.key}:a`, 'dupe').id, o.id, 'same marker = same row');
+  const o = store.enqueueOutbox(t.key, `${t.key}:approved:a`, 'hello reviewers');
+  assert.equal(store.enqueueOutbox(t.key, `${t.key}:approved:a`, 'dupe').id, o.id, 'same marker = same row');
   await github.flushOutbox();
   let row = store.listOutbox(t.key)[0];
   assert.equal(row.status, 'failed'); assert.equal(row.attempts, 1); assert.equal(row.gh_comment_id, null);
@@ -284,7 +282,7 @@ test('outbox: posts once with a marker, keeps failures pending, and adopts a com
   fs.rmSync(path.join(ghDir, 'fail-post'));
   // Simulate "GitHub accepted the POST but the desk crashed before recording it".
   const comments = JSON.parse(fs.readFileSync(path.join(ghDir, 'comments.json'), 'utf8'));
-  comments.push({ id: 4242, body: `hello reviewers\n\n${github.outboxMarker(`${t.key}:a`)}` });
+  comments.push({ id: 4242, body: `hello reviewers\n\n${github.outboxMarker(`${t.key}:approved:a`)}` });
   fs.writeFileSync(path.join(ghDir, 'comments.json'), JSON.stringify(comments));
   const posts = ghCalls().filter((c) => c[1] === '-X').length;
   await github.flushOutbox();
@@ -328,55 +326,7 @@ test('merge authorization matrix', () => {
   assert.equal(prs.authorizeMerge({ ...ok, mergeable: 'CONFLICTING' }, { expectedSha: sha, gate: { approvals: half }, overrideReason: 'hotfix for a live incident' }).blockers.length, 1, 'an override never skips conflicts or CI');
 });
 
-async function approvedTicket(opts) {
-  const s = await sliceThroughQa(opts);
-  await approve(s.key); await approve(s.key);
-  await github.flushOutbox();
-  const t = store.getTicket(s.key);
-  setGh('pr.json', { number: 7, title: `[${t.key}] ${t.title}`, state: 'OPEN', isDraft: true, mergeable: 'MERGEABLE', headRefOid: t.head_sha, baseRefName: 'main',
-    body: 'Opened by SigmaDesk', statusCheckRollup: [{ conclusion: 'SUCCESS' }] });
-  return t;
-}
-const merges = () => ghCalls().filter((c) => c[0] === 'pr' && c[1] === 'merge');
-
-test('auto-merge: low risk outside the window merges exactly the approved commit and says so on the PR', async () => {
-  store.setSetting('paused', 'false');
-  const t = await approvedTicket();
-  const before = merges().length;
-  const r = await reviews.tryAutoMerge(t, { now: SATURDAY });
-  assert.equal(r.merged, true, r.reason);
-  const m = merges().at(-1);
-  assert.equal(merges().length, before + 1);
-  assert.deepEqual(m.slice(-2), ['--match-head-commit', t.head_sha]);
-  assert.ok(ghCalls().some((c) => c[0] === 'pr' && c[1] === 'ready'), 'draft is readied first');
-  assert.match(store.listOutbox(t.key).at(-1).body, /Merged by SigmaDesk\*\* after approvals from Rowan \(Principal Backend Engineer\) and/);
-  assert.equal(store.getTicket(t.key).review_stage, 'merged');
-});
-
-test('auto-merge: high risk, unknown risk, busy window and a paused desk wait for the owner', async () => {
-  store.setSetting('paused', 'false');
-  const before = merges().length;
-  const high = await approvedTicket({ file: 'alpaca_trader/app/oms/exit_monitor.py' });
-  assert.equal(store.getTicket(high.key).diff_risk, 'high');
-  let r = await reviews.tryAutoMerge(store.getTicket(high.key), { now: SATURDAY });
-  assert.equal(r.merged, false);
-  assert.match(store.getTicket(high.key).progress_msg, /^Approved by Rowan and \w+ — waiting for your merge \(it touches trading\/deploy paths \(alpaca_trader\/app\/oms\/exit_monitor.py\)\)/);
-  const unknown = await approvedTicket({ risk: null });
-  r = await reviews.tryAutoMerge(store.getTicket(unknown.key), { now: SATURDAY });
-  assert.match(r.reason, /nobody recorded a risk/);
-  const low = await approvedTicket();
-  r = await reviews.tryAutoMerge(store.getTicket(low.key), { now: WEDNESDAY_11_ET });
-  assert.match(r.reason, /market-hours window/);
-  assert.match(store.getTicket(low.key).progress_msg, /auto-merge waiting: inside the market-hours window/);
-  store.setSetting('paused', 'true');
-  r = await reviews.tryAutoMerge(store.getTicket(low.key), { now: SATURDAY });
-  assert.match(r.reason, /paused/);
-  store.setSetting('paused', 'false');
-  setGh('pr.json', { ...JSON.parse(fs.readFileSync(path.join(ghDir, 'pr.json'), 'utf8')), statusCheckRollup: [{ status: 'QUEUED' }] });
-  r = await reviews.tryAutoMerge(store.getTicket(low.key), { now: SATURDAY });
-  assert.match(r.reason, /CI is still running/);
-  assert.equal(merges().length, before, 'nothing merged');
-});
+// Auto-merge timing, the deploy lock and the conflict sweep are covered in mergetrain.test.js (#3).
 
 test('owner UI merge: the two-approval gate applies, an audited reason overrides it', async () => {
   const s = await sliceThroughQa();
