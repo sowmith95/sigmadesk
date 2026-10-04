@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { config, validateConfig } from './config.js';
-import { AGENTS, ENGINEERS, STATUSES, applyTeamOverrides, agentById } from './team.js';
+import { AGENTS, ENGINEERS, STATUSES, applyTeamOverrides, agentById , TEAM_PROBLEMS } from './team.js';
+import { teamCoverage } from './team-catalog.js';
 import { ENGINES, detectEngines, presets, suggestFor, SEAT_TIER, TIER_TEXT } from './engines/index.js';
 import * as store from './db.js';
 import * as runner from './runner.js';
@@ -254,6 +255,13 @@ async function ownerRoute(req, res) {
       if (!agentById[id] || !o || typeof o !== 'object') return send(res, 400, { error: `invalid seat ${id}` });
       clean[id] = normalizeSeat(id, o);
     }
+    // Coverage: switching seats off may not leave a workflow without the roles it needs (checked as a whole team).
+    const opts = { independentSeats: config.review.independentSeats };
+    const before = new Set(teamCoverage(AGENTS.map((a) => ({ id: a.id, enabled: a.enabled })), opts));
+    const gaps = teamCoverage(AGENTS.map((a) => ({ id: a.id, enabled: clean[a.id]?.enabled ?? a.enabled })), opts);
+    const fresh = gaps.filter((g) => !before.has(g)); // a change may not open a new gap (an all-off preview desk stays editable)
+    if (fresh.length) return send(res, 409, { error: `That would leave the desk without: ${fresh.join('; ')}.` });
+    if (gaps.length && b.confirm) return send(res, 409, { error: `The team is missing: ${gaps.join('; ')}.` });
     store.setSetting('team', JSON.stringify(clean));
     applyTeamOverrides(clean);
     if (b.confirm) store.setSetting('team_confirmed', 'true');
@@ -462,6 +470,7 @@ export async function main() {
     console.error(`SigmaDesk config problems (${config.configFile}):\n - ${problems.join('\n - ')}\n${config.home ? 'Edit the project config in its SigmaDesk folder.' : 'Copy sigmadesk.config.example.json to sigmadesk.config.json and edit it.'}`);
     process.exit(1);
   }
+  if (TEAM_PROBLEMS.length) { console.error(`SigmaDesk not started: the team is invalid:\n - ${TEAM_PROBLEMS.join('\n - ')}`); process.exit(1); }
   try { acquireInstanceLock(); } catch (err) { console.error(`SigmaDesk not started: ${err.message}`); process.exit(1); }
   store.openDb();
   try { applyTeamOverrides(JSON.parse(store.getSettings().team || '{}')); } catch { /* ignore bad JSON */ }

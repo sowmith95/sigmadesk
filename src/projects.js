@@ -6,6 +6,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { appRoot, projectHome, deskPaths, ID_RE } from './app-paths.js';
+import { compileTeam, teamCoverage, CORE_IDS } from './team-catalog.js';
 
 const registryFile = (root) => path.join(root, 'projects.json');
 const bad = (message) => { throw Object.assign(new Error(message), { status: 400 }); };
@@ -77,7 +78,15 @@ const usedPorts = (reg) => new Set(reg.projects.map((p) => p.port));
 export function nextPort(reg, from = 8800) { let p = from; while (usedPorts(reg).has(p)) p += 1; return p; }
 
 /** Create a project home for a git checkout and register it. Nothing starts: installing the service is a separate step. */
-export function createProject({ repoPath, name, id, port, root = appRoot() } = {}) {
+/** Validate a team manifest the way the desk will at startup: catalog problems and workflow coverage. */
+export function checkTeam(team) {
+  const compiled = compileTeam(team);
+  const seats = [...CORE_IDS.map((id) => ({ id, enabled: compiled.core[id]?.enabled !== false })), ...compiled.advisors.map((a) => ({ id: a.id, enabled: true }))];
+  return [...compiled.problems, ...(compiled.problems.length ? [] : teamCoverage(seats))];
+}
+export function createProject({ repoPath, name, id, port, team = { version: 1, advisors: [] }, root = appRoot() } = {}) {
+  const teamProblems = checkTeam(team);
+  if (teamProblems.length) bad(`the team is not valid: ${teamProblems.join('; ')}`);
   const repo = inspectRepo(repoPath);
   const display = String(name || repo.name).trim().slice(0, 80);
   return withRegistry(root, (reg) => {
@@ -93,6 +102,7 @@ export function createProject({ repoPath, name, id, port, root = appRoot() } = {
     const prefix = (display.replace(/[^A-Za-z]/g, '').slice(0, 3) || 'SD').toUpperCase();
     fs.writeFileSync(path.join(home, 'config.json'), `${JSON.stringify(genericConfig({ name: display, repo, port: deskPort, prefix }), null, 2)}\n`, { flag: 'wx', mode: 0o600 });
     fs.writeFileSync(path.join(home, 'playbook.md'), PLAYBOOK(display), { flag: 'wx', mode: 0o600 });
+    fs.writeFileSync(path.join(home, 'team.json'), `${JSON.stringify(team, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
     const entry = { id: pid, uid: crypto.randomUUID(), name: display, repoPath: repo.repoPath, githubRepo: repo.githubRepo, port: deskPort,
       service: `com.sigmadesk.${pid}`, home, created_at: new Date().toISOString(), state: 'created' };
     reg.projects.push(entry);
