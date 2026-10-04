@@ -26,8 +26,16 @@ const firstName = (agents, id) => (agents.find((a) => a.id === id)?.name || '').
  * each pending design proposal, each finished council. `id` is unique per decision; `key` stays the ticket key.
  */
 export function decisionsFor(t, ctx = {}) {
-  const { agents = [], proposals = [], councils = [], productReviews = [], researchReviews = [] } = ctx;
+  const { agents = [], proposals = [], councils = [], productReviews = [], researchReviews = [], featurePlans = [] } = ctx;
   if (['done', 'wontdo'].includes(t.status)) return [];
+  // A feature waiting on its plan: the owner reviews a ready plan, or retries a failed grooming round.
+  const fp = featurePlans.find((p) => p.ticket_key === t.key);
+  if (fp && ['ready', 'failed'].includes(fp.status)) {
+    const n = nameOf(t);
+    return [{ key: t.key, name: n, stage: 'Planning', epic: false, worker: null, bucket: 'needs_you', id: `${t.key}:plan:${fp.revision}:${fp.status}`, kind: 'plan',
+      action: fp.status === 'ready' ? 'Review plan' : 'See what failed', verb: fp.status === 'ready' ? `Review the plan for ${n}` : `Grooming ${n} failed`,
+      reason: fp.status === 'ready' ? (fp.stale ? 'You changed the request after this plan was written; ask Codex for a new round.' : fp.plan?.summary || 'Codex finished a plan.') : fp.error || 'The grooming round failed.' }];
+  }
   const name = nameOf(t);
   const base = { key: t.key, name, stage: OPEN_STAGES[t.status] || null, epic: false, worker: null, bucket: 'needs_you' };
   const out = [];
@@ -70,6 +78,9 @@ export function attend(t, ctx = {}) {
   const decisions = decisionsFor(t, ctx);
   if (decisions.length) return { ...decisions[0], epic: base.epic, worker: base.worker };
 
+  const fp = (ctx.featurePlans || []).find((p) => p.ticket_key === t.key);
+  if (fp && ['queued', 'grooming', 'discarded'].includes(fp.status)) return { ...base, bucket: fp.status === 'grooming' ? 'working' : 'queued', stage: 'Planning',
+    worker: fp.status === 'grooming' ? 'manager' : null, verb: name, reason: fp.status === 'grooming' ? 'Morgan is grooming it with Codex' : fp.status === 'queued' ? 'Waiting for Codex to groom it' : 'Plan set aside; nothing starts until you approve one' };
   const review = (ctx.productReviews || []).find(r => r.ticket_key === t.key && r.status === 'reviewing' && !r.stale);
   if (review) return { ...base, bucket: worker ? 'working' : 'queued', stage: review.phase === 'plan' ? 'Product review' : 'User feedback', verb: name, reason: worker ? `${firstName(agents, worker.id)} is reviewing` : 'Review waiting for available reviewers and capacity' };
   const rr = (ctx.researchReviews || []).find((r) => r.ticket_key === t.key && ['pending', 'changes'].includes(r.state));
@@ -104,7 +115,7 @@ export function humanReason(reason, tickets) {
 export function board(state, extra = {}) {
   const tickets = state.tickets || [];
   const ctx = { agents: state.agents || [], tickets, events: state.events || [], waiting: state.meta?.scheduler?.waiting || [],
-    proposals: extra.proposals || state.meta?.decisions?.proposals || [], councils: state.meta?.council?.councils || [], productReviews: state.meta?.product_reviews || [], researchReviews: state.meta?.research_reviews || [] };
+    proposals: extra.proposals || state.meta?.decisions?.proposals || [], councils: state.meta?.council?.councils || [], productReviews: state.meta?.product_reviews || [], researchReviews: state.meta?.research_reviews || [], featurePlans: state.meta?.feature_plans || [] };
   const out = Object.fromEntries(BUCKETS.map((b) => [b, []]));
   out.epics = [];
   for (const t of tickets) {
@@ -118,7 +129,7 @@ export function board(state, extra = {}) {
     if (inc.status === 'paged' && !inc.ticket_key) out.needs_you.push({ key: `incident-${inc.id}`, id: `incident-${inc.id}`, incident: inc, bucket: 'needs_you', kind: 'page',
       action: 'Look at errors', verb: `Check ${inc.label || 'service'} errors`, reason: String(inc.normalized || '').slice(0, 160), name: inc.label });
   }
-  const rank = { guard: 0, question: 1, page: 2, merge: 3, publish: 4, design: 5, council: 6, research: 7 };
+  const rank = { guard: 0, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
   out.needs_you.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
   out.shipped.sort((a, b) => String(b.ticket?.updated_at).localeCompare(String(a.ticket?.updated_at)));
   return { ...out, counts: Object.fromEntries(BUCKETS.map((b) => [b, out[b].length])) };

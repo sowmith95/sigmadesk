@@ -43,8 +43,35 @@ export async function ensureLabels() {
   }
 }
 
+// A parent's issue carries a checklist of its tasks, ticked as they merge.
+function checklist(t) {
+  const kids = store.childrenOf(t.key);
+  return kids.length ? `\n\n### Tasks\n${kids.map((k) => `- [${k.status === 'done' ? 'x' : ' '}] ${k.issue_number ? `#${k.issue_number} ` : ''}[${k.key}] ${k.title}${k.status === 'wontdo' ? ' (not doing)' : ''}`).join('\n')}` : '';
+}
 function issueBody(t) {
-  return `${t.description}\n\n<!-- sigmadesk:${t.key} -->\n---\n_SigmaDesk ticket **${t.key}** · area: ${t.area || '-'} · complexity: ${t.complexity || '-'} · priority: ${t.priority} · assignee: ${t.assignee ? agentById[t.assignee].role : '-'}_\n_Worked by the SigmaDesk AI engineering desk. Reply on the desk board._`;
+  return `${t.description}${checklist(t)}\n\n<!-- sigmadesk:${t.key} -->\n---\n_SigmaDesk ticket **${t.key}** · area: ${t.area || '-'} · complexity: ${t.complexity || '-'} · priority: ${t.priority} · assignee: ${t.assignee ? agentById[t.assignee]?.role || t.assignee : '-'}_\n_Worked by the SigmaDesk AI engineering desk. Discuss and decide on the desk; this issue mirrors it._`;
+}
+const MANAGED_START = '<!-- sigmadesk:managed -->', MANAGED_END = '<!-- /sigmadesk:managed -->';
+/**
+ * Keep a feature's issue body current (plan and task checklist). An issue the desk opened is rewritten whole; an issue a
+ * person wrote (imported) keeps their text and gets a marked desk block, replaced in place on later updates.
+ */
+export function updateIssueBody(ticketKey) {
+  if (!enabled()) return null;
+  return enqueue('update issue', async () => {
+    const t = store.getTicket(ticketKey);
+    if (!t?.issue_number) return;
+    const current = JSON.parse(await gh(['issue', 'view', String(t.issue_number), '-R', config.project.githubRepo, '--json', 'body'])).body || '';
+    let body;
+    if (current.includes(`<!-- sigmadesk:${t.key} -->`)) body = issueBody(t);
+    else {
+      const block = `${MANAGED_START}\n---\n_SigmaDesk keeps this section current. Discuss and decide on the desk._\n\n${t.description}${checklist(t)}\n${MANAGED_END}`;
+      const a = current.indexOf(MANAGED_START), b = current.indexOf(MANAGED_END);
+      body = a >= 0 && b > a ? `${current.slice(0, a)}${block}${current.slice(b + MANAGED_END.length)}` : `${current}\n\n${block}`;
+    }
+    if (body.trim() === current.trim()) return;
+    await gh(['issue', 'edit', String(t.issue_number), '-R', config.project.githubRepo, '--body', store.sanitizeForGithub(body)]);
+  }, ticketKey);
 }
 
 export function createIssue(ticketKey) {

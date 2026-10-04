@@ -18,6 +18,7 @@ import * as refresh from './refresh.js';
 import * as research from './research.js';
 import * as researchReview from './research-review.js';
 import * as connectors from './connectors.js';
+import * as features from './features.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 import { selectionFor, pinnedSelection } from './dispatch.js';
@@ -83,6 +84,7 @@ export function setStatus(key, status, extra = {}) {
   return t;
 }
 researchReview.hooks.setStatus = setStatus; // holds, waivers and owner decisions on research proposals go through the same door
+features.hooks.setStatus = setStatus; // approving a feature plan starts the feature through the same door
 
 // Order may cross sub-epics within one feature (a slice of SD-30 may wait for SD-29, a task of the parent SD-28): two
 // tickets can be ordered when they share the same top-level ancestor.
@@ -120,9 +122,14 @@ export function rollupParent(parentKey) {
   if (settled === kids.length) {
     store.updateTicket(parentKey, { status: merged ? 'done' : 'wontdo', progress: 100, progress_msg: msg });
     github.syncIssueState(parentKey);
+    github.updateIssueBody(parentKey);
+    if (p.parent_key) rollupParent(p.parent_key); // a closed sub-epic counts toward its own parent
     store.logEvent({ agent_id: p.assignee || 'system', ticket_key: parentKey, kind: 'done', text: `epic ${parentKey} closed: ${msg}` });
   } else {
+    const before = p.progress_msg;
     store.updateTicket(parentKey, { progress: Math.min(99, progress), progress_msg: msg });
+    if (before !== msg) github.updateIssueBody(parentKey); // tick the checklist as tasks merge
+    if (p.parent_key) rollupParent(p.parent_key);
   }
 }
 
@@ -584,7 +591,7 @@ export async function tick() {
     const go = (agentId, fn, pin = null, pinKind = 'groom') => {
       if (!(pin ? pinnedSelection(agentId, pin, pinKind) : selectionFor(agentId)).seat) return false;
       if (setupHold(agentId)) return false;
-      const need = runner.runBudget(agentId);
+      const need = pin ? runner.engineOf({ engine: pin }).budgetUsd({}) : runner.runBudget(agentId); // a pinned job reserves its own engine's cap
       if (headroom < need) {
         const day = startOfToday();
         if (budgetWarned !== day) {
@@ -618,7 +625,7 @@ export async function tick() {
     };
 
     // 1. Support triages owner/GitHub tickets (cheap, fast).
-    const triage = store.ticketsByStatus('triage').find((t) => !t.active_run);
+    const triage = store.ticketsByStatus('triage').find((t) => !t.active_run && !features.holds(t));
     if (triage && slots > 0 && agentIdle('support')) go('support', (f) => launchTriage(triage, f));
     // 1b. On-call SRE investigates new recurring error signatures (rate-limited).
     if (config.watch.enabled && slots > 0 && agentIdle('sre')) {
@@ -632,6 +639,9 @@ export async function tick() {
     if (qa && slots > 0 && agentIdle('qa')) go('qa', (f) => launchQa(qa, f));
     const discussion = store.pendingDiscussions().find((d) => d.status === 'queued');
     if (discussion && slots > 0 && agentIdle('manager')) go('manager', (f) => launchDiscussion(discussion, f));
+    // Owner-requested feature grooming (Codex) runs before ordinary grooming: the owner is waiting on it.
+    const plan = features.next();
+    if (plan && slots > 0 && agentIdle('manager')) go('manager', (f) => features.launch(plan, f), features.ENGINE, 'feature_groom');
     // 2b. Two-reviewer code review (context, then independent) and the author's answers; legacy: requester acceptance.
     if (reviews.enabled()) {
       for (const job of reviews.nextJobs()) {
@@ -684,6 +694,7 @@ export async function tick() {
     for (const t of store.ticketsByStatus('todo')) {
       if (slots <= 0) break;
       if (t.active_run) continue;
+      if (features.holds(t)) continue; // a feature starts only through its approved plan
       if (t.after_key && store.getTicket(t.after_key)?.status === 'wontdo') { orphanedSlice(t); continue; }
       if (t.after_key && store.getTicket(t.after_key)?.status !== 'done') continue; // waits for its predecessor to merge
       const parent = t.parent_key && store.getTicket(t.parent_key);
@@ -700,7 +711,7 @@ export async function tick() {
       else go(who, (f) => launchImplement(t, who, f));
     }
     // 4. Manager grooms proposals (consulting principals inside the run); research proposals wait for their second review.
-    const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run && !researchReview.blocks(t));
+    const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run && !researchReview.blocks(t) && !features.holds(t));
     if (proposed && slots > 0 && agentIdle('manager')) go('manager', (f) => launchGroom(proposed, f), groomEngine());
     // 5. Research programs on their own cadence and market window while the funnel is thin (oldest last run first).
     for (const p of research.due(s)) {
@@ -717,6 +728,7 @@ export async function tick() {
 export function recoverOrphans() {
   productReview.recover();
   researchReview.recover();
+  features.recover();
   connectors.recover();
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
   for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });
@@ -1363,6 +1375,12 @@ export function ownerPatch(key, patch) {
   if (patch.assignee !== undefined) { need(!patch.assignee || ENGINEERS.includes(patch.assignee), 'bad assignee'); p.assignee = patch.assignee || null; }
   if (patch.complexity) { need(COMPLEXITIES.includes(patch.complexity), 'bad complexity'); p.complexity = patch.complexity; }
   if (patch.area) { need(AREAS.includes(patch.area), 'bad area'); p.area = patch.area; }
+  if (patch.title !== undefined || patch.description !== undefined) {
+    // Content edits are conditional: the owner edits what they read, never a version someone changed meanwhile.
+    if (patch.expected_updated_at !== t.updated_at) throw Object.assign(new Error('The ticket changed while you were editing. Your text is kept; review the latest and save again.'), { status: 409 });
+    if (patch.title !== undefined) { need(typeof patch.title === 'string' && patch.title.trim() && patch.title.length <= 200, 'a title of 1 to 200 characters'); p.title = patch.title.trim(); }
+    if (patch.description !== undefined) { need(typeof patch.description === 'string' && patch.description.length <= 12_000, 'at most 12000 characters'); p.description = features.replaceRequest(t.description, patch.description); }
+  }
   if (patch.after_key !== undefined) {
     // The owner orders a task after another task of the same feature; no self-reference and no cycles.
     if (patch.after_key) {
@@ -1376,7 +1394,8 @@ export function ownerPatch(key, patch) {
   if (p.status && t.active_run > 0 && p.status !== t.status) runner.killRun(t.active_run, 'owner moved the ticket');
   if (p.status === 'qa' && !t.head_sha) need(false, 'only submitted work can go to QA');
   const out = store.updateTicket(key, { ...p, stalls: 0 });
-  store.logEvent({ agent_id: 'owner', ticket_key: key, kind: 'action', text: `owner set ${Object.entries(p).map(([k, v]) => `${k}=${v}`).join(', ')}` });
+  if (p.description !== undefined && t.issue_number) github.updateIssueBody(key);
+  store.logEvent({ agent_id: 'owner', ticket_key: key, kind: 'action', text: `owner ${p.description !== undefined || p.title !== undefined ? 'edited the request' : `set ${Object.entries(p).map(([k, v]) => `${k}=${v}`).join(', ')}`}` });
   github.syncIssueState(key);
   return out;
 }

@@ -21,8 +21,10 @@ const PrsPage = lazy(() => import('@/pages/Prs'));
 const PrPanel = lazy(() => import('@/pages/Prs').then((m) => ({ default: m.PrPanel })));
 const DeskPage = lazy(() => import('@/pages/Desk'));
 const SettingsPage = lazy(() => import('@/pages/Settings'));
+const FeaturesPage = lazy(() => import('@/pages/Features'));
+const NewFeatureDialog = lazy(() => import('@/pages/Features').then((m) => ({ default: m.NewFeatureDialog })));
 
-const TITLES: Record<string, string> = { inbox: 'Inbox', work: 'Work', team: 'Team', research: 'Research', prs: 'Pull requests', desk: 'Desk', settings: 'Settings' };
+const TITLES: Record<string, string> = { inbox: 'Inbox', work: 'Work', features: 'Features', team: 'Team', research: 'Research', prs: 'Pull requests', desk: 'Desk', settings: 'Settings' };
 
 /** A part that cannot render (most often: the desk was updated and this tab asks for a replaced chunk) offers a reload. */
 class Boundary extends Component<{ children: ReactNode; resetKey: string; inPanel?: boolean }, { error: Error | null }> {
@@ -43,7 +45,7 @@ function Overlay() {
   const sh = S.sheet;
   if (!sh) return null;
   const key = `${sh.type}:${sh.key || sh.id || sh.number || ''}:${sh.nonce || ''}`;
-  const node = ({ ticket: <TicketSheet key={key} />, new: <NewTicketDialog key={key} />, seat: <SeatPanel key={key} />, models: <ModelsPanel key={key} id={sh.id!} />, pr: <PrPanel key={key} /> } as Record<string, ReactNode>)[sh.type] ?? null;
+  const node = ({ ticket: <TicketSheet key={key} />, new: <NewTicketDialog key={key} />, 'new-feature': <NewFeatureDialog key={key} />, seat: <SeatPanel key={key} />, models: <ModelsPanel key={key} id={sh.id!} />, pr: <PrPanel key={key} /> } as Record<string, ReactNode>)[sh.type] ?? null;
   return <Boundary resetKey={key} inPanel><Suspense fallback={<Panel title="Loading…" onClose={closeSheet}><Loading /></Panel>}>{node}</Suspense></Boundary>;
 }
 
@@ -53,10 +55,10 @@ export function App() {
   useEffect(() => { if (S.loaded) { for (const it of B.needs_you) S.seen.add(it.id); S.painted = true; } });
   const page = S.view as string;
   const content = !S.loaded && !S.loadError ? <Loading />
-    : ({ inbox: <InboxPage />, work: <WorkPage />, team: <TeamPage />, research: <ResearchPage />, prs: <PrsPage />, desk: <DeskPage />, settings: <SettingsPage /> } as Record<string, ReactNode>)[page] ?? <InboxPage />;
+    : ({ inbox: <InboxPage />, work: <WorkPage />, features: <FeaturesPage />, team: <TeamPage />, research: <ResearchPage />, prs: <PrsPage />, desk: <DeskPage />, settings: <SettingsPage /> } as Record<string, ReactNode>)[page] ?? <InboxPage />;
   return (
     <TooltipProvider delayDuration={300}>
-      <Shell title={TITLES[page] || 'Inbox'}><Boundary resetKey={page}><Suspense fallback={<Loading />}>{content}</Suspense></Boundary></Shell>
+      <Shell title={TITLES[page] || 'Inbox'}><Boundary resetKey={`${page}:${S.feature || ''}`}><Suspense fallback={<Loading />}>{content}</Suspense></Boundary></Shell>
       <Overlay />
       {S.palette && <Suspense fallback={null}><CommandPalette /></Suspense>}
       <Toaster position="top-center" />

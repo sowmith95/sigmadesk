@@ -61,6 +61,31 @@ for (const [status, title, assignee, priority, area, complexity] of tickets) {
   }
   if (status === 'ready_for_human') store.addComment(t.key, 'qa', 'Verified the submitted commit and the relevant tests. Ready for owner review.');
 }
+// Features: one plan waiting for the owner, one approved and building. No model calls: plans are fixtures.
+{
+  const features = await import('../src/features.js');
+  const plan = (title) => ({ summary: `Record what each ${title} costs, observe-only, so slippage per strategy is visible before any change to trading.`,
+    goal: 'The owner can see the real cost of every options fill per strategy, without touching order flow.', users: ['Owner reviewing ETF4 performance each evening'],
+    scope: ['A journal table with one row per fill', 'An observe-only writer behind a flag', 'A daily summary on the dashboard'], out_of_scope: ['Any change to order placement or sizing'],
+    acceptance: ['Every filled order has exactly one journal row', 'Turning the flag off stops writes with no other effect', 'The summary matches the broker statement within one cent'],
+    risks: ['The writer runs next to the trading loop: it must never block or raise into it'], questions: ['Should partial fills be one row or one row per partial?'],
+    tasks: [
+      { ref: 'T1', title: 'Define the fill-cost journal contract and DDL', area: 'db', complexity: 'S', risk: 'low', after: null, description: 'Draft the table, indexes and retention. Files: `migrations/`, `docs/journal.md`.', acceptance: ['Reviewed DDL', 'Retention documented'] },
+      { ref: 'T2', title: 'Write fills to the journal behind a flag', area: 'backend', complexity: 'M', risk: 'high', after: 'T1', description: 'Observe-only writer in the fill handler, off by default, never raising into the loop.', acceptance: ['No order path changed', 'Flag off means no writes'] },
+      { ref: 'T3', title: 'Show a daily fill-cost summary', area: 'frontend', complexity: 'S', risk: 'low', after: 'T2', description: 'A card on the dashboard with cost per strategy for the day.', acceptance: ['Matches the journal totals'] },
+    ] });
+  const groomed = (key, title) => {
+    const p = features.current(key);
+    store.kvSet(`feature-plan:${key}`, JSON.stringify({ ...p, stale: undefined, status: 'grooming', attempt: 'demo' }));
+    return features.complete(key, p.revision, 'demo', { plan: features.parsePlan(JSON.stringify(plan(title))), model: 'codex:gpt-6.1-sol' });
+  };
+  const a = features.create({ title: 'Options fill-cost journal', goal: 'Record what each ETF4 options fill actually cost, so I can see slippage per strategy. Observe-only: never touch orders.', priority: 'P1', area: 'backend' }).ticket;
+  groomed(a.key, 'options fill');
+  const b = features.create({ title: 'Equity fill-cost journal', goal: 'Same idea for equity fills, after the options journal proves itself.', priority: 'P2', area: 'backend' }).ticket;
+  const ready = groomed(b.key, 'equity fill');
+  const { tasks } = features.approve(b.key, { expected_revision: ready.revision });
+  store.updateTicket(tasks[0], { status: 'done' });
+}
 store.logEvent({ kind: 'system', text: 'Isolated demo: all execution seats disabled. No production state or credentials are used.' });
 console.log(`Preview fixture: ${tmp}`);
 process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));

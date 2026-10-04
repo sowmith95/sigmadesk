@@ -1,4 +1,4 @@
-import { S, currentBoard, agentMap, openTicket, questionFor, loadPrs } from '@/store.js';
+import { S, currentBoard, agentMap, openTicket, questionFor, loadPrs, openFeature } from '@/store.js';
 import { ago, clean, waited } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
 import { Tag, Key, SeatAvatar, Empty, Section } from '@/components/desk/Bits';
@@ -12,7 +12,7 @@ const fresh = (it: BoardItem) => S.painted && !S.seen.has(it.id) && !reduced();
 function DecisionCard({ it }: { it: BoardItem }) {
   const t = it.ticket;
   const reason = it.kind === 'question' && t ? questionFor(t) || it.reason : it.reason;
-  const open = () => t && openTicket(t.key, { decision: it.id });
+  const open = () => t && (it.kind === 'plan' ? openFeature(t.key) : openTicket(t.key, { decision: it.id }));
   return (
     <article data-key={it.id} data-kind={it.kind} data-ticket={t?.key} className={cn('grid gap-3 rounded-lg border border-l-[3px] border-l-needs bg-card p-4', fresh(it) && 'animate-in fade-in slide-in-from-top-2 duration-300')}>
       <div className="flex flex-wrap items-center gap-2"><Tag tone="needs">{KIND_LABEL[it.kind || ''] || 'Needs you'}</Tag>

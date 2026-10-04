@@ -106,8 +106,13 @@ test('formatting helpers and the stream contract', () => {
   sync.applyDelta(S, { type: 'event', data: { id: 1, ticket_key: 'T-1', agent_id: 'pm', text: 'x' } });
   assert.equal(S.events.length, 1); assert.equal(S.detail.pending.events.length, 1); assert.equal(S.seat.events.length, 2, 'seat log appends raw');
   sync.applyDelta(S, { type: 'comment', data: { id: 9, ticket_key: 'T-1', body: '❓ q' } }); assert.equal(S.questions['T-1'], undefined);
-  assert.deepEqual(sync.applyDelta(S, { type: 'council', data: { id: 3 } }), { meta: true, research: false }); assert.equal(S.councils[3], undefined);
-  assert.deepEqual(sync.applyDelta(S, { type: 'connector', data: {} }), { meta: true, research: true });
+  assert.deepEqual(sync.applyDelta(S, { type: 'council', data: { id: 3 } }), { meta: true, research: false, feature: null }); assert.equal(S.councils[3], undefined);
+  assert.deepEqual(sync.applyDelta(S, { type: 'connector', data: {} }), { meta: true, research: true, feature: null });
+  const plan = { ticket_key: 'SD-9', revision: 2, status: 'ready' };
+  S.meta = S.meta || {};
+  assert.equal(sync.applyDelta(S, { type: 'feature-plan', data: plan }).feature, 'SD-9');
+  assert.equal(sync.applyDelta(S, { type: 'feature-plan', data: { ...plan, status: 'approved' } }).feature, 'SD-9');
+  assert.deepEqual(S.meta.feature_plans.map((p) => p.status), ['approved'], 'one plan per feature, replaced in place');
   assert.equal(sync.applyDelta(S, { type: 'settings', data: { team: '{}' } }).meta, false, 'unchanged team: no snapshot');
   // Before the detail loads, reviews and branch refreshes are parked too (v2 dropped them).
   sync.applyDelta(S, { type: 'branch-refresh', data: { ticket_key: 'T-1', status: 'rebased' } });

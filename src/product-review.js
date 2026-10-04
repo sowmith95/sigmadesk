@@ -51,8 +51,15 @@ export function ensure(t, phase = 'plan') {
   if (r && !(phase === 'feedback' && r.stale && r.status !== 'reviewing')) return r;
   return start(t.key,{phase});
 }
-export function required(t) { return t.type === 'feature' && !t.parent_key && !t.head_sha; }
+// The owner approved a groomed feature plan (src/features.js) for this ticket's feature: that approval is the plan gate.
+export function waivedByPlan(t) {
+  let root = t;
+  for (let i = 0; root?.parent_key && i < 20; i++) root = store.getTicket(root.parent_key);
+  try { return JSON.parse(store.kvGet(`feature-plan:${root?.key}`) || 'null')?.status === 'approved'; } catch { return false; }
+}
+export function required(t) { return t.type === 'feature' && !t.parent_key && !t.head_sha && !waivedByPlan(t); }
 export function blocks(t) {
+  if (waivedByPlan(t)) return false;
   const r = current(t.key);
   const parent = t.parent_key && current(t.parent_key);
   if (r && (r.stale || r.status !== 'approved')) return true;
