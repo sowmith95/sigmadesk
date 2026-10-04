@@ -151,7 +151,7 @@ test('a manager split keeps the parent open as an epic, enforces order, and clos
   const made = (s) => s.match(/created (\S+)/)[1];
   const a = made(await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Verify fills', complexity: 'S', area: 'infra', body: 'Owner-run check' }));
   const b = made(await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Contract and DDL', complexity: 'M', area: 'db', body: 'Draft', after: a }));
-  await assert.rejects(sched.deskAction(run, 'create-task', { parent: parent.key, title: 'x', complexity: 'S', area: 'db', body: 'y', after: 'SD-9999' }), /same parent/);
+  await assert.rejects(sched.deskAction(run, 'create-task', { parent: parent.key, title: 'x', complexity: 'S', area: 'db', body: 'y', after: 'SD-9999' }), /same feature/);
   assert.equal(store.getTicket(b).after_key, a, 'the order is recorded, not just described');
   // The old "reject the parent after splitting" instruction now records a split.
   await sched.deskAction(run, 'reject', { key: parent.key, body: 'split into the tasks above' });
@@ -176,8 +176,11 @@ test('the owner can order a task after a sibling, without loops', () => {
   assert.equal(sched.ownerPatch(y, { after_key: x }).after_key, x);
   assert.equal(sched.ownerPatch(z, { after_key: y }).after_key, y);
   assert.throws(() => sched.ownerPatch(x, { after_key: z }), /loop/);
-  assert.throws(() => sched.ownerPatch(x, { after_key: x }), /same parent/);
+  assert.throws(() => sched.ownerPatch(x, { after_key: x }), /same feature/);
   const other = store.createTicket({ title: 'Elsewhere', status: 'todo' }).key;
-  assert.throws(() => sched.ownerPatch(y, { after_key: other }), /same parent/);
+  assert.throws(() => sched.ownerPatch(y, { after_key: other }), /same feature/);
+  const sub = store.createTicket({ title: 'Sub-epic', status: 'in_progress', parent_key: parent.key }).key;
+  const slice = store.createTicket({ title: 'Slice', status: 'todo', parent_key: sub }).key;
+  assert.equal(sched.ownerPatch(slice, { after_key: x }).after_key, x, 'a slice of a sub-epic can wait for a task elsewhere in the feature');
   assert.equal(sched.ownerPatch(y, { after_key: '' }).after_key, null);
 });
