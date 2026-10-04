@@ -180,6 +180,59 @@ CREATE TABLE IF NOT EXISTS council_members (
   UNIQUE(council_id,stage,ordinal)
 );
 CREATE INDEX IF NOT EXISTS councils_status ON councils(status);
+CREATE TABLE IF NOT EXISTS pr_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT NOT NULL,
+  seat TEXT NOT NULL,
+  role TEXT NOT NULL,
+  sha TEXT NOT NULL,
+  round INTEGER NOT NULL DEFAULT 0,
+  verdict TEXT NOT NULL DEFAULT 'pending',
+  state TEXT NOT NULL DEFAULT 'active',
+  body TEXT,
+  checked TEXT,
+  risks TEXT,
+  findings_json TEXT DEFAULT '[]',
+  nonce TEXT,
+  run_id INTEGER,
+  published_comment_id TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS pr_reviews_ticket ON pr_reviews(ticket_key, id);
+CREATE TABLE IF NOT EXISTS review_findings (
+  id TEXT PRIMARY KEY,
+  review_id INTEGER NOT NULL,
+  ticket_key TEXT NOT NULL,
+  seat TEXT NOT NULL,
+  file TEXT,
+  line INTEGER,
+  problem TEXT NOT NULL,
+  why TEXT,
+  fix TEXT,
+  blocking INTEGER NOT NULL DEFAULT 1,
+  response TEXT,
+  response_body TEXT,
+  response_sha TEXT,
+  resolution TEXT NOT NULL DEFAULT 'open',
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS review_findings_ticket ON review_findings(ticket_key);
+CREATE TABLE IF NOT EXISTS pr_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT NOT NULL,
+  marker TEXT UNIQUE NOT NULL,
+  body TEXT NOT NULL,
+  review_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  gh_comment_id TEXT,
+  last_error TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS pr_outbox_status ON pr_outbox(status, id);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -198,7 +251,10 @@ export function openDb(file = config.dbPath) {
 // Additive migrations for databases created by older versions.
 function migrate() {
   const want = {
-    tickets: { stalls: 'INTEGER DEFAULT 0', head_sha: 'TEXT', origin_session: 'TEXT', after_key: 'TEXT' },
+    tickets: { stalls: 'INTEGER DEFAULT 0', head_sha: 'TEXT', origin_session: 'TEXT', after_key: 'TEXT',
+      // two-reviewer PRs: stored risk (groom/parent), diff classifier result, who designed/sliced it, frozen reviewers
+      risk: 'TEXT', diff_risk: 'TEXT', designer: 'TEXT', qa_sha: 'TEXT', review_round: 'INTEGER DEFAULT 0', review_stage: 'TEXT',
+      reviewer_context: 'TEXT', reviewer_independent: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT' },
   };
@@ -286,7 +342,8 @@ export function createTicket(t) {
 }
 
 const TICKET_FIELDS = new Set(['title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
-  'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key']);
+  'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key',
+  'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent']);
 
 export function updateTicket(key, patch) {
   const cols = Object.keys(patch).filter((k) => TICKET_FIELDS.has(k));
@@ -513,6 +570,66 @@ export function updateCouncilMember(id, patch) {
   if (cols.length) q(`UPDATE council_members SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
   const m = q('SELECT * FROM council_members WHERE id=?').get(id);
   announce({ type: 'council', data: getCouncil(m.council_id) }); return m;
+}
+
+// ---------- two-reviewer PR reviews (authoritative; GitHub comments are a mirror) ----------
+const REVIEW_FIELDS = new Set(['round', 'verdict', 'state', 'body', 'checked', 'risks', 'findings_json', 'nonce', 'run_id', 'published_comment_id']);
+export const getPrReview = (id) => q('SELECT * FROM pr_reviews WHERE id=?').get(id) || null;
+export const listPrReviews = (key) => q('SELECT * FROM pr_reviews WHERE ticket_key=? ORDER BY id').all(key);
+export function createPrReview(r) {
+  const info = q('INSERT INTO pr_reviews(ticket_key,seat,role,sha,round) VALUES (?,?,?,?,?)').run(r.ticket_key, r.seat, r.role, r.sha, r.round || 0);
+  const row = getPrReview(info.lastInsertRowid);
+  announce({ type: 'pr-review', data: row });
+  return row;
+}
+export function updatePrReview(id, patch) {
+  const cols = Object.keys(patch).filter((k) => REVIEW_FIELDS.has(k));
+  if (cols.length) q(`UPDATE pr_reviews SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), now(), id);
+  const row = getPrReview(id);
+  announce({ type: 'pr-review', data: row });
+  return row;
+}
+/** Latest active review row per role for one commit. */
+export function latestReview(key, role, sha) {
+  return q("SELECT * FROM pr_reviews WHERE ticket_key=? AND role=? AND sha=? AND state='active' ORDER BY id DESC LIMIT 1").get(key, role, sha) || null;
+}
+/** Invalidate every review row that is not for `keepSha` (a new commit voids earlier approvals). */
+export function supersedeReviews(key, keepSha = null) {
+  q("UPDATE pr_reviews SET state='superseded', updated_at=? WHERE ticket_key=? AND state='active' AND (? IS NULL OR sha<>?)").run(now(), key, keepSha, keepSha);
+}
+/** Did a context AND an independent reviewer approve exactly this commit (and are those approvals on the PR)? */
+export function approvalsAt(key, sha) {
+  const context = sha ? latestReview(key, 'context', sha) : null;
+  const independent = sha ? latestReview(key, 'independent', sha) : null;
+  const ok = context?.verdict === 'approve' && independent?.verdict === 'approve' && context.seat !== independent.seat;
+  return { ok, context, independent, unpublished: q("SELECT COUNT(*) n FROM pr_outbox WHERE ticket_key=? AND status<>'sent'").get(key).n };
+}
+export const inReviewFlow = (key) => !!q('SELECT 1 FROM pr_reviews WHERE ticket_key=? LIMIT 1').get(key);
+export function addFinding(f) {
+  q('INSERT INTO review_findings(id,review_id,ticket_key,seat,file,line,problem,why,fix,blocking) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run(f.id, f.review_id, f.ticket_key, f.seat, f.file || null, Number.isInteger(f.line) ? f.line : null, f.problem, f.why || null, f.fix || null, f.blocking ? 1 : 0);
+  return getFinding(f.id);
+}
+export const getFinding = (id) => q('SELECT * FROM review_findings WHERE id=?').get(id) || null;
+export const listFindings = (key) => q('SELECT * FROM review_findings WHERE ticket_key=? ORDER BY created_at, id').all(key);
+export const findingsOf = (reviewId) => q('SELECT * FROM review_findings WHERE review_id=? ORDER BY rowid').all(reviewId);
+export function updateFinding(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['response', 'response_body', 'response_sha', 'resolution'].includes(k));
+  if (cols.length) q(`UPDATE review_findings SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), now(), id);
+  return getFinding(id);
+}
+
+// Durable outbox for PR comments: a row is 'sent' only after GitHub returned a comment id.
+export function enqueueOutbox(ticketKey, marker, body, reviewId = null) {
+  q('INSERT OR IGNORE INTO pr_outbox(ticket_key,marker,body,review_id) VALUES (?,?,?,?)').run(ticketKey, marker, redact(body).slice(0, 60000), reviewId);
+  return q('SELECT * FROM pr_outbox WHERE marker=?').get(marker);
+}
+export const pendingOutbox = (limit = 20) => q("SELECT o.*, t.pr_url FROM pr_outbox o JOIN tickets t ON t.key=o.ticket_key WHERE o.status<>'sent' AND t.pr_url IS NOT NULL ORDER BY o.id LIMIT ?").all(limit);
+export const listOutbox = (key) => q('SELECT * FROM pr_outbox WHERE ticket_key=? ORDER BY id').all(key);
+export function updateOutbox(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['status', 'attempts', 'gh_comment_id', 'last_error', 'sent_at'].includes(k));
+  if (cols.length) q(`UPDATE pr_outbox SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
+  return q('SELECT * FROM pr_outbox WHERE id=?').get(id);
 }
 
 // ---------- small durable key/value store (watch cursors etc.) ----------

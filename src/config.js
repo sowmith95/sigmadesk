@@ -45,7 +45,7 @@ const DEFAULTS = {
     busyWindow: { enabled: false, timezone: 'America/New_York', days: [1, 2, 3, 4, 5], start: '09:30', end: '16:15', maxConcurrent: 1 },
     dailyBudgetUsd: 150,
     runBudgetUsd: { fable: 8, opus: 5, sonnet: 3, haiku: 0.75 },
-    runTimeoutMin: { implement: 45, qa: 20, review: 20, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, design: 20, council_review: 5 },
+    runTimeoutMin: { implement: 45, qa: 20, review: 20, pr_review: 25, respond: 45, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, design: 20, council_review: 5 },
     maxQaLoops: 2,
     planHoldAt: 0.8, // hold new runs when the Claude plan's 5-hour window is this full (leave room for you)
     maxConsultsPerGroom: 1,
@@ -61,6 +61,21 @@ const DEFAULTS = {
     // Rework continues the engineer's own implementation session in the same clone.
     resumeRework: true,
     resumeReworkMaxAgeHours: 24,
+    // Two independent reviewers on every PR after QA: a context reviewer (the principal who designed/sliced it, else
+    // the Engineering Manager) and then an independent senior/principal. 0 = off (legacy requester acceptance).
+    required: 2,
+    independentSeats: ['principal-be', 'principal-fe', 'senior-be', 'senior-fe', 'dba'],
+    maxRounds: 3, // change requests per ticket before the owner is asked to settle the disagreement
+    escalateAfterMinutes: 240, // an assigned reviewer seat that stays switched off this long → owner
+    // Auto-merge after two approvals: only when the stored ticket risk AND the diff classifier both say low.
+    autoMerge: { enabled: true, excludeRiskHigh: true, outsideBusyWindowOnly: true, method: 'squash' },
+    // "auto": a PR with no checks at all may merge only if the repo has no GitHub Actions workflows.
+    // "required": no checks reported = not mergeable. Skipped/neutral-only checks never count as a pass.
+    ci: 'auto',
+    // Diff paths that make a change high-risk (trading, broker, risk, schema, deploy). Globs, like protectedPaths.
+    riskPaths: ['**/oms/**', '**/*order_execution*', '**/*order_execution*/**', '**/*position_manager*', '**/clients/alpaca*',
+      '**/clients/alpaca*/**', '**/risk/**', '**/migrations/**', '**/*migration*.sql', '**/docker-compose*', '**/compose*.y*ml',
+      '**/Dockerfile*', '.github/**', '**/.env*', '**/*.sh'],
   },
   // The watch desk: deterministic log watching; the SRE seat is only woken for new, recurring error signatures.
   watch: {
