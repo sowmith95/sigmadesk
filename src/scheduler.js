@@ -598,8 +598,8 @@ export async function deskAction(run, cmd, body = {}) {
     }
     case 'context-file': {
       // Perplexity seats: a file the model asked for, produced by the desk so the follow-up can be verified.
-      need(body.path || body.body, 'desk context-file <path>');
-      const out = packs.serveFile(run.id, run.cwd, String(body.path || body.body).trim());
+      need(body.path || body.body, 'desk context-file <path> [--page N]');
+      const out = await packs.serveFile(run.id, String(body.path || body.body).trim(), Number(body.page) || 1);
       ev(`fetched ${String(body.path || body.body).slice(0, 120)} for Perplexity`);
       return out;
     }

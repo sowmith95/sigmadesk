@@ -123,6 +123,7 @@ const DEFAULTS = {
       relayReserveChars: 8000, // part of that cap left for the task paragraph and relay additions
       remoteWaitMinutes: 8, // how long the relay polls a pending thread; run watchdogs are raised above it
       followupRounds: 1, // follow-ups on the same thread with files the model asked for
+      prepareDeadlineSeconds: 45, // total time to build a pack (git work is cancelled after this; the run is refused)
     },
   },
   advisors: {
@@ -193,7 +194,8 @@ export function loadConfig(file = process.env.SIGMADESK_CONFIG || path.join(ROOT
   if (!c.github.trustedAuthors.length && c.project.githubOwner) c.github.trustedAuthors = [c.project.githubOwner];
 
   c.root = ROOT;
-  c.dbPath = env.SIGMADESK_DB || path.join(ROOT, 'data', 'sigmadesk.db');
+  c.dataDir = env.SIGMADESK_DATA || path.join(ROOT, 'data'); // desk-owned state: publisher repo, context packs
+  c.dbPath = env.SIGMADESK_DB || path.join(c.dataDir, 'sigmadesk.db');
   // Agents talk to the desk over this unix socket (the sandbox allowlists it; the TCP UI port stays unreachable).
   // Real path matters: the sandbox matches resolved paths. macOS caps socket paths at 104 bytes.
   c.socketPath = env.SIGMADESK_SOCKET || path.join(fs.realpathSync(ROOT), 'run', 'agent.sock');
@@ -232,6 +234,7 @@ export function validateConfig(c = config) {
   const px = c.engines.perplexity || {};
   if (!(px.contextMaxChars >= 10000 && px.contextMaxChars <= 400000)) problems.push('engines.perplexity.contextMaxChars must be between 10000 and 400000');
   if (!(px.remoteWaitMinutes >= 1 && px.remoteWaitMinutes <= 60)) problems.push('engines.perplexity.remoteWaitMinutes must be between 1 and 60');
+  if (!(px.prepareDeadlineSeconds >= 5 && px.prepareDeadlineSeconds <= 300)) problems.push('engines.perplexity.prepareDeadlineSeconds must be between 5 and 300');
   if (!(Number.isInteger(px.followupRounds) && px.followupRounds >= 0 && px.followupRounds <= 3)) problems.push('engines.perplexity.followupRounds must be 0-3');
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');
   return problems;

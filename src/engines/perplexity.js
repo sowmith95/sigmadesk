@@ -119,23 +119,17 @@ export const perplexity = {
     let ev;
     try { ev = JSON.parse(line); } catch { return base; }
     const extra = [];
-    state.pplxTools ||= {};
     if (ev.type === 'assistant' && Array.isArray(ev.message?.content)) {
       for (const b of ev.message.content) {
-        if (b.type !== 'tool_use' || ![T('call_perplexity_computer'), T('read_thread')].includes(b.name)) continue;
-        state.pplxTools[b.id] = b.name;
-        if (b.input?.thread_id) { extra.push({ type: 'pplx', threadId: String(b.input.thread_id) }); context.recordThread(state.pack, String(b.input.thread_id)); }
-        if (b.name === T('call_perplexity_computer')) {
-          state.pplxAsked = true;
-          extra.push(...context.recordSend(state.pack, b.input || {}));
-        }
+        if (b.type !== 'tool_use') continue;
+        if (b.name === T('call_perplexity_computer')) { state.pplxAsked = true; extra.push(...context.recordSend(state.pack, b.id, 'call', b.input || {})); }
+        else if (b.name === T('read_thread')) extra.push(...context.recordSend(state.pack, b.id, 'read', b.input || {}));
       }
     } else if (ev.type === 'user' && Array.isArray(ev.message?.content)) {
       for (const b of ev.message.content) {
-        if (b.type !== 'tool_result' || !state.pplxTools[b.tool_use_id]) continue;
+        if (b.type !== 'tool_result') continue;
         const text = Array.isArray(b.content) ? b.content.map((c) => c.text || '').join('\n') : String(b.content ?? '');
-        const id = context.extractThreadId(text);
-        if (id) { context.recordThread(state.pack, id); extra.push({ type: 'pplx', threadId: id }); }
+        extra.push(...context.recordResult(state.pack, b.tool_use_id, { isError: !!b.is_error, text }));
       }
     }
     return [...base, ...extra];
