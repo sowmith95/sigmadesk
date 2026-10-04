@@ -1,3 +1,4 @@
+import * as productReview from './product-review.js';
 import crypto from 'node:crypto';
 import { config } from './config.js';
 import { agentById, ENGINEERS, PRINCIPALS, BUILDERS, AREAS, COMPLEXITIES, STATUSES, routeTicket, routeSlice, promptFor } from './team.js';
@@ -5,6 +6,7 @@ import * as store from './db.js';
 import * as advisors from './advisors.js';
 import * as council from './council.js';
 import * as runner from './runner.js';
+import * as packs from './context.js';
 import * as github from './github.js';
 import * as watch from './watch.js';
 import { notify } from './notify.js';
@@ -12,6 +14,7 @@ import * as prsync from './prsync.js';
 import * as prs from './prs.js';
 import * as reviews from './reviews.js';
 import * as mergetrain from './mergetrain.js';
+import * as refresh from './refresh.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
 import { selectionFor } from './dispatch.js';
@@ -231,9 +234,12 @@ async function launchImplement(ticket, agentId, fence) {
   if (!stillWanted(ticket.key, 'in_progress', agentId)) return;
   const t = store.updateTicket(ticket.key, { branch: ws.branch });
   const comments = store.listComments(t.key);
+  const pendingRefresh = refresh.current(t.key);
+  const refreshing = pendingRefresh && ['conflicts', 'rebased'].includes(pendingRefresh.status);
+  if (pendingRefresh?.status === 'conflicts') comments.push({ author: 'system', body: refresh.instructions(pendingRefresh) });
   const prev = store.lastRunFor(t.key, agentId, 'implement');
   // A stalled request (idle watchdog) is resumed in place: same session, same clone, nothing redone.
-  if (prev && prev.status === 'killed' && /idle timeout|desk restarted|desk shutdown/.test(prev.result_text || '') && runner.canResume(prev, 6) && prev.cwd === ws.dir) {
+  if (!refreshing && prev && prev.status === 'killed' && /idle timeout|desk restarted|desk shutdown/.test(prev.result_text || '') && runner.canResume(prev, 6) && prev.cwd === ws.dir) {
     const run = await launch({ fence, agentId, kind: 'implement', ticket: t, cwd: ws.dir, resume: prev.session_id,
       prompt: 'Your previous request stalled and was restarted. Continue exactly where you left off: finish the ticket, commit, and run desk submit.' });
     if (!(run && run.status === 'error' && !run.num_turns)) return;
@@ -241,14 +247,14 @@ async function launchImplement(ticket, agentId, fence) {
   }
   // Rework: continue this engineer's own session (same clone, full memory of what it tried) when it is recent.
   const notes = comments.filter((c) => /^(❌|🔁)/.test(c.body)).pop();
-  if (config.review.resumeRework && notes && runner.canResume(prev, config.review.resumeReworkMaxAgeHours) && prev.cwd === ws.dir) {
+  if (!refreshing && config.review.resumeRework && notes && runner.canResume(prev, config.review.resumeReworkMaxAgeHours) && prev.cwd === ws.dir) {
     const run = await launch({ fence, agentId, kind: 'implement', ticket: t, cwd: ws.dir, resume: prev.session_id, prompt: promptFor('rework', { ticket: t, extra: notes.body }) });
     if (run && run.status === 'error' && !run.num_turns) {
       store.logEvent({ agent_id: agentId, ticket_key: t.key, kind: 'system', text: 'session resume failed — starting fresh' });
       if (budgetHeadroom() < runner.runBudget(agentId)) { stall(store.getTicket(t.key), 'daily risk limit reached'); return; }
     } else return;
   }
-  await launch({ fence, agentId, kind: 'implement', ticket: store.getTicket(t.key), cwd: ws.dir, prompt: promptFor('implement', { ticket: store.getTicket(t.key), comments: store.listComments(t.key) }) });
+  await launch({ fence, agentId, kind: 'implement', ticket: store.getTicket(t.key), cwd: ws.dir, prompt: promptFor('implement', { ticket: store.getTicket(t.key), comments }) });
 }
 
 const nonce = () => crypto.randomBytes(5).toString('hex');
@@ -484,12 +490,16 @@ export function health() {
   const queued = store.listTickets().filter((t) => ['triage', 'proposed', 'todo', 'qa', 'review'].includes(t.status));
   return { last_tick: lastTick, last_error: lastError, paused: settings.paused === 'true', budget_headroom: budgetHeadroom(settings),
     queued: queued.length, discussions: store.pendingDiscussions().length, waiting: queued.filter((t) => !t.active_run).map((t) => {
+      const review = productReview.current(t.key) || (t.parent_key && productReview.current(t.parent_key));
+      if (review && (review.stale || review.status !== 'approved')) return { key: t.key, code: review.status === 'reviewing' && !review.stale ? 'product_review' : 'review_decision', reason: review.stale ? 'Product/design review is stale' : `Product/design review: ${review.status}` };
       const seat = t.status === 'triage' ? 'support' : t.status === 'proposed' ? 'manager' : t.status === 'qa' ? 'qa'
         : t.status === 'review' ? (t.review_stage === 'resolving' ? store.conflictJobsFor(t.key).at(-1)?.seat : reviews.enabled() ? reviews.jobFor(t)?.seat : requesterOf(t)) : t.assignee || routeTicket(t);
       const chosen = selectionFor(seat);
-      const why = settings.paused === 'true' ? 'Desk paused' : t.after_key && store.getTicket(t.after_key)?.status !== 'done' ? `Waiting for ${t.after_key} to merge`
-        : !chosen.seat ? chosen.reason : setupHold(seat) ? `Setup retry after ${setupHold(seat).until}` : !agentIdle(seat) ? 'Seat busy' : budgetHeadroom(settings) < runner.runBudget(seat) ? 'Daily budget reached' : 'Ready for next scheduler tick';
-      return { key: t.key, seat, reason: why, engine: chosen.seat?.engine, fallback: chosen.fallback || false };
+      // `code` is the structured reason the UI classifies on; `reason` stays human-readable.
+      const [code, why] = settings.paused === 'true' ? ['paused', 'Desk paused'] : t.after_key && store.getTicket(t.after_key)?.status !== 'done' ? ['dependency', `Waiting for ${t.after_key} to merge`]
+        : !chosen.seat ? ['provider_hold', chosen.reason] : setupHold(seat) ? ['setup_retry', `Setup retry after ${setupHold(seat).until}`] : !agentIdle(seat) ? ['seat_busy', 'Seat busy']
+          : budgetHeadroom(settings) < runner.runBudget(seat) ? ['budget', 'Daily budget reached'] : ['tick', 'Ready for next scheduler tick'];
+      return { key: t.key, seat, code, reason: why, engine: chosen.seat?.engine, fallback: chosen.fallback || false };
     }) };
 }
 
@@ -585,6 +595,13 @@ export async function tick() {
         go(seat, (f) => launchReview(t, seat, f));
       }
     }
+    productReview.refreshChangedPlans();
+    // Bounded independent product/design reviews; preserve capacity for QA/SRE.
+    let reviewSlots = 2 - store.listAgentStates().filter(a => a.status === 'working' && a.current_kind === 'product_review').length;
+    for (const { r, m } of productReview.pending()) {
+      if (slots <= (capacity(s)>1?1:0) || reviewSlots <= 0) break;
+      if (agentIdle(m.agent_id) && go(m.agent_id, f => productReview.launch(r, m, f))) reviewSlots--;
+    }
     // 3. Engineers pick up groomed work by routing (area × complexity × risk).
     council.pump();
     slots = capacity(s) - workCount(); headroom = budgetHeadroom(s);
@@ -593,6 +610,13 @@ export async function tick() {
       if (t.active_run) continue;
       if (t.after_key && store.getTicket(t.after_key)?.status === 'wontdo') { orphanedSlice(t); continue; }
       if (t.after_key && store.getTicket(t.after_key)?.status !== 'done') continue; // waits for its predecessor to merge
+      const parent = t.parent_key && store.getTicket(t.parent_key);
+      if (parent && productReview.required(parent) && ['proposed','todo'].includes(parent.status)) {
+        if (parent.active_run || parent.status==='proposed') continue;
+        productReview.ensure(parent); // slices cannot race ahead of their parent's first review
+      }
+      if (productReview.required(t)) productReview.ensure(t);
+      if (productReview.blocks(t)) continue;
       const who = t.assignee && ENGINEERS.includes(t.assignee) && agentById[t.assignee].enabled !== false ? t.assignee : routeTicket(t);
       if (!agentIdle(who)) continue;
       if (PRINCIPALS.includes(who)) go(who, (f) => launchDesign(t, who, f));
@@ -613,6 +637,7 @@ export async function tick() {
 
 // ---------------- recovery ----------------
 export function recoverOrphans() {
+  productReview.recover();
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
   for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });
   for (const run of store.unfinishedRuns()) {
@@ -629,6 +654,7 @@ export function recoverOrphans() {
   for (const a of store.listAgentStates()) store.updateAgent(a.id, { status: 'idle', current_ticket: null, current_run: null, current_kind: null, meeting: null });
   for (const t of store.listTickets()) {
     if (t.active_run) store.updateTicket(t.key, { active_run: null, ...(t.status === 'in_progress' ? { status: 'todo' } : {}) });
+    if (refresh.current(t.key)?.status === 'preparing') store.updateTicket(t.key, { status: 'needs_human', active_run: null, resume_status: 'todo', progress_msg: 'branch refresh interrupted — preserved recovery clone needs inspection' });
   }
 }
 
@@ -639,6 +665,7 @@ const PERMS = {
   route: ['support'], submit: ENGINEERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
   review: ['manager', ...ENGINEERS], respond: ENGINEERS, resolve: ENGINEERS,
+  'continue-rebase': BUILDERS,
 };
 const PRIORITY = /^P[0-3]$/;
 const consultsByRun = new Map();
@@ -653,9 +680,10 @@ function fmtTicket(t, comments) {
 
 export async function deskAction(run, cmd, body = {}) {
   const agentId = run.agent_id;
+  if (run.kind === 'product_review') need(['context-file'].includes(cmd), 'Product reviewers are read-only; return a structured report, not desk mutations');
   if (run.kind === 'council_review') need(false, 'council calls cannot invoke desk commands');
   if (run.kind === 'owner_discussion') {
-    need(['list', 'show', 'comment', 'consult', 'discussion-result'].includes(cmd), 'design discussions can only read, consult and respond');
+    need(['list', 'show', 'comment', 'consult', 'discussion-result', 'context-file'].includes(cmd), 'design discussions can only read, consult and respond');
     need(!body.key || body.key === run.ticket_key, 'discussion belongs to its original ticket');
   }
   if (PERMS[cmd]) need(PERMS[cmd].includes(agentId), `${agentById[agentId].role} cannot run "${cmd}"`);
@@ -666,6 +694,13 @@ export async function deskAction(run, cmd, body = {}) {
   const ev = (text, k = key) => store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: k, kind: 'action', text });
 
   switch (cmd) {
+    case 'continue-rebase': {
+      need(run.kind === 'implement' && ticket?.key === run.ticket_key && ticket.status === 'in_progress', 'only the current implementer can finish a rebase');
+      const r = await refresh.continueRebase(ticket.key);
+      store.updateTicket(ticket.key, { progress: 50, progress_msg: r.status === 'conflicts' ? 'resolving refreshed base conflicts' : 'rebased — rerun tests' });
+      store.addComment(ticket.key, 'system', refresh.instructions(r));
+      return refresh.instructions(r);
+    }
     case 'council-models': return JSON.stringify({ models: council.models(), lenses: council.LENSES });
     case 'council': {
       ownTicket();
@@ -690,6 +725,13 @@ export async function deskAction(run, cmd, body = {}) {
         const done = await advisors.runReview(r.id);
         return done.result || `Peer review failed: ${done.error}. Continue using the design evidence; do not retry this run.`;
       } catch (err) { return `Review brief #${r.id} saved; ${err.message}. Continue without another attempt this run.`; }
+    }
+    case 'context-file': {
+      // Perplexity seats: a file the model asked for, produced by the desk so the follow-up can be verified.
+      need(body.path || body.body, 'desk context-file <path> [--page N]');
+      const out = await packs.serveFile(run.id, String(body.path || body.body).trim(), Number(body.page) || 1);
+      ev(`fetched ${String(body.path || body.body).slice(0, 120)} for Perplexity`);
+      return out;
     }
     case 'show':
       need(ticket, 'no such ticket');
@@ -840,6 +882,7 @@ export async function deskAction(run, cmd, body = {}) {
     }
     case 'submit': {
       need(ticket && ticket.key === run.ticket_key && ticket.status === 'in_progress' && run.kind === 'implement', 'submit only from your implementation run');
+      need(!refresh.current(ticket.key) || ['rebased', 'published'].includes(refresh.current(ticket.key).status), 'finish conflicts with desk continue-rebase before submitting');
       const dir = runner.workspaceDir(ticket.key);
       need(await runner.commitsAhead(dir) > 0, 'no commits on your branch yet — git add + git commit your work first');
       const sha = await runner.headSha(dir);
@@ -873,6 +916,7 @@ export async function deskAction(run, cmd, body = {}) {
       // The verdict only counts for the exact commit that was submitted.
       const sha = await runner.headSha(runner.workspaceDir(ticket.key));
       need(!ticket.head_sha || sha === ticket.head_sha, `HEAD moved since submission (${sha.slice(0, 7)} ≠ ${String(ticket.head_sha).slice(0, 7)}); QA must not commit`);
+      refresh.recordQa(ticket.key, sha);
       store.addComment(ticket.key, agentId, `✅ **QA passed** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
       ev(`QA passed ${ticket.key}`);
       const seat = requesterOf(ticket);
@@ -902,6 +946,12 @@ export async function deskAction(run, cmd, body = {}) {
         ev(`requested changes on ${ticket.key}`);
         github.flushComments();
         return 'Recorded. Stop now.';
+      }
+      // A Perplexity review only counts if the model saw the whole change (the desk checked what was sent).
+      if (String(run.model || '').startsWith('perplexity:')) {
+        const blocked = packs.acceptBlockers(packs.metaFor(run));
+        if (blocked) ev(`pass refused: ${blocked.slice(0, 200)}`);
+        need(!blocked, blocked);
       }
       const sha = await runner.headSha(runner.workspaceDir(ticket.key));
       need(!ticket.head_sha || sha === ticket.head_sha, 'HEAD moved since QA; reviewers must not commit');
@@ -956,8 +1006,8 @@ const publishing = new Set();
 async function publishBranch(key) {
   const t = store.getTicket(key);
   if (store.getSettings().open_draft_prs !== 'true' || store.getSettings().github_sync !== 'true') return;
-  // A PR that exists is updated when the QA-approved commit changed (review fixes push to the same PR).
-  if (publishing.has(key) || (t.pr_url && store.kvGet(`published:${key}`) === t.head_sha)) return;
+  // A PR that exists is updated when the QA-approved commit changed (review fixes, desk updates, branch refresh).
+  if (publishing.has(key) || (t.pr_url && store.kvGet(`published:${key}`) === t.head_sha && refresh.current(key)?.status !== 'rebased')) return;
   publishing.add(key);
   try { await publishInner(t, key); } finally { publishing.delete(key); }
 }
@@ -976,14 +1026,22 @@ export async function ownerApprovePublish(key) {
 }
 
 export function retryPublications() {
-  // Whenever GitHub may not have the QA-approved commit: no PR yet, or the PR holds an older commit (approved PRs too).
+  // Whenever GitHub may not have the QA-approved commit: no PR yet, the PR holds an older commit (approved PRs too),
+  // or an owner-triggered branch refresh passed QA and still has to be pushed.
   for (const t of [...store.ticketsByStatus('ready_for_human'), ...store.ticketsByStatus('review')]) {
     if (t.status === 'review' && !t.review_stage) continue;
-    if (t.head_sha && (!t.pr_url || store.kvGet(`published:${t.key}`) !== t.head_sha)) publishBranch(t.key);
+    if (t.head_sha && (!t.pr_url || store.kvGet(`published:${t.key}`) !== t.head_sha || refresh.current(t.key)?.status === 'rebased')) publishBranch(t.key);
   }
 }
 
 async function publishInner(t, key, { ownerApproved = false } = {}) {
+  const plan = productReview.current(t.parent_key || key);
+  if (plan || productReview.current(key, 'feedback')) {
+    if (productReview.blocks(t)) return;
+    if (t.active_run || store.unfinishedRuns().some(r => r.ticket_key === key)) return;
+    const feedback = productReview.ensure(t, 'feedback');
+    if (feedback.stale || feedback.status !== 'approved') return;
+  }
   let staged;
   try {
     staged = await runner.stageApproved(key, runner.workspaceDir(key), t.head_sha);
@@ -1001,18 +1059,27 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
       return;
     }
   }
+  const freshQa = refresh.validationBlockers(key, t.head_sha, staged.baseSha);
+  if (freshQa.length) {
+    setStatus(key, 'needs_human', { resume_status: 'todo', progress_msg: 'base changed — refresh and rerun QA' });
+    store.addComment(key, 'system', `Publication held: ${freshQa.join('; ')}. Use Refresh branch to revalidate against the new base.`);
+    return;
+  }
   try {
     if (!t.issue_number) await github.createIssue(key);
-    await runner.pushBranch(key, t.branch, t.head_sha);
+    await runner.pushBranch(key, t.branch, t.head_sha, { lease: refresh.current(key)?.remote_head });
+    if (refresh.current(key)) refresh.published(key, t.head_sha);
     store.kvSet(`published:${key}`, t.head_sha);
     store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch} at ${t.head_sha.slice(0, 7)}` });
-    if (t.pr_url) { github.flushOutbox(); return; } // existing PR: the push updated it
+    if (t.pr_url) { github.flushOutbox(); return; } // existing PR: the push updated it; its discussion and reviews stay
     const cs = store.listComments(key);
     const last = (prefix) => cs.filter((c) => c.body.startsWith(prefix)).pop()?.body.replace(/^[^\n]*\n*/, '') || '';
     const stack = await prsync.stackBaseFor(store.getTicket(key));
     if (stack) store.addComment(key, 'system', `🧱 Contains unmerged commits from ${stack.key}, so the draft PR targets its branch (\`${stack.branch}\`) and shows only this ticket's changes. GitHub retargets it to ${config.project.baseBranch} when ${stack.key} merges.`);
     await github.openDraftPr(key, [stack ? `> Stacked on #${stack.pr} (${stack.key}) — merge that first.` : '', `## Summary\n${last('🚀')}`, `## QA (correctness)\n${last('✅')}`, last('🤝') ? `## Acceptance (requester intent)\n${last('🤝')}` : ''].filter(Boolean).join('\n\n'), stack ? { base: stack.branch } : {});
   } catch (err) {
+    if (refresh.current(key) && /stale info|\[rejected\]/i.test(String(err.stderr || err.message)))
+      setStatus(key, 'needs_human', { resume_status: 'todo', progress_msg: 'remote branch changed — reconcile before publishing' });
     store.logEvent({ kind: 'error', ticket_key: key, text: `publish failed: ${err.message}` });
   }
 }
@@ -1032,7 +1099,40 @@ export function ownerCreate(body) {
     priority: PRIORITY.test(body.priority) ? body.priority : 'P2', reporter: 'owner', source: 'human' });
 }
 
-export function ownerReply(key, text, mode = 'auto') {
+export async function ownerRefreshBase(key, { expected_updated_at } = {}) {
+  const t = store.getTicket(key);
+  need(t?.head_sha && t.pr_url && ['needs_human', 'ready_for_human', 'todo'].includes(t.status), 'Refresh needs a submitted PR awaiting work or owner review');
+  if (expected_updated_at && expected_updated_at !== t.updated_at) throw Object.assign(new Error('The ticket changed. Read it before refreshing.'), { status: 409 });
+  if (t.active_run || store.unfinishedRuns().some((r) => r.ticket_key === key)) throw Object.assign(new Error('Wait for this ticket’s workers to finish before refreshing.'), { status: 409 });
+  need(!['merging', 'merge_unknown'].includes(t.review_stage), 'A merge of this PR is being confirmed with GitHub; wait for it to settle');
+  need(!store.conflictJobsFor(key).some((j) => ['pending', 'running'].includes(j.status)), 'The builder is resolving a merge conflict on this branch; wait for it to finish');
+  store.updateTicket(key, { active_run: -1, status: 'needs_human', progress_msg: 'desk refreshing remote base' });
+  try {
+    if (store.getSettings().github_sync === 'true') await prs.assertRefreshable(prNumberOf(t.pr_url), t);
+    const r = await refresh.prepare(t);
+    store.kvSet(`guard:${key}`, '');
+    store.addComment(key, 'owner', `Approved desk-owned branch refresh. Original commit \`${r.original_head}\` preserved; remote lease \`${r.remote_head}\`; refreshed base \`${r.base}\`. Previous QA is historical. Final merge still requires owner review.`);
+    store.addComment(key, 'system', refresh.instructions(r));
+    // Same rule as the merge train: a rewritten branch voids QA and both reviewer approvals; the queue spot is kept.
+    store.transaction(() => {
+      store.supersedeReviews(key, null);
+      setStatus(key, 'todo', { active_run: null, head_sha: null, resume_status: null, stalls: 0, review_stage: null, merge_after: null,
+        reconfirm_from: null, reconfirm_kind: null, reconfirm_base: null, qa_sha: null,
+        progress: 50, progress_msg: r.status === 'conflicts' ? 'refreshed — engineer resolving conflicts' : 'rebased — waiting for fresh tests and QA' });
+    });
+    if (t.pr_url) {
+      store.enqueueOutbox(key, `${key}:refresh:${r.base}:${r.original_head}`, `🔄 **The owner refreshed this branch onto \`${config.project.baseBranch}\`** (\`${String(r.base).slice(0, 7)}\`). Earlier QA and both reviewer approvals no longer count: the engineer re-runs the tests, QA checks the new commit, and the reviewers look again before it can merge.\n\n<sub>SigmaDesk ${key}</sub>`);
+      github.flushOutbox();
+    }
+    github.flushComments();
+    return { ticket: store.getTicket(key), refresh: refresh.publicState(key) };
+  } catch (err) {
+    store.updateTicket(key, { active_run: null, status: t.status, progress_msg: `Branch refresh held: ${store.redact(err.message).slice(0, 160)}` });
+    throw err;
+  }
+}
+
+export function ownerReply(key, text, mode = 'auto', { expected_updated_at } = {}) {
   const t = store.getTicket(key);
   need(t, 'no such ticket');
   need(typeof text === 'string' && text.trim(), 'empty reply');
@@ -1040,6 +1140,9 @@ export function ownerReply(key, text, mode = 'auto') {
   need(['auto', 'discussion', 'answer', 'comment'].includes(mode), 'invalid message destination');
   const discussion = mode === 'discussion' || mode === 'auto' && /\b(discuss|debate|design review|architecture review)\b/i.test(text) && /\b(manager|principal|principals|team)\b/i.test(text);
   if (discussion) need(store.pendingDiscussions().length < 20, 'discussion queue is full');
+  // An answer resumes whatever hold the ticket is in now: it must be the hold the owner read (same stale guard as decisions).
+  if (!discussion && mode !== 'comment' && expected_updated_at && expected_updated_at !== t.updated_at)
+    throw Object.assign(new Error('The question changed. Read the latest ticket before answering.'), { status: 409 });
   store.addComment(key, 'owner', text);
   store.requeueOutbox(key); // an owner reply retries PR comments that had given up
   let request;
@@ -1102,7 +1205,12 @@ export function ownerPatch(key, patch) {
   const t = store.getTicket(key);
   need(t, 'no such ticket');
   const p = {};
-  if (patch.status) { need(STATUSES.includes(patch.status), 'bad status'); p.status = patch.status; }
+  if (patch.status) {
+    need(STATUSES.includes(patch.status), 'bad status');
+    // Shipping is recorded by the merge (PR sync), never by a generic edit.
+    if (patch.status === 'done' && t.status !== 'done') throw Object.assign(new Error('Tickets become done when their PR merges; merge it from the PR console.'), { status: 409 });
+    p.status = patch.status;
+  }
   if (patch.priority) { need(PRIORITY.test(patch.priority), 'bad priority'); p.priority = patch.priority; }
   if (patch.assignee !== undefined) { need(!patch.assignee || ENGINEERS.includes(patch.assignee), 'bad assignee'); p.assignee = patch.assignee || null; }
   if (patch.complexity) { need(COMPLEXITIES.includes(patch.complexity), 'bad complexity'); p.complexity = patch.complexity; }

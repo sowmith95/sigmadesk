@@ -280,7 +280,8 @@ function migrate() {
       builder: 'TEXT', contributors: "TEXT DEFAULT '[]'", approved_at: 'TEXT', merge_after: 'TEXT', merge_hold: 'TEXT', reconfirm_from: 'TEXT', reconfirm_kind: 'TEXT', reconfirm_base: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     pr_outbox: { next_attempt_at: 'TEXT' },
-    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT' },
+    runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT',
+      thread_id: 'TEXT', context_hash: 'TEXT', context_meta: 'TEXT', job_hash: 'TEXT' },
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -489,6 +490,12 @@ export function spendByAgentSince(isoTs) {
 }
 export function lastRunFor(ticketKey, agentId, kind) {
   return q('SELECT * FROM runs WHERE ticket_key=? AND agent_id=? AND kind=? AND session_id IS NOT NULL ORDER BY id DESC LIMIT 1').get(ticketKey, agentId, kind) || null;
+}
+// The latest unfinished attempt of the same Perplexity job (job, task, seat contract and pack — see context.jobIdentity):
+// a retry resumes polling its thread instead of asking again.
+export function lastThreadRun({ job_hash }) {
+  if (!job_hash) return null;
+  return q("SELECT * FROM runs WHERE job_hash=? AND thread_id IS NOT NULL AND ended_at IS NOT NULL AND status!='success' ORDER BY id DESC LIMIT 1").get(job_hash) || null;
 }
 export function runBySession(sessionId) {
   return q('SELECT * FROM runs WHERE session_id=? ORDER BY id DESC LIMIT 1').get(sessionId) || null;
@@ -708,6 +715,23 @@ export function updateConflictJob(id, patch) {
   const row = getConflictJob(id); announce({ type: 'conflict-job', data: row }); return row;
 }
 
+// ---------- per-ticket branch-update ownership ----------
+// Only one actor may rewrite a ticket's PR branch at a time: the owner's branch refresh (refresh.js) or the merge
+// train's lazy update / conflict resolution (mergetrain.js). Durable, so a restart keeps the claim.
+export function branchUpdateOf(key) { try { return JSON.parse(kvGet(`branch-update:${key}`) || 'null'); } catch { return null; } }
+export function claimBranchUpdate(key, who, note = '') {
+  return transaction(() => {
+    const cur = branchUpdateOf(key);
+    if (cur && cur.who !== who) return { ok: false, holder: cur };
+    kvSet(`branch-update:${key}`, JSON.stringify({ who, note, at: cur?.at || now() }));
+    return { ok: true };
+  });
+}
+export function releaseBranchUpdate(key, who) {
+  const cur = branchUpdateOf(key);
+  if (cur && (!who || cur.who === who)) kvSet(`branch-update:${key}`, 'null');
+}
+
 // ---------- small durable key/value store (watch cursors etc.) ----------
 export function createDiscussion(ticketKey, question) {
   const info = q('INSERT INTO owner_discussions(ticket_key,question) VALUES(?,?)').run(ticketKey, question);
@@ -715,6 +739,8 @@ export function createDiscussion(ticketKey, question) {
 }
 export const getDiscussion = (id) => q('SELECT * FROM owner_discussions WHERE id=?').get(id) || null;
 export const pendingDiscussions = () => q("SELECT * FROM owner_discussions WHERE status IN ('queued','running') ORDER BY id").all();
+// Finished design recommendations still waiting for the owner (Inbox cards).
+export const pendingProposals = () => q("SELECT id, ticket_key FROM owner_discussions WHERE status='complete' ORDER BY id DESC LIMIT 50").all();
 export const ticketDiscussions = (key) => q('SELECT * FROM owner_discussions WHERE ticket_key=? ORDER BY id DESC LIMIT 20').all(key);
 export function updateDiscussion(id, patch) {
   const cols = Object.keys(patch).filter((k) => ['status', 'response', 'error', 'run_id', 'ended_at'].includes(k));

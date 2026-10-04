@@ -1,6 +1,7 @@
 // Provider holds are separate from ticket failures: exhausted credits must not park good work.
 import { config } from './config.js';
 import { ENGINES, detectEngines, suggestFor } from './engines/index.js';
+import { supportsSeat } from './team-settings.js';
 import { agentById } from './team.js';
 import * as store from './db.js';
 
@@ -43,7 +44,7 @@ export function providerHealth(now = Date.now()) {
     const available = detected?.available === true;
     return { id: e.id, label: e.label, available, version: detected?.version || '', default_model: detected?.defaultModel || '', quota,
       ready: available && !full && !cooling,
-      reason: !detected ? 'Detecting CLI' : !available ? 'CLI unavailable' : cooling ? hold.reason : full ? 'Plan usage limit reached' : null,
+      reason: !detected ? 'Detecting CLI' : !available ? 'CLI unavailable' : cooling ? hold.reason : full ? (['rejected', 'blocked'].includes(quota?.status) ? 'Provider usage limit reached' : `Usage reserve reached (${Math.round(config.limits.planHoldAt * 100)}% used)`) : null,
       retry_at: cooling ? hold.until : full ? (() => {
         const times = ['five_hour', 'seven_day'].filter(windowFull).map(windowReset).filter(Number.isFinite);
         times.push(...blockingWindows.map((w) => Date.parse(w.resets_at)).filter(Number.isFinite));
@@ -67,12 +68,20 @@ export function selectionFor(agentId, now = Date.now()) {
   const health = providerHealth(now);
   const primary = health.find((e) => e.id === preferred);
   const resolveSeat = (s) => ({ ...s, model: s.engine === 'codex' && !s.model ? availability.codex?.defaultModel || '' : s.model });
-  if (primary?.ready) return { seat: resolveSeat(seat), fallback: false };
+  const ready = (engine) => {
+    const p = health.find(e => e.id === engine);
+    return p?.ready && supportsSeat(agentId, engine)
+      && (engine !== 'perplexity' || health.find(e => e.id === 'claude')?.ready);
+  };
+  const reason = preferred === 'perplexity' && primary?.ready && !ready(preferred) ? 'Perplexity needs an available Claude relay' : primary?.reason;
+  if (ready(preferred)) return { seat: resolveSeat(seat), fallback: false };
   if (store.getSettings().auto_fallback === 'true') {
-    const alt = health.find((e) => e.id !== preferred && e.ready && ENGINES[e.id]?.autoFallback !== false); // never fall back onto Perplexity
-    if (alt) return { seat: resolveSeat({ ...seat, engine: alt.id, ...suggestFor(agentId, alt.id) }), fallback: true, reason: primary?.reason };
+    const alternatives = seat.fallbacks ?? health.filter(e => e.id !== preferred && ENGINES[e.id]?.autoFallback !== false)
+      .map(e => ({ engine: e.id, ...suggestFor(agentId, e.id) }));
+    const alt = alternatives.find(p => ready(p.engine));
+    if (alt) return { seat: resolveSeat({ ...seat, ...alt }), fallback: true, reason };
   }
-  return { seat: null, reason: primary?.reason || 'Provider unavailable', retry_at: primary?.retry_at };
+  return { seat: null, reason: reason || 'No compatible provider available', retry_at: primary?.retry_at };
 }
 export function classifyProviderFailure(text) {
   const s = String(text || '');

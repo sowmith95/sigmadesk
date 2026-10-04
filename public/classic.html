@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#07090d">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>SigmaDesk</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="sigma">σ</span><span class="brand-name">SigmaDesk</span><span class="project" id="project"></span></div>
+    <div class="ticker" id="ticker"></div>
+    <div class="controls">
+      <button class="btn" id="btn-toggle" type="button"></button>
+      <button class="btn danger" id="btn-breaker" type="button" title="Circuit breaker: halt the desk and stop every running seat">⛔<span class="hide-sm"> Breaker</span></button>
+      <button class="btn primary" id="btn-new" type="button" aria-label="New ticket">＋<span class="hide-sm"> New ticket</span></button>
+    </div>
+  </header>
+  <nav class="tabs" id="tabs" aria-label="Views">
+    <button data-view="board" type="button"><span class="ti">▦</span><span>Board</span></button>
+    <button data-view="desk" type="button"><span class="ti">◉</span><span>Floor</span></button>
+    <button data-view="tape" type="button"><span class="ti">≋</span><span>Activity</span></button>
+    <button data-view="prs" type="button"><span class="ti">⇅</span><span>PRs</span></button>
+    <button data-view="watch" type="button"><span class="ti">⚠</span><span>Reliability</span><span class="badge" id="watch-badge" hidden></span></button>
+    <button data-view="settings" type="button"><span class="ti">⚙</span><span>Settings</span></button>
+  </nav>
+  <div id="health-banner" class="health-banner" role="status" hidden></div>
+  <main id="view"></main>
+  <div id="sheet" class="sheet" hidden></div>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <noscript>SigmaDesk needs JavaScript.</noscript>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

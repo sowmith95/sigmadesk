@@ -18,7 +18,7 @@ fs.writeFileSync(cfg, JSON.stringify({ project: { repoPath: repo, ticketPrefix: 
 process.env.SIGMADESK_CONFIG = cfg; process.env.SIGMADESK_WORKSPACES = path.join(tmp, 'ws');
 let store, sched, reviews, dispatch, config;
 before(async () => {
-  ({ config } = await import('../src/config.js')); config.root = tmp;
+  ({ config } = await import('../src/config.js')); config.root = tmp; config.dataDir = path.join(tmp, 'data');
   store = await import('../src/db.js'); store.openDb(':memory:');
   dispatch = await import('../src/dispatch.js'); dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: false }]);
   sched = await import('../src/scheduler.js'); reviews = await import('../src/reviews.js');
@@ -26,7 +26,7 @@ before(async () => {
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 test('picking up a ticket makes the seat a contributor before any submission', async () => {
-  const t = store.createTicket({ title: 'Picked up then interrupted', status: 'todo', area: 'frontend', complexity: 'M', assignee: 'senior-fe' });
+  const t = store.createTicket({ title: 'Picked up then interrupted', type: 'bug', status: 'todo', area: 'frontend', complexity: 'M', assignee: 'senior-fe' });
   store.setSetting('paused', 'false');
   await sched.tick();
   for (let i = 0; i < 100 && !store.contributorsOf({ contributors: store.getTicket(t.key).contributors }).has('senior-fe'); i++) await new Promise((r) => setTimeout(r, 30));

@@ -1,3 +1,4 @@
+import * as productReview from './product-review.js';
 // PR console: every PR the desk opened, with live GitHub state, and the owner's actions on them
 // (approve, ready, merge, close, reviewers, tags). Agents never reach this module: it is called only from owner
 // routes on the TCP listener. Merging the base branch may deploy production, so merges are guarded.
@@ -6,6 +7,7 @@ import { promisify } from 'node:util';
 import { config } from './config.js';
 import * as store from './db.js';
 import { agentById } from './team.js';
+import * as refresh from './refresh.js';
 
 const pexec = promisify(execFile);
 const repo = () => config.project.githubRepo;
@@ -67,6 +69,11 @@ async function pr(number) {
   return p;
 }
 const bust = () => { cache.at = 0; };
+export async function assertRefreshable(number, ticket) {
+  const p = await pr(number);
+  if (p.state !== 'OPEN' || p.headRefName !== ticket.branch) fail('Refresh requires this ticket’s open PR branch');
+  if (p.baseRefName !== config.project.baseBranch) fail('Merge the predecessor first: this stacked PR targets a different base');
+}
 const note = (p, text) => {
   const key = p.title.match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1];
   if (key && store.getTicket(key)) store.addComment(key, 'owner', text);
@@ -250,7 +257,25 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   const noChecksConfigured = (p.statusCheckRollup || []).length === 0 && noWorkflows;
   const req = requiredChecks();
   if (actor !== 'owner' && !req.names.length && !noWorkflows) fail('Not merged: nobody has confirmed which CI checks a merge must wait for (review.requiredChecks) — the owner merges until then.');
-  const { blockers, overridden } = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, noChecksConfigured, required: req.names });
+  const auth = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, noChecksConfigured, required: req.names });
+  const { overridden } = auth;
+  const blockers = [...auth.blockers];
+  // Product/design feedback and owner-triggered branch refresh gates (main): they add blockers, never remove any.
+  if (key) {
+    const ticket = t;
+    const plan = ticket && productReview.current(ticket.parent_key || key);
+    if (plan || productReview.current(key, 'feedback')) {
+      const feedback = productReview.current(key, 'feedback');
+      if (productReview.blocks(ticket) || !feedback || feedback.stale || feedback.status !== 'approved' || ticket.head_sha !== p.headRefOid) blockers.push('product/design or user feedback approval is missing or stale for this commit');
+    }
+  }
+  if (key && refresh.current(key)) {
+    if (p.baseRefName !== config.project.baseBranch) blockers.push('PR base changed since refreshed QA');
+    // GraphQL baseRefOid may describe the PR's original base. Read the live branch ref.
+    const base = JSON.parse(await gh(['api', `repos/${repo()}/git/ref/heads/${config.project.baseBranch}`])).object.sha;
+    blockers.push(...refresh.validationBlockers(key, p.headRefOid, base));
+    if (refresh.current(key).status !== 'published') blockers.push('the rebased branch has not been published after QA');
+  }
   if (blockers.length) fail(`Not merged: ${blockers.join('; ')}.`);
   if (p.isDraft) await gh(['pr', 'ready', String(p.number), '-R', repo()]);
   if (overridden.length) {

@@ -52,7 +52,7 @@ process.env.SIGMADESK_WORKSPACES = path.join(tmp, 'workspaces');
 let config, store, sched, reviews, runner, team, dispatch, github, prs;
 before(async () => {
   ({ config } = await import('../src/config.js'));
-  config.root = tmp;
+  config.root = tmp; config.dataDir = path.join(tmp, 'data');
   store = await import('../src/db.js'); store.openDb(':memory:');
   team = await import('../src/team.js');
   dispatch = await import('../src/dispatch.js');

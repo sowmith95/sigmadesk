@@ -75,7 +75,7 @@ process.env.SIGMADESK_WORKSPACES = path.join(tmp, 'workspaces');
 let config, store, sched, reviews, train, runner, wf, github, dispatch;
 before(async () => {
   ({ config } = await import('../src/config.js'));
-  config.root = tmp;
+  config.root = tmp; config.dataDir = path.join(tmp, 'data');
   store = await import('../src/db.js'); store.openDb(':memory:');
   dispatch = await import('../src/dispatch.js');
   dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: true }]);
@@ -685,4 +685,48 @@ test('required checks are learned from base commits only (pull-request workflows
   assert.deepEqual(prs.requiredChecks().names.sort(), ['ci/legacy', 'unit-tests']);
   fs.rmSync(path.join(ghDir, `runs-${snap.base}.json`));
   prs.setRequiredChecks(['tests'], 'owner');
+});
+
+// ---------------- integration with the owner's branch refresh (refresh.js) ----------------
+test('owner branch refresh and the merge train never rewrite the same branch at once', async () => {
+  resetTrain();
+  const refresh = await import('../src/refresh.js');
+  const t = await approvedPr('notes/claim.txt');
+  landOnMain('notes/claim-other.txt', 'x\n', 'moves main (#395)');
+  // the train holds the branch → a refresh is refused
+  assert.equal(store.claimBranchUpdate(t.key, 'train', 'merge-train update').ok, true);
+  await assert.rejects(refresh.prepare(store.getTicket(t.key)), /merge train is already updating this branch/);
+  store.releaseBranchUpdate(t.key, 'train');
+  // a refresh holds the branch → the train's lazy update and conflict jobs stay away
+  assert.equal(store.claimBranchUpdate(t.key, 'refresh', 'owner branch refresh').ok, true);
+  const u = await train.lazyUpdate(store.getTicket(t.key), await train.watchBase());
+  assert.equal(u.action, 'skip'); assert.match(u.reason, /another update of this branch/);
+  store.releaseBranchUpdate(t.key, 'refresh');
+});
+
+test('an owner-triggered refresh voids QA and both approvals exactly like a desk update', async () => {
+  resetTrain();
+  const t = await approvedPr('notes/refresh-me.txt');
+  setGh('pr.json', { number: 7, title: `[${t.key}] x`, state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', headRefOid: t.head_sha, headRefName: t.branch, baseRefName: 'main', body: 'SigmaDesk', statusCheckRollup: [] });
+  store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
+  assert.equal(store.approvalsAt(t.key, t.head_sha).ok, true);
+  landOnMain('notes/refresh-other.txt', 'y\n', 'moves main (#396)');
+  for (const r of store.unfinishedRuns().filter((x) => x.ticket_key === t.key)) store.updateRun(r.id, { status: 'success', ended_at: store.now(), token: null });
+  await sched.ownerRefreshBase(t.key, {});
+  const after = store.getTicket(t.key);
+  assert.equal(after.status, 'todo'); assert.equal(after.head_sha, null); assert.equal(after.review_stage, null); assert.equal(after.qa_sha, null);
+  assert.ok(store.listPrReviews(t.key).every((r) => r.state === 'superseded'), 'both approvals void');
+  assert.equal(store.branchUpdateOf(t.key).who, 'refresh', 'the refresh owns the branch until it is published');
+  assert.match(store.listOutbox(t.key).at(-1).body, /owner refreshed this branch.*approvals no longer count/s);
+});
+
+test('updating a seat clone never discards uncommitted edits', async () => {
+  const t = await approvedPr('notes/dirty.txt');
+  const ws = runner.workspaceDir(t.key);
+  fs.writeFileSync(path.join(ws, 'notes/dirty.txt'), 'uncommitted work\n');
+  await runner.syncWorkspace(store.getTicket(t.key), t.head_sha);
+  const backups = fs.readdirSync(path.dirname(ws)).filter((d) => d.startsWith(`${t.key}-backup-`));
+  assert.equal(backups.length, 1);
+  assert.equal(fs.readFileSync(path.join(path.dirname(ws), backups[0], 'notes/dirty.txt'), 'utf8'), 'uncommitted work\n');
+  assert.equal(g(ws, 'rev-parse', 'HEAD'), t.head_sha);
 });

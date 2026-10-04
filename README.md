@@ -103,6 +103,39 @@ model and seat contract match. Partial changes stay in the ticket clone and must
 Adding another execution engine means
 implementing one file in `src/engines/` (`command()` + `parse()` → normalized events).
 
+**Perplexity context packs.** A Perplexity-backed thinking seat (groom, design, consult, owner discussion, review,
+research, triage, investigate) no longer relies on its local relay to pick what to send. `src/context.js` builds a
+deterministic pack in the desk-owned bare repo (`data/publisher.git`), never from the seat's clone: the base is frozen
+from the owner's remote (or the owner's checkout) and the review head is the desk-recorded `head_sha`, imported by object
+id. Git runs with no system/global config, hooks, fsmonitor, signature checks, external diff or textconv. The pack
+holds the frozen ticket and acceptance criteria, decision history, parent design, prerequisites and siblings, playbook
+rules, protected paths, labelled excerpts and "references found by search" (text matches, not proven callers).
+Reviews carry the committed diff in whole hunks; anything over budget is listed as omitted, and required content that
+cannot fit refuses the run. One scrubber covers the whole pack and every served file (quoted JSON/YAML credentials,
+private-key blocks, bearer tokens, URL credentials, known key formats); secret paths and both sides of secret renames
+are withheld. Packs are stored in `data/context/` (0600). If a pack cannot be built within `prepareDeadlineSeconds`,
+the run is refused.
+
+The relay must send the pack verbatim. The desk inspects every outgoing call. It stops the run immediately and
+invalidates it only for this run's exact token or verdict code, a validated private-key block, a recognised provider
+secret (Anthropic/OpenAI/GitHub/AWS/Slack/Google/Stripe secret keys…, never public `pk_*` keys), a format listed in
+`engines.perplexity.secretPatterns`, the value of a secret-named desk environment variable, or a message over
+`contextMaxChars`. Generic credential-looking code (`token = getToken()`) is redacted from packs but never stops a run.
+This is observation of the relay's stream, not a proxy: a violating message may already be in flight when the run is
+stopped. The pack counts as delivered only when that call's tool result succeeds. Requested files
+(`desk context-file <path> [--page N]`) are paginated without truncation; every page fits `pageChars` and pages may go
+in several follow-ups, but they count only on the pack's own thread. `desk accept pass` is refused until the pack was
+delivered, every omitted changed file was fully sent, no message to the thread is in flight, and `read_thread`'s
+structured state shows the latest entry as `WORKFLOW_COMPLETED` after the last message (a later error or follow-up
+undoes it). Stop-all also aborts runs that are still building their pack. A retry of the same job (same task, seat
+contract and pack) resumes polling the recorded thread; anything else asks afresh. Knobs under `engines.perplexity`:
+`contextMaxChars` (60000), `relayReserveChars` (8000), `remoteWaitMinutes` (8; idle watchdog and run timeouts are
+raised above it), `followupRounds` (1), `pageRounds` (6), `pageChars` (0 = the pack budget), `secretPatterns` ([]),
+`prepareDeadlineSeconds` (45), `maxRunMinutes` (90; the run timeout covers the first answer, follow-ups and page rounds, and
+fewer page rounds are allowed when the cap is lower). Remote state is dated by when it was requested, so a `read_thread`
+issued before a follow-up never counts as that follow-up's answer; if the pack thread fails, a replacement thread
+carrying the pack takes over (coverage and completion start over on it).
+
 ## Owner decisions and discussions
 
 Tickets awaiting you show **Approve**, **Needs correction** and **Reject** beside one message box. Approval continues
@@ -258,6 +291,7 @@ Everything lives in `sigmadesk.config.json` (gitignored). See `sigmadesk.config.
 | `project.extraAllowedBash`, `readOnlyPaths` | E.g. a shared virtualenv the seats may use. |
 | `team.<seat>` | Override `name`, `model`, `enabled`, `charter` per seat. |
 | `limits.*` | Concurrency, busy window, daily budget, per-run budgets, timeouts. |
+| `engines.perplexity.*` | Context-pack cap (`contextMaxChars`), remote wait for pending threads, follow-up rounds. |
 | `review.*` | Two-reviewer PRs (`required`, `independentSeats`, `maxRounds`, `autoMerge`, `riskPaths`, `ci`), legacy acceptance reviews, session resume. `ci: "auto"` lets a PR with no checks merge only when the repo has no Actions workflows; skipped/neutral-only checks never count as a pass. Every merge (yours or the desk's) needs the exact head SHA, green CI, known mergeability, the configured base branch, and two approvals at that commit — you can override the approvals with a reason that is posted on the PR. |
 | `deploy.*`, `mergeTrain.*`, `resolve.*` | Which workflows deploy, how long to wait for a deploy, the lazy update of the queue front, the conflict-resolution budget and resume policy. |
 | `watch.*` | Log sources (`loki` / `docker` / `file`), thresholds, storm and regression handling. |
@@ -271,7 +305,7 @@ Live knobs (concurrency, budget, PM cadence, GitHub sync, draft PRs) are also ed
 
 Agents talk to the desk only through `bin/desk` over the socket: `desk progress 40 "writing tests"`, `desk comment`,
 `desk needs-human "<question>"`, `desk propose`, `desk groom`, `desk consult`, `desk submit`, `desk qa pass|fail`,
-`desk accept pass|changes`, `desk incident file|mute|page`. Run `bin/desk --help` for the full list.
+`desk accept pass|changes`, `desk incident file|mute|page`, `desk context-file <path>` (Perplexity seats). Run `bin/desk --help` for the full list.
 Every subcommand also accepts `--help` or `-h`; help never submits a desk action.
 
 ## How it compares

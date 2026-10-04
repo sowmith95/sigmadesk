@@ -93,6 +93,17 @@
       "bin": "",
       "runBudgetUsd": 3,
       "models": []
+    },
+    "perplexity": {
+      "contextMaxChars": 60000,
+      "relayReserveChars": 8000,
+      "remoteWaitMinutes": 8,
+      "followupRounds": 1,
+      "prepareDeadlineSeconds": 45,
+      "pageChars": 0,
+      "pageRounds": 6,
+      "maxRunMinutes": 90,
+      "secretPatterns": []
     }
   },
   "advisors": {

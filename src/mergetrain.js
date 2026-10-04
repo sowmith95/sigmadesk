@@ -20,6 +20,7 @@ import * as github from './github.js';
 import * as prs from './prs.js';
 import * as workflows from './workflows.js';
 import * as reviews from './reviews.js';
+import * as refresh from './refresh.js';
 import crypto from 'node:crypto';
 import { notify } from './notify.js';
 // Circular on purpose: only used at call time.
@@ -287,13 +288,18 @@ export function resolverFor(t) {
   return candidates.find((id) => id && !PRINCIPALS.includes(id) && cappedSeat(id)) || null;
 }
 const RESOLVABLE = new Set(['review', 'ready_for_human']);
+/** An owner-triggered branch refresh that has not been published yet owns the branch (refresh.js). */
+const refreshPending = (key) => { const r = refresh.current(key); return !!r && r.status !== 'published'; };
 export async function onConflict(t, base, head, mt) {
   if (!t || !RESOLVABLE.has(t.status)) return null; // in progress / QA / owner: checked again next cycle
+  if (refreshPending(t.key)) return null; // the owner's refresh is handling this branch
   const jobs = store.conflictJobsFor(t.key);
   if (jobs.some((j) => j.status === 'running')) return null; // finish the current resolution first
   const files = mt.conflicts.map((c) => ({ path: c.path, kind: c.kind, stages: c.stages, messages: c.messages.slice(0, 3) }));
   const incoming = await incomingFor(base, head, files.map((f) => f.path)).catch(() => []);
   const seat = resolverFor(t) || t.builder || t.assignee; // nobody capped: the job waits (nextResolveJobs re-picks)
+  const claim = store.claimBranchUpdate(t.key, 'train', 'merge-train conflict resolution');
+  if (!claim.ok) return null; // someone else is rewriting this branch right now
   const { job, created } = store.createConflictJob({ ticket_key: t.key, pr_number: prNumber(t.pr_url), base_sha: base, head_sha: head, seat, files, incoming });
   if (!created) return job;
   for (const j of jobs) if (['pending', 'needs_owner'].includes(j.status)) store.updateConflictJob(j.id, { status: 'superseded' });
@@ -408,6 +414,7 @@ export async function finishResolution(t, job, head, dir, how) {
     store.updateConflictJob(job.id, { status: 'resolved', result_sha: head, note: how });
     store.addContributor(t.key, job.seat); // the resolver wrote code: they can never review this ticket
     store.supersedeReviews(t.key, null);
+    store.releaseBranchUpdate(t.key, 'train');
     say(t, `resolved:${job.id}`, `✅ **${nameOf(job.seat)} resolved the conflict** with ${describeIncoming(incoming)} (now \`${short(head)}\`): ${how}\n\nQA re-checks it next, then both reviewers re-confirm the resolution.`, head, job.seat);
     setStatus(t.key, 'qa', { head_sha: head, review_stage: null, reconfirm_from: job.head_sha, reconfirm_kind: 'resolution', reconfirm_base: job.base_sha,
       progress: 90, progress_msg: 'conflict resolved — QA re-checking' });
@@ -437,6 +444,7 @@ async function completeUpdate(t, j) {
     setStatus(t.key, 'qa', { head_sha: j.new, review_stage: null, reconfirm_from: j.old, reconfirm_kind: 'rebase', reconfirm_base: j.base,
       progress: 92, progress_msg: `updated onto ${config.project.baseBranch} — QA re-checking before merge` });
     journalSet(t.key, null);
+    store.releaseBranchUpdate(t.key, 'train');
   });
   github.flushOutbox();
   return { action: 'updated', head: j.new };
@@ -455,10 +463,14 @@ export async function lazyUpdate(t, snap, { epoch = runner.currentEpoch() } = {}
     return { action: 'held' };
   }
   if (await isAncestor(snap.base, head)) return { action: 'current' };
+  if (refreshPending(t.key)) return { action: 'skip', reason: 'an owner branch refresh is in progress' };
   if (config.mergeTrain?.updateWhenBehind === false) return { action: 'behind', reason: `the branch is behind ${config.project.baseBranch}; update it (CI must run on the combined code)` };
   const mt = await mergeTree(snap.base, head);
   if (mt.status === 'conflict') { await onConflict(t, snap.base, head, mt); return { action: 'conflict' }; }
   if (mt.status === 'error') return { action: 'skip', reason: mt.error };
+  const claim = store.claimBranchUpdate(t.key, 'train', 'merge-train update onto the base');
+  if (!claim.ok) return { action: 'skip', reason: `another update of this branch is in progress (${claim.holder.note || claim.holder.who})` };
+  let pushed = false;
   const parent = t.after_key ? store.getTicket(t.after_key) : null;
   const dir = await runner.scratchClone(`update-${t.key}`, [`+${head}:refs/heads/work`, `+${snap.base}:refs/heads/sigmadesk-base`,
     ...(parent?.head_sha ? [`+${parent.head_sha}:refs/heads/sigmadesk-parent`] : [])]);
@@ -486,13 +498,17 @@ export async function lazyUpdate(t, snap, { epoch = runner.currentEpoch() } = {}
     const incoming = describeIncoming(await incomingFor(snap.base, head, []).catch(() => []));
     const journal = { old: head, new: newHead, base: snap.base, how, incoming, at: store.now() };
     journalSet(t.key, journal);
-    try { await runner.pushBranchLease(t.branch, newHead, head); } catch (err) {
+    // The same lease push the owner's branch refresh uses: GitHub refuses it if the branch moved since we looked.
+    try { await runner.pushBranch(t.key, t.branch, newHead, { lease: head }); pushed = true; } catch (err) {
       journalSet(t.key, null);
       store.logEvent({ kind: 'github', ticket_key: t.key, text: `update push refused (the branch moved?): ${String(err.stderr || err.message).slice(0, 200)}` });
       return { action: 'raced' };
     }
-    return completeUpdate(t, journal);
-  } finally { runner.removeScratch(`update-${t.key}`); }
+    return await completeUpdate(t, journal);
+  } finally {
+    runner.removeScratch(`update-${t.key}`);
+    if (!pushed && !journalGet(t.key)) store.releaseBranchUpdate(t.key, 'train'); // nothing rewritten: free the claim
+  }
 }
 
 // ---------------- the queue ----------------

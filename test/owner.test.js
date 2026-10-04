@@ -92,3 +92,26 @@ test('design approval, correction and rejection are separate from task decisions
   }
   assert.ok(store.pendingDiscussions().some(d=>d.question.includes('Keep the pilot bounded')));
 });
+
+test('an answer carries the version it answers: a newer hold rejects it without resuming', () => {
+  const t = blocked();
+  assert.throws(() => sched.ownerReply(t.key, 'Old answer', 'answer', { expected_updated_at: '1999-01-01T00:00:00.000Z' }), { status: 409 });
+  assert.equal(store.getTicket(t.key).status, 'needs_human');
+  assert.equal(store.listComments(t.key).filter((c) => c.body === 'Old answer').length, 0);
+  assert.equal(sched.ownerReply(t.key, 'Fresh answer', 'answer', { expected_updated_at: store.getTicket(t.key).updated_at }).status, 'todo');
+  // comments never resume work, so they need no version
+  assert.equal(sched.ownerReply(t.key, 'note', 'comment', { expected_updated_at: 'old' }).status, 'todo');
+});
+
+test('a generic edit cannot mark a ticket done; only a merge ships it', () => {
+  const t = store.createTicket({ title: 'Patch guard fixture', status: 'todo' });
+  assert.throws(() => sched.ownerPatch(t.key, { status: 'done' }), { status: 409 });
+  assert.equal(store.getTicket(t.key).status, 'todo');
+  assert.equal(sched.ownerPatch(t.key, { status: 'wontdo' }).status, 'wontdo');
+});
+
+test('scheduler waiting entries carry a structured code', () => {
+  const w = sched.health().waiting;
+  assert.ok(w.length > 0);
+  for (const x of w) assert.ok(['paused', 'dependency', 'provider_hold', 'setup_retry', 'seat_busy', 'budget', 'tick'].includes(x.code), x.code);
+});

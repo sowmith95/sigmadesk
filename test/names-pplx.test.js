@@ -51,13 +51,11 @@ test('perplexity engine: thinking seats get only the Computer MCP; approvals are
   assert.ok(a.includes('--setting-sources') && a.includes('--strict-mcp-config'));
 });
 
-test('perplexity engine never runs builds: implementation falls back to a local relay without Perplexity', () => {
+test('perplexity rejects incompatible execution instead of silently running another model', () => {
   const seat = { ...team.agentById.junior, engine: 'perplexity', model: 'pplx_asi_glm_5_3' };
-  const cmd = pplx.perplexity.command({ seat, kind: 'implement', cwd: '/w', perms: team.permissionsFor('implement', '/w'), denyRules: team.DENY_RULES, charter: 'C', settings: {} });
-  assert.equal(cmd.args[cmd.args.indexOf('--mcp-config') + 1], '{"mcpServers":{}}');
-  assert.ok(!cmd.args.some((x) => String(x).includes('perplexity-computer')));
+  assert.throws(() => pplx.perplexity.command({ seat, kind: 'implement' }), /cannot run implement/);
   assert.equal(pplx.perplexity.autoFallback, false);
-  assert.ok(pplx.perplexity.supports('design') && !pplx.perplexity.supports('qa'));
+  assert.ok(pplx.perplexity.supports('product_review') && !pplx.perplexity.supports('qa'));
 });
 
 test('perplexity tool calls read as human activity', () => {

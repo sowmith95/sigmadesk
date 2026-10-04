@@ -71,3 +71,12 @@ const sample = council.create(ticket.key, { question: 'Demo: assess durable prov
 const report = { verdict: 'changes', recommendation: 'Demo recommendation: freeze the review brief, reserve each call, and preserve dissent before the owner makes a design decision.', findings: [{ severity: 'medium', evidence: 'Demo acceptance contract: a changed candidate invalidates an earlier report.', issue: 'A stale report could guide a changed implementation.', test: 'Change the candidate SHA and verify approval is disabled.' }], alternatives: ['Use one reviewer for routine small work.'], dissent: ['A second reviewer may cost more without finding additional defects.'], conditions: ['Run independent QA on the exact implementation commit.'] };
 for (const m of sample.members) store.updateCouncilMember(m.id, { status: 'complete', result: JSON.stringify(report), ended_at: store.now() });
 store.updateCouncil(sample.id, { status: 'complete', result: JSON.stringify(report), ended_at: store.now() });
+
+if (process.env.SIGMADESK_REVIEW_DEMO === '1') {
+  const reviews = await import('../src/product-review.js');
+  const demo = store.listTickets().find(t=>t.area==='frontend' && t.status==='todo');
+  const r = reviews.start(demo.key);
+  for (const m of [...r.members.filter(m=>m.stage==='review'),r.members.find(m=>m.agent_id==='product-design'),r.members.at(-1)]) reviews.complete(demo.key,'plan',r.revision,m.agent_id,{model:'codex/demo',report:{
+    verdict:m.agent_id==='product-design'?'concern':'support',recommendation:m.agent_id==='product-design'?'Keep the message draft visible when new updates arrive.':'Build a small preview and measure task completion.',
+    users:['Owner reviewing work on a phone'],benefits:['Less searching for the current status'],drawbacks:['More controls on a small screen'],alternatives:['Keep the existing expanded log'],evidence:['Demo acceptance criteria and fixture state'],conditions:m.agent_id==='product-design'?['Verify draft preservation at 390px']:[],architecture:'Reuse the task sheet and event stream.',rollout:'Preview, limited rollout, then general use; revert on draft loss.',success_metric:'Reviewers can find the latest update and retain their reply draft.'}});
+}

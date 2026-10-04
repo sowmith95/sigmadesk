@@ -3,38 +3,40 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#07090d">
+  <meta name="theme-color" content="#0F1622">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>SigmaDesk</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/icon.svg">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="preload" href="/fonts/ibm-plex-sans-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/v2.css">
 </head>
 <body>
-  <header class="top">
-    <div class="brand"><span class="sigma">σ</span><span class="brand-name">SigmaDesk</span><span class="project" id="project"></span></div>
-    <div class="ticker" id="ticker"></div>
-    <div class="controls">
-      <button class="btn" id="btn-toggle" type="button"></button>
-      <button class="btn danger" id="btn-breaker" type="button" title="Circuit breaker: halt the desk and stop every running seat">⛔<span class="hide-sm"> Breaker</span></button>
-      <button class="btn primary" id="btn-new" type="button" aria-label="New ticket">＋<span class="hide-sm"> New ticket</span></button>
+  <a class="skip" href="#view">Skip to content</a>
+  <header class="hdr">
+    <div class="hdr-row">
+      <div class="brand"><span class="sigma" aria-hidden="true">σ</span><span class="brand-name">SigmaDesk</span><span class="project" id="project"></span></div>
+      <nav class="tabs" id="tabs" aria-label="Views">
+        <button data-view="inbox" type="button">Inbox<span class="tab-n" id="tab-inbox-n" hidden></span></button>
+        <button data-view="work" type="button">Work</button>
+        <button data-view="team" type="button">Team</button>
+      </nav>
+      <div class="hdr-actions">
+        <button class="btn primary" id="btn-new" type="button" aria-label="New ticket"><span aria-hidden="true">+</span><span class="lbl">New ticket</span></button>
+        <button class="icon-btn" id="btn-gear" type="button" aria-label="Settings">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 8.6a3.4 3.4 0 1 0 0 6.8 3.4 3.4 0 0 0 0-6.8Zm8.2 4.6-.1-1.2 1.9-1.5-1.9-3.3-2.3.8a7 7 0 0 0-2-1.2L15.4 4h-3.8l-.4 2.4a7 7 0 0 0-2 1.2l-2.3-.8L5 10.1 7 11.6a7 7 0 0 0 0 2.4l-2 1.5 1.9 3.3 2.3-.8a7 7 0 0 0 2 1.2l.4 2.4h3.8l.4-2.4a7 7 0 0 0 2-1.2l2.3.8 1.9-3.3-1.9-1.5.1-1.2Z"/></svg>
+        </button>
+      </div>
     </div>
+    <div class="instruments" id="instruments" role="group" aria-label="Desk status"></div>
   </header>
-  <nav class="tabs" id="tabs" aria-label="Views">
-    <button data-view="board" type="button"><span class="ti">▦</span><span>Board</span></button>
-    <button data-view="desk" type="button"><span class="ti">◉</span><span>Floor</span></button>
-    <button data-view="tape" type="button"><span class="ti">≋</span><span>Activity</span></button>
-    <button data-view="prs" type="button"><span class="ti">⇅</span><span>PRs</span></button>
-    <button data-view="watch" type="button"><span class="ti">⚠</span><span>Reliability</span><span class="badge" id="watch-badge" hidden></span></button>
-    <button data-view="settings" type="button"><span class="ti">⚙</span><span>Settings</span></button>
-  </nav>
-  <div id="health-banner" class="health-banner" role="status" hidden></div>
-  <main id="view"></main>
+  <div id="banner" class="banner" role="status" hidden></div>
+  <main id="view" tabindex="-1"></main>
   <div id="sheet" class="sheet" hidden></div>
-  <div id="toast" class="toast" role="status" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <noscript>SigmaDesk needs JavaScript.</noscript>
-  <script type="module" src="/app.js"></script>
+  <script type="module" src="/v2.js"></script>
 </body>
 </html>
