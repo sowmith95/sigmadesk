@@ -31,12 +31,18 @@ export const claude = {
   costNote: 'USD per run reported by Claude Code (notional on a subscription).',
   canFork: true,
   usesSocket: true,
-  models: () => [
-    { id: 'fable', tier: 'frontier', note: 'most capable' },
-    { id: 'opus', tier: 'strong', note: 'strong all-rounder' },
-    { id: 'sonnet', tier: 'fast', note: 'fast, cheaper' },
-    { id: 'haiku', tier: 'cheap', note: 'cheapest, triage' },
-  ],
+  // Claude Code has no local model catalog file; the four aliases are always offered and the owner may add exact
+  // model ids in engines.claude.models (duplicates of the aliases are ignored; access is checked on use).
+  models: () => {
+    const base = [
+      { id: 'fable', tier: 'frontier', note: 'most capable' },
+      { id: 'opus', tier: 'strong', note: 'strong all-rounder' },
+      { id: 'sonnet', tier: 'fast', note: 'fast, cheaper' },
+      { id: 'haiku', tier: 'cheap', note: 'cheapest, triage' },
+    ];
+    for (const id of config.engines?.claude?.models || []) if (id && !base.some((m) => m.id === id)) base.push({ id, tier: 'strong', note: 'configured model; access checked on use' });
+    return base;
+  },
   efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
   suggest(tier) {
     return { frontier: { model: 'fable', effort: 'high' }, strong: { model: 'opus', effort: 'high' }, fast: { model: 'sonnet', effort: 'medium' }, cheap: { model: 'haiku', effort: 'low' } }[tier];

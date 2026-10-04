@@ -3,6 +3,8 @@
 // and runs the desk commands the model decides. Only "thinking" seats can use it: Perplexity cannot edit local files,
 // so implementation and QA always run on a local engine.
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import { config } from '../config.js';
 import { claude } from './claude.js';
 import * as context from '../context.js';
@@ -10,29 +12,72 @@ import * as context from '../context.js';
 const SERVER = 'perplexity-computer';
 const MCP = JSON.stringify({ mcpServers: { [SERVER]: { type: 'http', url: 'https://www.perplexity.ai/rest/computer/mcp' } } });
 const T = (name) => `mcp__${SERVER}__${name}`;
+// For scripts/refresh-perplexity-models.mjs: the same server, reached the same way a seat reaches it.
+export const MCP_CONFIG = MCP;
+export const MODELS_LIST_TOOL = T('models_list');
 const ALLOW = [T('call_perplexity_computer'), T('read_thread'), T('answer_question'), T('confirm_action_deny'), T('models_list')];
 // Computer can act in the world (connected apps, files): the desk never lets a seat approve those actions.
 const BLOCK = [T('confirm_action_approve'), T('create_attachment_upload'), T('create_asset_download'), T('projects_list'), T('notify_connected')];
 // owner_discussion is the manager's design discussion (scheduler.launchDiscussion); without it here, a manager seat on
 // Perplexity silently ran those on local Claude.
 export const THINK_KINDS = ['research', 'groom', 'design', 'consult', 'review', 'triage', 'investigate', 'owner_discussion', 'product_review'];
+// council_review (a frozen, read-only engineering council brief) is opt-in: a Computer task bills account credits and
+// cannot be cancelled from here, so docs/perplexity-connection.md must be verified before engines.perplexity.councilEnabled.
+const councilEnabled = () => config.engines?.perplexity?.councilEnabled === true;
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-// From models.list on the owner's account (2026-10-03). Ids are passed straight to call_perplexity_computer.
+// From models_list on the owner's account (2026-10-03, effort sets re-checked 2026-10-04). Ids are passed straight to
+// call_perplexity_computer. `efforts` lists the desk efforts a model accepts when it differs from EFFORTS; [] means the
+// model takes no effort parameter. `npm run models:refresh` records the live list in data/perplexity-models.json.
 export const MODELS = [
-  { id: 'pplx_asi_kimi_k3', label: 'Kimi K3', tier: 'frontier', note: 'architecture & independent design reasoning' },
-  { id: 'pplx_asi_grok', label: 'Grok 4.7', tier: 'frontier', note: 'reliability, adversarial review' },
-  { id: 'pplx_asi_glm_5_3', label: 'GLM 5.3', tier: 'cheap', note: 'fewest credits; delivery & cost review' },
-  { id: 'pplx_asi_deepseek_v4_pro', label: 'DeepSeek V4 Pro', tier: 'strong', note: 'strong reasoning, US hosted' },
+  { id: 'pplx_asi_kimi_k3', label: 'Kimi K3', tier: 'frontier', note: 'architecture & independent design reasoning', efforts: ['low', 'medium', 'high', 'max'] },
+  { id: 'pplx_asi_grok', label: 'Grok 4.7', tier: 'frontier', note: 'reliability, adversarial review', efforts: ['low', 'medium', 'high'] },
+  { id: 'pplx_asi_glm_5_3', label: 'GLM 5.3', tier: 'cheap', note: 'fewest credits; delivery & cost review', efforts: ['low', 'medium', 'high', 'xhigh'] },
+  { id: 'pplx_asi_deepseek_v4_pro', label: 'DeepSeek V4 Pro', tier: 'strong', note: 'strong reasoning, US hosted', efforts: [] },
   { id: 'pplx_asi_gpt_6_1_sol', label: 'GPT-6.1 Sol', tier: 'frontier', note: 'complex tasks' },
   { id: 'pplx_asi_gpt_6_1_sol_fast', label: 'GPT-6.1 Sol fast', tier: 'strong', note: 'faster' },
   { id: 'pplx_asi_astra', label: 'GPT-6 Astra', tier: 'frontier', note: 'complex tasks' },
   { id: 'pplx_asi_astra_fast', label: 'GPT-6 Astra fast', tier: 'strong', note: 'faster' },
   { id: 'pplx_asi_opus', label: 'Claude Opus 5.5', tier: 'strong', note: "Perplexity's default" },
   { id: 'pplx_asi_opus_fast', label: 'Claude Opus 5.5 fast', tier: 'strong', note: 'faster' },
-  { id: 'pplx_asi_sonnet', label: 'Claude Sonnet 5.5', tier: 'fast', note: 'fewer credits' },
+  { id: 'pplx_asi_sonnet', label: 'Claude Sonnet 5.5', tier: 'fast', note: 'fewer credits', efforts: ['low', 'medium', 'high', 'xhigh'] },
   { id: 'pplx_asi_fable_5', label: 'Claude Fable 5.1', tier: 'frontier', note: 'most powerful; extra credits' },
 ];
-const labelOf = (id) => MODELS.find((m) => m.id === id)?.label || id || 'Perplexity default';
+
+// data/perplexity-models.json: the raw models_list payload plus fetched_at, written atomically by the refresh script.
+// Read defensively: a missing, partial or reshaped file never breaks the engine, it just adds nothing.
+export const catalogPath = () => path.join(config.root, 'data', 'perplexity-models.json');
+let catalogCache = null; // { at, value }
+export function readCatalog() {
+  if (catalogCache && Date.now() - catalogCache.at < 30_000) return catalogCache.value;
+  let value = null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(catalogPath(), 'utf8'));
+    if (raw && Array.isArray(raw.models)) {
+      const models = raw.models.filter((m) => m && typeof m.id === 'string' && /^[\w.:-]{1,80}$/.test(m.id)).map((m) => ({
+        id: m.id, label: typeof m.label === 'string' && m.label.trim() ? m.label.trim().slice(0, 80) : m.id,
+        fast: m.fast === true, efforts: Array.isArray(m.efforts) ? m.efforts.filter((e) => EFFORTS.includes(e)) : null }));
+      value = { fetched_at: typeof raw.fetched_at === 'string' ? raw.fetched_at : null, models };
+    }
+  } catch { /* no catalog file yet, or unreadable: the built-in list stands */ }
+  catalogCache = { at: Date.now(), value };
+  return value;
+}
+export const resetCatalogCache = () => { catalogCache = null; };
+// Built-in entries first (curated tiers and notes), then models the account lists that we do not know, then configured ids.
+function catalog() {
+  const live = readCatalog();
+  const out = MODELS.map((m) => {
+    const seen = live?.models.find((x) => x.id === m.id);
+    return { ...m, efforts: seen?.efforts ?? m.efforts ?? null };
+  });
+  for (const m of live?.models || []) if (!out.some((x) => x.id === m.id)) out.push({ id: m.id, label: m.label, tier: m.fast ? 'strong' : 'frontier', efforts: m.efforts, note: `on your account${live.fetched_at ? ` (listed ${live.fetched_at.slice(0, 10)})` : ''}; access checked on use` });
+  for (const id of config.engines?.perplexity?.models || []) if (id && !out.some((x) => x.id === id)) out.push({ id, label: id, tier: 'frontier', efforts: null, note: 'configured model; access checked on use' });
+  return out;
+}
+const labelOf = (id) => catalog().find((m) => m.id === id)?.label || id || 'Perplexity default';
+// null = unknown (any desk effort), [] = the model takes no effort parameter.
+export const effortsOf = (id) => catalog().find((m) => m.id === id)?.efforts ?? null;
 
 let detected = null;
 function connected() {
@@ -48,15 +93,18 @@ function connected() {
 
 function relayCharter(seat, kind) {
   const model = seat.model || 'pplx_asi_kimi_k3';
+  const efforts = effortsOf(model);
+  const effort = Array.isArray(efforts) && efforts.length === 0 ? '' : `, effort="${seat.effort || 'medium'}"`;
+  const review = ['product_review', 'council_review'].includes(kind);
   return `
 
 # You are the hands of ${labelOf(model)} (Perplexity)
 Your judgment comes from ${labelOf(model)}, reached with ${T('call_perplexity_computer')}. You do not decide yourself.
 1. Read your task. The desk has already gathered the context (the context pack at the end of your instructions); read
    more files only if something specific is missing, and add those excerpts after the pack, never inside it.
-2. Call ${T('call_perplexity_computer')} ONCE with model="${model}", effort="${seat.effort || 'medium'}" (do not pass mode — Computer rejects mode+model together).
+2. Call ${T('call_perplexity_computer')} ONCE with model="${model}"${effort} (do not pass mode — Computer rejects mode+model together).
    Tell it to answer read-only: no connected apps, no files, no accounts, nothing outside this conversation.
-3. ${kind==='product_review'?'Return its structured review JSON as your final answer. Do not run desk mutations.':'Act on its answer by running the desk commands it decides, quoting its reasoning where useful.'} For a follow-up, call
+3. ${review ? 'Return its structured review JSON as your final answer. Do not run desk mutations.' : 'Act on its answer by running the desk commands it decides, quoting its reasoning where useful.'}${kind === 'council_review' ? ' The brief is frozen: answer from the brief and the pack only, request no files, and do not ask for a second opinion.' : ''} For a follow-up, call
    again with the same thread_id.
 4. Never approve a Computer action (only ${T('confirm_action_deny')}). If Perplexity fails or times out, say so with
    \`desk comment\` and stop — do not substitute your own judgment.
@@ -72,9 +120,10 @@ export const perplexity = {
   costNote: 'Perplexity account credits per Computer task, plus a small local Claude relay.',
   canFork: false,
   usesSocket: true,
-  supports: (kind) => THINK_KINDS.includes(kind),
-  models: () => MODELS.map((m) => ({ id: m.id, tier: m.tier, note: `${m.label} — ${m.note}` })),
-  efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+  supports: (kind) => THINK_KINDS.includes(kind) || (kind === 'council_review' && councilEnabled()),
+  // efforts is omitted when unknown (any desk effort) or empty (no effort parameter), so seat validation falls back to EFFORTS.
+  models: () => catalog().map((m) => ({ id: m.id, tier: m.tier, note: `${m.label} — ${m.note}`, ...(m.efforts?.length ? { efforts: m.efforts } : {}) })),
+  efforts: EFFORTS,
   suggest(tier) {
     return { frontier: { model: 'pplx_asi_kimi_k3', effort: 'high' }, strong: { model: 'pplx_asi_kimi_k3', effort: 'medium' },
       fast: { model: 'pplx_asi_glm_5_3', effort: 'medium' }, cheap: { model: 'pplx_asi_glm_5_3', effort: 'low' } }[tier];

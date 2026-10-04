@@ -156,6 +156,8 @@ const DEFAULTS = {
     autoFallback: true,
     fallbackCooldownMinutes: 15,
     codex: { bin: '', models: [], pricing: null, reserveUsd: 2 },
+    // Extra Claude Code model ids offered to seats besides fable/opus/sonnet/haiku (access is checked on use).
+    claude: { models: [] },
     // Perplexity thinking seats: the desk builds a context pack the local relay must send verbatim.
     perplexity: {
       contextMaxChars: 60000, // hard cap on the whole outgoing message (pack + task + relay additions)
@@ -167,6 +169,10 @@ const DEFAULTS = {
       pageRounds: 6, // follow-ups that only carry requested file pages
       maxRunMinutes: 90, // cap on a Perplexity run's timeout; fewer page rounds are allowed if the cap is lower
       secretPatterns: [], // extra high-confidence secret formats (regex strings) that stop a run, e.g. a broker's key shape
+      models: [], // extra Perplexity model ids besides the built-in catalog and data/perplexity-models.json (npm run models:refresh)
+      // Let Perplexity models sit on engineering councils. Off until docs/perplexity-connection.md has been verified:
+      // a Computer task cannot be cancelled remotely and bills account credits.
+      councilEnabled: false,
     },
   },
   advisors: {
@@ -286,6 +292,9 @@ export function validateConfig(c = config) {
   if (!(px.maxRunMinutes >= 15 && px.maxRunMinutes <= 240)) problems.push('engines.perplexity.maxRunMinutes must be between 15 and 240');
   if (!(px.prepareDeadlineSeconds >= 5 && px.prepareDeadlineSeconds <= 300)) problems.push('engines.perplexity.prepareDeadlineSeconds must be between 5 and 300');
   if (!(Number.isInteger(px.followupRounds) && px.followupRounds >= 0 && px.followupRounds <= 3)) problems.push('engines.perplexity.followupRounds must be 0-3');
+  if (typeof px.councilEnabled !== 'boolean') problems.push('engines.perplexity.councilEnabled must be true or false');
+  const modelList = (v) => Array.isArray(v) && v.every((id) => typeof id === 'string' && /^[\w.:-]{1,80}$/.test(id));
+  for (const id of ['claude', 'codex', 'perplexity']) if (!modelList(c.engines[id]?.models)) problems.push(`engines.${id}.models must be a list of model ids`);
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');
   return problems;
 }

@@ -103,7 +103,9 @@
       "pageChars": 0,
       "pageRounds": 6,
       "maxRunMinutes": 90,
-      "secretPatterns": []
+      "secretPatterns": [],
+      "models": [],
+      "councilEnabled": false
     }
   },
   "advisors": {
