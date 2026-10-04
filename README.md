@@ -83,17 +83,25 @@ implementing one file in `src/engines/` (`command()` + `parse()` → normalized 
 
 **Perplexity context packs.** A Perplexity-backed thinking seat (groom, design, consult, owner discussion, review,
 research, triage, investigate) no longer relies on its local relay to pick what to send. `src/context.js` builds a
-deterministic pack from committed git objects: repo, base/head SHAs, the frozen ticket and acceptance criteria, decision
-history, parent design, prerequisites and siblings, playbook rules, protected paths, the files in scope with labelled
-excerpts, and "references found by search" (text matches, not proven callers). Reviews carry the full committed diff
-`<base>...<head_sha>` in whole hunks; when it exceeds the budget the pack says exactly which files or hunks were omitted.
-Secret-looking paths are listed by name only; symlinks and traversal are rejected; run tokens and verdict codes never
-appear. The relay must send the pack verbatim. The desk checks each outgoing call, logs "Perplexity did not receive
-the full context" when it was not sent, records the pack hash and Perplexity `thread_id` on the run, and refuses
-`desk accept pass` until the pack arrived and every omitted changed file was fetched (`desk context-file <path>`) and
-sent on the same thread. Retries resume polling the recorded thread rather than asking again. Knobs under
-`engines.perplexity`: `contextMaxChars` (60000, the whole outgoing message), `relayReserveChars` (8000),
-`remoteWaitMinutes` (8; idle watchdog and run timeouts are raised above it) and `followupRounds` (1).
+deterministic pack in the desk-owned bare repo (`data/publisher.git`), never from the seat's clone: the base is frozen
+from the owner's remote (or the owner's checkout) and the review head is the desk-recorded `head_sha`, imported by object
+id. Git runs with no system/global config, hooks, fsmonitor, signature checks, external diff or textconv. The pack
+holds the frozen ticket and acceptance criteria, decision history, parent design, prerequisites and siblings, playbook
+rules, protected paths, labelled excerpts and "references found by search" (text matches, not proven callers).
+Reviews carry the committed diff in whole hunks; anything over budget is listed as omitted, and required content that
+cannot fit refuses the run. One scrubber covers the whole pack and every served file (quoted JSON/YAML credentials,
+private-key blocks, bearer tokens, URL credentials, known key formats); secret paths and both sides of secret renames
+are withheld. Packs are stored in `data/context/` (0600). If a pack cannot be built within `prepareDeadlineSeconds`,
+the run is refused.
+
+The relay must send the pack verbatim. The desk inspects every outgoing call: a run token, verdict code, secret-looking
+content or a message over `contextMaxChars` stops the run immediately and invalidates it. The pack counts as delivered
+only when that call's tool result succeeds; requested files (`desk context-file <path> [--page N]`, paginated, never
+truncated) count only once every page reaches the pack's own thread. `desk accept pass` is refused until the pack was
+delivered, every omitted changed file was fully sent, and the thread shows `WORKFLOW_COMPLETED` after the last message.
+A retry of the same job (same task, seat contract and pack) resumes polling the recorded thread; anything else asks
+afresh. Knobs under `engines.perplexity`: `contextMaxChars` (60000), `relayReserveChars` (8000), `remoteWaitMinutes`
+(8; idle watchdog and run timeouts are raised above it), `followupRounds` (1), `prepareDeadlineSeconds` (45).
 
 ## Owner decisions and discussions
 
