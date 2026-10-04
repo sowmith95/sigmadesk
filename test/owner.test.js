@@ -222,3 +222,22 @@ test('parents the manager closed while splitting are repaired once; an owner rej
   assert.match(store.listComments(live.key).at(-1).body, /Reopened as an epic/);
   assert.deepEqual(sched.repairSplitEpics(), [], 'runs once');
 });
+
+test('the split repair respects later owner decisions and settles nested epics from their real work', () => {
+  store.kvSet('migration:split-epics:v1', '');
+  const root = store.createTicket({ title: 'Nested root', status: 'wontdo', type: 'feature' });
+  const sub = store.createTicket({ title: 'Nested sub-epic', status: 'wontdo', parent_key: root.key });
+  const leaf = store.createTicket({ title: 'Leaf still open', status: 'todo', parent_key: sub.key });
+  store.addComment(root.key, 'manager', 'Closed: split into the sub-epic');
+  store.addComment(sub.key, 'manager', 'Closed: split into one leaf');
+  const later = store.createTicket({ title: 'Owner rejected after split', status: 'wontdo' });
+  store.createTicket({ title: 'kid', status: 'todo', parent_key: later.key });
+  store.addComment(later.key, 'manager', 'Closed: split into kid');
+  store.addComment(later.key, 'owner', '⛔ **Rejected by owner**: not needed');
+  const fixed = sched.repairSplitEpics();
+  assert.ok(fixed.includes(root.key) && fixed.includes(sub.key));
+  assert.ok(!fixed.includes(later.key), 'a later owner decision wins');
+  assert.equal(store.getTicket(root.key).status, 'in_progress', 'the root is not closed early by a stale sub-epic state');
+  assert.equal(store.getTicket(sub.key).status, 'in_progress');
+  assert.equal(store.getTicket(leaf.key).status, 'todo');
+});

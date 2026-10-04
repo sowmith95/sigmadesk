@@ -391,8 +391,9 @@ function openMailbox(runId, cwd) {
 export const openMailboxes = () => [...mailboxes.entries()];
 export const runCwd = (runId) => store.getRun(runId)?.cwd;
 
-export const runBudget = (agentId) => {
-  const seat = selectionFor(agentId).seat || agentById[agentId] || {};
+// The reservation follows the engine the job will actually use (a capability fallback can cost more than the seat's own).
+export const runBudget = (agentId, kind = null) => {
+  const seat = selectionFor(agentId, Date.now(), null, kind).seat || agentById[agentId] || {};
   return engineOf(seat).budgetUsd(seat);
 };
 export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: String(run?.model || '').split(':')[0] }).budgetUsd({ model: String(run?.model || '').split(':').slice(1).join(':') });

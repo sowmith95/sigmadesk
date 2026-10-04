@@ -132,6 +132,24 @@ export function parseWorkflow(text) {
 const list = (v) => (v == null ? null : Array.isArray(v) ? v.map(String) : [String(v)]);
 
 /** Would a push of `files` to `branch` trigger this parsed workflow's push event? */
+/** Would a pull request into `base` that changes `files` start this workflow? (pull_request or pull_request_target) */
+export function pullRequestTriggers(wf, base, files) {
+  if (!wf?.on) return false;
+  return ['pull_request', 'pull_request_target'].some((ev) => {
+    if (!Object.prototype.hasOwnProperty.call(wf.on, ev)) return false;
+    const pr = wf.on[ev];
+    if (pr == null || typeof pr !== 'object' || Array.isArray(pr)) return true;
+    const branches = list(pr.branches); const branchesIgnore = list(pr['branches-ignore']);
+    const paths = list(pr.paths); const pathsIgnore = list(pr['paths-ignore']);
+    if (branches && !matchesFilters(base, branches)) return false;
+    if (branchesIgnore && matchesFilters(base, branchesIgnore)) return false;
+    if (paths && !files.some((f) => matchesFilters(f, paths))) return false;
+    if (pathsIgnore && files.length && files.every((f) => matchesFilters(f, pathsIgnore))) return false;
+    return true;
+  });
+}
+export const hasPullRequestTrigger = (wf) => !!wf?.on && ['pull_request', 'pull_request_target'].some((ev) => Object.prototype.hasOwnProperty.call(wf.on, ev));
+
 export function pushTriggers(wf, branch, files) {
   if (!wf?.on || !Object.prototype.hasOwnProperty.call(wf.on, 'push')) return false;
   const push = wf.on.push;

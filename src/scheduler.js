@@ -138,24 +138,40 @@ export function rollupParent(parentKey) {
 // parents the manager closed with a split note are touched; an owner's rejection is never reopened.
 export function repairSplitEpics() {
   if (store.kvGet('migration:split-epics:v1')) return [];
+  const leaves = (key, seen = new Set()) => store.childrenOf(key).flatMap((k) => {
+    if (seen.has(k.key)) return []; seen.add(k.key);
+    const kids = store.childrenOf(k.key);
+    return kids.length ? leaves(k.key, seen) : [k];
+  });
+  const depth = (t) => { let d = 0; for (let p = t; p?.parent_key && d < 20; p = store.getTicket(p.parent_key)) d++; return d; };
+  const candidates = store.listTickets().filter((p) => {
+    if (p.status !== 'wontdo' || !store.childrenOf(p.key).length) return false;
+    const comments = store.listComments(p.key);
+    const closed = comments.filter((c) => c.body.startsWith('Closed:')).at(-1);
+    if (closed?.author !== 'manager' || !/\bsplit\b/i.test(closed.body)) return false;
+    // Anything the owner did after that closure (a rejection, a status edit, a reply) is their decision: keep it.
+    if (comments.some((c) => c.author === 'owner' && c.id > closed.id)) return false;
+    return !store.recentEvents({ ticket_key: p.key, limit: 200 }).some((e) => e.agent_id === 'owner' && e.ts >= closed.ts);
+  });
   const fixed = [];
-  for (const p of store.listTickets()) {
-    if (p.status !== 'wontdo') continue;
-    const kids = store.childrenOf(p.key);
-    if (!kids.length) continue;
-    const closed = store.listComments(p.key).filter((c) => c.body.startsWith('Closed:')).at(-1);
-    if (closed?.author !== 'manager' || !/\bsplit\b/i.test(closed.body)) continue;
-    const open = kids.some((k) => !['done', 'wontdo'].includes(k.status));
-    const next = open ? 'in_progress' : kids.some((k) => k.status === 'done') ? 'done' : null;
-    if (!next) continue;
-    store.updateTicket(p.key, { status: next, ...(open ? {} : { progress: 100 }) });
-    store.addComment(p.key, 'system', `Reopened as an epic. It was closed as "won't do" when the manager split it into tasks; a split parent now stays open${open ? ' and closes itself when its tasks are done' : ', and every task has settled, so it is done'}.`);
-    fixed.push(p.key);
-  }
-  for (const k of fixed) { rollupParent(k); github.syncIssueState(k); }
-  store.kvSet('migration:split-epics:v1', JSON.stringify({ at: store.now(), fixed }));
-  if (fixed.length) store.logEvent({ kind: 'system', agent_id: 'system', text: `Repaired ${fixed.length} split parent${fixed.length === 1 ? '' : 's'} closed by the old split rule: ${fixed.join(', ')}.` });
-  return fixed;
+  store.transaction(() => {
+    // Phase 1: decide every candidate from its real work (leaf tasks), before any rollup can settle an ancestor early.
+    for (const p of candidates) {
+      const work = leaves(p.key);
+      const open = work.some((k) => !['done', 'wontdo'].includes(k.status));
+      const next = open ? 'in_progress' : work.some((k) => k.status === 'done') ? 'done' : null;
+      if (!next) continue;
+      store.updateTicket(p.key, { status: next, ...(open ? {} : { progress: 100 }) });
+      store.addComment(p.key, 'system', `Reopened as an epic. It was closed as "won't do" when the manager split it into tasks; a split parent now stays open${open ? ' and closes itself when its tasks are done' : ', and every task has settled, so it is done'}.`);
+      fixed.push(p);
+    }
+    // Phase 2: roll up deepest first, so each ancestor sees its sub-epics' final state.
+    for (const p of [...fixed].sort((x, y) => depth(y) - depth(x))) rollupParent(p.key);
+    store.kvSet('migration:split-epics:v1', JSON.stringify({ at: store.now(), fixed: fixed.map((p) => p.key) }));
+  });
+  for (const p of fixed) github.syncIssueState(p.key);
+  if (fixed.length) store.logEvent({ kind: 'system', agent_id: 'system', text: `Repaired ${fixed.length} split parent${fixed.length === 1 ? '' : 's'} closed by the old split rule: ${fixed.map((p) => p.key).join(', ')}.` });
+  return fixed.map((p) => p.key);
 }
 
 function stall(ticket, reason) {
@@ -370,7 +386,7 @@ async function launchReview(ticket, seat, fence) {
     const run = await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: origin.cwd, resume: origin.session_id, fork: true, extraDirs: [ws.dir], nonce: code,
       prompt: promptFor('review-resumed', { ticket: { ...ticket, nonce: code }, comments, extra: ws.dir }) });
     if (!(run && run.status === 'error' && !run.num_turns)) return;
-    if (budgetHeadroom() < runner.runBudget(seat)) { stall(store.getTicket(ticket.key), 'daily risk limit reached'); return; }
+    if (budgetHeadroom() < runner.runBudget(seat, 'pr_review')) { stall(store.getTicket(ticket.key), 'daily risk limit reached'); return; }
   }
   const code = nonce();
   await launch({ fence, agentId: seat, kind: 'review', ticket, cwd: ws.dir, nonce: code, prompt: promptFor('review', { ticket, comments, extra: code }) });
@@ -594,7 +610,7 @@ export function health() {
 
 export function budgetHeadroom(settings = store.getSettings()) {
   // Reserve each running seat's full per-run cap so concurrent runs can't jointly blow the daily limit.
-  const preparing = store.listAgentStates().filter((a) => a.status === 'working' && !a.current_run).reduce((sum, a) => sum + runner.runBudget(a.id), 0);
+  const preparing = store.listAgentStates().filter((a) => a.status === 'working' && !a.current_run).reduce((sum, a) => sum + runner.runBudget(a.id, a.current_kind || null), 0);
   return Number(settings.daily_budget_usd) - store.spendSince(startOfToday()) - preparing - runner.runningBudget() - council.reservations();
 }
 export function workCount() {
@@ -617,7 +633,7 @@ export async function tick() {
     const go = (agentId, fn, pin = null, kind = null) => {
       if (!(pin ? pinnedSelection(agentId, pin, kind || 'groom') : selectionFor(agentId, Date.now(), null, kind)).seat) return false;
       if (setupHold(agentId)) return false;
-      const need = pin ? runner.engineOf({ engine: pin }).budgetUsd({}) : runner.runBudget(agentId); // a pinned job reserves its own engine's cap
+      const need = pin ? runner.engineOf({ engine: pin }).budgetUsd({}) : runner.runBudget(agentId, kind); // reserve the cap of the engine that will run it
       if (headroom < need) {
         const day = startOfToday();
         if (budgetWarned !== day) {

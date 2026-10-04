@@ -26,6 +26,30 @@ const Bool = ({ k, label, hint }: { k: string; label: string; hint: string }) =>
 );
 const Group = ({ children }: { children: React.ReactNode }) => <div className="divide-y rounded-lg border bg-card px-4">{children}</div>;
 
+/** The CI checks a merge waits for: learned from the repository or set by you, with where each one comes from. */
+function RequiredChecks() {
+  const [rc, setRc] = useState<{ names: string[]; source: string; workflows: Record<string, string[]> } | null>(null);
+  const [add, setAdd] = useState('');
+  const load = () => api('GET', '/api/ci/required-checks').then(setRc).catch(() => setRc({ names: [], source: 'auto', workflows: {} }));
+  useEffect(() => { load(); }, []);
+  const save = async (names: string[], learn = false) => { setRc(await api('POST', '/api/ci/required-checks', { names, learn }).then(() => api('GET', '/api/ci/required-checks'))); toast('Saved'); };
+  if (!rc) return <p className="py-3 text-muted-foreground">Loading checks…</p>;
+  return (
+    <div className="grid gap-3 py-3">
+      <div className="grid gap-0.5"><b className="font-medium">Checks a merge waits for</b>
+        <span className="text-[13px] text-muted-foreground">{rc.source === 'auto' ? 'Learned from pull-request workflows that run on your base branch. Checks that never run on pull requests are dropped automatically.' : 'Set by you; the desk will not change this list.'} A check whose workflow does not run for a pull request's files is not required for that pull request.</span></div>
+      <div className="flex flex-wrap gap-1.5">{rc.names.length ? rc.names.map((n) => (
+        <span key={n} className="inline-flex items-center gap-1 rounded-full border py-0.5 pl-3 pr-1 text-sm" title={(rc.workflows[n] || []).join(', ') || 'workflow unknown'}>{n}
+          <span className="text-xs text-muted-foreground">{(rc.workflows[n] || [])[0]?.split('/').pop() || ''}</span>
+          <button type="button" aria-label={`Stop requiring ${n}`} className="grid size-7 place-items-center rounded-full hover:bg-secondary" onClick={() => save(rc.names.filter((x) => x !== n))}>×</button></span>))
+        : <span className="text-sm text-muted-foreground">None yet. Until the desk has seen a pull-request check, you merge yourself.</span>}</div>
+      <div className="flex flex-wrap gap-2"><Input aria-label="Add a required check" placeholder="Exact check name, e.g. Run tests (alpaca_trader)" value={add} onChange={(e) => setAdd(e.target.value)} className="min-w-64 flex-1" />
+        <Button variant="secondary" disabled={!add.trim()} onClick={async () => { await save([...rc.names, add.trim()]); setAdd(''); }}>Require</Button>
+        {rc.source !== 'auto' && <Button variant="ghost" onClick={() => save(rc.names, true)}>Let the desk keep it up to date</Button>}</div>
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const progs = S.meta.research?.programs || [];
   return (
@@ -51,6 +75,7 @@ export default function SettingsPage() {
       <Section title="GitHub"><Group>
         <Bool k="github_sync" label="Sync GitHub issues" hint={`Mirror tickets and comments to ${S.meta.repo || 'GitHub'}.`} />
         <Bool k="open_draft_prs" label="Open draft PRs" hint="After QA, push the branch and open a draft PR. Nothing merges automatically." />
+        <RequiredChecks />
       </Group></Section>
       <Section title="Models per seat"><div className="divide-y rounded-lg border bg-card">
         {S.agents.map((a: { id: string; name: string; role: string; engine?: string; model?: string; enabled?: boolean }) => { const r = S.meta.routing?.[a.id] || {}; return (

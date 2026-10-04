@@ -8,6 +8,7 @@ import { config } from './config.js';
 import * as store from './db.js';
 import { agentById } from './team.js';
 import * as refresh from './refresh.js';
+import * as workflowsLib from './workflows.js';
 
 const pexec = promisify(execFile);
 const repo = () => config.project.githubRepo;
@@ -173,6 +174,48 @@ export function learnChecks(names = []) {
   if (grown.length !== cur.names.length) setRequiredChecks(grown, 'auto');
   return requiredChecks();
 }
+/** Auto mode: drop names that only ever came from workflows with no pull-request trigger (they can never report on a PR). */
+export function pruneImpossibleChecks(names = []) {
+  const cur = requiredChecks();
+  if (cur.source !== 'auto' || !names.length) return cur;
+  const gone = cur.names.filter((n) => names.includes(n));
+  if (!gone.length) return cur;
+  setRequiredChecks(cur.names.filter((n) => !gone.includes(n)), 'auto');
+  store.logEvent({ kind: 'github', agent_id: 'github', text: `removed required check${gone.length > 1 ? 's' : ''} ${gone.join(', ')}: ${gone.length > 1 ? 'their workflows never run' : 'its workflow never runs'} on pull requests` });
+  return requiredChecks();
+}
+
+/**
+ * Which required checks apply to this PR, and where each stands on its head commit.
+ * checkFiles: { check name → workflow files } (learned); workflows: [{ file, text }] at the base; files: the PR's paths.
+ * A check whose every known workflow would not start for these files (pull_request paths/branches) is not required for
+ * this PR. Unknown provenance stays required. `uncovered` = nothing applies and nothing reported: no CI looked at it.
+ */
+export function ciCoverage({ required = [], rollup = [], files = [], workflows: wfs = null, checkFiles = {}, base = config.project.baseBranch } = {}) {
+  const parsed = new Map((wfs || []).map((w) => [w.file, w.text ? workflowsLib.parseWorkflow(w.text) : null]));
+  const reported = new Map(rollup.map((c) => [checkName(c), c.conclusion || c.state || c.status || '']));
+  const rows = required.map((name) => {
+    const fs = checkFiles[name] || [];
+    const known = fs.length && fs.every((f) => parsed.get(f));
+    const applies = !known || !files.length || fs.some((f) => workflowsLib.pullRequestTriggers(parsed.get(f), base, files));
+    const v = reported.get(name);
+    const state = v === 'SUCCESS' ? 'passed' : FAILED.includes(v) ? 'failed' : v && v !== 'SKIPPED' && v !== 'NEUTRAL' ? 'running' : !applies ? 'not_run_for_files' : v ? 'skipped' : 'waiting';
+    const wf = fs.map((f) => { const w = parsed.get(f); return { file: f, name: w?.name || f.split('/').pop(), paths: pathsOf(w) }; });
+    return { name, state, applies, workflows: wf };
+  });
+  const applicable = rows.filter((r) => r.applies).map((r) => r.name);
+  // Uncovered only when we can see every workflow and none of them starts for these files, no required check applies,
+  // and nothing reported. "Nothing reported yet" on its own may just mean CI has not started.
+  const fires = (wfs || []).filter((w) => workflowsLib.pullRequestTriggers(parsed.get(w.file), base, files)).map((w) => parsed.get(w.file)?.name || w.file);
+  const readable = !!wfs && wfs.every((w) => parsed.get(w.file));
+  return { rows, applicable, firing: fires, uncovered: readable && files.length > 0 && !fires.length && !applicable.length && !rollup.length,
+    areas: [...new Set(files.map((f) => f.split('/')[0]))] };
+}
+const pathsOf = (wf) => {
+  const pr = wf?.on?.pull_request ?? wf?.on?.pull_request_target;
+  return pr && typeof pr === 'object' && Array.isArray(pr.paths) ? pr.paths.filter((p) => !String(p).startsWith('!')) : null;
+};
+
 /** Check runs (with their check suite) and commit statuses GitHub recorded for a commit. */
 export async function checksForCommit(sha) {
   const runs = JSON.parse(await gh(['api', `repos/${repo()}/commits/${encodeURIComponent(String(sha))}/check-runs?per_page=100`,
@@ -191,7 +234,7 @@ const seatName = (seat) => (seat ? `${agentById[seat]?.name || seat}` : '?');
  * nothing bypasses state, head commit, base branch, conflicts or CI.
  */
 export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, override = '', actor = 'owner', halted = false, gate = null,
-  overrideReason = '', noChecksConfigured = false, baseBranch = config.project.baseBranch, required = [] } = {}) {
+  overrideReason = '', noChecksConfigured = false, baseBranch = config.project.baseBranch, required = [], uncovered = null } = {}) {
   const blockers = []; const chain = [];
   if (p.state !== 'OPEN') blockers.push(`PR is ${String(p.state).toLowerCase()}`);
   if (!/^[0-9a-f]{7,40}$/.test(String(expectedSha))) blockers.push('the request did not say which commit it approves (expected head SHA)');
@@ -203,6 +246,9 @@ export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, over
   if (ci === 'failing') blockers.push('CI is failing');
   else if (ci === 'pending') blockers.push('CI is still running');
   else if (ci === 'inconclusive') blockers.push('a CI check was skipped or neutral instead of passing (only review.optionalChecks may skip)');
+  // No CI workflow starts for the files this PR changes: nothing can ever report, so waiting would block forever. The owner
+  // may merge with an audited reason (posted on the PR); the desk's own auto-merge never can.
+  else if (ci === 'none' && uncovered) chain.push(`no CI workflow runs for the files this PR changes (${uncovered.areas.join(', ') || 'these paths'}), so nothing tested it`);
   else if (ci === 'none' && !noChecksConfigured) blockers.push('no CI result has been reported for this commit yet');
   const reported = new Map((p.statusCheckRollup || []).map((c) => [checkName(c), c.conclusion || c.state || c.status || '']));
   const missing = required.filter((n) => reported.get(n) !== 'SUCCESS');
@@ -246,6 +292,34 @@ export function deskReview(t, headSha) {
     stage: t.review_stage || null, round: t.review_round || 0, risk: t.risk || null, diff_risk: t.diff_risk || null };
 }
 
+/** Coverage for a live PR: its changed files against the base's workflows and the learned check → workflow map. */
+export async function coverageFor(p) {
+  const [rawFiles, rawWfs] = await Promise.all([prFiles(p.number).catch(() => []), import('./mergetrain.js').then((m) => m.workflowsAtBase()).catch(() => null)]);
+  const files = Array.isArray(rawFiles) ? rawFiles.map(String) : [];
+  const wfs = Array.isArray(rawWfs) ? rawWfs : null;
+  let checkFiles = {};
+  try { checkFiles = JSON.parse(store.kvGet('ci:check-files') || '{}'); } catch { checkFiles = {}; }
+  return { ...ciCoverage({ required: requiredChecks().names, rollup: p.statusCheckRollup || [], files, workflows: wfs, checkFiles }), files };
+}
+/**
+ * Dry run of the merge gate for the PR panel: what blocks (hard), what the owner may override with a reason, and every
+ * required check's state on the head commit. Nothing is merged. The real merge re-checks everything.
+ */
+export async function mergeCheck(number, { inBusyWindow = false, halted = false } = {}) {
+  const p = await pr(number);
+  const key = keyOfTitle(p.title);
+  const t = key ? store.getTicket(key) : null;
+  const gate = t && store.inReviewFlow(t.key) ? { approvals: store.approvalsAt(t.key, p.headRefOid), qaSha: t.qa_sha } : null;
+  const noWorkflows = await repoHasNoWorkflows();
+  const cov = await coverageFor(p);
+  const common = { expectedSha: p.headRefOid, inBusyWindow, actor: 'owner', halted, gate, required: cov.applicable, uncovered: cov.uncovered ? cov : null,
+    noChecksConfigured: (p.statusCheckRollup || []).length === 0 && noWorkflows };
+  // With a reason and the market-hours phrase supplied, what remains is what nothing can override.
+  const probe = authorizeMerge(p, { ...common, overrideReason: 'x'.repeat(MIN_OVERRIDE_REASON), override: OVERRIDE_PHRASE });
+  return { number: p.number, head: p.headRefOid, blockers: probe.blockers, overridable: probe.overridden, busy_window: inBusyWindow,
+    ready: !probe.blockers.length && !probe.overridden.length,
+    coverage: { rows: cov.rows, uncovered: cov.uncovered, firing: cov.firing, areas: cov.areas, files: cov.files.length } };
+}
 export async function merge(number, { method = 'squash', override = '', inBusyWindow = false, expectedSha = '', overrideReason = '', actor = 'owner', halted = false, preflight = null } = {}) {
   if (!MERGE_METHODS.includes(method)) fail(`method must be ${MERGE_METHODS.join('|')}`, 400);
   const p = await pr(number);
@@ -257,7 +331,8 @@ export async function merge(number, { method = 'squash', override = '', inBusyWi
   const noChecksConfigured = (p.statusCheckRollup || []).length === 0 && noWorkflows;
   const req = requiredChecks();
   if (actor !== 'owner' && !req.names.length && !noWorkflows) fail('Not merged: nobody has confirmed which CI checks a merge must wait for (review.requiredChecks) — the owner merges until then.');
-  const auth = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, noChecksConfigured, required: req.names });
+  const cov = await coverageFor(p);
+  const auth = authorizeMerge(p, { expectedSha, inBusyWindow, override, actor, halted, gate, overrideReason, noChecksConfigured, required: cov.applicable, uncovered: cov.uncovered ? cov : null });
   const { overridden } = auth;
   const blockers = [...auth.blockers];
   // Product/design feedback and owner-triggered branch refresh gates (main): they add blockers, never remove any.
