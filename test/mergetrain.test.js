@@ -866,7 +866,7 @@ test('the merge check refuses an older PR head when the desk holds a newer revie
   const prs = await import('../src/prs.js');
   const t = store.createTicket({ title: 'held fix', status: 'needs_human', assignee: 'junior' });
   store.updateTicket(t.key, { head_sha: '2'.repeat(40), qa_sha: '2'.repeat(40), pr_url: 'https://github.com/test/repo/pull/79', branch: 'b79', progress_msg: 'publish guard: needs owner approval' });
-  store.kvSet(`published:${t.key}`, '1'.repeat(40));
+  store.kvSet(`published:${t.key}`, '1'.repeat(40)); store.kvSet(`guard:${t.key}`, '2'.repeat(40));
   setGh('pr.json', { number: 79, title: `[${t.key}] held fix`, state: 'OPEN', isDraft: false, mergeable: 'MERGEABLE', headRefOid: '1'.repeat(40), baseRefName: 'main', body: 'SigmaDesk', statusCheckRollup: [{ name: 'tests', conclusion: 'SUCCESS' }] });
   setGh('files.json', ['app/x.py']);
   try {
@@ -876,5 +876,8 @@ test('the merge check refuses an older PR head when the desk holds a newer revie
     assert.match(check.blockers[0], /newer commit \(2222222\) that QA passed is not on this PR yet; approve publishing it/);
     assert.deepEqual(check.overridable, [], 'no "merge anyway with a reason" for stale code');
     assert.equal(check.ready, false);
+    // QA failed on the newer commit: nothing will publish it, so the PR falls back to the ordinary checks.
+    store.kvSet(`guard:${t.key}`, ''); store.updateTicket(t.key, { status: 'todo', qa_sha: null, progress_msg: 'fixing QA findings' });
+    assert.equal((await prs.mergeCheck(79)).unpublished, null);
   } finally { resetTrain(); }
 });

@@ -154,7 +154,8 @@ async function prepareClaimed(ticket, previous, reservation) {
     const published = store.kvGet(`published:${ticket.key}`);
     const ancestor = async (a, b) => { try { await git(dir, ['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; } };
     const ours = remote_head === ticket.head_sha || remote_head === previous?.published_head || (remote_head === published && await ancestor(remote_head, ticket.head_sha));
-    if (!ours) fail('Remote branch changed; reconcile its commits before rebasing');
+    if (!ours) fail(remote_head === published ? 'The branch on GitHub is the desk\'s last publish, but the commit to refresh does not build on it; ask the engineer to rebase onto the PR branch'
+      : 'Remote branch changed; reconcile its commits before rebasing');
     // Trusted index/config, seat worktree. This checks edits without executing seat hooks or filters.
     const names = lines((await git(dir, ['ls-files', '-z'])).stdout);
     const manifest = Object.fromEntries(names.map((n) => [n, fingerprint(ws, n)]));

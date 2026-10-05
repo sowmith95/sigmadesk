@@ -133,8 +133,13 @@ test('a guard hold that an old refresh message replaced is restored at start', (
   const t = store.createTicket({ title: 'guard repair', status: 'needs_human', assignee: 'junior' });
   store.updateTicket(t.key, { head_sha: 'b'.repeat(40), pr_url: 'https://github.com/test/repo/pull/9', progress_msg: 'Branch refresh held: Remote branch changed' });
   store.kvSet(`published:${t.key}`, 'a'.repeat(40));
-  store.addComment(t.key, 'qa', '✅ **QA passed** at `bbbbbbb`');
-  store.addComment(t.key, 'system', '🛑 **Publish guard** — not pushed: diff is 411 lines (cap for S is 400).');
+  store.kvSet(`guard:${t.key}`, 'b'.repeat(40)); // the guard parked this exact commit
   sched.repairGuardHolds();
   assert.equal(store.getTicket(t.key).progress_msg, 'publish guard: needs owner approval');
+  // A ticket held for another reason (QA failed repeatedly after an earlier guard was approved) is left alone.
+  const other = store.createTicket({ title: 'qa loop', status: 'needs_human', assignee: 'junior' });
+  store.updateTicket(other.key, { head_sha: 'd'.repeat(40), pr_url: 'https://github.com/test/repo/pull/10', progress_msg: 'QA failed repeatedly' });
+  store.kvSet(`published:${other.key}`, 'c'.repeat(40)); store.kvSet(`guard:${other.key}`, '');
+  sched.repairGuardHolds();
+  assert.equal(store.getTicket(other.key).progress_msg, 'QA failed repeatedly');
 });

@@ -897,11 +897,8 @@ export async function tick() {
 export function repairGuardHolds() {
   for (const t of store.ticketsByStatus('needs_human')) {
     if (/publish guard/i.test(t.progress_msg || '') || !t.head_sha || !t.pr_url) continue;
-    if (store.kvGet(`published:${t.key}`) === t.head_sha) continue;
-    const comments = store.listComments(t.key);
-    const guard = comments.filter((c) => c.author === 'system' && /Publish guard/.test(c.body)).at(-1);
-    const qa = comments.filter((c) => /QA passed/.test(c.body)).at(-1);
-    if (!guard || (qa && guard.ts < qa.ts)) continue; // the guard must be about the commit QA passed last
+    // The desk's own record (set when the guard parks a commit, cleared on approval or refresh) is the only proof.
+    if (store.kvGet(`guard:${t.key}`) !== t.head_sha || store.kvGet(`published:${t.key}`) === t.head_sha) continue;
     store.updateTicket(t.key, { progress_msg: 'publish guard: needs owner approval' });
     store.logEvent({ ticket_key: t.key, agent_id: 'system', kind: 'system', text: 'Restored the publish-guard hold that a branch refresh message had replaced.' });
   }

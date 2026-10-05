@@ -344,8 +344,13 @@ export async function mergeCheck(number, { inBusyWindow = false, halted = false 
   // The desk holds a newer commit than the PR has (for example a review fix QA passed, kept back by the publish guard):
   // merging now would ship the older code. Not overridable: publish it first, then the reviewers re-check it.
   let unpublished = null;
-  if (t?.head_sha && t.head_sha !== p.headRefOid && store.kvGet(`published:${t.key}`) !== t.head_sha) {
-    unpublished = { key: t.key, head: t.head_sha, pr_head: p.headRefOid, qa_passed: t.qa_sha === t.head_sha, guard: /publish guard/i.test(t.progress_msg || ''), updated_at: t.updated_at };
+  // Only while a publish of the desk's newer commit to THIS PR is actually pending: parked by the guard, or QA passed
+  // and on its way. A failed QA, a closed ticket or another PR fall through to the ordinary checks.
+  const guarded = !!t?.head_sha && store.kvGet(`guard:${t.key}`) === t.head_sha;
+  const onItsWay = !!t?.head_sha && t.qa_sha === t.head_sha && ['ready_for_human', 'review', 'needs_human'].includes(t.status);
+  if (t?.head_sha && t.pr_url && Number(String(t.pr_url).match(/\/pull\/(\d+)/)?.[1]) === p.number && t.head_sha !== p.headRefOid
+    && store.kvGet(`published:${t.key}`) !== t.head_sha && (guarded || onItsWay)) {
+    unpublished = { key: t.key, head: t.head_sha, pr_head: p.headRefOid, qa_passed: t.qa_sha === t.head_sha, guard: guarded, updated_at: t.updated_at };
     probe.blockers.unshift(`a newer commit (${t.head_sha.slice(0, 7)})${unpublished.qa_passed ? ' that QA passed' : ''} is not on this PR yet; ${unpublished.guard ? 'approve publishing it' : 'it is published automatically'}, then the reviewers re-check it`);
   }
   return { number: p.number, head: p.headRefOid, blockers: probe.blockers, overridable: unpublished ? [] : probe.overridden, ci_gap: unpublished ? [] : probe.acknowledged, busy_window: inBusyWindow, deploy_hold, unpublished,
