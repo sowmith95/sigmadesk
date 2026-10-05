@@ -250,8 +250,8 @@ test('a request opens on its tracker: where it stands, step by step, on a phone'
   const { page, errors } = await openPage(browser, `${preview.url}/#/inbox/${made.body.key}`, { width: 390, height: 844 });
   const tracker = page.locator(`[data-tracker="${made.body.key}"]`);
   await tracker.waitFor();
-  assert.match(await tracker.textContent(), /Received[\s\S]*step 1 of 8[\s\S]*Waiting to be triaged/);
-  await tracker.getByText('All steps').click();
+  assert.match(await tracker.textContent(), /Received[\s\S]*Waiting to be triaged[\s\S]*1\/8/);
+  await tracker.locator('button[aria-expanded]').click();
   assert.equal(await tracker.locator('ol li').count(), 8);
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'fits a phone');
   assert.equal((await api('POST', '/api/tickets', { title: 'Show the shipping cost before checkout', description: 'Buyers abandon carts.', kind: 'auto', request_id: 'e2e-tracker-1', source: 'hub' })).status, 200, 'a retry returns the same ticket');
