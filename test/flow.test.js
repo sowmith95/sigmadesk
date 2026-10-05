@@ -127,6 +127,8 @@ test('handing back a read-only production check routes it to the SRE when produc
     assert.equal(store.getTicket(v).assignee, 'sre'); assert.equal(store.kvGet(`verify:${v}`), '1');
     const w = task(e, 'Rotate the broker key'); sched.ownerTask(w, { owner_task: true }); sched.ownerTask(w, { owner_task: false });
     assert.notEqual(store.getTicket(w).assignee, 'sre', 'a write/credential task is never routed as a check');
+    const x = task(e, 'Establish cause; no blind restart or deletion'); sched.ownerTask(x, { owner_task: true }); sched.ownerTask(x, { owner_task: false, verify: true });
+    assert.equal(store.getTicket(x).assignee, 'sre', 'the owner can declare a check explicitly');
   } finally { config.ops.enabled = prev; store.setSetting('ops_enabled', 'false'); }
 });
 

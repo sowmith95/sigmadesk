@@ -308,7 +308,7 @@ async function ownerRoute(req, res) {
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
   if (req.method === 'POST' && (mm = m('^/api/discussions/(\\d+)/(retry|cancel)$'))) return send(res, 200, sched.ownerDiscussion(mm[1], mm[2]));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/refresh-base$'))) return send(res, 200, await sched.ownerRefreshBase(mm[1], await readBody(req)));
-  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/owner-task$'))) { const b = await readBody(req); return send(res, 200, sched.ownerTask(mm[1], { owner_task: b.owner_task, why: b.why })); }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/owner-task$'))) { const b = await readBody(req); return send(res, 200, sched.ownerTask(mm[1], { owner_task: b.owner_task, why: b.why, verify: b.verify === true })); }
   if (req.method === 'POST' && (mm = m('^/api/epics/KEY/review$'))) {
     const b = await readBody(req);
     const out = b.action === 'start' ? epicReview.start(mm[1], { by: 'owner', reason: b.reason }) : b.action === 'retry' ? epicReview.retry(mm[1])

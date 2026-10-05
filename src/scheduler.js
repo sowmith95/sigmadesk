@@ -1756,7 +1756,7 @@ export async function ownerDecision(key, { decision, message = '', expected_upda
  * the record); handing it back routes it to a seat again. Completing it records the owner's notes and unblocks the
  * tasks that wait on it.
  */
-export function ownerTask(key, { owner_task, why = '', by = 'owner' } = {}) {
+export function ownerTask(key, { owner_task, why = '', by = 'owner', verify = false } = {}) {
   const t = store.getTicket(key);
   need(t, 'no such ticket');
   need(!['done', 'wontdo'].includes(t.status), 'this ticket is closed');
@@ -1769,7 +1769,9 @@ export function ownerTask(key, { owner_task, why = '', by = 'owner' } = {}) {
   } else {
     need(t.owner_task, 'this is not an owner task');
     // A read-only production check goes to the SRE (desk ops probes) when production read access is on.
-    if (isVerifyAsk(`${t.title}\n${t.description || ''}`) && verifyReady()) {
+    // verify:true is the owner's explicit call that this is a read-only check (the text classifier is conservative).
+    if (by === 'owner' && verify === true) need(verifyReady(), 'production read access is off (Settings → Production read access)');
+    if (((by === 'owner' && verify === true) || isVerifyAsk(`${t.title}\n${t.description || ''}`)) && verifyReady()) {
       store.updateTicket(key, { owner_task: 0, assignee: 'sre', assign_pinned: 1, status: 'todo', progress_msg: null });
       store.kvSet(`verify:${key}`, '1');
       store.addComment(key, 'owner', `↩️ **Handed back to the team**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'} Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes.`);
