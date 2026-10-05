@@ -16,6 +16,7 @@ const CommandPalette = lazy(() => import('@/app/CommandPalette').then((m) => ({ 
 const NewTicketDialog = lazy(() => import('@/app/Panels').then((m) => ({ default: m.NewTicketDialog })));
 const SeatPanel = lazy(() => import('@/app/Panels').then((m) => ({ default: m.SeatPanel })));
 const ModelsPanel = lazy(() => import('@/app/Panels').then((m) => ({ default: m.ModelsPanel })));
+const AccessPanel = lazy(() => import('@/app/Access').then((m) => ({ default: m.AccessPanel })));
 const ResearchPage = lazy(() => import('@/pages/Research'));
 const PrsPage = lazy(() => import('@/pages/Prs'));
 const PrPanel = lazy(() => import('@/pages/Prs').then((m) => ({ default: m.PrPanel })));
@@ -45,7 +46,7 @@ function Overlay() {
   const sh = S.sheet;
   if (!sh) return null;
   const key = `${sh.type}:${sh.key || sh.id || sh.number || ''}:${sh.nonce || ''}`;
-  const node = ({ ticket: <TicketSheet key={key} />, new: <NewTicketDialog key={key} />, 'new-feature': <NewFeatureDialog key={key} />, seat: <SeatPanel key={key} />, models: <ModelsPanel key={key} id={sh.id!} />, pr: <PrPanel key={key} /> } as Record<string, ReactNode>)[sh.type] ?? null;
+  const node = ({ ticket: <TicketSheet key={key} />, new: <NewTicketDialog key={key} />, 'new-feature': <NewFeatureDialog key={key} />, seat: <SeatPanel key={key} />, models: <ModelsPanel key={key} id={sh.id!} />, pr: <PrPanel key={key} />, access: <AccessPanel key={key} /> } as Record<string, ReactNode>)[sh.type] ?? null;
   return <Boundary resetKey={key} inPanel><Suspense fallback={<Panel title="Loading…" onClose={closeSheet}><Loading /></Panel>}>{node}</Suspense></Boundary>;
 }
 

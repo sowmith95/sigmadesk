@@ -192,6 +192,13 @@ export function board(state, extra = {}) {
       action: 'Check the deploy', verb: `The deploy of ${lt ? nameOf(lt) : lock.key || 'the last merge'} ${lock.state === 'failed' ? 'failed' : 'was never confirmed'}`,
       reason: `${lock.note ? `${lock.note}. ` : ''}Every merge that deploys waits until you check it, then clear the hold (or merge with a reason).`, deploy: lock });
   }
+  // A production read access request beyond the EM/SRE's policy (or with no agent approver) is the owner's decision.
+  for (const r of state.meta?.access?.owner_requests || []) {
+    const who = (state.agents || []).find((a) => a.id === r.seat)?.name || r.seat_name || r.seat;
+    const span = r.ticket_scoped ? (r.ticket_key ? ` for ${r.ticket_key}` : ' for one run') : r.minutes ? ` for ${r.minutes >= 60 && r.minutes % 60 === 0 ? `${r.minutes / 60}h` : `${r.minutes} min`}` : '';
+    out.needs_you.push({ key: `access-${r.id}`, id: `access:${r.id}`, kind: 'access', bucket: 'needs_you', name: who, access: r, ticket_key: r.ticket_key || null,
+      action: 'Review access', verb: `Grant ${who} production read access${span}?`, reason: `${r.why || ''}${r.owner_reason ? ` (${r.owner_reason})` : ''}`.trim() });
+  }
   // An epic review's one question (and its proposed closes) is the owner's single decision for that epic.
   const byKey = new Map(tickets.map((t) => [t.key, t]));
   const covered = new Map();
@@ -233,7 +240,7 @@ export function board(state, extra = {}) {
   // `decisions` keeps every decision (the ticket sheet, Work page and palette find a ticket's decision there);
   // `needs_you` is the grouped Inbox list the counts describe.
   out.decisions = [...out.needs_you];
-  const rank = { guard: 0, deploy: 0, owner_task: 1, conflict: 1, setup: 1, refresh: 1, stuck: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
+  const rank = { guard: 0, deploy: 0, access: 1, owner_task: 1, conflict: 1, setup: 1, refresh: 1, stuck: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
   out.decisions.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
   // The Inbox: grouped rows in lanes and order (public/inbox.js); snoozed rows are set aside, not resolved, and are
   // not counted as needing you until they wake. Every decision stays in `decisions` for sheets, trackers and search.

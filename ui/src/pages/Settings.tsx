@@ -77,6 +77,16 @@ export default function SettingsPage() {
         <Bool k="open_draft_prs" label="Open draft PRs" hint="After QA, push the branch and open a draft PR. Nothing merges automatically." />
         <RequiredChecks />
       </Group></Section>
+      <Section title="Production read access"><Group>
+        <Bool k="ops_enabled" label="Production read access" hint={S.meta.ops?.configured ? 'Seats holding a grant may run the read-only probes below. Off stops every probe at once.' : 'Not configured on this desk: set ops.enabled and the databases/containers in the config first (README, "Production read access").'} />
+        <div className="flex items-center justify-between gap-4 py-3"><div className="grid gap-0.5"><b className="font-medium">Who has access</b>
+          <span className="text-[13px] text-muted-foreground">{(S.meta.access?.grants || []).length ? (S.meta.access.grants as { seat_name: string }[]).map((g) => g.seat_name).join(', ') : 'Nobody right now.'}{(S.meta.access?.owner_requests || []).length ? ` ${S.meta.access.owner_requests.length} request(s) wait for you.` : ''} Grants are time-boxed and revocable; the EM and SRE approve within your policy.</span></div>
+          <Button variant="secondary" onClick={() => openSheet({ type: 'access' })}>Production access</Button></div>
+        <div className="grid gap-1 py-3 text-[13px] text-muted-foreground">
+          {(S.meta.ops?.probes || []).map((p: { id: string; about: string }) => <p key={p.id}><span className="font-mono text-foreground">{p.id}</span> · {p.about}</p>)}
+          {S.meta.ops?.busy && <p>Market hours now: tighter timeouts and budgets.</p>}
+        </div>
+      </Group></Section>
       <Section title="Models per seat"><div className="divide-y rounded-lg border bg-card">
         {S.agents.map((a: { id: string; name: string; role: string; engine?: string; model?: string; enabled?: boolean }) => { const r = S.meta.routing?.[a.id] || {}; return (
           <button key={a.id} type="button" onClick={() => openSheet({ type: 'models', id: a.id })} className="flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-secondary">
