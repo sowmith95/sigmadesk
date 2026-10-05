@@ -519,6 +519,15 @@ test('provisioning: sigmadesk_ro gets NO hypertable grants; a SECURITY DEFINER f
     'GRANT EXECUTE ON FUNCTION sigmadesk_ops.ingest_freshness(integer) TO sigmadesk_ro', 'GRANT USAGE ON SCHEMA sigmadesk_ops TO sigmadesk_ro',
     "('bar_ticks 1s', 'bar_ticks', 'timestamp', 'timeframe', '1s')", "('bars_1m', 'bars_1m', 'bucket', NULL, NULL)"]) assert.ok(code.includes(part), part);
   assert.ok(code.indexOf('REVOKE ALL ON FUNCTION') < code.indexOf('GRANT EXECUTE ON FUNCTION'));
+  // Dollar quotes: the live dry run once failed on '$body$$f$' (it contains '$$', closing the outer DO $$). Every DO
+  // block's tag must not appear inside it, and no two tags may touch.
+  assert.ok(!/\$[a-z]*\$\$[a-z]*\$/.test(code.replace(/DO \$\$|END \$\$;/g, '')), 'adjacent dollar-quote tags');
+  for (const block of code.split(/^DO /m).slice(1)) {
+    const tag = block.match(/^(\$[a-z]*\$)/)?.[1];
+    if (!tag) continue;
+    const body = block.slice(tag.length, block.indexOf(`END ${tag};`));
+    assert.ok(!body.includes(tag), `DO ${tag} body contains its own tag`);
+  }
   // Self-check as sigmadesk_ro before COMMIT/ROLLBACK.
   assert.ok(code.indexOf('SET LOCAL ROLE sigmadesk_ro;') > code.indexOf('GRANT EXECUTE ON FUNCTION') && code.indexOf('SET LOCAL ROLE sigmadesk_ro;') < end);
   // Preflight: ADMIN OPTION, ACLs from the catalogs, the owner's family incl. compressed hypertables and cagg views,

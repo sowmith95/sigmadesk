@@ -237,7 +237,8 @@ END $$;
 -- 3. Schema + SECURITY DEFINER function, generated from sigmadesk_sources. Fixed text; p_minutes clamped to 1..1440.
 CREATE SCHEMA IF NOT EXISTS sigmadesk_ops AUTHORIZATION sigmadesk_ops_owner;
 REVOKE ALL ON SCHEMA sigmadesk_ops FROM PUBLIC;
-DO $$
+-- Distinct dollar-quote tags at each level ($gen$ > $f$ > $body$): an inner tag must never form '$$' with its neighbour.
+DO $gen$
 DECLARE body text;
 BEGIN
   SELECT string_agg(format(
@@ -256,8 +257,9 @@ BEGIN
       RETURN QUERY
       %s;
     END
-    $body$$f$, body);
-END $$;
+    $body$
+    $f$, body);
+END $gen$;
 ALTER FUNCTION sigmadesk_ops.ingest_freshness(integer) OWNER TO sigmadesk_ops_owner;
 REVOKE ALL ON FUNCTION sigmadesk_ops.ingest_freshness(integer) FROM PUBLIC;
 GRANT USAGE ON SCHEMA sigmadesk_ops TO sigmadesk_ro;
