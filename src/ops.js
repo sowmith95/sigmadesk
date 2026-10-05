@@ -161,20 +161,19 @@ SELECT application_name, state, sync_state, write_lag, flush_lag, replay_lag FRO
 SELECT pg_size_pretty(pg_database_size(current_database())) AS size, numbackends, xact_commit, xact_rollback, deadlocks, temp_files,
        pg_size_pretty(temp_bytes) AS temp_bytes FROM pg_stat_database WHERE datname = current_database();` }),
 
+  // The read-only role holds NO grants on hypertables: it executes sigmadesk_ops.ingest_freshness(minutes), a
+  // SECURITY DEFINER function created by scripts/provision-role.sql that owns the fixed per-table queries (half-open
+  // windows on each table's time column). ops.freshness only names which labels to show.
   ingest_freshness: (params) => {
     const sources = (config.ops.freshness || []).filter((f) => (f.db || dbNames()[0]) === params.db);
     if (!sources.length) throw refuse(`no ingest_freshness sources are configured for ${params.db} (owner: ops.freshness)`, 409);
-    const vars = { minutes: String(params.minutes) };
-    const selects = sources.map((f, i) => {
-      const col = quoteIdent(f.column), tbl = quoteIdent(f.table);
-      vars[`label_${i}`] = String(f.label || f.table).slice(0, 60);
-      let filter = '';
-      if (f.filter) { vars[`filter_${i}`] = String(f.filter.value); filter = ` AND ${quoteIdent(f.filter.column)} = :'filter_${i}'`; }
-      // Half-open window on the partition column (chunk exclusion); a small future allowance shows clock skew.
-      return `SELECT :'label_${i}' AS source, max(${col}) AS latest, round(extract(epoch FROM now() - max(${col})))::bigint AS lag_s
-  FROM ${tbl} WHERE ${col} >= now() - make_interval(mins => :'minutes'::int) AND ${col} < now() + interval '5 minutes'${filter}`;
-    });
-    return { vars, body: `\\echo '# latest row per source within the last ' :minutes ' minutes'\n${selects.join('\nUNION ALL\n')};` };
+    const labels = sources.map((f) => f.label).filter((l) => typeof l === 'string' && l.trim()).map((l) => l.slice(0, 60));
+    const vars = { minutes: String(params.minutes), labels: JSON.stringify(labels) };
+    return { vars, body: `\\echo '# latest row per source within the last ' :minutes ' minutes'
+SELECT f.label AS source, f.last_ts AS latest, round(extract(epoch FROM f.lag))::bigint AS lag_s
+  FROM sigmadesk_ops.ingest_freshness(:'minutes'::int) AS f
+ WHERE :'labels' = '[]' OR f.label IN (SELECT jsonb_array_elements_text(:'labels'::jsonb))
+ ORDER BY 1;` };
   },
 
   timescale_jobs: () => ({ vars: {}, body: `

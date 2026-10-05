@@ -174,10 +174,13 @@ test('DB probes: BEGIN READ ONLY wrapper, local timeouts, params as psql variabl
   for (const re of [/^SET LOCAL statement_timeout = 15000;$/m, /^SET LOCAL lock_timeout = 1000;$/m, /^SET LOCAL idle_in_transaction_session_timeout = 10000;$/m,
     /^SET LOCAL work_mem = '4MB';$/m, /^SET LOCAL temp_file_limit = '64MB';$/m, /^SET LOCAL max_parallel_workers_per_gather = 0;$/m]) assert.match(c.stdin, re);
   assert.equal(lines.filter(Boolean).at(-1), 'ROLLBACK;');
-  // Half-open window on the partition column; the user's number travels only as a psql variable.
-  assert.match(c.stdin, /"timestamp" >= now\(\) - make_interval\(mins => :'minutes'::int\) AND "timestamp" < now\(\) \+ interval '5 minutes' AND "timeframe" = :'filter_0'/);
+  // The read-only role reads hypertables only through the SECURITY DEFINER function; numbers and labels travel only as
+  // psql variables.
+  assert.match(c.stdin, /FROM sigmadesk_ops\.ingest_freshness\(:'minutes'::int\) AS f/);
+  assert.match(c.stdin, /f\.label IN \(SELECT jsonb_array_elements_text\(:'labels'::jsonb\)\)/);
+  assert.ok(!/\bbar_ticks\b|\bwhale_trades\b/.test(c.stdin.replace(/^\\echo.*$/m, '')), 'no table names in the probe');
   assert.ok(!c.stdin.includes('90'));
-  assert.ok(c.argv.includes('minutes=90') && c.argv.includes('filter_0=1s'));
+  assert.ok(c.argv.includes('minutes=90') && c.argv.includes('labels=["bar_ticks 1s","whale_trades"]'));
   assert.ok(c.argv.includes('-X') && c.argv.at(-1) === '-' && c.argv.at(-2) === '-f');
   const conn = c.argv[c.argv.indexOf('-d') + 1];
   assert.match(conn, /host=127\.0\.0\.1 port=5433 dbname=trading_ts user=sigmadesk_ro application_name=sigmadesk_ops connect_timeout=5 options='-c default_transaction_read_only=on'/);
@@ -493,42 +496,47 @@ test('revocation is per operation: revoking the DB grant stops the DB probe whil
   await rejects(ops.handle(run, { probe: 'db_health', db: 'app' }), /no production read access grant/);
 });
 
-test('provisioning: one bounded transaction, prints versions, ADMIN OPTION and propagated chunk grants handled, idempotent', () => {
+test('provisioning: sigmadesk_ro gets NO hypertable grants; a SECURITY DEFINER freshness function; dry run; bounded, re-runnable', () => {
   const prov = fs.readFileSync(path.join(ROOT, 'scripts', 'provision-role.sql'), 'utf8');
   const code = prov.split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');
+  // One transaction, bounded, versions printed first; -v dry_run=1 ends with ROLLBACK instead of COMMIT.
   assert.equal((code.match(/^BEGIN;$/gm) || []).length, 1);
-  assert.equal((code.match(/^COMMIT;$/gm) || []).length, 1);
-  const begin = code.indexOf('BEGIN;'), commit = code.indexOf('COMMIT;');
+  const begin = code.indexOf('BEGIN;');
+  assert.ok(code.indexOf("extversion FROM pg_extension WHERE extname = 'timescaledb'") < begin);
   assert.ok(code.indexOf("SET LOCAL lock_timeout = '2s';") > begin && code.indexOf("SET LOCAL statement_timeout = '120s';") > begin);
-  for (const stmt of ['CREATE ROLE', 'GRANT pg_read_all_stats', 'GRANT SELECT (%I)', 'GRANT USAGE ON SCHEMA public']) { const i = code.indexOf(stmt); assert.ok(i > begin && i < commit, stmt); }
-  assert.ok(code.indexOf("extversion FROM pg_extension WHERE extname = 'timescaledb'") < begin, 'version printed first');
-  assert.match(code, /m\.admin_option/);
-  assert.match(code, /_timescaledb_catalog\.chunk/);
-  assert.match(code, /_timescaledb_catalog\.continuous_agg/);
-  // A cagg grant lands on the user view, its direct and partial views, the materialization hypertable and its chunks:
-  // every one of them is in the family the preflight accepts.
-  // Both catalog shapes: the internal catalog (TimescaleDB 2.25: _direct_view_19/_partial_view_19, mat_hypertable_id 19
-  // for bars_1m) and an information view that exposes the names; neither → abort before any change.
-  for (const part of ["table_schema = '_timescaledb_catalog' AND table_name = 'continuous_agg'", 'ca.direct_view_name::text AS dname', 'ca.partial_view_name::text AS pname',
-    'ca.mat_hypertable_id AS mat_id', "table_schema = 'timescaledb_information' AND table_name = 'continuous_aggregates'", 'v.direct_view_name::text AS dname',
-    "RAISE EXCEPTION 'cannot find continuous-aggregate direct/partial view names", 'format(\'%I.%I\', dschema, dname)', 'format(\'%I.%I\', pschema, pname)',
-    'mh.id = cg.mat_id', 'ch.hypertable_id = cg.mat_id', "RAISE EXCEPTION 'an approved view is not a continuous aggregate"])
-    assert.ok(code.includes(part), part);
-  // The family is built (and may abort) before the preflight and before any GRANT.
-  assert.ok(code.indexOf('sigmadesk_caggs ON COMMIT DROP') < code.indexOf('CREATE ROLE'));
-  assert.match(code, /aclexplode\(at\.attacl\)/); // column ACLs read from the catalog, chunk grants accepted via the family table
-  assert.match(code, /c\.relname IN \('jobs', 'job_stats', 'job_errors', 'continuous_aggregates'\) AND a\.privilege_type = 'SELECT'/);
-  // The grants and the preflight whitelist come from the same table: what provisioning grants, a re-run accepts.
-  assert.match(code, /FOR g IN SELECT rel, col FROM sigmadesk_approved_cols/);
+  assert.match(code, /\\if :\{\?dry_run\}\n\\echo '== DRY RUN[^\n]*\nROLLBACK;\n\\else\nCOMMIT;/);
+  const end = code.indexOf('\\if :{?dry_run}');
+  // sigmadesk_ro never receives a privilege on a table or column: no column grants anywhere, table grants only to the
+  // NOLOGIN owner role (table-level, so Timescale's propagation to compressed hypertables carries no column names).
+  assert.ok(!/GRANT SELECT \(/.test(code), 'no column grants');
+  const tableGrants = code.match(/GRANT SELECT ON TABLE [^;]*/g) || [];
+  assert.ok(tableGrants.length && tableGrants.every((g) => /TO sigmadesk_ops_owner/.test(g)), tableGrants.join('|'));
+  assert.match(code, /CREATE ROLE sigmadesk_ops_owner NOLOGIN/);
+  // The function: SECURITY DEFINER, pinned search_path, clamp, half-open windows, generated from the same source list.
+  for (const part of ['CREATE OR REPLACE FUNCTION sigmadesk_ops.ingest_freshness(p_minutes integer)', 'SECURITY DEFINER', 'SET search_path = pg_catalog, pg_temp',
+    'least(greatest(coalesce(p_minutes, 120), 1), 1440)', "t.%I >= now() - make_interval(mins => m) AND t.%I < now() + interval %L", 'FROM sigmadesk_sources',
+    'ALTER FUNCTION sigmadesk_ops.ingest_freshness(integer) OWNER TO sigmadesk_ops_owner', 'REVOKE ALL ON FUNCTION sigmadesk_ops.ingest_freshness(integer) FROM PUBLIC',
+    'GRANT EXECUTE ON FUNCTION sigmadesk_ops.ingest_freshness(integer) TO sigmadesk_ro', 'GRANT USAGE ON SCHEMA sigmadesk_ops TO sigmadesk_ro',
+    "('bar_ticks 1s', 'bar_ticks', 'timestamp', 'timeframe', '1s')", "('bars_1m', 'bars_1m', 'bucket', NULL, NULL)"]) assert.ok(code.includes(part), part);
+  assert.ok(code.indexOf('REVOKE ALL ON FUNCTION') < code.indexOf('GRANT EXECUTE ON FUNCTION'));
+  // Self-check as sigmadesk_ro before COMMIT/ROLLBACK.
+  assert.ok(code.indexOf('SET LOCAL ROLE sigmadesk_ro;') > code.indexOf('GRANT EXECUTE ON FUNCTION') && code.indexOf('SET LOCAL ROLE sigmadesk_ro;') < end);
+  // Preflight: ADMIN OPTION, ACLs from the catalogs, the owner's family incl. compressed hypertables and cagg views,
+  // schema/function ownership and executors; all before CREATE ROLE.
+  for (const part of ['m.admin_option', 'h.compressed_hypertable_id', '_timescaledb_catalog.chunk', 'ca.direct_view_name::text AS dname', 'ca.partial_view_name::text AS pname',
+    "table_schema = 'timescaledb_information' AND table_name = 'continuous_aggregates'", "RAISE EXCEPTION 'cannot find continuous-aggregate direct/partial view names",
+    "c.oid IN (SELECT relid FROM sigmadesk_family)", 'sigmadesk_ro has column privileges', 'sigmadesk_ro has other function privileges', 'ingest_freshness is executable by',
+    'schema sigmadesk_ops holds objects other than ingest_freshness(integer)', 'sigmadesk_ops_owner can log in']) assert.ok(code.includes(part), part);
+  assert.ok(code.indexOf("RAISE EXCEPTION 'existing SigmaDesk roles/schema") < code.indexOf('CREATE ROLE'));
   assert.match(prov, /~2,400 chunks/);
+  assert.match(prov, /-v dry_run=1/);
 });
 
-test('setup scripts: provisioning never touches PUBLIC and aborts on unexpected privileges; the audit only prints', () => {
+test('setup scripts: PUBLIC is only ever revoked from our own function and schema; the audit only prints', () => {
   const prov = fs.readFileSync(path.join(ROOT, 'scripts', 'provision-role.sql'), 'utf8');
   const code = prov.split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');
-  assert.ok(!/\bREVOKE\b/i.test(code), 'no REVOKE in provisioning');
-  assert.ok(!/\bPUBLIC\b/.test(code.replace(/'public'|public\.|SCHEMA public|table_schema = 'public'/g, '')), 'no PUBLIC changes');
-  assert.match(code, /RAISE EXCEPTION 'sigmadesk_ro already exists with privileges outside the reviewed set/);
+  const revokes = code.match(/REVOKE [^;]*;/g) || [];
+  assert.deepEqual(revokes, ['REVOKE ALL ON SCHEMA sigmadesk_ops FROM PUBLIC;', 'REVOKE ALL ON FUNCTION sigmadesk_ops.ingest_freshness(integer) FROM PUBLIC;']);
   for (const check of ['pg_auth_members', 'relowner', 'relacl', 'attacl', 'pg_default_acl']) assert.ok(code.includes(check), check);
   assert.ok(!fs.existsSync(path.join(ROOT, 'scripts', 'create-readonly-role.sql')));
   const audit = fs.readFileSync(path.join(ROOT, 'scripts', 'audit-public-functions.sql'), 'utf8').split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');

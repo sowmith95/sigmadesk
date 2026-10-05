@@ -331,7 +331,7 @@ hands back a redacted, byte-capped result labelled as untrusted data.
 | Probe | What the desk runs |
 |---|---|
 | `db_health --db NAME` | `pg_stat_activity` grouped by state/application, the 10 longest-running sessions (no query text), `pg_locks` summary, top dead-tuple tables, `pg_stat_replication`, `pg_stat_database` |
-| `ingest_freshness [--db NAME] [--minutes N]` | `max(<partition column>)` per configured source with a half-open window `col >= now() - N min AND col < now() + 5 min` (chunk exclusion) |
+| `ingest_freshness [--db NAME] [--minutes N]` | `SELECT … FROM sigmadesk_ops.ingest_freshness(N)`: a SECURITY DEFINER function (created by `scripts/provision-role.sql`, owned by a NOLOGIN role) whose fixed queries take `max(<time column>)` per approved table with a half-open window `col >= now() - N min AND col < now() + 5 min`; the read-only role holds no grant on any hypertable |
 | `timescale_jobs [--db NAME]` | `timescaledb_information.jobs` ⋈ `job_stats`, `continuous_aggregates`, last 24 h of `job_errors` |
 | `container_status` | `docker ps -a`, `docker inspect` with a fixed format (health, restarts, start, OOM — never env), `docker stats --no-stream`, allowlisted containers only |
 | `container_logs --container C [--since 30m] [--grep TEXT] [--tail N]` | `docker logs --timestamps --since … --tail …` on one allowlisted container; literal filter; byte-capped streaming |
@@ -380,14 +380,18 @@ production *read* (`desk create-task --verify`, or an `--owner` step that is pla
 answers it with probes under a ticket-scoped grant; it comes to you only if no probe can answer it.
 
 **Setup (owner, once):**
-1. Provision the read-only role on each database: `psql -X -U postgres -h 127.0.0.1 -p 5433 -d trading_ts -v ON_ERROR_STOP=1 -f scripts/provision-role.sql`
-   (and again for the app database), then `\password sigmadesk_ro`. It prints the PostgreSQL and TimescaleDB versions
-   and runs as one transaction with `lock_timeout 2s` / `statement_timeout 120s`: a hypertable column grant is propagated
-   to every chunk (~2,400 chunks: seconds to a few tens of seconds); on a timeout everything rolls back. Re-running it is
-   safe. It grants only session statistics, CONNECT, the
-   Timescale job views and the reviewed time columns, never touches PUBLIC or other roles, and aborts without changes if
-   an existing `sigmadesk_ro` holds anything beyond that set. `scripts/audit-public-functions.sql` is a separate,
-   optional, read-only report of what PUBLIC can execute; any revocation it prompts is your own reviewed change.
+1. Provision the read-only role on each database — **dry run first** (does everything, self-checks the function as
+   `sigmadesk_ro`, then rolls back):
+   `psql -X -U postgres -h 127.0.0.1 -p 5433 -d trading_ts -v ON_ERROR_STOP=1 -v dry_run=1 -f scripts/provision-role.sql`,
+   then the same without `-v dry_run=1`, and again for the app database (`-p 5434 -d trading_app`); then
+   `\password sigmadesk_ro`. `sigmadesk_ro` gets session statistics, CONNECT, the Timescale job views and EXECUTE on
+   `sigmadesk_ops.ingest_freshness(int)` — no grant on any hypertable (column grants fail on compressed hypertables).
+   The function's owner, NOLOGIN `sigmadesk_ops_owner`, holds table-level SELECT on the approved tables, which Timescale
+   propagates to every chunk (~2,400 chunks: seconds to a few tens of seconds). One transaction with `lock_timeout 2s` /
+   `statement_timeout 120s`; it prints the PostgreSQL and TimescaleDB versions, never touches PUBLIC (except on its own
+   schema and function) or other roles, aborts without changes if either role or the schema already holds anything
+   beyond the reviewed set, and is safe to re-run. `scripts/audit-public-functions.sql` is a separate, optional,
+   read-only report.
 2. Put the password in a pgpass file only the desk reads (`chmod 600 ~/.pgpass-sigmadesk`); the sandbox denies it to seats.
 3. Configure the desk (`sigmadesk.config.json`):
    ```json
@@ -400,9 +404,8 @@ answers it with probes under a ticket-scoped grant; it comes to you only if no p
        "app": { "host": "127.0.0.1", "port": 5434, "dbname": "trading_app", "user": "sigmadesk_ro" }
      },
      "freshness": [
-       { "label": "bar_ticks 1s", "db": "timescale", "table": "bar_ticks", "column": "timestamp", "filter": { "column": "timeframe", "value": "1s" } },
-       { "label": "whale_trades", "db": "timescale", "table": "whale_trades", "column": "timestamp" },
-       { "label": "bars_1m", "db": "timescale", "table": "bars_1m", "column": "bucket" }
+       { "label": "bar_ticks 1s", "db": "timescale" }, { "label": "bar_ticks_1s", "db": "timescale" },
+       { "label": "whale_trades", "db": "timescale" }, { "label": "bars_1m", "db": "timescale" }
      ],
      "containers": ["alpaca-trader", "precompute-worker", "stock-ingestor", "options-whale-ingestor", "timescaledb", "app-postgres"],
      "appHealth": { "baseUrl": "http://127.0.0.1:8001" }

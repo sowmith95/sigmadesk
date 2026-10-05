@@ -177,7 +177,8 @@ const DEFAULTS = {
     pgServiceFile: '', // optional pg_service.conf; a database may name a service instead of host/port/dbname/user
     // name -> { service } | { host, port, dbname, user }. Passwords only ever come from pgpassFile / the service file.
     databases: {},
-    // Ingest freshness sources: { label, db, table, column (the hypertable's partition column), filter?: { column, value } }
+    // Ingest freshness: [{ label?, db }]. The tables, time columns and filters live in the database function
+    // sigmadesk_ops.ingest_freshness (scripts/provision-role.sql); a label here limits the output to that source.
     freshness: [],
     docker: '', // docker CLI path; empty = `docker` on PATH
     containers: [], // the only containers container_status / container_logs may name
