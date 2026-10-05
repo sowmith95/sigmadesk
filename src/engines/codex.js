@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { config } from '../config.js';
+import { SECRET_GLOBS } from '../secret-globs.js';
 
 const short = (s, n = 180) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 // codex wraps commands as `/bin/bash -lc '<cmd>'`; show just the command
@@ -45,6 +46,8 @@ export function codexHome() {
     '[permissions.sigmadesk_seat.filesystem.":workspace_roots"]',
     '"." = "write"',
     '".git" = "write"',
+    // Secret-looking files inside the clone stay unreadable (verified: "none" entries win inside a writable root).
+    ...SECRET_GLOBS.map((g) => `${q(g)} = "none"`),
     '',
     '[permissions.sigmadesk_seat.network]',
     'enabled = false',
@@ -53,7 +56,7 @@ export function codexHome() {
     '":minimal" = "read"', '":tmpdir" = "write"',
     ...readable.map((p) => `${q(p)} = "read"`),
     '[permissions.sigmadesk_review.filesystem.":workspace_roots"]',
-    '"." = "read"', '".git" = "read"',
+    '"." = "read"', '".git" = "read"', ...SECRET_GLOBS.map((g) => `${q(g)} = "none"`),
     '[permissions.sigmadesk_review.network]', 'enabled = false',
     '',
     '[features]',

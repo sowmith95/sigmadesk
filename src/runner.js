@@ -14,6 +14,7 @@ import { selectionFor, reviewSelection, pinnedSelection, classifyProviderFailure
 import * as store from './db.js';
 import * as context from './context.js';
 import * as ops from './ops.js';
+import { SECRET_GLOBS } from './secret-globs.js';
 import * as access from './access.js';
 
 const pexec = promisify(execFile);
@@ -304,7 +305,18 @@ export const ALWAYS_DENY = ['~/.ssh', '~/.aws', '~/.config/gh', '~/.codex', '~/.
   '~/.zshrc', '~/.zshenv', '~/.zprofile', '~/.zlogin', '~/.zsh_history', '~/.bashrc', '~/.bash_profile', '~/.bash_login', '~/.profile', '~/.bash_history',
   '~/.config/fish', '~/.git-credentials', '~/.npmrc', '~/.pypirc', '~/.config/gcloud', '~/.azure', '~/.config/op', '~/.terraform.d',
   '~/.pgpass', '~/.pgpass-sigmadesk', '~/.pg_service.conf', '~/.psql_history', '~/.sigmadesk-ro-verifier', '~/.config/sigmadesk'];
-const ENV_FILES = ['.env', '.env.local', '.env.production', '.env.production.local', '.env.development', '.env.development.local', '.env.test', '.env.staging', '.envrc'];
+export { SECRET_GLOBS };
+// Toolchains and caches a seat's shell genuinely needs under the owner's home (read only). Everything else in the home
+// folder is unreadable: an enumerated deny list always misses something (~/.zsh_sessions, an app's token cache, …).
+export const HOME_TOOLCHAINS = ['~/.local/share/mise', '~/.local/bin', '~/.nvm', '~/.volta', '~/.fnm', '~/.pyenv', '~/.rustup', '~/.cargo/bin',
+  '~/.cargo/registry', '~/.bun/bin', '~/.deno/bin', '~/go/bin', '~/go/pkg/mod', '~/.gitconfig', '~/.config/git', '~/.cache/uv', '~/.cache/pip',
+  '~/Library/Caches/pip', '~/.cache/ms-playwright', '~/Library/Caches/ms-playwright'];
+const expand = (p) => (p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
+/** What a seat may read under the owner's home: its clone, other read-only trees it was given, the desk CLI, toolchains. */
+export function readAllowlist(cwd, extraDirs = [], socketPath = config.socketPath) {
+  return [cwd, ...extraDirs, ...(config.project.readOnlyPaths || []), path.join(config.root, 'bin'), socketPath,
+    ...HOME_TOOLCHAINS, ...(config.sandbox.allowRead || [])].filter(Boolean);
+}
 export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketPath = config.socketPath) {
   const deny = [...config.sandbox.denyRead,
     // desk state: run tokens, verdict codes, config, private notes, and every seat's session transcript
@@ -314,8 +326,8 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
   if (config.advisors.keyFile) deny.push(config.advisors.keyFile);
   // Production read credentials belong to the desk (desk ops), never to a seat.
   deny.push(...ALWAYS_DENY, ...[config.ops?.pgpassFile, config.ops?.pgServiceFile, ...(config.ops?.secretFiles || [])].filter(Boolean));
-  // Environment files in the owner's checkout AND the seat's own clone (copyPaths could bring one along).
-  for (const root of [config.project.repoPath, cwd].filter(Boolean)) for (const f of ENV_FILES) deny.push(path.join(root, f));
+  // Secret-looking files inside every tree a seat can read (more specific than the allowlist, so they stay denied).
+  const secretFiles = [...new Set([config.project.repoPath, cwd, ...(config.project.readOnlyPaths || []), ...extraDirs].filter(Boolean))].flatMap((root) => SECRET_GLOBS.map((g) => path.join(root, g)));
   const asRule = (p) => (p.startsWith('~') ? p : `/${p}`);
   return {
     sandbox: {
@@ -326,12 +338,17 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
       // (deny rules still apply). The support bot keeps the strict allowlist: it only ever needs `desk`.
       autoAllowBashIfSandboxed: config.sandbox.enabled && kind !== 'triage' && !READ_ONLY_KINDS.has(kind),
       network: { allowedDomains: config.sandbox.allowedDomains, allowUnixSockets: [socketPath] },
+      // The whole home folder is denied to shell commands; allowRead re-opens only the seat's trees, the desk CLI and
+      // toolchains. Credential paths and secret-looking files are denied more specifically and stay closed.
       // readOnlyPaths and other seats' clones stay readable but are explicitly write-protected.
-      filesystem: { denyRead: deny, allowWrite: READ_ONLY_KINDS.has(kind) ? [] : [cwd], denyWrite: [...config.project.readOnlyPaths, ...extraDirs, config.project.repoPath, ...(READ_ONLY_KINDS.has(kind) ? [cwd] : [])].filter(Boolean) },
+      filesystem: { denyRead: ['~', ...deny, ...secretFiles], allowRead: readAllowlist(cwd, extraDirs, socketPath),
+        allowWrite: READ_ONLY_KINDS.has(kind) ? [] : [cwd], denyWrite: [...config.project.readOnlyPaths, ...extraDirs, config.project.repoPath, ...(READ_ONLY_KINDS.has(kind) ? [cwd] : [])].filter(Boolean) },
     },
     permissions: {
-      deny: deny.flatMap((p) => [`Read(${asRule(p)})`, `Read(${asRule(p)}/**)`]),
-      additionalDirectories: [],
+      deny: [...deny.flatMap((p) => [`Read(${asRule(p)})`, `Read(${asRule(p)}/**)`]), ...secretFiles.map((p) => `Read(${asRule(p)})`)],
+      // File tools (Read/Grep/Glob) read only inside the working directory and the trees named here.
+      blockReadsOutsideWorkingDirectories: true,
+      additionalDirectories: [...(config.project.readOnlyPaths || []), ...extraDirs].filter(Boolean),
     },
   };
 }
