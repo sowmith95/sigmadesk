@@ -324,14 +324,27 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
   };
 }
 
-function childEnv(token, engine) {
-  const env = { ...process.env, ...config.project.env };
-  for (const k of Object.keys(env)) if (k === 'CLAUDECODE' || k.startsWith('CLAUDE_CODE_')) delete env[k];
-  // Strip obvious secrets from the agent environment (keep Claude's own auth variables).
-  for (const k of Object.keys(env)) if (/(_TOKEN|_SECRET|_KEY|PASSWORD|_DSN)$/i.test(k) && !/^(DESK_|ANTHROPIC_|CLAUDE_)/.test(k)) delete env[k];
-  if (engine !== 'claude') for (const k of Object.keys(env)) if (/^(ANTHROPIC_|CLAUDE_)/.test(k)) delete env[k];
-  env.PATH = [path.join(config.root, 'bin'), ...String(process.env.PATH || '/usr/bin:/bin').split(':')].join(':');
-  if (config.bins.agentShell && fs.existsSync(config.bins.agentShell)) env.SHELL = config.bins.agentShell;
+// The agent environment is built from an explicit allowlist, never inherited: the owner's shell may hold DATABASE_URL,
+// *_DSN, broker and API keys, cloud credentials, SSH agent sockets… none of which a seat may see. What a CLI needs:
+//  - every engine: PATH (desk bin first), locale, terminal, temp dir, HOME/USER (the CLIs keep their own config and the
+//    macOS keychain lookup under the real home; the OS sandbox already denies reads of ~/.ssh, ~/.aws, ~/.pgpass, …),
+//    SHELL=/bin/bash (no personal aliases), proxy/CA settings the CLI needs to reach its provider, and the desk vars;
+//  - claude (and the Perplexity relay, which is Claude): its own auth/config variables when the owner uses them;
+//  - codex: CODEX_HOME (the desk-owned home with auth.json linked) comes from the engine command.
+// project.env is the owner's explicit per-project addition; secret-looking names are dropped even there.
+const ENV_BASE = ['PATH', 'LANG', 'TERM', 'COLORTERM', 'TMPDIR', 'TZ', 'HOME', 'USER', 'LOGNAME'];
+const ENV_NET = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR'];
+const ENV_CLAUDE = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CONFIG_DIR'];
+const SECRET_ENV = /(SECRET|TOKEN|PASSWORD|PASSWD|_KEY$|^KEY$|_KEY_|DSN|DATABASE_URL|_URL$|CREDENTIAL|PRIVATE|^PG|^AWS_|^APCA_|^ALPACA_|^POLYGON_|^IBKR_)/i;
+export function childEnv(token, engine, base = process.env) {
+  const env = {};
+  const keep = [...ENV_BASE, ...ENV_NET, ...(engine === 'claude' || engine === 'perplexity' ? ENV_CLAUDE : [])];
+  for (const k of keep) if (base[k] !== undefined && base[k] !== '') env[k] = base[k];
+  for (const k of Object.keys(base)) if (/^LC_[A-Z_]+$/.test(k)) env[k] = base[k];
+  if (!env.HOME) env.HOME = os.homedir();
+  for (const [k, v] of Object.entries(config.project.env || {})) if (!SECRET_ENV.test(k)) env[k] = String(v);
+  env.PATH = [path.join(config.root, 'bin'), ...String(base.PATH || '/usr/bin:/bin').split(':')].join(':');
+  env.SHELL = config.bins.agentShell && fs.existsSync(config.bins.agentShell) ? config.bins.agentShell : '/bin/bash';
   env.DESK_SOCKET = config.socketPath;
   env.DESK_RUN_TOKEN = token;
   return env;
