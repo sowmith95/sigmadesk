@@ -687,6 +687,7 @@ export const openGrants = (seat = null) => (seat ? q('SELECT * FROM ops_grants W
 export function endGrant(id, by, reason = null) {
   return q('UPDATE ops_grants SET revoked_at=?, revoked_by=?, revoke_reason=? WHERE id=? AND revoked_at IS NULL').run(now(), by, reason, id).changes > 0;
 }
+export function bindGrantRun(id, runId) { q('UPDATE ops_grants SET run_id=? WHERE id=? AND run_id IS NULL').run(runId, id); }
 /** Shorten (or, for the owner, set) a grant's end. */
 export function setGrantExpiry(id, iso) { q('UPDATE ops_grants SET expires_at=? WHERE id=?').run(iso, id); }
 export const grantHistory = (limit = 50) => q('SELECT * FROM ops_grants ORDER BY id DESC LIMIT ?').all(limit);
@@ -703,6 +704,7 @@ export function updateAccessRequest(id, patch) {
 }
 export const openAccessRequests = () => q("SELECT * FROM ops_requests WHERE status IN ('pending','reviewing','owner') ORDER BY id").all();
 export const accessRequestHistory = (limit = 50) => q('SELECT * FROM ops_requests ORDER BY id DESC LIMIT ?').all(limit);
+export function opsSucceededInRun(runId) { return q("SELECT COUNT(*) n FROM ops_audit WHERE run_id=? AND outcome IN ('ok','cached')").get(runId).n; }
 export function listOpsAudit(limit = 50) {
   return q('SELECT * FROM ops_audit ORDER BY id DESC LIMIT ?').all(limit);
 }

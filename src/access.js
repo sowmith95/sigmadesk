@@ -69,20 +69,34 @@ const span = (g) => (g.standing ? 'standing' : g.run_id && !g.ticket_key ? 'for 
 const forText = (minutes, ticketScoped, ticketKey) => (ticketScoped ? (ticketKey ? `for ${ticketKey}` : 'for this run') : minutes >= 60 && minutes % 60 === 0 ? `for ${minutes / 60}h` : `for ${minutes} min`);
 
 // ---------------- validity (every probe call) ----------------
+// A ticket-scoped grant is dormant until a run of that seat starts on that ticket (bindRun), then lives only while that
+// run is live AND the ticket is being worked (in_progress / review); it is never usable in todo or needs_human.
+export const TICKET_LIVE = ['in_progress', 'review'];
+const ENDINGS = ['expired', 'ticket closed', 'ticket left work', 'run ended'];
 function endReason(g, at = nowIso()) {
   if (g.revoked_at) return 'revoked';
   if (g.expires_at && g.expires_at <= at) return 'expired';
-  if (g.ticket_key && ['done', 'wontdo'].includes(store.getTicket(g.ticket_key)?.status)) return 'ticket closed';
+  const t = g.ticket_key ? store.getTicket(g.ticket_key) : null;
+  if (g.ticket_key && (!t || ['done', 'wontdo'].includes(t.status))) return 'ticket closed';
   if (g.run_id && !store.getRun(g.run_id)?.token) return 'run ended';
+  if (g.ticket_key && g.run_id && !TICKET_LIVE.includes(t.status)) return 'ticket left work';
   return null;
+}
+/** Bind this seat's dormant ticket grants to the run that starts work on the ticket (called at launch). */
+export function bindRun(seat, ticketKey, runId) {
+  if (!ticketKey) return 0;
+  let n = 0;
+  for (const g of store.openGrants(seat)) if (g.ticket_key === ticketKey && !g.run_id && !endReason(g)) { store.bindGrantRun(g.id, runId); n++; }
+  return n;
 }
 function endGrant(g, by, reason) {
   if (!store.endGrant(g.id, by, reason)) return false;
-  const text = by === 'expired' || by === 'ticket closed' || by === 'run ended'
+  try { ops.grantEnded(g.id); } catch { /* ops not loaded yet: nothing can be running */ }
+  const text = ENDINGS.includes(by)
     ? `${nameOf(g.seat)}'s production read access ended (${by})`
     : `${by === 'owner' ? 'The owner' : nameOf(by)} revoked ${nameOf(g.seat)}'s production read access${reason ? `: ${reason}` : ''}`;
-  store.logEvent({ kind: 'action', agent_id: ['owner', 'expired', 'ticket closed', 'run ended'].includes(by) ? 'system' : by, ticket_key: g.ticket_key, text });
-  if (g.ticket_key && store.getTicket(g.ticket_key) && !['expired', 'ticket closed', 'run ended'].includes(by)) store.addComment(g.ticket_key, 'system', `🔒 ${text}.`);
+  store.logEvent({ kind: 'action', agent_id: ['owner', ...ENDINGS].includes(by) ? 'system' : by, ticket_key: g.ticket_key, text });
+  if (g.ticket_key && store.getTicket(g.ticket_key) && !ENDINGS.includes(by)) store.addComment(g.ticket_key, 'system', `🔒 ${esc(text)}.`);
   return true;
 }
 /** End every grant whose time, ticket or run is over; then stop probes that lost their authorization. */
@@ -93,7 +107,7 @@ export function sweep() {
     if (r.run_id && !r.ticket_key && !store.getRun(r.run_id)?.token) store.updateAccessRequest(r.id, { status: 'withdrawn', note: 'the asking run ended', decided_at: nowIso() });
     else if (r.ticket_key && ['done', 'wontdo'].includes(store.getTicket(r.ticket_key)?.status)) store.updateAccessRequest(r.id, { status: 'withdrawn', note: 'the ticket closed', decided_at: nowIso() });
   }
-  if (ended) ops.recheckInflight();
+  ops.recheckAll();
   return ended;
 }
 /** The grant that lets this run use this probe right now, or null. Never cached. */
@@ -102,8 +116,8 @@ export function grantFor(run, probe, at = nowIso()) {
     const why = endReason(g, at);
     if (why) { if (why !== 'revoked') { endGrant(g, why); } continue; }
     if (!covers(json(g.probes, []), probe)) continue;
-    if (g.run_id && g.run_id !== run.id) continue; // run-scoped: that run only
-    if (g.ticket_key && g.ticket_key !== run.ticket_key) continue; // ticket-scoped: runs on that ticket only
+    if (g.run_id && g.run_id !== run.id) continue; // run-bound: that run only
+    if (g.ticket_key && (!g.run_id || g.ticket_key !== run.ticket_key)) continue; // ticket grants: only once bound, on that ticket
     return g;
   }
   return null;
@@ -111,6 +125,12 @@ export function grantFor(run, probe, at = nowIso()) {
 /** Does this seat hold a grant usable for this ticket (any probe)? Used before starting a verify run. */
 export function seatHasAccess(seat, ticketKey = null) {
   return store.openGrants(seat).some((g) => !endReason(g) && !g.run_id && (!g.ticket_key || g.ticket_key === ticketKey));
+}
+const esc = (s) => String(s ?? '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+/** Held access now, or ended within the last hour: asking again is a renewal, and renewals are the owner's. */
+function recentAccess(seat) {
+  const hour = new Date(Date.now() - 3600_000).toISOString();
+  return store.grantHistory(200).some((g) => g.seat === seat && (!g.revoked_at || g.revoked_at > hour));
 }
 
 // ---------------- requests ----------------
@@ -120,6 +140,9 @@ export function violations({ seat, probes, minutes, ticketScoped }, approver = n
   const v = [];
   if (approver && !pol.approvers.includes(approver)) v.push(`${nameOf(approver)} is not an approver`);
   if (approver && approver === seat) v.push('nobody approves their own access');
+  // Approver seats never get access from each other (no EM↔SRE reciprocity), and renewals are the owner's call.
+  if (pol.approvers.includes(seat) || ['manager', 'sre'].includes(seat)) v.push(`${nameOf(seat)} approves access, so their own access is the owner's decision`);
+  if (recentAccess(seat)) v.push(`${nameOf(seat)} has or just had access: a renewal is the owner's decision`);
   if (!pol.seats.includes(seat)) v.push(`${nameOf(seat)} is not a seat the policy allows`);
   if (!pol.probes.includes('*') && (probes.includes('*') || probes.some((p) => !pol.probes.includes(p)))) v.push(`probes beyond the policy (${pol.probes.join(', ')})`);
   if (!ticketScoped && !(minutes > 0)) v.push('a timed grant needs a duration');
@@ -148,7 +171,7 @@ export function request({ seat, probes, why, minutes = null, ticketScoped = fals
   const what = `${describeProbes(probes)} ${forText(minutes, ticketScoped, ticketKey)}`;
   const text = `${nameOf(seat)} asked for production read access (${what}): ${r.why}`;
   store.logEvent({ kind: 'action', agent_id: filedBy === 'desk' ? 'system' : seat, ticket_key: ticketKey, text: `${text} → ${toOwner ? 'the owner decides' : `${nameOf(approver)} reviews`}` });
-  if (ticketKey) store.addComment(ticketKey, filedBy === 'desk' ? 'system' : seat, `🔑 ${text}\n\n${toOwner ? `This needs the owner: ${r.owner_reason}.` : `${nameOf(approver)} reviews it within the owner's access policy.`}`);
+  if (ticketKey) store.addComment(ticketKey, filedBy === 'desk' ? 'system' : seat, `🔑 ${esc(text)}\n\n${toOwner ? `This needs the owner: ${r.owner_reason}.` : `${nameOf(approver)} reviews it within the owner's access policy.`}`);
   if (toOwner) notify('needs_human', ticketKey ? store.getTicket(ticketKey) : null, `Grant ${nameOf(seat)} production read access ${forText(minutes, ticketScoped, ticketKey)}?`);
   return { request: r, message: `Request #${r.id} filed; ${toOwner ? `it needs the owner (${r.owner_reason})` : `${nameOf(approver)} reviews it`}. Probes work as soon as it is granted (desk ops list shows your access). Continue meanwhile from code and logs.` };
 }
@@ -157,19 +180,23 @@ export function request({ seat, probes, why, minutes = null, ticketScoped = fals
 function makeGrant({ seat, probes, minutes, ticketScoped, ticketKey, runId, standing = false, by, reason, requestId = null }) {
   const pol = policy();
   const cap = new Date(Date.now() + (ticketScoped ? pol.ticketMaxHours * 60 : minutes) * 60_000).toISOString();
-  const g = store.insertGrant({ seat, probes, expires_at: standing ? null : cap, ticket_key: ticketScoped ? ticketKey : null, run_id: ticketScoped && !ticketKey ? runId : null,
+  // Ticket grants bind to the asking run if it is still live on that ticket, else stay dormant until the next launch.
+  const asking = runId ? store.getRun(runId) : null;
+  const liveRun = asking?.token ? asking : null;
+  const runBinding = !ticketScoped ? null : !ticketKey ? liveRun?.id ?? -1 : liveRun && liveRun.ticket_key === ticketKey ? liveRun.id : null;
+  const g = store.insertGrant({ seat, probes, expires_at: standing ? null : cap, ticket_key: ticketScoped ? ticketKey : null, run_id: runBinding,
     standing, granted_by: by, request_id: requestId, reason });
   const what = describeProbes(probes);
   const text = `${by === 'owner' ? 'The owner' : nameOf(by)} gave ${nameOf(seat)} production read access ${standing ? '(standing)' : forText(minutes, ticketScoped, ticketKey)} to ${what === 'all read-only probes' ? 'use the read-only probes' : `check ${what}`}${reason ? ` — ${reason}` : ''}`;
   store.logEvent({ kind: 'action', agent_id: by === 'owner' ? 'owner' : by, ticket_key: g.ticket_key, text });
   const onTicket = g.ticket_key || ticketKey; // a timed grant answering a ticket's request is reported there too
-  if (onTicket && store.getTicket(onTicket)) store.addComment(onTicket, by === 'owner' ? 'owner' : by, `🔑 ${text}.`);
+  if (onTicket && store.getTicket(onTicket)) store.addComment(onTicket, by === 'owner' ? 'owner' : by, `🔑 ${esc(text)}.`);
   if (by !== 'owner') notify('access', g.ticket_key ? store.getTicket(g.ticket_key) : null, text); // every agent-made grant reaches the owner
   return g;
 }
 
 /** An approver seat decides (desk access approve|deny|owner). Policy and self-approval are enforced here. */
-export function decide(approverSeat, id, action, { minutes = null, ticketScoped = null, note = '' } = {}) {
+export function decide(approverSeat, id, action, { minutes = null, ticketScoped = null, note = '', runId = null } = {}) {
   const r = store.getAccessRequest(Number(id));
   if (!r || !['pending', 'reviewing', 'owner'].includes(r.status)) throw err(`no open access request #${id}`);
   const pol = policy();
@@ -177,13 +204,15 @@ export function decide(approverSeat, id, action, { minutes = null, ticketScoped 
     if (!pol.approvers.includes(approverSeat)) throw err(`${nameOf(approverSeat)} is not an access approver`, 403);
     if (r.seat === approverSeat) throw err('nobody approves their own access (that includes extending it); the other approver or the owner decides', 403);
     if (r.status === 'owner') throw err('this request is the owner\'s decision', 403);
+    // Bound to the review: only the run the desk assigned to THIS request may decide it.
+    if (r.status !== 'reviewing' || r.approver !== approverSeat || !runId || r.review_run !== runId) throw err(`request #${r.id} is not the one assigned to this review run`, 403);
   }
   if (!String(note || '').trim() && action !== 'approve') throw err('say why');
   if (action === 'deny') {
     store.updateAccessRequest(r.id, { status: 'denied', decided_by: approverSeat, decided_at: nowIso(), note: String(note).slice(0, 500) });
     const text = `${approverSeat === 'owner' ? 'The owner' : nameOf(approverSeat)} declined ${nameOf(r.seat)}'s production read access request: ${note}`;
     store.logEvent({ kind: 'action', agent_id: approverSeat, ticket_key: r.ticket_key, text });
-    if (r.ticket_key) store.addComment(r.ticket_key, approverSeat, `🔒 ${text}`);
+    if (r.ticket_key) store.addComment(r.ticket_key, approverSeat, `🔒 ${esc(text)}`);
     return 'Declined.';
   }
   if (action === 'owner') {
@@ -253,7 +282,7 @@ export function reviewPrompt(r) {
   const active = store.openGrants().filter((g) => !endReason(g));
   return `Production access review. ${nameOf(r.seat)} (${agentById[r.seat]?.role}) asks for read-only production probes.
 Request #${r.id}: ${describeProbes(json(r.probes, []))} ${forText(r.minutes, !!r.ticket_scoped, r.ticket_key)}${r.ticket_key ? ` on ${r.ticket_key}` : ''}.
-<request-reason untrusted="true">${r.why}</request-reason>
+<request-reason untrusted="true">${esc(r.why)}</request-reason>
 Owner policy for agent approvers: seats ${pol.seats.join(', ')}; probes ${pol.probes.join(', ')}; at most ${pol.maxMinutes} min (or ticket-scoped); at most ${pol.maxActive} active agent-approved grants.
 Active grants now: ${active.map((g) => `#${g.id} ${nameOf(g.seat)} ${span(g)}`).join('; ') || 'none'}.
 ${r.ticket_key ? `Read the ticket first (desk show ${r.ticket_key}). ` : ''}Grant the least that answers the need: the fewest probes, the shortest time, ticket-scoped where it fits.

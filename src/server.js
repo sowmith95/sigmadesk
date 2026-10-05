@@ -641,6 +641,8 @@ export async function main() {
   github.ensureLabels().catch(() => {});
   setInterval(() => sched.tick(), 15_000);
   setInterval(pollMailboxes, 400);
+  // Production access expiry, ticket/run endings: enforced even while the scheduler is halted.
+  setInterval(() => { try { access.sweep(); } catch { /* next pass */ } }, 10_000);
   if (config.watch.enabled) {
     let polling = false; // serialize: overlapping polls would read the same cursor twice and double-count
     const loop = async () => {

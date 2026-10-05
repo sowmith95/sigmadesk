@@ -346,8 +346,10 @@ function verifyToOwner(t, why = 'a read-only production check, and production re
 async function launchVerify(t, fence) {
   const { cwd } = await readonlyJob('sre', t);
   store.logEvent({ agent_id: 'sre', ticket_key: t.key, kind: 'pickup', text: `verifying in production: ${t.title.slice(0, 120)}` });
-  await launch({ fence, agentId: 'sre', kind: 'verify', ticket: t, cwd, prompt: promptFor('verify', { ticket: t, comments: store.listComments(t.key) }),
-    outcome: (after) => after.status !== 'todo' || !!after.owner_task });
+  // in_progress while the check runs: a ticket grant is only usable then (bound to this run at launch).
+  setStatus(t.key, 'in_progress', { progress_msg: 'verifying in production' });
+  await launch({ fence, agentId: 'sre', kind: 'verify', ticket: store.getTicket(t.key), cwd, prompt: promptFor('verify', { ticket: t, comments: store.listComments(t.key) }),
+    outcome: (after) => after.status !== 'in_progress' || !!after.owner_task });
 }
 
 async function launchTriage(t, fence) {
@@ -1415,13 +1417,15 @@ export async function deskAction(run, cmd, body = {}) {
       if (a === 'revoke') { need(body.body, 'say why'); return access.revoke(body.id, agentId, String(body.body)); }
       need(['approve', 'deny', 'owner'].includes(a), 'desk access list|approve|deny|owner|revoke');
       const ticketScoped = body.ticket === true || body.ticket === 'true' ? true : null;
-      return access.decide(agentId, body.id, a, { minutes: ticketScoped ? null : access.parseDuration(body.for), ticketScoped, note: String(body.body || '') });
+      return access.decide(agentId, body.id, a, { minutes: ticketScoped ? null : access.parseDuration(body.for), ticketScoped, note: String(body.body || ''), runId: run.id });
     }
     case 'verify': {
       need(run.kind === 'verify' && ticket && ticket.key === run.ticket_key, 'desk verify only works inside a verify run on its own ticket');
       need(['done', 'owner'].includes(body.action), 'desk verify done|owner "<text>"');
       need(body.body, 'say what you found (done) or why no read-only probe can answer it (owner)');
       if (body.action === 'done') {
+        // "Verified" must rest on evidence: at least one successful, audited probe in THIS run.
+        need(store.opsSucceededInRun(run.id) > 0, 'no successful production probe in this run yet: run the desk ops probe that answers the question first (or desk verify owner "<why>")');
         store.addComment(ticket.key, agentId, `🔎 **Verified in production (read-only probes):** ${body.body}`);
         store.kvSet(`verify:${ticket.key}`, 'done');
         setStatus(ticket.key, 'done', { progress: 100, progress_msg: 'verified in production' });
@@ -1430,7 +1434,7 @@ export async function deskAction(run, cmd, body = {}) {
         return 'Recorded; the tasks waiting on this check can start. Stop now.';
       }
       store.kvSet(`verify:${ticket.key}`, '');
-      store.updateTicket(ticket.key, { owner_task: 1, assignee: null });
+      store.updateTicket(ticket.key, { owner_task: 1, assignee: null, status: 'todo' });
       store.addComment(ticket.key, agentId, `🙋 **This is your task**: ${body.body}\n\n_(The SRE's read-only production probes could not answer it.)_`);
       ev(`handed to the owner: ${String(body.body).slice(0, 140)}`);
       github.flushComments();
