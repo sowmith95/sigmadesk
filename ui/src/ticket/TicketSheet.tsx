@@ -22,8 +22,8 @@ type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-
 
 /** Decision actions. Decisions carry the ticket version on screen (expected_updated_at), so a stale screen cannot act;
  *  a draft is cleared only after the server accepts it; a 409 refreshes and keeps the draft. */
-function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef }:
-  { t: Ticket; dec: BoardItem | null; d: Detail | null; compose: boolean; setCompose: (v: boolean) => void; onDecided: () => void; replyRef: React.RefObject<HTMLTextAreaElement | null> }) {
+function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping }:
+  { t: Ticket; dec: BoardItem | null; d: Detail | null; compose: boolean; setCompose: (v: boolean) => void; onDecided: () => void; replyRef: React.RefObject<HTMLTextAreaElement | null>; onTyping: (v: boolean) => void }) {
   const [mode, setMode] = useState<'changes' | null>(null);
   const [busy, setBusy] = useState(false);
   const dk = draftKey(t.key, dec?.id);
@@ -57,10 +57,14 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef }:
   };
   const menuRun = (fn: () => Promise<unknown>, ok: string) => async () => { if (busy) return; setBusy(true); try { const r = await fn(); if (r !== false) toast(ok); } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); } };
   // The reply grows with what you type (up to 40% of the screen), so the whole answer stays readable while writing.
-  const grow = (el: HTMLTextAreaElement | null) => { if (!el) return; el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight + 2, window.innerHeight * 0.4)}px`; };
+  // Phones keep it shorter (22% of the screen) so the message being answered stays readable above it.
+  const grow = (el: HTMLTextAreaElement | null) => { if (!el) return; el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight + 2, window.innerHeight * (window.innerWidth < 768 ? 0.22 : 0.4))}px`; };
   useLayoutEffect(() => { grow(replyRef.current); }, [text, mode, compose]); // eslint-disable-line react-hooks/exhaustive-deps
   const box = (placeholder: string, label: string) => <Textarea id="reply" ref={replyRef} rows={2} aria-label={label} placeholder={placeholder} maxLength={8000} value={text}
-    className="max-h-[40dvh] min-h-[3.25rem] resize-none overflow-y-auto text-base leading-relaxed" onChange={(e) => { edit(e.target.value); grow(e.target); }} />;
+    className="max-h-[40dvh] min-h-[3.25rem] resize-none overflow-y-auto text-base leading-relaxed max-md:max-h-[22dvh]" onChange={(e) => { edit(e.target.value); grow(e.target); }}
+    // Typing on a phone: the header shrinks to one line and the thread scrolls so the newest message starts at the top.
+    onFocus={() => { if (window.innerWidth >= 768) return; onTyping(true); setTimeout(() => document.querySelector('[data-panel] [role="log"]')?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 250); }}
+    onBlur={() => onTyping(false)} />;
   const More = ({ items }: { items: { label: string; run: () => Promise<unknown>; ok: string; danger?: boolean; disabled?: boolean }[] }) => (
     <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" aria-label="More actions"><MoreHorizontal className="size-4" />More</Button></DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="min-w-60">{items.map((i) => <DropdownMenuItem key={i.label} disabled={i.disabled || busy} variant={i.danger ? 'destructive' : 'default'} onSelect={menuRun(i.run, i.ok)} className="min-h-10">{i.label}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
@@ -120,6 +124,7 @@ export function TicketSheet() {
   // Session state above the tabs: switching tabs never loses a choice, a draft or a scroll position.
   const [decisionId, setDecisionId] = useState<string | null>(sh.decision ?? null);
   const [compose, setCompose] = useState(false);
+  const [typing, setTyping] = useState(false); // phone: the reply has focus, so the header gives its room to the thread
   const [reviewMsg, setReviewMsg] = useState('');
   const conv = useRef<ConvState>({ agent: '', follow: true, top: 0 });
   const replyRef = useRef<HTMLTextAreaElement>(null);
@@ -139,6 +144,7 @@ export function TicketSheet() {
   const label = (x: BoardItem) => (x.proposal_id ? `Design #${x.proposal_id}` : x.council_id ? `Council #${x.council_id}` : KIND_LABEL[x.kind || ''] || x.kind);
   const reviewsCount = [prReviewsOf(t, d), (d?.product_reviews || []).length, t.research_review].filter(Boolean).length;
   const kids = childrenOf(t.key);
+  const tracked = t.reporter === 'owner' && !t.parent_key;
   const head = (
     <div className="grid gap-1.5">
     <Lineage t={t} />
@@ -150,17 +156,18 @@ export function TicketSheet() {
     </div>
     </div>
   );
-  const footer = <Footer t={t} dec={dec} d={d} compose={compose} setCompose={setCompose} onDecided={() => setDecisionId(null)} replyRef={replyRef} />;
+  const footer = <Footer t={t} dec={dec} d={d} compose={compose} setCompose={setCompose} onDecided={() => setDecisionId(null)} replyRef={replyRef} onTyping={setTyping} />;
   return (
-    <Panel wide label={nameOf(t)} title={nameOf(t)} head={head} onClose={closeSheet}
+    <Panel wide label={nameOf(t)} title={nameOf(t)} head={head} compact={typing} onClose={closeSheet}
       footer={(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); }}>Comment or ask the manager</Button></div>}>
-      {t.reporter === 'owner' && !t.parent_key && <Tracker t={t} B={B} mergeState={d?.merge_state} onDecision={(id, key) => { if (key === t.key) { setDecisionId(id); setTab('decision'); } else openTicket(key, { decision: id }); }} />}
-      {decisions.length > 1 && <div role="group" aria-label="Decisions on this ticket" className="flex flex-wrap gap-2">
+      {tracked && <Tracker t={t} B={B} mergeState={d?.merge_state} choices={decisions} selected={dec?.id} labelOf={(x) => label(x) || "Decision"}
+        onChoose={(id) => { setDecisionId(id); setTab('decision'); }} onDecision={(id, key) => { if (key === t.key) { setDecisionId(id); setTab('decision'); } else openTicket(key, { decision: id }); }} />}
+      {!tracked && decisions.length > 1 && <div role="group" aria-label="Decisions on this ticket" className="flex flex-wrap gap-2">
         {decisions.map((x) => <Button key={x.id} size="sm" variant={dec?.id === x.id ? 'default' : 'secondary'} aria-pressed={dec?.id === x.id} onClick={() => { setDecisionId(x.id); setTab('decision'); }}>{label(x)}</Button>)}</div>}
-      {isFeatureRoot(t) && <div className="flex flex-wrap items-center gap-3 rounded-md bg-primary/10 px-3 py-2"><span className="min-w-0 flex-1 text-sm">This is a feature. Its plan, tasks and grooming session are on its feature page.</span><Button size="sm" variant="secondary" onClick={() => openFeature(t.key)}>Open the feature</Button></div>}
+      {isFeatureRoot(t) && <p className="text-[13px] text-muted-foreground">A feature: its plan, tasks and grooming are on <button type="button" className="text-primary hover:underline" onClick={() => openFeature(t.key)}>its feature page</button>.</p>}
       {gone && <p role="status" className="rounded-md bg-blocked/15 px-3 py-2">That decision was resolved or changed while you were reading. Nothing was submitted.</p>}
       {!dec && it && ['blocked', 'queued', 'epic'].includes(it.bucket) && <p className="rounded-md bg-secondary px-3 py-2"><Named text={humanReason(clean(it.reason), S.tickets)} /></p>}
-      <Tabs value={dec || tab !== 'decision' ? tab : 'conversation'} onValueChange={setTab} className="min-w-0 gap-4">
+      <Tabs data-sheet-tabs value={dec || tab !== 'decision' ? tab : 'conversation'} onValueChange={setTab} className="min-w-0 scroll-mt-2 gap-4">
         <TabsList className="w-full max-w-full justify-start overflow-x-auto">
           {dec && <TabsTrigger value="decision">Decision</TabsTrigger>}
           {kids.length > 0 && <TabsTrigger value="tasks">Tasks ({kids.length})</TabsTrigger>}

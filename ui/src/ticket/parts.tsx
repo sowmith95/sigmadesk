@@ -25,7 +25,7 @@ const Row = ({ k, children }: { k: string; children: ReactNode }) => <div classN
 type Item = { id: string; who: string; text: string; kind: string; ts: string; runId?: number; ask?: boolean; open?: boolean; raw?: string;
   discussionId?: number; status?: string; error?: string | null; steps?: { id: string; ts: string; raw: string }[] };
 const EVENT_TONE: Record<string, string> = { error: 'text-blocked', done: 'text-shipped' };
-const FILTERS = [['', 'Everyone'], ['owner', 'You'], ['seats', 'Team'], ['desk', 'Desk & GitHub']] as const;
+const FILTERS = [['', 'All'], ['owner', 'You'], ['seats', 'Team'], ['desk', 'Desk']] as const; // short: they share one row with the order toggle on a phone
 const DISCUSSION_TONE: Record<string, 'needs' | 'blocked' | 'shipped' | 'neutral' | 'action'> = { queued: 'neutral', running: 'action', complete: 'needs', approved: 'shipped', failed: 'blocked', cancelled: 'neutral', rejected: 'neutral', changes_requested: 'neutral' };
 
 function DiscussionRow({ it, onChange }: { it: Item; onChange: () => void }) {
@@ -70,17 +70,18 @@ export function Conversation({ d, live, tkey, state, status }: { d: Detail; live
   let prev: Item | null = null;
   return (
     <section aria-label="Conversation" className="grid min-w-0 gap-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <div role="radiogroup" aria-label="Show messages from" className="flex flex-wrap gap-1.5">
+      {/* One row: who to show, then the order (scrolls sideways on a narrow phone instead of wrapping). */}
+      <div className="flex items-center gap-2 overflow-x-auto [scrollbar-width:none]">
+        <div role="radiogroup" aria-label="Show messages from" className="flex shrink-0 gap-1.5">
           {FILTERS.map(([v, label]) => <button key={v} type="button" role="radio" aria-checked={st.agent === v}
             className={cn('h-8 rounded-full border px-3 text-sm', st.agent === v ? 'border-primary bg-primary/15 text-foreground' : 'text-muted-foreground hover:bg-secondary')}
             onClick={() => { st.agent = v; st.follow = true; st.top = 0; st.seen = undefined; force((n) => n + 1); }}>{label}</button>)}
         </div>
         <span className="flex-1" />
-        <span className="text-sm text-muted-foreground" role="status">{!S.connected ? 'Reconnecting…' : live ? 'Live' : ''}</span>
-        <button type="button" data-conv-order={order} className="h-8 rounded-full px-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
+        <span className="shrink-0 text-sm text-muted-foreground" role="status">{!S.connected ? 'Reconnecting…' : live ? 'Live' : ''}</span>
+        <button type="button" data-conv-order={order} className="h-8 shrink-0 whitespace-nowrap rounded-full px-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
           onClick={() => { const next = newest ? 'oldest' : 'newest'; localStorage.setItem('sd2.convOrder', next); st.follow = true; st.top = 0; setOrder(next); }}>
-          {newest ? 'Newest first' : 'Oldest first'}<span className="sr-only">: switch order</span></button>
+          {newest ? '↓ Newest' : '↑ Oldest'}<span className="sr-only"> first</span><span className="sr-only">: switch order</span></button>
       </div>
       <div className="relative">
         <div ref={log} role="log" aria-label="Task conversation" tabIndex={0}
