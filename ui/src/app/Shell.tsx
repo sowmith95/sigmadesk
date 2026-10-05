@@ -68,7 +68,7 @@ function StatusStrip({ B }: { B: Board }) {
   const item = 'inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-sm hover:bg-secondary whitespace-nowrap';
   return (
     <div role="group" aria-label="Desk status" className="flex flex-wrap items-center gap-x-1 gap-y-0 px-3 py-1.5 md:px-5">
-      <button type="button" className={cn(item, c.needs_you && 'text-needs')} onClick={() => setView('inbox')}><b className="font-mono font-semibold tabular">{c.needs_you}</b> need you</button>
+      <button type="button" className={cn(item, c.needs_you && 'text-needs')} onClick={() => setView('inbox')}><b className="font-mono font-semibold tabular">{c.needs_you}</b> need you{c.snoozed ? <span className="text-muted-foreground"> · {c.snoozed} snoozed</span> : null}</button>
       <button type="button" className={cn(item, c.blocked && 'text-blocked')} onClick={() => setView('inbox')}><b className="font-mono font-semibold tabular">{c.blocked}</b> blocked</button>
       <button type="button" className={item} onClick={() => setView('desk')} title="Spend today against the daily limit"><b className="font-mono font-medium tabular">{money(spend)}</b><span className="text-muted-foreground">of {money(limit)} today</span></button>
       <button type="button" className={item} onClick={() => setView('desk')} title={`Desk ${desk.label}: ${desk.detail}`}><span className={cn('size-2 rounded-full', dot)} aria-hidden />{desk.label}</button>

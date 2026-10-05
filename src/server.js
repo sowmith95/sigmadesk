@@ -12,6 +12,7 @@ import { AGENTS, ENGINEERS, STATUSES, applyTeamOverrides, agentById , TEAM_PROBL
 import { teamCoverage } from './team-catalog.js';
 import { board } from '../public/attention.js';
 import { stageOf } from '../public/stages.js';
+import * as inboxState from './inbox-state.js';
 import * as flow from '../public/flow.js';
 import { ENGINES, detectEngines, presets, suggestFor, SEAT_TIER, TIER_TEXT } from './engines/index.js';
 import * as store from './db.js';
@@ -62,7 +63,7 @@ export function snapshot() {
   const states = Object.fromEntries(store.listAgentStates().map((a) => [a.id, a]));
   const spend = store.spendByAgentSince(sched.startOfToday());
   const settings = store.getSettings();
-  return {
+  const snap = {
     agents: AGENTS.map(({ charter, ...a }) => ({ ...a, ...states[a.id], spend_today: spend[a.id] || 0 })),
     tickets: store.listTickets().map(withName),
     events: store.recentEvents({ limit: 200 }),
@@ -88,6 +89,11 @@ export function snapshot() {
       decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
   };
+  // Inbox attention state: real waiting time per decision and the owner's snoozes (public/inbox.js applies them).
+  const decisions = board(snap).decisions || [];
+  snap.meta.waiting_since = inboxState.trackSince(decisions);
+  snap.meta.snoozes = inboxState.snoozes(new Set(decisions.map((d) => d.id)));
+  return snap;
 }
 
 // ---------------- SSE ----------------
@@ -215,13 +221,19 @@ async function ownerRoute(req, res) {
     const recent = requestsOf(snap, B, 5);
     return send(res, 200, { version: 1, id: config.projectId, project: config.project.name, repo: config.project.githubRepo || config.project.repoPath,
       paused: snap.settings.paused === 'true', team_confirmed: snap.settings.team_confirmed === 'true', needs_you: B.counts.needs_you, working: B.counts.working,
-      blocked: B.counts.blocked, queued: B.counts.queued, spend_today: snap.meta.spend_today, budget: Number(snap.settings.daily_budget_usd), recent_requests: recent, at: store.now() });
+      blocked: B.counts.blocked, queued: B.counts.queued, spend_today: snap.meta.spend_today, budget: Number(snap.settings.daily_budget_usd), recent_requests: recent, snoozed: B.counts.snoozed || 0, at: store.now() });
   }
   if (req.method === 'GET' && p === '/api/health') return send(res, 200, { at: store.now(), providers: dispatch.providerHealth(), scheduler: sched.health(), watch: snapshot().meta.watch });
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
     return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), research_reviews: researchReview.forTicket(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
+  }
+  if (req.method === 'POST' && p === '/api/inbox/snooze') {
+    const snap = snapshot();
+    const out = inboxState.setSnooze(await readBody(req), { decisions: board(snap).decisions || [], incidents: snap.incidents || [] });
+    store.bus.emit('msg', { type: 'inbox', data: null });
+    return send(res, 200, out);
   }
   if (req.method === 'GET' && p === '/api/team/stats') return send(res, 200, teamStats.current());
   if (req.method === 'GET' && p === '/api/lessons') return send(res, 200, store.listLessons());

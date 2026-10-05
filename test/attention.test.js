@@ -17,7 +17,7 @@ test('owner decisions get a verb and a single bucket', () => {
     T('X-7', 'done'), T('X-8', 'wontdo'),
   ];
   const b = board({ agents, tickets, events: [], meta: { scheduler: { waiting: [{ key: 'X-6', reason: 'Waiting for X-4 to merge' }] } } });
-  assert.deepEqual(b.counts, { needs_you: 4, blocked: 0, working: 1, queued: 1, shipped: 1, closed: 1 });
+  assert.deepEqual(b.counts, { needs_you: 4, blocked: 0, working: 1, queued: 1, shipped: 1, closed: 1, snoozed: 0 });
   assert.equal(b.needs_you[0].kind, 'guard');                     // guard first
   assert.match(b.needs_you[1].verb, /^Answer Sage$/);
   assert.equal(b.needs_you.find((x) => x.key === 'X-5').verb, 'Publish Eastern session helpers');

@@ -9,6 +9,7 @@
 //   shipped   — done
 //   closed    — won't do (hidden by default)
 import * as flow from './flow.js';
+import * as inbox from './inbox.js';
 import { nameOf } from './names.js';
 
 export const BUCKETS = ['needs_you', 'blocked', 'working', 'queued', 'shipped', 'closed'];
@@ -173,11 +174,16 @@ export function board(state, extra = {}) {
   // `decisions` keeps every decision (the ticket sheet, Work page and palette find a ticket's decision there);
   // `needs_you` is the grouped Inbox list the counts describe.
   out.decisions = [...out.needs_you];
-  out.needs_you = grouped;
   const rank = { guard: 0, owner_task: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
-  for (const list of [out.needs_you, out.decisions]) list.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
+  out.decisions.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
+  // The Inbox: grouped rows in lanes and order (public/inbox.js); snoozed rows are set aside, not resolved, and are
+  // not counted as needing you until they wake. Every decision stays in `decisions` for sheets, trackers and search.
+  const arranged = inbox.arrange(grouped, { tickets, ix, snoozes: state.meta?.snoozes || {}, since: state.meta?.waiting_since || {}, incidents: state.incidents || [], now: extra.now || Date.now() });
+  out.needs_you = arranged.active;
+  out.snoozed = arranged.snoozed;
+  out.do_first = arranged.doFirst;
   out.shipped.sort((a, b) => String(b.ticket?.updated_at).localeCompare(String(a.ticket?.updated_at)));
-  return { ...out, counts: Object.fromEntries(BUCKETS.map((b) => [b, out[b].length])) };
+  return { ...out, counts: { ...Object.fromEntries(BUCKETS.map((b) => [b, out[b].length])), snoozed: out.snoozed.length } };
 }
 
 const age = (it) => Date.parse(it.ticket?.updated_at || it.incident?.last_seen || 0) || 0;

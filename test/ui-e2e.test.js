@@ -282,3 +282,31 @@ test('the conversation reads newest first (toggle kept), the thread scrolls with
   assert.deepEqual(errors, []);
   await page.close();
 });
+
+test('the Inbox: do first, lanes, compact rows, and a snooze that leaves the count and comes back', { skip, timeout: 90_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 390, height: 844 });
+  await page.waitForSelector('[data-do-first]');
+  assert.ok(await page.locator('[data-lane="unblock"]').count(), 'lanes by what you are doing');
+  const row = page.locator('[data-lane] article[data-kind="question"]').first();
+  const id = await row.getAttribute('data-key');
+  const rowHeight = await row.evaluate((el) => el.getBoundingClientRect().height);
+  assert.ok(rowHeight < 120, `a compact row (${rowHeight}px)`);
+  const before = (await api('GET', '/api/state')).body;
+  await row.getByRole('button', { name: /^Options for/ }).click();
+  await page.getByRole('menuitem', { name: /Snooze for 4 hours/ }).click();
+  await page.waitForSelector(`[data-lane] article[data-key="${id}"]`, { state: 'detached' }).catch(() => {});
+  await page.waitForSelector('[data-snoozed]');
+  assert.equal(await page.locator(`[data-lane] article[data-key="${id}"]`).count(), 0, 'gone from the lanes');
+  assert.match(await page.getByRole('group', { name: 'Desk status' }).textContent(), /1 snoozed/);
+  await page.locator('[data-snoozed] > button').click();
+  const snoozedRow = page.locator(`[data-snoozed] article[data-key="${id}"]`);
+  assert.match(await snoozedRow.textContent(), /back /);
+  await snoozedRow.getByRole('button', { name: /^Options for/ }).click();
+  await page.getByRole('menuitem', { name: 'Bring back now' }).click();
+  await page.locator('[data-snoozed]').waitFor({ state: 'detached' });
+  assert.ok(await page.locator(`article[data-key="${id}"]`).count(), 'back in the Inbox');
+  assert.ok(before.meta.waiting_since && Object.keys(before.meta.waiting_since).length, 'the desk records when each decision appeared');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'fits a phone');
+  assert.deepEqual(errors, []);
+  await page.close();
+});

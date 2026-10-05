@@ -11,7 +11,7 @@ export interface Comment { id: number; ticket_key: string; author: string; body:
 export interface BoardItem { id: string; key: string; name: string; bucket: string; kind?: string; stage?: string | null; verb?: string; reason?: string; action?: string; ticket?: Ticket;
   worker?: string | null; epic?: boolean; live?: boolean; proposal_id?: number; council_id?: number; incident?: { last_seen?: string; [k: string]: unknown }; code?: string;
   waiting?: { key: string; name: string; id: string }[] }
-export interface Board { needs_you: BoardItem[]; decisions?: BoardItem[]; blocked: BoardItem[]; working: BoardItem[]; queued: BoardItem[]; shipped: BoardItem[]; closed: BoardItem[]; epics: BoardItem[];
+export interface Board { needs_you: BoardItem[]; decisions?: BoardItem[]; snoozed?: BoardItem[]; do_first?: string | null; blocked: BoardItem[]; working: BoardItem[]; queued: BoardItem[]; shipped: BoardItem[]; closed: BoardItem[]; epics: BoardItem[];
   counts: Record<string, number>; byKey: Record<string, BoardItem> }
 export interface Program { id: string; label: string; seat: string; enabled: boolean; intervalMinutes: number; window: string; focus: string; sources: string[];
   tools: { web: boolean; connectors: string[] }; maxProposals: number; review: { minReviewers: number; reviewers: string[] };
