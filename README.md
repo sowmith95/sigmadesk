@@ -335,7 +335,7 @@ hands back a redacted, byte-capped result labelled as untrusted data.
 | `timescale_jobs [--db NAME]` | `timescaledb_information.jobs` ⋈ `job_stats`, `continuous_aggregates`, last 24 h of `job_errors` |
 | `container_status` | `docker ps -a`, `docker inspect` with a fixed format (health, restarts, start, OOM — never env), `docker stats --no-stream`, allowlisted containers only |
 | `container_logs --container C [--since 30m] [--grep TEXT] [--tail N]` | `docker logs --timestamps --since … --tail …` on one allowlisted container; literal filter; byte-capped streaming |
-| `app_health [--path health\|cache_quality]` | fixed GETs on the configured base URL; redirects are not followed |
+| `app_health` | one GET of the configured base URL's `/health`, 5 s total deadline, 64 KB cap; redirects are not followed. Diagnostics that make the app query its own database (e.g. `/diag/cache/quality`) are deliberately not offered: they would bypass the DB lane, the read-only wrapper and cancellation |
 
 Every DB probe runs as `BEGIN READ ONLY; SET LOCAL statement_timeout / lock_timeout / idle_in_transaction_session_timeout /
 work_mem / temp_file_limit / max_parallel_workers_per_gather = 0; …; ROLLBACK;` through the host `psql` with parameters
@@ -350,14 +350,29 @@ ticket closes) or a run. A seat asks with `desk ops request <probe…> --why "�
 Manager or the SRE (whichever is not asking) approves within your policy (allowed seats, probes, longest duration, active
 grants — Settings → Production read access → Production access), never for themselves. Anything beyond the policy is
 an Inbox card for you ("Grant Devon production read access for 2h?"). You can grant anything (including standing
-grants), revoke any grant, or **Revoke all**. Validity is checked at every probe call. A manager task that only needs a
+grants), revoke any grant, or **Revoke all**. Access for an approver seat (EM, SRE) and renewals (a seat that has or just
+had access) are always yours to decide. A ticket-scoped grant is dormant until that seat's run starts work on the ticket,
+then lives only while that run is live and the ticket is in progress or in review. Validity is checked at every probe call,
+every running probe is re-checked on its own (at its grant's expiry instant and every 2 s), and every way a grant ends —
+revocation, expiry, ticket or run end, Revoke all, the switch — cancels the probes it authorized, even while the desk is
+halted. A `desk verify done` needs at least one successful probe in that run.
+
+**Seat environments.** Seats get an allowlisted environment (no inherited `DATABASE_URL`, DSNs or keys), and their tool
+shells get an isolated per-run HOME (no dotfiles, histories or credential stores; a `.gitconfig` that includes yours).
+Claude keeps its real HOME for its own login and session transcripts and switches tool shells through
+`CLAUDE_ENV_FILE` (sourced before every Bash command, which also unsets its auth variables); Codex authenticates from its
+desk-owned `CODEX_HOME`, so it runs with the isolated HOME directly. Shell startup files, histories, credential stores,
+`.env*` files and the desk's pgpass/service/verifier files are unreadable in the sandbox. `project.env` entries must be
+plain names and values: anything that looks like a credential (URL with a password, DSN, key, token) is withheld. A manager task that only needs a
 production *read* (`desk create-task --verify`, or an `--owner` step that is plainly a check) goes to the SRE, who
 answers it with probes under a ticket-scoped grant; it comes to you only if no probe can answer it.
 
 **Setup (owner, once):**
-1. Create the read-only role on each server: `psql -U postgres -h 127.0.0.1 -p 5433 -d trading_ts -f scripts/create-readonly-role.sql`
-   (and again for the app database), then `\password sigmadesk_ro`. The script grants only catalog statistics, the
-   Timescale job views and the reviewed time columns, and prints what PUBLIC can still execute for you to review.
+1. Provision the read-only role on each database: `psql -U postgres -h 127.0.0.1 -p 5433 -d trading_ts -v ON_ERROR_STOP=1 -f scripts/provision-role.sql`
+   (and again for the app database), then `\password sigmadesk_ro`. It grants only session statistics, CONNECT, the
+   Timescale job views and the reviewed time columns, never touches PUBLIC or other roles, and aborts without changes if
+   an existing `sigmadesk_ro` holds anything beyond that set. `scripts/audit-public-functions.sql` is a separate,
+   optional, read-only report of what PUBLIC can execute; any revocation it prompts is your own reviewed change.
 2. Put the password in a pgpass file only the desk reads (`chmod 600 ~/.pgpass-sigmadesk`); the sandbox denies it to seats.
 3. Configure the desk (`sigmadesk.config.json`):
    ```json
