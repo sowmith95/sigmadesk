@@ -6,7 +6,8 @@ const H = 3600_000;
 /** state: the desk snapshot; B: its board (attention.board). → { lines: [{ id, tone, text, keys }], shipped, stuck, needs } */
 export function programUpdate(state, B, now = Date.now(), windowHours = 24) {
   const since = now - windowHours * H;
-  const shipped = (B.shipped || []).map((x) => x.ticket).filter((t) => t && Date.parse(t.updated_at) >= since);
+  // Shipped by when it shipped (done_at), never by a later edit of the ticket.
+  const shipped = (B.shipped || []).map((x) => x.ticket).filter((t) => t && Date.parse(t.done_at || '') >= since);
   const stuck = [...(B.blocked || [])];
   const needs = B.needs_you || [];
   const first = needs.find((d) => d.id === B.do_first) || needs[0] || null;

@@ -1416,6 +1416,12 @@ export function retryPublications() {
 
 /** One publication attempt, without the settings and retry gates (tests). */
 export const publishOnce = (key) => publishInner(store.getTicket(key), key);
+/** Visible to the owner's step and the program update: what failed, how often, for which commit. */
+function recordPublishError(t, key, message) {
+  let prev = null; try { prev = JSON.parse(store.kvGet(`publish-error:${key}`) || 'null'); } catch { prev = null; }
+  store.kvSet(`publish-error:${key}`, JSON.stringify({ head: t.head_sha, message: store.redact(String(message)).slice(0, 240), at: store.now(), count: (prev?.head === t.head_sha ? prev.count : 0) + 1 }));
+}
+
 async function publishInner(t, key, { ownerApproved = false } = {}) {
   const plan = productReview.current(t.parent_key || key);
   if (plan || productReview.current(key, 'feedback')) {
@@ -1429,6 +1435,7 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     staged = await runner.stageApproved(key, runner.workspaceDir(key), t.head_sha);
   } catch (err) {
     store.logEvent({ kind: 'error', ticket_key: key, text: `publish staging failed: ${err.message}` });
+    recordPublishError(t, key, `preparing the commit failed: ${err.message}`);
     return;
   }
   if (!ownerApproved && store.kvGet(`publish-approved:${key}`) !== t.head_sha) {
@@ -1453,21 +1460,21 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     await runner.pushBranch(key, t.branch, t.head_sha, { lease: refresh.current(key)?.remote_head });
     if (refresh.current(key)) refresh.published(key, t.head_sha);
     store.kvSet(`published:${key}`, t.head_sha);
-    store.kvSet(`publish-error:${key}`, '');
     store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch} at ${t.head_sha.slice(0, 7)}` });
-    if (t.pr_url) { github.flushOutbox(); return; } // existing PR: the push updated it; its discussion and reviews stay
+    if (t.pr_url) { store.kvSet(`publish-error:${key}`, ''); github.flushOutbox(); return; } // existing PR: the push updated it; its discussion and reviews stay
     const cs = store.listComments(key);
     const last = (prefix) => cs.filter((c) => c.body.startsWith(prefix)).pop()?.body.replace(/^[^\n]*\n*/, '') || '';
     const stack = await prsync.stackBaseFor(store.getTicket(key));
     if (stack) store.addComment(key, 'system', `🧱 Contains unmerged commits from ${stack.key}, so the draft PR targets its branch (\`${stack.branch}\`) and shows only this ticket's changes. GitHub retargets it to ${config.project.baseBranch} when ${stack.key} merges.`);
     await github.openDraftPr(key, [stack ? `> Stacked on #${stack.pr} (${stack.key}) — merge that first.` : '', `## Summary\n${last('🚀')}`, `## QA (correctness)\n${last('✅')}`, last('🤝') ? `## Acceptance (requester intent)\n${last('🤝')}` : ''].filter(Boolean).join('\n\n'), stack ? { base: stack.branch } : {});
+    // openDraftPr reports failures in the activity log and returns nothing: the PR must exist for this to count.
+    if (store.getTicket(key)?.pr_url) store.kvSet(`publish-error:${key}`, '');
+    else recordPublishError(t, key, 'GitHub did not open the pull request (see the activity log)');
   } catch (err) {
     if (refresh.current(key) && /stale info|\[rejected\]/i.test(String(err.stderr || err.message)))
       setStatus(key, 'needs_human', { resume_status: 'todo', progress_msg: 'remote branch changed — reconcile before publishing' });
     store.logEvent({ kind: 'error', ticket_key: key, text: `publish failed: ${err.message}` });
-    // Visible to the owner's step and the program update: what failed, how often, for which commit.
-    let prev = null; try { prev = JSON.parse(store.kvGet(`publish-error:${key}`) || 'null'); } catch { prev = null; }
-    store.kvSet(`publish-error:${key}`, JSON.stringify({ head: t.head_sha, message: store.redact(String(err.message)).slice(0, 240), at: store.now(), count: (prev?.head === t.head_sha ? prev.count : 0) + 1 }));
+    recordPublishError(t, key, err.message);
   }
 }
 

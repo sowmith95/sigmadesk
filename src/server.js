@@ -63,6 +63,7 @@ export function snapshot({ inbox = true } = {}) {
   const states = Object.fromEntries(store.listAgentStates().map((a) => [a.id, a]));
   const spend = store.spendByAgentSince(sched.startOfToday());
   const settings = store.getSettings();
+  const mergeReasons = {};
   const snap = {
     agents: AGENTS.map(({ charter, ...a }) => ({ ...a, ...states[a.id], spend_today: spend[a.id] || 0 })),
     tickets: store.listTickets().map(withName),
@@ -81,7 +82,8 @@ export function snapshot({ inbox = true } = {}) {
       feature_plans: features.summaries(),
       epic_reviews: epicReview.summaries(),
       team_stats: teamStats.current(),
-      merge_states: mergeStates(), // per ticket ready to merge: queued / scheduled / held / owner / merging … (the request tracker reads it)
+      merge_states: mergeStates(undefined, mergeReasons), // per ticket ready to merge: queued / scheduled / held / owner / merging … (the request tracker reads it)
+      merge_reasons: mergeReasons,
       deploy_lock: mergetrain.deployState(), // as stored (refreshed by the PR sync loop): the request tracker reads it
       lessons: store.listLessons(),
       groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
@@ -126,11 +128,15 @@ setInterval(() => { for (const res of clients) res.write(': ping\n\n'); }, 20_00
 // The owner's own requests (newest first) and where each stands: the Projects home lists them across desks.
 // What needs the owner comes from the board (one source of truth); the deploy lock is read as stored, never polled.
 /** Merge state of every ticket that is ready to merge (or confirming one): key → state. */
-function mergeStates(tickets = store.listTickets()) {
+function mergeStates(tickets = store.listTickets(), reasons = null) {
   const out = {};
   for (const t of tickets) {
     if (t.review_stage === 'merge_unknown' || t.review_stage === 'merging') out[t.key] = 'merging'; // confirming with GitHub
-    else if (t.status === 'ready_for_human') out[t.key] = mergetrain.mergeState(t)?.state || null;
+    else if (t.status === 'ready_for_human') {
+      const m = mergetrain.mergeState(t);
+      out[t.key] = m?.state || null;
+      if (reasons && m?.reason) reasons[t.key] = m.reason; // why the merge is the owner's (or held): the Inbox says it
+    }
   }
   return out;
 }

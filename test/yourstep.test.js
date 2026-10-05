@@ -33,6 +33,9 @@ test('the guard says why it held the commit; a stale record for another commit i
   assert.equal(g.kind, 'guard'); assert.match(g.verb, /^Approve publishing /); assert.match(g.reason, /411 changed lines/);
   assert.equal(b.do_first, g.id);
   assert.doesNotMatch(board({ tickets: [t], meta: {} }).needs_you[0].reason, /411/);
+  // A record for the previous commit (the stream moved head_sha before the next snapshot) is not this commit's reason.
+  const stale = board({ tickets: [t], meta: { guard_reasons: { 'G-1': { head: 'a'.repeat(40), reasons: ['old reason'] } } } });
+  assert.doesNotMatch(stale.needs_you[0].reason, /old reason/);
 });
 
 test('a merge the desk does by itself never needs the owner; held and owner merges do', () => {
@@ -81,7 +84,7 @@ test('new kinds sort sensibly: a deploy and a conflict jump questions; time hint
 test('the program update: shipped, working, stuck with reasons, and the one thing to do first', () => {
   const now = Date.parse('2026-10-05T12:00:00Z');
   const tickets = [
-    T('S-1', 'done', { updated_at: '2026-10-05T08:00:00Z' }), T('S-2', 'done', { updated_at: '2026-10-01T08:00:00Z' }),
+    T('S-1', 'done', { done_at: '2026-10-05T08:00:00Z' }), T('S-2', 'done', { done_at: '2026-09-01T08:00:00Z', updated_at: '2026-10-05T11:00:00Z' }), // S-2: renamed today, shipped last month
     T('S-3', 'in_progress', { assignee: 'junior' }), T('S-4', 'todo'),
     T('S-5', 'needs_human', { progress_msg: 'publish guard: needs owner approval' }),
   ];
@@ -120,4 +123,22 @@ test('a merge waiting on the owner only says "risk or policy" when the train sai
   assert.match(board({ tickets: [t], meta: { merge_states: { 'W-1': 'owner' } } }).needs_you[0].reason, /risk or policy/);
   const d = board({ tickets: [], meta: { deploy_lock: { state: 'escalated', key: null, merge_sha: null, id: 'L9' } } }).needs_you[0];
   assert.equal(d.name, 'the last merge'); assert.equal(d.id, 'deploy:L9:escalated'); assert.match(d.verb, /the last merge was never confirmed/);
+});
+
+test('Codex findings: a retry beats an automatic merge, desk holds are not "you paused it", owner reasons are said', () => {
+  const head = 'e'.repeat(40);
+  const t = T('C-1', 'ready_for_human', { pr_url: 'https://github.com/o/r/pull/21', head_sha: head });
+  const retry = board({ tickets: [t], meta: { merge_states: { 'C-1': 'queued' }, publish_errors: { 'C-1': { head, message: 'push rejected', count: 1 } } } });
+  assert.match(retry.queued[0].reason, /push rejected/, 'the PR holds an older commit: the retry is what is happening');
+  const old = board({ tickets: [t], meta: { merge_states: { 'C-1': 'queued' }, publish_errors: { 'C-1': { head: 'd'.repeat(40), message: 'push rejected', count: 5 } } } });
+  assert.equal(old.queued[0].reason, 'Approved; the desk merges it when CI and the deploy allow', 'an error about an earlier commit is ignored');
+  const foreign = board({ tickets: [{ ...t, merge_hold: 'the PR branch changed outside the desk (abc1234)' }], meta: { merge_states: { 'C-1': 'held' } } }).needs_you[0];
+  assert.match(foreign.verb, /^Check the branch of /); assert.doesNotMatch(foreign.verb, /you paused/); assert.match(foreign.reason, /changed outside the desk/);
+  const guarded = board({ tickets: [{ ...t, merge_hold: 'publish guard: 900 changed lines' }], meta: { merge_states: { 'C-1': 'held' } } }).needs_you[0];
+  assert.match(guarded.verb, /^Review the protected update/);
+  const mine = board({ tickets: [{ ...t, merge_hold: 'held by the owner' }], meta: { merge_states: { 'C-1': 'held' } } }).needs_you[0];
+  assert.match(mine.verb, /you paused it/);
+  const stalled = board({ tickets: [t], meta: { merge_states: { 'C-1': 'owner' }, merge_reasons: { 'C-1': 'the desk has waited 7 h: CI coverage needs your waiver' } } }).needs_you[0];
+  assert.match(stalled.reason, /waited 7 h: CI coverage needs your waiver/);
+  assert.match(board({ tickets: [T('C-2', 'needs_human', { progress_msg: 'no eligible code reviewer' })], meta: {} }).needs_you[0].reason, /Switch a reviewer seat on/);
 });

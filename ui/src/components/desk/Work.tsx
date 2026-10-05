@@ -4,7 +4,7 @@ import { ChevronRight } from 'lucide-react';
 import { runCard } from '../../../../public/runcard.js';
 import { humanReason } from '../../../../public/attention.js';
 import { safeGithubUrl } from '../../../../public/prs-model.js';
-import { setView, S, api, agentMap, openTicket, openSheet, prFor, setOpen, openFeature } from '@/store.js';
+import { S, api, agentMap, openTicket, openSheet, prFor, setOpen, openFeature, loadSnapshot } from '@/store.js';
 import { mergeEvents } from '@/lib/sync.js';
 import { clean, money, mins, hhmm, prNumber } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
@@ -162,7 +162,17 @@ export function DecisionButton({ it, label, className, size }: { it: BoardItem; 
     case 'merge': return <Button size={size} className={className} onClick={() => { const n = prNumber(t.pr_url); if (n) openSheet({ type: 'pr', number: n }); else openTicket(t.key, { decision: it.id }); }}>{text}</Button>;
     case 'page': return <Button size={size} className={className} onClick={() => openSheet({ type: 'desk' })}>{text}</Button>;
     case 'plan': return <Button size={size} className={className} onClick={() => openFeature(t.key)}>{text}</Button>;
-    case 'deploy': return <Button size={size} className={className} onClick={() => (it.ticket ? openTicket(it.ticket.key, { decision: it.id }) : setView('prs'))}>{text}</Button>;
+    case 'deploy': {
+      if (it.ticket) return <Button size={size} className={className} onClick={() => openTicket(it.ticket!.key, { decision: it.id })}>{text}</Button>;
+      // A deploy with no desk ticket (a commit pushed to main by hand): its runs and the clear are right here.
+      const lock = (it as BoardItem & { deploy?: { merge_sha?: string } }).deploy;
+      const runs = S.meta.repo && lock?.merge_sha ? `https://github.com/${S.meta.repo}/commit/${lock.merge_sha}/checks` : null;
+      return <span className={cn('inline-flex gap-2', className)}>
+        {runs && <Button size={size} variant="secondary" asChild><a href={runs} target="_blank" rel="noopener noreferrer">See the runs</a></Button>}
+        <AsyncButton size={size} confirm="Clear the deploy hold? Do this after checking the deploy runs: deploying merges continue."
+          run={async () => { await api('POST', '/api/merge-train/clear-deploy', { merge_sha: lock?.merge_sha }); await loadSnapshot(); }} ok="Deploy hold cleared">Clear the hold</AsyncButton>
+      </span>;
+    }
     case 'conflict': case 'setup': case 'refresh': case 'stuck': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id, focus: true })}>{text}</Button>;
     case 'owner_task': case 'epic_review': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id })}>{text}</Button>;
     case 'guard': case 'publish':

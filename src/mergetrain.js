@@ -544,6 +544,15 @@ export function queue() {
     .sort((a, b) => String(a.approved_at || a.updated_at).localeCompare(String(b.approved_at || b.updated_at)) || a.id - b.id);
 }
 
+// How long the train has waited on this commit, and why: a wait that never ends is handed to the owner (mergeState).
+const WAIT_KEY = (key) => `train:wait:${key}`;
+function noteWait(t, action, reason) {
+  let prev = null; try { prev = JSON.parse(store.kvGet(WAIT_KEY(t.key)) || 'null'); } catch { prev = null; }
+  const since = prev?.head === t.head_sha && prev?.action === action ? prev.since : new Date().toISOString();
+  store.kvSet(WAIT_KEY(t.key), JSON.stringify({ head: t.head_sha, action, reason, since }));
+}
+export const ownerAfterHours = () => Number(config.mergeTrain?.ownerAfterHours ?? 6);
+
 function waitMsg(t, names, text) {
   const msg = `Approved by ${names} — ${text}`;
   if (store.getTicket(t.key)?.progress_msg !== msg) store.updateTicket(t.key, { progress_msg: msg });
@@ -731,7 +740,7 @@ async function considerHeld(t, { now = new Date(), snap = null, allowMerge = tru
   const ap = store.approvalsAt(t.key, t.head_sha);
   if (!ap.ok) return { action: 'skip', reason: 'approvals are not at the current commit (or a reviewer contributed code)' };
   const names = `${nameOf(ap.context.seat)} and ${nameOf(ap.independent.seat)}`;
-  const wait = (reason, action = 'wait') => { waitMsg(t, names, reason); return { action, reason }; };
+  const wait = (reason, action = 'wait') => { waitMsg(t, names, reason); noteWait(t, action, reason); return { action, reason }; };
   const policy = reviews.autoMergePolicy(t);
   if (!policy.eligible) return wait(`waiting for your merge (${policy.reason})`, 'owner');
   if (t.merge_hold) return wait(`on hold: ${t.merge_hold}`, 'held');
@@ -966,9 +975,15 @@ export function mergeState(t, now = new Date()) {
   const lock = lockGet();
   if (['merging', 'merged'].includes(t.review_stage)) return { state: 'merging' }; // merged on GitHub; the board catches up on the next sync
   if (t.status !== 'ready_for_human' || t.review_stage !== 'approved') return null;
+  if (!enabled()) return { state: 'owner', reason: 'automatic merging is off' };
   const policy = reviews.autoMergePolicy(t);
   if (!policy.eligible) return { state: 'owner', reason: policy.reason };
   if (t.merge_after && Date.parse(t.merge_after) > now.getTime()) return { state: 'scheduled', at: t.merge_after, label: fmtTime(new Date(t.merge_after)) };
+  // A wait that has not moved for hours (a CI gap only the owner can waive, a comment that never posts, a lock nobody
+  // clears) is the owner's: the desk says what it is waiting for instead of promising an automatic merge forever.
+  let w = null; try { w = JSON.parse(store.kvGet(WAIT_KEY(t.key)) || 'null'); } catch { w = null; }
+  if (w?.head === t.head_sha && w.action !== 'scheduled' && now.getTime() - Date.parse(w.since) > ownerAfterHours() * 3600_000)
+    return { state: 'owner', reason: `the desk has waited ${Math.round((now.getTime() - Date.parse(w.since)) / 3600_000)} h: ${w.reason}`, stalled: true };
   const q = queue().filter((x) => reviews.autoMergePolicy(x).eligible && !x.merge_hold);
   return { state: 'queued', position: q.findIndex((x) => x.key === t.key) + 1, deploy_lock: lock ? { key: lock.key, state: lock.state } : null };
 }

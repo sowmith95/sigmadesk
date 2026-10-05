@@ -30,7 +30,7 @@ const AUTO_MERGE = { queued: 'Approved; the desk merges it when CI and the deplo
  */
 const HOLDS = [
   [/conflict needs your call/i, 'conflict', 'Decide the conflict', (n) => `Decide how to combine ${n} with the latest code`, 'The engineer could not combine both sides safely; the choice is yours.'],
-  [/no eligible code reviewer/i, 'setup', 'Choose a reviewer', (n) => `Nobody can review ${n}`, 'Every reviewer seat built it or is switched off. Switch a reviewer on in Team, or reply to review it yourself.'],
+  [/no eligible code reviewer/i, 'setup', 'Choose a reviewer', (n) => `Nobody can review ${n}`, 'Every reviewer seat built it or is switched off. Switch a reviewer seat on in Team, then reply here to resume the review.'],
   [/^\S.* is switched off$/, 'setup', 'Switch the seat on', (n) => `Switch a seat back on for ${n}`, null],
   [/workspace setup failed/i, 'setup', 'Retry', (n) => `Retry preparing ${n}`, 'The desk could not prepare a workspace (disk, git or network). Reply to retry once it is fixed.'],
   [/base changed — refresh/i, 'refresh', 'Refresh the branch', (n) => `Refresh ${n} onto the latest code`, 'The main branch moved under this change; refresh it and QA runs again.'],
@@ -46,6 +46,11 @@ function guardWhy(g) {
   if (!g?.reasons?.length) return 'The change touches protected paths or is unusually large. Review the diff before it is pushed.';
   return `Held before pushing: ${g.reasons.join('; ')}. Approving pushes it; the reviewers then check this exact commit.`;
 }
+// Records about a commit (why the guard held it, a failed publish) only count for the ticket's current commit: a
+// stream update can change head_sha before the next snapshot refreshes the records.
+const atHead = (rec, t) => (rec && rec.head && rec.head === t.head_sha ? rec : null);
+// A merge hold the desk set itself (a foreign push, a guarded automatic update) is not the owner's pause.
+const DESK_HOLD = /^(the PR branch changed outside the desk|publish guard:)/i;
 const firstName = (agents, id) => (agents.find((a) => a.id === id)?.name || '').split(/\s+/)[0] || 'the engineer';
 
 /**
@@ -53,7 +58,7 @@ const firstName = (agents, id) => (agents.find((a) => a.id === id)?.name || '').
  * each pending design proposal, each finished council. `id` is unique per decision; `key` stays the ticket key.
  */
 export function decisionsFor(t, ctx = {}) {
-  const { agents = [], proposals = [], councils = [], productReviews = [], researchReviews = [], featurePlans = [], mergeStates = {}, guardReasons = {}, publishErrors = {} } = ctx;
+  const { agents = [], proposals = [], councils = [], productReviews = [], researchReviews = [], featurePlans = [], mergeStates = {}, mergeReasons = {}, guardReasons = {}, publishErrors = {} } = ctx;
   if (['done', 'wontdo'].includes(t.status)) return [];
   // A feature waiting on its plan: the owner reviews a ready plan, or retries a failed grooming round.
   const fp = featurePlans.find((p) => p.ticket_key === t.key);
@@ -80,16 +85,21 @@ export function decisionsFor(t, ctx = {}) {
   if (t.status === 'needs_human' && REFRESHING(t)) return [];
   if (t.status === 'needs_human') {
     const hold = !isGuard(t) && holdOf(t);
-    if (isGuard(t)) out.push({ ...base, id: `${t.key}:guard`, kind: 'guard', action: 'Approve publication', verb: `Approve publishing ${name}`, reason: guardWhy(guardReasons[t.key]) });
+    if (isGuard(t)) out.push({ ...base, id: `${t.key}:guard`, kind: 'guard', action: 'Approve publication', verb: `Approve publishing ${name}`, reason: guardWhy(atHead(guardReasons[t.key], t)) });
     else if (hold) out.push({ ...base, id: `${t.key}:${hold[1]}`, kind: hold[1], action: hold[2], verb: hold[3](name), reason: hold[4] || t.progress_msg });
     else out.push({ ...base, id: `${t.key}:question`, kind: 'question', action: 'Answer and continue', verb: `Answer ${firstName(agents, t.assignee)}`, reason: t.progress_msg || 'Waiting for your direction.' });
   } else if (t.status === 'ready_for_human') {
     // Only a merge that is the owner's: a queued, scheduled or merging one the desk does by itself.
     const ms = mergeStates[t.key];
-    if (t.pr_url && AUTO_MERGE[ms]) { /* the desk's step, shown by attend() */ }
-    else if (publishErrors[t.key]) { /* the desk is retrying the push of this commit, shown by attend() */ }
+    const why = mergeReasons[t.key] || '';
+    if (atHead(publishErrors[t.key], t)) { /* the desk is retrying the push of this commit, shown by attend() */ }
+    else if (t.pr_url && AUTO_MERGE[ms]) { /* the desk's step, shown by attend() */ }
+    else if (t.pr_url && ms === 'held' && DESK_HOLD.test(t.merge_hold || why)) out.push({ ...base, id: `${t.key}:merge`, kind: 'merge', action: 'Review merge',
+      verb: /^publish guard/i.test(t.merge_hold || why) ? `Review the protected update to ${name}` : `Check the branch of ${name}`,
+      reason: `The desk held this merge: ${t.merge_hold || why}. Look at the PR, then merge it yourself or release the hold once the branch is right.` });
     else if (t.pr_url) out.push({ ...base, id: `${t.key}:merge`, kind: 'merge', action: 'Review merge', verb: ms === 'held' ? `Release or merge ${name} (you paused it)` : `Merge ${name}`,
-      reason: ms === 'held' ? 'You put its merge on hold. Release it to let the desk merge, or merge it yourself.' : ms === 'owner' ? 'QA passed and the reviewers approved. This one needs your merge (risk or policy).' : 'QA passed. Review the PR and merge it when you are ready.' });
+      reason: ms === 'held' ? 'You put its merge on hold. Release it to let the desk merge, or merge it yourself.'
+        : ms === 'owner' ? `QA passed and the reviewers approved. This one needs your merge${why ? `: ${why}` : ' (risk or policy)'}.` : 'QA passed. Review the PR and merge it when you are ready.' });
     else out.push({ ...base, id: `${t.key}:publish`, kind: 'publish', action: 'Approve publication', verb: `Publish ${name}`, reason: 'QA passed. Approving pushes the branch and opens a draft PR.' });
   }
   const props = proposals.filter((p) => p.ticket_key === t.key).sort((a, b) => a.id - b.id);
@@ -133,8 +143,8 @@ export function attend(t, ctx = {}) {
   if (worker) return { ...base, bucket: 'working', verb: name, reason: `${firstName(agents, worker.id)} · ${stage || 'working'}` };
   // The desk's own steps, said plainly: an automatic merge, or a publish that keeps failing.
   const ms = (ctx.mergeStates || {})[t.key];
-  if (t.status === 'ready_for_human' && AUTO_MERGE[ms]) return { ...base, bucket: 'queued', stage: 'Merging', verb: name, reason: AUTO_MERGE[ms] };
-  const pe = (ctx.publishErrors || {})[t.key];
+  const pe = atHead((ctx.publishErrors || {})[t.key], t);
+  if (t.status === 'ready_for_human' && !pe && AUTO_MERGE[ms]) return { ...base, bucket: 'queued', stage: 'Merging', verb: name, reason: AUTO_MERGE[ms] };
   if (pe) return { ...base, bucket: pe.count >= 3 ? 'blocked' : 'queued', verb: pe.count >= 3 ? `Publishing ${name} keeps failing` : name,
     reason: `Publishing to GitHub failed${pe.count > 1 ? ` ${pe.count} times` : ''}: ${pe.message}. The desk retries every few minutes.` };
 
@@ -160,7 +170,7 @@ export function board(state, extra = {}) {
   const tickets = state.tickets || [];
   const ctx = { agents: state.agents || [], tickets, events: state.events || [], waiting: state.meta?.scheduler?.waiting || [],
     proposals: extra.proposals || state.meta?.decisions?.proposals || [], councils: state.meta?.council?.councils || [], productReviews: state.meta?.product_reviews || [], researchReviews: state.meta?.research_reviews || [], featurePlans: state.meta?.feature_plans || [],
-    mergeStates: state.meta?.merge_states || {}, guardReasons: state.meta?.guard_reasons || {}, publishErrors: state.meta?.publish_errors || {} };
+    mergeStates: state.meta?.merge_states || {}, mergeReasons: state.meta?.merge_reasons || {}, guardReasons: state.meta?.guard_reasons || {}, publishErrors: state.meta?.publish_errors || {} };
   const out = Object.fromEntries(BUCKETS.map((b) => [b, []]));
   out.epics = [];
   for (const t of tickets) {

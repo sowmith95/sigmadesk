@@ -200,3 +200,15 @@ test('while the desk refreshes a branch, the doctor leaves it alone and a guard 
   await assert.rejects(sched.ownerApprovePublish(t.key), /working on this branch/);
   assert.equal(store.kvGet(`guard:${t.key}`), 'f'.repeat(40), 'the refused approval used nothing up');
 });
+
+test('a publish that cannot even stage its commit is recorded for the owner; done_at is set once', async () => {
+  const t = store.createTicket({ title: 'missing commit', status: 'ready_for_human', assignee: 'junior' });
+  store.updateTicket(t.key, { head_sha: '9'.repeat(40), qa_sha: '9'.repeat(40), branch: 'nowhere', issue_number: 3 });
+  await sched.publishOnce(t.key);
+  const e = JSON.parse(store.kvGet(`publish-error:${t.key}`));
+  assert.equal(e.head, '9'.repeat(40)); assert.match(e.message, /preparing the commit failed/);
+  store.updateTicket(t.key, { status: 'done' });
+  const at = store.getTicket(t.key).done_at; assert.ok(at);
+  store.updateTicket(t.key, { title: 'renamed later', status: 'done' });
+  assert.equal(store.getTicket(t.key).done_at, at, 'a later edit never moves when it shipped');
+});

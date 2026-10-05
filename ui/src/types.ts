@@ -1,7 +1,7 @@
 // Shapes of the desk API as the UI uses them. Server rows carry more fields; the index signatures keep them reachable.
 export interface Agent { id: string; name: string; role: string; bio?: string; short?: string; engine?: string; model?: string; effort?: string; enabled?: boolean; status?: string;
   current_ticket?: string | null; current_run?: number | null; current_kind?: string | null; meeting?: string | null; fallbacks?: Array<{ engine: string; model?: string; effort?: string }>; spend_today?: number; color?: string; [k: string]: unknown }
-export interface Ticket { key: string; title: string; name?: string; description?: string; status: string; type?: string; priority?: string; priority_pinned?: number; area?: string | null; complexity?: string | null;
+export interface Ticket { key: string; title: string; name?: string; description?: string; status: string; type?: string; priority?: string; priority_pinned?: number; done_at?: string | null; area?: string | null; complexity?: string | null;
   assignee?: string | null; reporter?: string; source?: string; parent_key?: string | null; branch?: string | null; pr_url?: string | null; head_sha?: string | null; active_run?: number | null;
   updated_at?: string; created_at?: string; progress_msg?: string | null; issue_number?: number | null; qa_loops?: number; research_review?: string | null; research_program?: string | null;
   research_generation?: number; after_key?: string | null; risk?: string | null; assign_pinned?: number; assign_reason?: string | null; [k: string]: unknown }

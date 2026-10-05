@@ -894,3 +894,19 @@ test('the owner clears only a failed or unconfirmed deploy, and only the one the
   assert.equal(train.ownerClearDeploy({ merge_sha: '2'.repeat(40) }).id, 'L2');
   assert.equal(lockNow(), null);
 });
+
+test('the train hands a merge to the owner when it is switched off or its wait has not moved for hours', async () => {
+  resetTrain();
+  const t = await approvedPr('docs/stalled.md'); prFor(t);
+  const fresh = () => store.getTicket(t.key);
+  assert.equal(train.mergeState(fresh()).state, 'queued');
+  store.kvSet(`train:wait:${t.key}`, JSON.stringify({ head: fresh().head_sha, action: 'queued', reason: 'auto-merge waiting: CI coverage needs your waiver', since: new Date(Date.now() - 7 * 3600_000).toISOString() }));
+  const m = train.mergeState(fresh());
+  assert.equal(m.state, 'owner'); assert.match(m.reason, /waited 7 h: auto-merge waiting: CI coverage/);
+  store.kvSet(`train:wait:${t.key}`, JSON.stringify({ head: 'f'.repeat(40), action: 'queued', reason: 'old commit', since: new Date(Date.now() - 70 * 3600_000).toISOString() }));
+  assert.equal(train.mergeState(fresh()).state, 'queued', 'a wait recorded for another commit does not count');
+  const was = config.mergeTrain?.enabled; config.mergeTrain = { ...(config.mergeTrain || {}), enabled: false };
+  try { assert.deepEqual(train.mergeState(fresh()), { state: 'owner', reason: 'automatic merging is off' }); }
+  finally { config.mergeTrain.enabled = was; }
+  store.kvSet(`train:wait:${t.key}`, 'null');
+});

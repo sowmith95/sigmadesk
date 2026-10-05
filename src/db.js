@@ -378,7 +378,9 @@ function migrate() {
       // assignment: pinned to one seat (explicit --assign / owner edit), and why the desk picked the seat it did
       assign_pinned: 'INTEGER DEFAULT 0', assign_reason: 'TEXT',
       // the owner set this priority: grooming, epic reviews and the program manager leave it alone
-      priority_pinned: 'INTEGER DEFAULT 0' },
+      priority_pinned: 'INTEGER DEFAULT 0',
+      // when it shipped (set once on done; later edits move updated_at, never this)
+      done_at: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     pr_outbox: { next_attempt_at: 'TEXT' },
@@ -389,7 +391,10 @@ function migrate() {
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
-    for (const [col, type] of Object.entries(cols)) if (!have.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+    for (const [col, type] of Object.entries(cols)) if (!have.has(col)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+      if (table === 'tickets' && col === 'done_at') db.exec("UPDATE tickets SET done_at = updated_at WHERE status = 'done'"); // best record for earlier work
+    }
   }
   backfillQaVerdicts();
 }
@@ -538,13 +543,15 @@ export function createTicket(t) {
   return ticket;
 }
 
-const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', 'priority_pinned', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
+const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', 'priority_pinned', 'done_at', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
   'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key',
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
   'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base',
   'research_program', 'research_run', 'research_policy', 'research_review', 'research_generation', 'research_revisions', 'research_sources']);
 
 export function updateTicket(key, patch) {
+  // When it shipped, recorded once by whichever path finishes it (merge sync, epic roll-up, owner).
+  if (patch.status === 'done' && patch.done_at === undefined && getTicket(key)?.status !== 'done') patch = { ...patch, done_at: now() };
   const cols = Object.keys(patch).filter((k) => TICKET_FIELDS.has(k));
   if (!cols.length) return getTicket(key);
   const sql = `UPDATE tickets SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE key=?`;
