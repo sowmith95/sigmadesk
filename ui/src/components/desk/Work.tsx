@@ -161,6 +161,7 @@ export function DecisionButton({ it, label, className, size }: { it: BoardItem; 
     case 'question': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id, focus: true })}>{text}</Button>;
     case 'merge': return <Button size={size} className={className} onClick={() => { const n = prNumber(t.pr_url); if (n) openSheet({ type: 'pr', number: n }); else openTicket(t.key, { decision: it.id }); }}>{text}</Button>;
     case 'page': return <Button size={size} className={className} onClick={() => openSheet({ type: 'desk' })}>{text}</Button>;
+    case 'access': return <Button size={size} className={className} onClick={() => openSheet({ type: 'access' })}>{text}</Button>;
     case 'plan': return <Button size={size} className={className} onClick={() => openFeature(t.key)}>{text}</Button>;
     case 'deploy': {
       if (it.ticket) return <Button size={size} className={className} onClick={() => openTicket(it.ticket!.key, { decision: it.id })}>{text}</Button>;

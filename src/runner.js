@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { config, publisherPath } from './config.js';
+import { config, publisherPath, agentEnvProblem, credentialLike } from './config.js';
 import { agentById, charterFor, featureGroomCharter, epicReviewCharter, productReviewCharter, researchCharter, readOnlyReviewCharter, permissionsFor, promptFor, DENY_RULES, READ_ONLY_KINDS } from './team.js';
 import * as connectors from './connectors.js';
 import * as lessons from './lessons.js';
@@ -13,6 +13,9 @@ import { describeToolUse } from './engines/claude.js';
 import { selectionFor, reviewSelection, pinnedSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
 import * as store from './db.js';
 import * as context from './context.js';
+import * as ops from './ops.js';
+import { SECRET_GLOBS } from './secret-globs.js';
+import * as access from './access.js';
 
 const pexec = promisify(execFile);
 const children = new Map(); // runId -> ChildProcess
@@ -296,6 +299,24 @@ function siblingWorkspaces() {
   const dir = path.join(config.appRoot, 'workspaces');
   try { return fs.readdirSync(dir).filter((d) => d !== config.projectId).map((d) => path.join(dir, d)); } catch { return []; }
 }
+// Never readable by any seat, whatever the owner's sandbox.denyRead says: shell startup files and histories (they
+// often export credentials), credential stores, and the desk's production read credentials.
+export const ALWAYS_DENY = ['~/.ssh', '~/.aws', '~/.config/gh', '~/.codex', '~/.docker', '~/.kube', '~/.gnupg', '~/.netrc', '~/Library/Keychains',
+  '~/.zshrc', '~/.zshenv', '~/.zprofile', '~/.zlogin', '~/.zsh_history', '~/.bashrc', '~/.bash_profile', '~/.bash_login', '~/.profile', '~/.bash_history',
+  '~/.config/fish', '~/.git-credentials', '~/.npmrc', '~/.pypirc', '~/.config/gcloud', '~/.azure', '~/.config/op', '~/.terraform.d',
+  '~/.pgpass', '~/.pgpass-sigmadesk', '~/.pg_service.conf', '~/.psql_history', '~/.sigmadesk-ro-verifier', '~/.config/sigmadesk'];
+export { SECRET_GLOBS };
+// Toolchains and caches a seat's shell genuinely needs under the owner's home (read only). Everything else in the home
+// folder is unreadable: an enumerated deny list always misses something (~/.zsh_sessions, an app's token cache, …).
+export const HOME_TOOLCHAINS = ['~/.local/share/mise', '~/.local/bin', '~/.nvm', '~/.volta', '~/.fnm', '~/.pyenv', '~/.rustup', '~/.cargo/bin',
+  '~/.cargo/registry', '~/.bun/bin', '~/.deno/bin', '~/go/bin', '~/go/pkg/mod', '~/.gitconfig', '~/.config/git', '~/.cache/uv', '~/.cache/pip',
+  '~/Library/Caches/pip', '~/.cache/ms-playwright', '~/Library/Caches/ms-playwright'];
+const expand = (p) => (p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
+/** What a seat may read under the owner's home: its clone, other read-only trees it was given, the desk CLI, toolchains. */
+export function readAllowlist(cwd, extraDirs = [], socketPath = config.socketPath) {
+  return [cwd, ...extraDirs, ...(config.project.readOnlyPaths || []), path.join(config.root, 'bin'), socketPath,
+    ...HOME_TOOLCHAINS, ...(config.sandbox.allowRead || [])].filter(Boolean);
+}
 export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketPath = config.socketPath) {
   const deny = [...config.sandbox.denyRead,
     // desk state: run tokens, verdict codes, config, private notes, and every seat's session transcript
@@ -303,7 +324,10 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
     // project homes: every project's config, db and sockets (this one's too), the registry, and sibling projects' clones
     ...(config.appRoot ? [path.join(config.appRoot, 'projects'), path.join(config.appRoot, 'projects.json'), ...siblingWorkspaces()] : [])];
   if (config.advisors.keyFile) deny.push(config.advisors.keyFile);
-  if (config.project.repoPath) deny.push(path.join(config.project.repoPath, '.env'));
+  // Production read credentials belong to the desk (desk ops), never to a seat.
+  deny.push(...ALWAYS_DENY, ...[config.ops?.pgpassFile, config.ops?.pgServiceFile, ...(config.ops?.secretFiles || [])].filter(Boolean));
+  // Secret-looking files inside every tree a seat can read (more specific than the allowlist, so they stay denied).
+  const secretFiles = [...new Set([config.project.repoPath, cwd, ...(config.project.readOnlyPaths || []), ...extraDirs].filter(Boolean))].flatMap((root) => SECRET_GLOBS.map((g) => path.join(root, g)));
   const asRule = (p) => (p.startsWith('~') ? p : `/${p}`);
   return {
     sandbox: {
@@ -314,26 +338,68 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
       // (deny rules still apply). The support bot keeps the strict allowlist: it only ever needs `desk`.
       autoAllowBashIfSandboxed: config.sandbox.enabled && kind !== 'triage' && !READ_ONLY_KINDS.has(kind),
       network: { allowedDomains: config.sandbox.allowedDomains, allowUnixSockets: [socketPath] },
+      // The whole home folder is denied to shell commands; allowRead re-opens only the seat's trees, the desk CLI and
+      // toolchains. Credential paths and secret-looking files are denied more specifically and stay closed.
       // readOnlyPaths and other seats' clones stay readable but are explicitly write-protected.
-      filesystem: { denyRead: deny, allowWrite: READ_ONLY_KINDS.has(kind) ? [] : [cwd], denyWrite: [...config.project.readOnlyPaths, ...extraDirs, config.project.repoPath, ...(READ_ONLY_KINDS.has(kind) ? [cwd] : [])].filter(Boolean) },
+      filesystem: { denyRead: ['~', ...deny, ...secretFiles], allowRead: readAllowlist(cwd, extraDirs, socketPath),
+        allowWrite: READ_ONLY_KINDS.has(kind) ? [] : [cwd], denyWrite: [...config.project.readOnlyPaths, ...extraDirs, config.project.repoPath, ...(READ_ONLY_KINDS.has(kind) ? [cwd] : [])].filter(Boolean) },
     },
     permissions: {
-      deny: deny.flatMap((p) => [`Read(${asRule(p)})`, `Read(${asRule(p)}/**)`]),
-      additionalDirectories: [],
+      deny: [...deny.flatMap((p) => [`Read(${asRule(p)})`, `Read(${asRule(p)}/**)`]), ...secretFiles.map((p) => `Read(${asRule(p)})`)],
+      // File tools (Read/Grep/Glob) read only inside the working directory and the trees named here.
+      blockReadsOutsideWorkingDirectories: true,
+      additionalDirectories: [...(config.project.readOnlyPaths || []), ...extraDirs].filter(Boolean),
     },
   };
 }
 
-function childEnv(token, engine) {
-  const env = { ...process.env, ...config.project.env };
-  for (const k of Object.keys(env)) if (k === 'CLAUDECODE' || k.startsWith('CLAUDE_CODE_')) delete env[k];
-  // Strip obvious secrets from the agent environment (keep Claude's own auth variables).
-  for (const k of Object.keys(env)) if (/(_TOKEN|_SECRET|_KEY|PASSWORD|_DSN)$/i.test(k) && !/^(DESK_|ANTHROPIC_|CLAUDE_)/.test(k)) delete env[k];
-  if (engine !== 'claude') for (const k of Object.keys(env)) if (/^(ANTHROPIC_|CLAUDE_)/.test(k)) delete env[k];
-  env.PATH = [path.join(config.root, 'bin'), ...String(process.env.PATH || '/usr/bin:/bin').split(':')].join(':');
-  if (config.bins.agentShell && fs.existsSync(config.bins.agentShell)) env.SHELL = config.bins.agentShell;
+// The agent environment is built from an explicit allowlist, never inherited: the owner's shell may hold DATABASE_URL,
+// *_DSN, broker and API keys, cloud credentials, SSH agent sockets… none of which a seat may see.
+//  - every engine: PATH (desk bin first), locale, terminal, temp dir, USER, SHELL=/bin/bash (no personal aliases),
+//    proxy/CA settings (dropped when they carry a password) and the desk run variables;
+//  - the ENGINE process keeps the real HOME (Claude keeps its login in the macOS keychain / ~/.claude and its session
+//    transcripts under ~/.claude/projects, which resume reads), but the seat's TOOL shells get an isolated HOME (see
+//    toolHome): Claude sources CLAUDE_ENV_FILE before every Bash command, which switches HOME/XDG dirs and unsets the
+//    engine's own auth variables; Codex authenticates from CODEX_HOME, so its process (and shells) get the tool HOME;
+//  - claude (and the Perplexity relay, which is Claude): its own auth/config variables, for the CLI process only;
+//  - project.env: the owner's explicit additions, through a name/value schema (config.agentEnvProblem).
+const ENV_BASE = ['PATH', 'LANG', 'TERM', 'COLORTERM', 'TMPDIR', 'TZ', 'HOME', 'USER', 'LOGNAME'];
+const ENV_NET = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR'];
+const ENV_CLAUDE = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CONFIG_DIR'];
+export function childEnv(token, engine, base = process.env) {
+  const env = {};
+  const keep = [...ENV_BASE, ...ENV_NET, ...(engine === 'claude' || engine === 'perplexity' ? ENV_CLAUDE : [])];
+  for (const k of keep) if (base[k] !== undefined && base[k] !== '') env[k] = base[k];
+  for (const k of ENV_NET) if (env[k] && credentialLike(env[k])) delete env[k]; // a proxy URL with a password stays home
+  for (const k of Object.keys(base)) if (/^LC_[A-Z_]+$/.test(k)) env[k] = base[k];
+  if (!env.HOME) env.HOME = os.homedir();
+  for (const [k, v] of Object.entries(config.project.env || {})) if (!agentEnvProblem(k, v)) env[k] = String(v);
+  env.PATH = [path.join(config.root, 'bin'), ...String(base.PATH || '/usr/bin:/bin').split(':')].join(':');
+  env.SHELL = config.bins.agentShell && fs.existsSync(config.bins.agentShell) ? config.bins.agentShell : '/bin/bash';
   env.DESK_SOCKET = config.socketPath;
   env.DESK_RUN_TOKEN = token;
+  return env;
+}
+/** Root of per-run tool homes: under the real temp dir (readable by sandboxed shells; Codex's :tmpdir). */
+export const toolHomeRoot = () => path.join(fs.realpathSync(os.tmpdir()), 'sigmadesk-tool-home', String(config.projectId || 'desk'));
+/** A per-run HOME for the seat's tools: no dotfiles, history, keys or credential stores — only a .gitconfig that
+ * includes the owner's (identity, aliases) and the env file Claude sources before each Bash command. */
+export function toolHome(runId) {
+  const dir = path.join(toolHomeRoot(), `r${runId}`);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(dir, '.config'), { recursive: true, mode: 0o755 });
+  const realGit = path.join(os.homedir(), '.gitconfig');
+  if (fs.existsSync(realGit)) fs.writeFileSync(path.join(dir, '.gitconfig'), `[include]\n\tpath = ${realGit}\n`);
+  const q = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
+  fs.writeFileSync(path.join(dir, '.desk-env.sh'), [
+    `export HOME=${q(dir)}`, `export XDG_CONFIG_HOME=${q(path.join(dir, '.config'))}`, `export XDG_CACHE_HOME=${q(path.join(dir, '.cache'))}`,
+    `export XDG_DATA_HOME=${q(path.join(dir, '.local', 'share'))}`, 'unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR CLAUDE_ENV_FILE', ''].join('\n'));
+  return dir;
+}
+/** Engine-specific tool isolation on top of childEnv. */
+export function isolateTools(env, engine, home) {
+  if (engine === 'claude' || engine === 'perplexity') env.CLAUDE_ENV_FILE = path.join(home, '.desk-env.sh');
+  else { env.HOME = home; env.XDG_CONFIG_HOME = path.join(home, '.config'); } // codex: auth lives in CODEX_HOME
   return env;
 }
 
@@ -426,6 +492,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
   if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
   store.updateRun(run.id, { reserve_usd: engineOf(agent).budgetUsd(agent) });
+  access.bindRun(agentId, ticketKey, run.id); // dormant ticket-scoped production access becomes this run's
   onStart?.(run);
   const ctx = { run, cwd, result: null, state: {}, presence: track };
   if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
@@ -478,6 +545,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
     cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job });
     env = { ...childEnv(token, engine.id), ...cmd.env };
+    isolateTools(env, engine.id, toolHome(run.id));
     if (kind === 'council_review') { delete env.DESK_RUN_TOKEN; delete env.DESK_SOCKET; }
     if (cmd.mailbox) env.DESK_MAILBOX = openMailbox(run.id, cwd);
   } catch (err) {
@@ -534,6 +602,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (idleTimer) clearInterval(idleTimer);
       children.delete(run.id);
       mailboxes.delete(run.id);
+      ops.cancelRun(run.id); // production probes never outlive their run
+      fs.rm(path.join(toolHomeRoot(), `r${run.id}`), { recursive: true, force: true }, () => {});
       setTimeout(() => evidence.delete(run.id), 60_000).unref();
       sock?.close();
       if (buf.trim()) applyEvents(engine.parse(buf, cwd, ctx.state), ctx);

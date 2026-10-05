@@ -265,7 +265,10 @@ test('security: sandbox hides desk state + transcripts and write-protects read-o
   assert.ok(s.sandbox.filesystem.denyWrite.includes('/ws/other'));
   assert.ok(s.sandbox.filesystem.denyWrite.includes(config.project.repoPath));
   assert.deepEqual(s.sandbox.network.allowUnixSockets, ['/run/r1.sock']);
-  assert.deepEqual(s.permissions.additionalDirectories, []);
+  // File tools read only inside the working directory and the read-only trees the run was given (never written:
+  // Edit/Write are allowed only under the clone, and the sandbox write-protects these trees).
+  assert.equal(s.permissions.blockReadsOutsideWorkingDirectories, true);
+  assert.deepEqual(s.permissions.additionalDirectories, [...config.project.readOnlyPaths, '/ws/other']);
 });
 
 test('security: QA verdicts need the per-run code; seats cannot act on tickets they were not given', async () => {

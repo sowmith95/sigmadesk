@@ -35,6 +35,8 @@ import { normalizeSeat, supportsSeat } from './team-settings.js';
 import * as research from './research.js';
 import * as researchReview from './research-review.js';
 import * as connectors from './connectors.js';
+import * as ops from './ops.js';
+import * as access from './access.js';
 
 const PUBLIC = path.join(config.root, 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -87,7 +89,7 @@ export function snapshot({ inbox = true } = {}) {
       deploy_lock: mergetrain.deployState(), // as stored (refreshed by the PR sync loop): the request tracker reads it
       lessons: store.listLessons(),
       groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
-      research: research.status(settings), research_reviews: researchReview.summaries(),
+      research: research.status(settings), research_reviews: researchReview.summaries(), ops: ops.describe(settings), access: access.summary(),
       decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
   };
@@ -344,9 +346,28 @@ async function ownerRoute(req, res) {
   if (req.method === 'POST' && p === '/api/settings') {
     const b = await readBody(req);
     store.setSetting(b.key, b.value);
+    if (b.key === 'ops_enabled' && String(b.value) !== 'true') ops.cancelAll(); // emergency stop: nothing keeps running
     store.logEvent({ kind: 'system', agent_id: 'owner', text: `setting ${b.key} = ${b.value}` });
     return send(res, 200, store.getSettings());
   }
+  // Production read access: the owner grants, decides requests, revokes and sets the approver policy.
+  if (req.method === 'GET' && p === '/api/access') { access.sweep(); return send(res, 200, access.details()); }
+  if (req.method === 'POST' && p === '/api/access/grant') {
+    const b = await readBody(req);
+    const g = access.ownerGrant({ seat: b.seat, probes: b.probes, minutes: b.minutes, ticket_key: b.ticket_key || null, standing: b.standing === true, reason: String(b.reason || '').slice(0, 300) });
+    return send(res, 200, { ok: true, grant: g });
+  }
+  if (req.method === 'POST' && (mm = m('^/api/access/requests/(\\d+)/(approve|deny)$'))) {
+    const b = await readBody(req);
+    const out = access.decide('owner', Number(mm[1]), mm[2], { minutes: b.minutes ? Number(b.minutes) : null, ticketScoped: b.ticket === true ? true : null, note: String(b.reason || (mm[2] === 'approve' ? 'approved by the owner' : '')).slice(0, 300) });
+    return send(res, 200, { ok: true, message: out });
+  }
+  if (req.method === 'POST' && (mm = m('^/api/access/grants/(\\d+)/revoke$'))) {
+    const b = await readBody(req);
+    return send(res, 200, { ok: true, message: access.revoke(Number(mm[1]), 'owner', String(b.reason || '').slice(0, 300)) });
+  }
+  if (req.method === 'POST' && p === '/api/access/revoke-all') return send(res, 200, { ok: true, revoked: access.revokeAll('owner') });
+  if (req.method === 'POST' && p === '/api/access/policy') { const b = await readBody(req); return send(res, 200, { ok: true, policy: access.setPolicy(b.policy) }); }
   if (req.method === 'GET' && p === '/api/engines') {
     const engines = await detectEngines();
     dispatch.setAvailability(engines);
@@ -470,6 +491,14 @@ async function agentRoute(req, res, boundRunId) {
   if (!run || run.id !== boundRunId) return send(res, 401, { error: 'invalid or finished run token' });
   const out = await sched.deskAction(run, mm[1], await readBody(req));
   return send(res, 200, { ok: true, output: out });
+}
+
+/** One run's unix socket (the only door a sandboxed seat can reach). Exported for the transport tests. */
+export function agentSocket(runId, p) {
+  try { fs.unlinkSync(p); } catch { /* none */ }
+  const srv = http.createServer((req, res) => agentRoute(req, res, runId).catch((err) => { if (!res.headersSent) send(res, err.status || 500, { error: err.message }); }));
+  srv.listen(p, () => { try { fs.chmodSync(p, 0o600); } catch { /* raced with close */ } });
+  return { path: p, server: srv, close: () => { srv.close(); try { fs.unlinkSync(p); } catch { /* gone */ } } };
 }
 
 // File-mailbox transport for engines whose sandbox blocks the socket (e.g. Codex with network off).
@@ -606,18 +635,14 @@ export async function main() {
   const sockDir = path.dirname(config.socketPath);
   fs.mkdirSync(sockDir, { recursive: true });
   for (const f of fs.readdirSync(sockDir)) if (/^r\d+\.sock$/.test(f)) fs.rmSync(path.join(sockDir, f), { force: true });
-  runner.setSocketFactory((runId) => {
-    const p = path.join(sockDir, `r${runId}.sock`);
-    try { fs.unlinkSync(p); } catch { /* none */ }
-    const srv = http.createServer((req, res) => agentRoute(req, res, runId).catch((err) => { if (!res.headersSent) send(res, err.status || 500, { error: err.message }); }));
-    srv.listen(p, () => { try { fs.chmodSync(p, 0o600); } catch { /* raced with close */ } });
-    return { path: p, close: () => { srv.close(); try { fs.unlinkSync(p); } catch { /* gone */ } } };
-  });
+  runner.setSocketFactory((runId) => agentSocket(runId, path.join(sockDir, `r${runId}.sock`)));
 
   store.logEvent({ kind: 'system', text: `Desk online for ${config.project.name}${config.home ? ` (project ${config.projectId})` : ''} (${store.getSettings().paused === 'true' ? 'halted' : 'open'})` });
   github.ensureLabels().catch(() => {});
   setInterval(() => sched.tick(), 15_000);
   setInterval(pollMailboxes, 400);
+  // Production access expiry, ticket/run endings: enforced even while the scheduler is halted.
+  setInterval(() => { try { access.sweep(); } catch { /* next pass */ } }, 10_000);
   if (config.watch.enabled) {
     let polling = false; // serialize: overlapping polls would read the same cursor twice and double-count
     const loop = async () => {
