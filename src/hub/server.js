@@ -81,7 +81,8 @@ async function sendInstruction(req, b) {
   // Ready means this desk answered as itself: a stopped desk is offline; another service on the port is refused.
   const sum = await summaryOf(desk.port, desk.token);
   if (!sum.online) return [409, { error: `${desk.name} is not running. Start it, then send again.`, offline: true }];
-  if (sum.error || (sum.id && sum.id !== desk.id && b.project !== 'classic')) return [409, { error: `${desk.name} did not answer as expected (${sum.error || 'another desk is on its port'})` }];
+  // Exactly this desk: anything else on its port (another project, an old build without an id) is refused.
+  if (sum.error || sum.id !== desk.id) return [409, { error: `${desk.name} did not answer as expected (${sum.error || 'another service is on its port'})` }];
   let r;
   try {
     r = await fetch(`http://127.0.0.1:${desk.port}/api/tickets`, { method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(10_000),
@@ -129,7 +130,15 @@ async function route(req, res) {
   }
   const isApi = p.startsWith('/api/');
   if (isApi && !authed(req)) return send(res, 401, { error: 'open /?token=<owner token> once on this device' });
-  if (isApi && req.method !== 'GET' && !String(req.headers['content-type'] || '').includes('application/json')) return send(res, 415, { error: 'json only' });
+  // CSRF: a write must be real JSON (the media type itself, not a parameter: `text/plain; x=application/json` is a
+  // "simple" request a foreign page can send without a preflight) and, when a browser says where it came from, from this
+  // page's own origin. Another local port is same-site, so the SameSite cookie alone does not stop it.
+  if (isApi && req.method !== 'GET') {
+    const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (type !== 'application/json') return send(res, 415, { error: 'json only' });
+    const origin = req.headers.origin;
+    if (origin && origin !== 'null' ? (() => { try { return new URL(origin).host !== req.headers.host; } catch { return true; } })() : origin === 'null') return send(res, 403, { error: 'cross-origin write refused' });
+  }
   let mm;
   if (req.method === 'GET' && p === '/api/hub/state') return send(res, 200, await state(req));
   if (req.method === 'GET' && p === '/api/hub/catalog') return send(res, 200, { questions: QUESTIONS, packs: PACKS, advisors: Object.fromEntries(Object.entries(ADVISORS).map(([id, a]) => [id, { name: a.name, role: a.role, bio: a.bio, pack: a.pack }])), core: CORE });

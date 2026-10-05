@@ -288,14 +288,14 @@ export function approve(key, { expected_revision, edits = [], message = '' } = {
 }
 
 /** Owner creates a feature from the Features page: it skips triage and goes straight to a Codex grooming round. */
-export function create({ title, goal, priority, area } = {}) {
+export function create({ title, goal, priority, area, source = 'human' } = {}) {
   const name = String(title || '').trim();
   const request = String(goal || '').trim();
   if (!name) bad('Give the feature a name');
   if (!request) bad('Describe what it should do and for whom');
   if (name.length > 200 || request.length > 12_000) bad('That is too long');
   const t = store.createTicket({ title: name, description: request, type: 'feature', status: 'proposed', priority: /^P[0-3]$/.test(priority) ? priority : 'P2',
-    area: AREAS.includes(area) ? area : null, reporter: 'owner', source: 'human' });
+    area: AREAS.includes(area) ? area : null, reporter: 'owner', source: source === 'hub' ? 'hub' : 'human' });
   return { ticket: store.getTicket(t.key), plan: start(t.key) };
 }
 

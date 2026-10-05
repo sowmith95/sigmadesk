@@ -18,8 +18,10 @@ export function stageFor(t: Ticket, B: Board, mergeState?: { state?: string } | 
   const ix = flow.index(S.tickets);
   const tree = new Set([t.key, ...flow.descendants(t.key, ix).map((k: Ticket) => k.key)]);
   const names = Object.fromEntries(S.agents.map((a) => [a.id, a.name.split(/\s+/)[0]]));
-  return stageOf(t, { kids: ix.kids.get(t.key) || [], plan: planFor(t.key), deploy: S.meta.deploy_lock || null, names,
-    merge: t.status === 'ready_for_human' ? mergeState || null : null, decisions: (B.decisions || B.needs_you).filter((d) => tree.has(d.key)) }) as Stage;
+  // Merge states for every ticket ready to merge come with the snapshot; this ticket's fresher detail wins.
+  const merges = { ...(S.meta.merge_states || {}), ...(mergeState?.state ? { [t.key]: mergeState.state } : {}) };
+  return stageOf(t, { kids: ix.kids.get(t.key) || [], plan: planFor(t.key), deploy: S.meta.deploy_lock || null, names, merges,
+    decisions: (B.decisions || B.needs_you).filter((d) => tree.has(d.key)) }) as Stage;
 }
 
 export function Tracker({ t, B, mergeState, onDecision }: { t: Ticket; B: Board; mergeState?: { state?: string } | null; onDecision: (id: string, key: string) => void }) {

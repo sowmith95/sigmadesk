@@ -20,7 +20,13 @@ export function Composer({ projects, onSent }: { projects: Any[]; onSent: () => 
   const [d, setD] = useState<Draft>(load);
   const [busy, setBusy] = useState<'' | 'sending'>('');
   const [problem, setProblem] = useState<Any | null>(null);
-  const set = (patch: Partial<Draft>) => setD((x) => { const n = { ...x, ...patch }; localStorage.setItem(KEY, JSON.stringify(n)); return n; });
+  // A changed request is a new request: a retry of the same text keeps its id (the desk returns the same ticket), an
+  // edit gets a fresh one (reusing it for different text would be refused).
+  const set = (patch: Partial<Draft>) => setD((x) => {
+    const changed = (['text', 'project', 'kind', 'priority'] as const).some((k) => k in patch && patch[k] !== x[k]);
+    const n = { ...x, ...patch, ...(changed ? { request_id: newId() } : {}) };
+    localStorage.setItem(KEY, JSON.stringify(n)); return n;
+  });
   // Last used project, else the only/first one.
   useEffect(() => { if (!d.project && projects.length) set({ project: projects[0].id }); }, [projects.length]); // eslint-disable-line react-hooks/exhaustive-deps
   const target = projects.find((p) => p.id === d.project);
@@ -28,13 +34,19 @@ export function Composer({ projects, onSent }: { projects: Any[]; onSent: () => 
     if (d.text.trim().length < 3) { toast('Write what the team should do first.', true); return; }
     if (!target) { toast('Choose a project.', true); return; }
     setBusy('sending'); setProblem(null);
+    const sent = { ...d };
     try {
       const res = await fetch('/api/hub/instructions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(30_000),
-        body: JSON.stringify({ project: d.project, text: d.text, kind: d.kind, priority: d.priority, request_id: d.request_id }) });
+        body: JSON.stringify({ project: sent.project, text: sent.text, kind: sent.kind, priority: sent.priority, request_id: sent.request_id }) });
       const j = await res.json().catch(() => ({}));
-      if (!res.ok) { setProblem({ ...j, error: j.error || `HTTP ${res.status}` }); return; }
-      // Confirmed: forget the draft (keep the project for next time), then open the request on its desk.
-      localStorage.setItem(KEY, JSON.stringify({ text: '', project: d.project, kind: 'auto', priority: 'P2', request_id: newId() }));
+      if (!res.ok) {
+        setProblem({ ...j, error: j.error || `HTTP ${res.status}` });
+        if (res.status === 409 && !j.offline) setD((x) => { const n = { ...x, request_id: newId() }; localStorage.setItem(KEY, JSON.stringify(n)); return n; }); // that id is spent
+        return;
+      }
+      // Confirmed: forget exactly the request that was sent (the box was locked meanwhile), keep the project.
+      const stored = load();
+      if (stored.request_id === sent.request_id) localStorage.setItem(KEY, JSON.stringify({ text: '', project: d.project, kind: 'auto', priority: 'P2', request_id: newId() }));
       toast(j.duplicate ? `Already sent as ${j.key}; opening it` : `Sent to ${j.name} as ${j.key}`);
       onSent();
       window.location.href = j.url;
@@ -44,12 +56,12 @@ export function Composer({ projects, onSent }: { projects: Any[]; onSent: () => 
   return (
     <section aria-label="Tell a team what to do" className="grid gap-3 rounded-lg border bg-card p-4">
       <label htmlFor="instruction" className="text-[17px] font-semibold">What should the team do?</label>
-      <Textarea id="instruction" rows={4} maxLength={8000} value={d.text} onChange={(e) => set({ text: e.target.value })}
+      <Textarea id="instruction" rows={4} maxLength={8000} value={d.text} readOnly={!!busy} onChange={(e) => set({ text: e.target.value })}
         placeholder="Fix the stale quote badge on the positions page; it should turn grey after 30 seconds without a tick." />
       <div className="grid gap-1.5">
         <span className="text-sm text-muted-foreground">Project</span>
         <div role="radiogroup" aria-label="Project" className="flex flex-wrap gap-2">{projects.map((p) => (
-          <button key={p.id} type="button" role="radio" aria-checked={d.project === p.id} onClick={() => set({ project: p.id })}
+          <button key={p.id} type="button" role="radio" aria-checked={d.project === p.id} disabled={!!busy} onClick={() => set({ project: p.id })}
             className={cn('min-h-10 rounded-full border px-3.5 text-sm', d.project === p.id ? 'border-primary bg-primary/15 text-foreground' : 'text-muted-foreground hover:text-foreground')}>
             {p.name}{!p.summary?.online && <span className="text-muted-foreground"> (stopped)</span>}</button>))}</div>
       </div>
@@ -72,7 +84,8 @@ export function Composer({ projects, onSent }: { projects: Any[]; onSent: () => 
 export function Recent({ projects }: { projects: Any[] }) {
   const rows = projects.flatMap((p) => (p.summary?.recent_requests || []).map((r: Any) => ({ ...r, project: p.id, projectName: p.name, url: p.url })))
     .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 12);
-  const offline = projects.filter((p) => !p.summary?.online);
+  // Not shown: stopped desks, and desks that answered with an error (for example refused the hub's sign-in).
+  const offline = projects.filter((p) => !p.summary?.online || p.summary?.error);
   if (!rows.length && !offline.length) return null;
   return (
     <section aria-label="Your instructions" className="grid gap-2">
@@ -87,7 +100,7 @@ export function Recent({ projects }: { projects: Any[] }) {
             <span className="text-sm text-muted-foreground">{r.line}{r.who_name && !r.done && !r.closed ? ` · ${r.who_name}` : ''}</span>
           </a></li>))}</ul>
         : <p className="text-sm text-muted-foreground">Nothing sent yet.</p>}
-      {offline.length > 0 && <p className="text-[13px] text-muted-foreground">Not shown: requests on {offline.map((p) => p.name).join(', ')} ({offline.length === 1 ? 'it is' : 'they are'} not running).</p>}
+      {offline.length > 0 && <p className="text-[13px] text-muted-foreground">Not shown: requests on {offline.map((p) => p.name).join(', ')} (not running or not reachable).</p>}
     </section>
   );
 }

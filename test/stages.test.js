@@ -35,9 +35,9 @@ test('planned vs current engineer, design vs build, and rework moving back', () 
 
 test('what needs the owner comes from the board; an automatic merge is not the owner\'s job', () => {
   const merge = { id: 'R-1:merge', key: 'R-1', kind: 'merge', verb: 'Merge x' };
-  const queued = at(T({ status: 'ready_for_human', pr_url: 'u' }), { merge: { state: 'queued' }, decisions: [merge] });
+  const queued = at(T({ status: 'ready_for_human', pr_url: 'u' }), { merges: { 'R-1': 'queued' }, decisions: [merge] });
   assert.deepEqual(queued.actions, []); assert.match(queued.line, /merges automatically/);
-  const owner = at(T({ status: 'ready_for_human', pr_url: 'u' }), { merge: { state: 'owner' }, decisions: [merge] });
+  const owner = at(T({ status: 'ready_for_human', pr_url: 'u' }), { merges: { 'R-1': 'owner' }, decisions: [merge] });
   assert.equal(owner.actions.length, 1); assert.equal(owner.line, 'Merge x');
   const q = at(T({ status: 'needs_human', resume_status: 'todo', assignee: 'junior' }), { decisions: [{ id: 'R-1:question', key: 'R-1', kind: 'question', verb: 'Answer Riley' }] });
   assert.equal(q.actions[0].kind, 'question');
@@ -58,4 +58,18 @@ test('features plan first, epics build through their tasks, and done means what 
   assert.equal(at(T({ status: 'done', pr_url: 'u' }), { deploy: { key: 'OTHER', state: 'running' } }).done, true);
   assert.equal(at(T({ status: 'wontdo' })).closed, true);
   assert.match(at(T({ status: 'mystery' })).line, /Status unavailable \(mystery\)/);
+});
+
+test('review regressions: a held merge is the owner\'s, a child queued for auto-merge is not, built parents keep their real step', () => {
+  const merge = (key) => ({ id: `${key}:merge`, key, kind: 'merge', verb: `Merge ${key}` });
+  const held = at(T({ status: 'ready_for_human', pr_url: 'u' }), { merges: { 'R-1': 'held' }, decisions: [merge('R-1')] });
+  assert.equal(held.actions.length, 1, 'releasing a hold is the owner\'s call'); assert.match(held.line, /On hold/);
+  const kids = [{ key: 'R-2', status: 'ready_for_human' }, { key: 'R-3', status: 'in_progress' }];
+  const feature = at(T({ status: 'in_progress' }), { kids, merges: { 'R-2': 'queued' }, decisions: [merge('R-2')], plan: { status: 'approved' } });
+  assert.deepEqual(feature.actions, [], 'the child merges by itself');
+  const parent = at(T({ status: 'qa', assignee: 'senior-be' }), { kids: [{ key: 'R-4', status: 'done' }] });
+  assert.equal(parent.at, 'qa', 'a ticket that has slices still shows its own QA');
+  const escalated = at(T({ status: 'needs_human', resume_status: 'todo', head_sha: 'abc', qa_loops: 3, assignee: 'junior' }));
+  assert.equal(escalated.at, 'building', 'repeated QA failures are rework, not "assigned"');
+  assert.equal(at(T({ status: 'review', review_stage: 'merge_unknown' }), { merges: { 'R-1': 'merging' }, decisions: [merge('R-1')] }).actions.length, 0);
 });

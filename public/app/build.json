@@ -1,5 +1,5 @@
 {
-  "source": "e076eade04953962c9f99a68911f8007247f91e518e6e9b955a969775921aed4",
+  "source": "fb54bfbbffb511040a7a4b961432089aea58a626910a980e55060981e72b311f",
   "outputs": {
     "public/app/chunks/arrow-left-C_PThnYe.js": "4ac38b9a3cf8b1715f165dfea4cc956d94d6bdd846428923f65eb3bf8171ada8",
     "public/app/chunks/Bits-DrYZSlkO.js": "4e0d7d152f3dc4af1fe19ff0903923c6e202903d9401bb5948e4f848a53dc6c5",
@@ -14,8 +14,8 @@
     "public/app/chunks/Prs-Bf3P2UVT.js": "522dc311db5be58ef478194bf2a52f7c344fe20f7daffeb9f451442c7d1893b1",
     "public/app/chunks/Research-vyiq26Ec.js": "035d250aba8f35634b00d6f8132ad6cf9fed4cda91edfe5303c92e791b2101da",
     "public/app/chunks/Settings-C8bAuAg0.js": "df3a47b1caed271edad97d8607397cd5ea0748ef4beeda154518dbc00751c3d9",
-    "public/app/hub.js": "4e615c90709d38a845917e7d0d99512e6ed6265c673f48a7a37d01289977dc67",
+    "public/app/hub.js": "e777d0bfc9c43d6cae6afa8bb266286d8191d1a67c3d06f1e96dad34d78b3696",
     "public/app/main.css": "8d17f5745773d62e171031e6020f9038ef023b0996f79b0b12e3b2d2d74676aa",
-    "public/app/main.js": "47ead6fc605b49ad1173b4f40836607d7d85fff4d00ac62b31694f1efb4623aa"
+    "public/app/main.js": "8e0cfd39834b931e0d91a041a8f333d41ae7dd1c645c9d50c7c636a01b99ee3d"
   }
 }

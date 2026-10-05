@@ -64,13 +64,17 @@ test('scan, recommend, create and open: a new project gets a desk with the team 
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'team.json'), 'utf8')).advisors, ['security', 'product-design']);
   assert.match(fs.readFileSync(path.join(home, 'playbook.md'), 'utf8'), /handmade mugs[\s\S]*npm test[\s\S]*Money and payments/);
 
+  // Give the desk an owner token (as a desk reachable from a phone has) so the hub's signed-in path is exercised.
+  cfg.server = { ...(cfg.server || {}), ownerToken: 'desk-token-abc123' };
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(cfg, null, 2));
   run([path.join(ROOT, 'src/server.js')], { SIGMADESK_HOME: home, SIGMADESK_APP_ROOT: app, SIGMADESK_CONFIG: '', SIGMADESK_PORT: String(made.body.port) });
-  await wait(`http://127.0.0.1:${made.body.port}/api/summary`);
+  await wait(`http://127.0.0.1:${made.body.port}/api/summary`, (r) => r.status === 401); // up (and asking for its token)
   const st = await (await fetch(`${base}/api/hub/state`)).json();
   const shop = st.projects.find((p) => p.id === 'mug-shop');
   assert.equal(shop.summary.online, true); assert.equal(shop.summary.project, 'Mug Shop');
   assert.equal(shop.summary.team_confirmed, true, 'the wizard approval is recorded'); assert.equal(shop.summary.paused, true, 'it starts paused');
-  const desk = await (await fetch(`http://127.0.0.1:${made.body.port}/api/state`)).json();
+  const deskAuth = { 'x-sigmadesk-token': 'desk-token-abc123' };
+  const desk = await (await fetch(`http://127.0.0.1:${made.body.port}/api/state`, { headers: deskAuth })).json();
   assert.ok(desk.agents.some((a) => a.id === 'security') && !desk.agents.some((a) => a.id === 'trading-advisor'));
   assert.equal(desk.agents.find((a) => a.id === 'sre').enabled, false);
 
@@ -84,16 +88,32 @@ test('scan, recommend, create and open: a new project gets a desk with the team 
   const again = await post('/api/hub/instructions', say);
   assert.equal(again.status, 200); assert.equal(again.body.key, sent.body.key); assert.equal(again.body.duplicate, true);
   assert.equal((await post('/api/hub/instructions', { ...say, text: 'Something else entirely' })).status, 409, 'a reused id with another request is refused');
-  const created = (await (await fetch(`http://127.0.0.1:${made.body.port}/api/state`, { headers: cfg.server?.ownerToken ? { 'x-sigmadesk-token': cfg.server.ownerToken } : {} })).json()).tickets.find((t) => t.key === sent.body.key);
+  const deskState = async () => (await fetch(`http://127.0.0.1:${made.body.port}/api/state`, { headers: deskAuth })).json();
+  const created = (await deskState()).tickets.find((t) => t.key === sent.body.key);
   assert.equal(created.title, 'Show the shipping cost before checkout'); assert.equal(created.type, 'task'); assert.equal(created.source, 'hub'); assert.equal(created.status, 'triage');
   const listed = (await (await fetch(`${base}/api/hub/state`)).json()).projects.find((p) => p.id === 'mug-shop').summary.recent_requests;
   assert.equal(listed[0].key, sent.body.key); assert.equal(listed[0].at, 'received'); assert.equal(listed[0].step, 1);
-  if (cfg.server?.ownerToken) {
+  {
     const go = (next) => fetch(`http://127.0.0.1:${made.body.port}/?token=${encodeURIComponent(cfg.server.ownerToken)}&next=${encodeURIComponent(next)}`, { redirect: 'manual' });
     assert.equal((await go(`#/inbox/${sent.body.key}`)).headers.get('location'), `/#/inbox/${sent.body.key}`);
     assert.equal((await go('//evil.example/x')).headers.get('location'), '/', 'anything but a desk page goes home');
     assert.equal((await go(`#/inbox/${sent.body.key}`)).headers.get('referrer-policy'), 'no-referrer');
   }
+  assert.match(sent.body.url, /\?token=desk-token-abc123&next=%23%2Finbox%2F/, 'the hub signs in with the desk token and lands on the request');
+  // CSRF: a disguised content type or another origin cannot make the hub write.
+  const raw = (headers) => fetch(`${base}/api/hub/instructions`, { method: 'POST', headers, body: JSON.stringify({ ...say, request_id: 'req-csrf-0001' }) }).then((r) => r.status);
+  assert.equal(await raw({ 'Content-Type': 'text/plain; x=application/json' }), 415);
+  assert.equal(await raw({ 'Content-Type': 'application/json', Origin: 'http://127.0.0.1:9' }), 403);
+  // A feature from the hub is planned first and remembers where it came from.
+  const feat = await post('/api/hub/instructions', { project: 'mug-shop', text: 'Gift wrapping at checkout', kind: 'feature', request_id: 'req-feature-01' });
+  assert.equal(feat.status, 201, JSON.stringify(feat.body));
+  const ft = (await deskState()).tickets.find((t) => t.key === feat.body.key);
+  assert.equal(ft.type, 'feature'); assert.equal(ft.source, 'hub'); assert.equal(ft.status, 'proposed');
+  // A wrong token on the desk side is reported as a sign-in problem, not as the desk's own error.
+  cfg.server.ownerToken = 'stale-token'; fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(cfg, null, 2));
+  const stale = await post('/api/hub/instructions', { ...say, request_id: 'req-stale-001' });
+  assert.ok([409, 502].includes(stale.status), JSON.stringify(stale)); assert.match(stale.body.error, /did not answer as expected|refused the Projects home/);
+  cfg.server.ownerToken = 'desk-token-abc123'; fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(cfg, null, 2));
 
   if (!findChromium()) return;
   const browser = await launch();

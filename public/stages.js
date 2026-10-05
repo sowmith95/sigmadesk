@@ -2,7 +2,7 @@
 // code review → ready to merge → done. Pure: the desk's ticket sheet and the Projects home both use it.
 // It is a projection of state the desk already has; it never decides on its own what needs the owner:
 // - decisions: the board's decisions (public/attention.js) for this ticket and its tasks
-// - merge: mergetrain.mergeState(ticket) when it is ready (queued / scheduled / owner / conflict …)
+// - merges: { key: merge state } for tickets ready to merge (queued / scheduled / held / owner / conflict / merging)
 // - plan: the feature plan record; kids: child tasks (an epic's work); deploy: the stored deploy lock
 // Work that goes back (QA sent it back, a refresh re-runs QA) moves back; an unknown status says so.
 
@@ -21,12 +21,15 @@ const AT = { triage: 'received', proposed: 'planned', todo: 'assigned', in_progr
 const PRINCIPAL = /^principal-/;
 const PLANNING = { queued: 'Waiting for the planning session', grooming: 'The manager is writing the plan', ready: 'The plan is ready for you',
   failed: 'Planning failed: retry it on the feature page', discarded: 'You set the plan aside', approved: null };
-const AUTO_MERGE = { queued: 'Approved; it merges automatically when the checks allow', scheduled: 'Approved; it merges automatically after the busy hours',
+const MERGE_LINE = { queued: 'Approved; it merges automatically when the checks allow', scheduled: 'Approved; it merges automatically after the busy hours',
   merging: 'Merging now', conflict: 'Resolving a conflict with the latest code', held: 'On hold: you paused its merge' };
+// The desk merges these by itself: a merge decision on such a ticket is not the owner's job. A held merge is.
+const AUTOMATIC = new Set(['queued', 'scheduled', 'merging', 'conflict']);
 
+const rework = (t) => t.qa_loops > 0 || !!t.head_sha;
 function atOf(t) {
-  if (t.status === 'needs_human') return t.resume_status === 'done' ? 'ready' : AT[t.resume_status] || (t.head_sha ? 'qa' : 'building');
-  if (t.status === 'todo' && (t.qa_loops > 0 || t.head_sha)) return 'building'; // sent back: rework is building again
+  if (t.status === 'needs_human') return t.resume_status === 'done' ? 'ready' : t.resume_status === 'todo' && rework(t) ? 'building' : AT[t.resume_status] || (t.head_sha ? 'qa' : 'building');
+  if (t.status === 'todo' && rework(t)) return 'building'; // sent back: rework is building again
   return AT[t.status] || null;
 }
 
@@ -43,7 +46,7 @@ export function stageOf(t, ctx = {}) {
   let who = null;
   // Planning: a feature waits on its plan; ordinary work waits on grooming.
   if (ctx.plan && ctx.plan.status !== 'approved' && t.status !== 'done') { at = 'planned'; line = PLANNING[ctx.plan.status] || 'Being planned'; who = 'manager'; }
-  else if (epic && t.status !== 'done') {
+  else if (epic && ['todo', 'in_progress'].includes(t.status)) {
     // An epic is built through its tasks: progress, and who is on them now.
     const merged = kids.filter((k) => k.status === 'done').length;
     at = 'building';
@@ -52,19 +55,18 @@ export function stageOf(t, ctx = {}) {
   // Who has it now, and what they are doing.
   if (!who) who = t.owner_task ? 'you' : at === 'received' ? 'support' : at === 'planned' ? 'manager' : at === 'qa' ? 'qa' : epic ? null : t.assignee || null;
   if (!line && t.status === 'in_progress' && PRINCIPAL.test(t.assignee || '')) line = `${name(t.assignee)} is designing it and splitting it into tasks`;
-  if (!line && t.status === 'todo' && !(t.qa_loops > 0 || t.head_sha)) line = t.assignee ? `Planned for ${name(t.assignee)}; another engineer who fits may take it first` : 'Waiting for an engineer';
+  if (!line && t.status === 'todo' && !rework(t)) line = t.assignee ? `Planned for ${name(t.assignee)}; another engineer who fits may take it first` : 'Waiting for an engineer';
   if (!line && t.status === 'todo') line = `Back with ${name(t.assignee) || 'the engineer'} to fix what QA or review found`;
   if (!line && t.review_stage === 'resolving') line = 'Resolving a merge conflict';
   if (!line && t.review_stage === 'responding') line = `${name(t.assignee) || 'The engineer'} is answering the reviewers`;
-  // Ready: queued for the automatic merge is not the owner's job; the merge state says which it is.
-  const auto = at === 'ready' && ctx.merge && AUTO_MERGE[ctx.merge.state];
-  if (!line && auto) line = auto;
+  const merges = ctx.merges || {};
+  if (!line && merges[t.key] && MERGE_LINE[merges[t.key]]) line = MERGE_LINE[merges[t.key]];
   // Done: merged code, a completed owner task, or an epic whose tasks settled.
   const deploying = t.status === 'done' && ctx.deploy?.key === t.key && ['running', 'merging'].includes(ctx.deploy.state);
   if (t.status === 'done') line = deploying ? 'Merged; the deploy is running' : epic ? (all.some((k) => k.status === 'wontdo') ? 'Done (some tasks were dropped)' : 'Every task is done')
     : t.pr_url ? 'Merged' : 'Completed';
   // What the owner must do: the board's decisions, minus a merge the desk will do by itself.
-  const actions = (ctx.decisions || []).filter((d) => !(d.kind === 'merge' && auto)).map((d) => ({ id: d.id, key: d.key, kind: d.kind, text: d.verb || d.action || 'Needs you' }));
+  const actions = (ctx.decisions || []).filter((d) => !(d.kind === 'merge' && AUTOMATIC.has(merges[d.key]))).map((d) => ({ id: d.id, key: d.key, kind: d.kind, text: d.verb || d.action || 'Needs you' }));
   if (!line) line = actions[0]?.text || { received: 'Waiting to be triaged', planned: 'Being groomed into a plan', assigned: 'Waiting for an engineer',
     building: `${name(who) || 'An engineer'} is building it`, qa: 'QA is checking it', review: 'Two engineers are reviewing the code', ready: 'Ready to merge' }[at];
   const i = ORDER.indexOf(at);

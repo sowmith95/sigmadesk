@@ -80,6 +80,7 @@ export function snapshot() {
       feature_plans: features.summaries(),
       epic_reviews: epicReview.summaries(),
       team_stats: teamStats.current(),
+      merge_states: mergeStates(), // per ticket ready to merge: queued / scheduled / held / owner / merging … (the request tracker reads it)
       deploy_lock: mergetrain.deployState(), // as stored (refreshed by the PR sync loop): the request tracker reads it
       lessons: store.listLessons(),
       groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
@@ -100,11 +101,20 @@ setInterval(() => { for (const res of clients) res.write(': ping\n\n'); }, 20_00
 
 // The owner's own requests (newest first) and where each stands: the Projects home lists them across desks.
 // What needs the owner comes from the board (one source of truth); the deploy lock is read as stored, never polled.
-export function requestStage(t, snap, B, ix = flow.index(snap.tickets)) {
+/** Merge state of every ticket that is ready to merge (or confirming one): key → state. */
+function mergeStates(tickets = store.listTickets()) {
+  const out = {};
+  for (const t of tickets) {
+    if (t.review_stage === 'merge_unknown' || t.review_stage === 'merging') out[t.key] = 'merging'; // confirming with GitHub
+    else if (t.status === 'ready_for_human') out[t.key] = mergetrain.mergeState(t)?.state || null;
+  }
+  return out;
+}
+export function requestStage(t, snap, B, ix = flow.index(snap.tickets), merges = snap.meta?.merge_states || mergeStates(snap.tickets)) {
   const names = Object.fromEntries(AGENTS.map((a) => [a.id, a.name]));
   const tree = new Set([t.key, ...flow.descendants(t.key, ix).map((k) => k.key)]);
-  return stageOf(t, { kids: ix.kids.get(t.key) || [], plan: features.current(t.key), deploy: mergetrain.deployState(), names,
-    merge: t.status === 'ready_for_human' ? mergetrain.mergeState(t) : null, decisions: (B.decisions || B.needs_you).filter((d) => tree.has(d.key)) });
+  return stageOf(t, { kids: ix.kids.get(t.key) || [], plan: features.current(t.key), deploy: mergetrain.deployState(), names, merges,
+    decisions: (B.decisions || B.needs_you).filter((d) => tree.has(d.key)) });
 }
 function requestsOf(snap, B, limit = 5) {
   const names = Object.fromEntries(AGENTS.map((a) => [a.id, a.name]));
@@ -149,7 +159,15 @@ async function ownerRoute(req, res) {
   const isApi = p.startsWith('/api/');
   if (isApi && !ownerAuthed(req)) return send(res, 401, { error: 'open /?token=<ownerToken> once on this device' });
   // CSRF: state-changing calls must be JSON from this origin (SameSite=Strict cookie + content-type check).
-  if (isApi && req.method !== 'GET' && !String(req.headers['content-type'] || '').includes('application/json')) return send(res, 415, { error: 'json only' });
+  // CSRF: a write must be real JSON (the media type itself, not a parameter: `text/plain; x=application/json` is a
+  // "simple" request a foreign page can send without a preflight) and, when a browser says where it came from, from this
+  // page's own origin. Another local port is same-site, so the SameSite cookie alone does not stop it.
+  if (isApi && req.method !== 'GET') {
+    const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (type !== 'application/json') return send(res, 415, { error: 'json only' });
+    const origin = req.headers.origin;
+    if (origin && origin !== 'null' ? (() => { try { return new URL(origin).host !== req.headers.host; } catch { return true; } })() : origin === 'null') return send(res, 403, { error: 'cross-origin write refused' });
+  }
 
   if (req.method === 'GET' && p === '/api/stream') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
