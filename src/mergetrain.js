@@ -132,6 +132,14 @@ export function releaseLock(id) {
     return true;
   });
 }
+/** The owner's "Clear the hold": only a failed or unconfirmed deploy, and only the one they were looking at. */
+export function ownerClearDeploy({ merge_sha } = {}) {
+  const l = lockGet();
+  if (!l) return null;
+  if (!OVERRIDABLE_HOLDS.includes(l.state)) throw Object.assign(new Error('A deploy is running now; wait for it to finish.'), { status: 409 });
+  if (merge_sha && l.merge_sha !== merge_sha) throw Object.assign(new Error('The deploy hold changed since you opened it; look at the current one first.'), { status: 409 });
+  return clearDeployLock('owner');
+}
 export function clearDeployLock(by = 'owner') {
   const l = lockGet();
   if (l) releaseLock(l.id);

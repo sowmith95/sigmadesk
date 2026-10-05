@@ -91,7 +91,7 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping 
     return <div className={row}>
       {repo && lock?.merge_sha && <Button variant="secondary" asChild><a href={`https://github.com/${repo}/commit/${lock.merge_sha}/checks`} target="_blank" rel="noopener noreferrer">See the deploy runs</a></Button>}
       <span className="flex-1" />
-      <AsyncButton data-primary size="lg" confirm="Clear the deploy hold? Do this after checking the deploy runs: deploying merges continue." run={async () => { await api('POST', '/api/merge-train/clear-deploy', {}); done(); await refresh(); }} ok="Deploy hold cleared">Clear the hold</AsyncButton>
+      <AsyncButton data-primary size="lg" confirm="Clear the deploy hold? Do this after checking the deploy runs: deploying merges continue." run={async () => { await api('POST', '/api/merge-train/clear-deploy', { merge_sha: lock?.merge_sha }); done(); await refresh(); }} ok="Deploy hold cleared">Clear the hold</AsyncButton>
     </div>;
   }
   if (['question', 'conflict', 'setup', 'refresh', 'stuck'].includes(dec?.kind || '')) return <>

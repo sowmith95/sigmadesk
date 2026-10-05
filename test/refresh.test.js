@@ -122,8 +122,10 @@ test('a commit held by the publish guard is ours: refresh accepts the desk\'s ow
   const other = fixture({ conflict: false });
   store.kvSet(`published:${other.t.key}`, other.head);
   git(owner, ['push', '-q', '--force', 'origin', `main:refs/heads/${other.branch}`]);
-  store.updateTicket(other.t.key, { progress_msg: 'publish guard: needs owner approval' });
+  store.updateTicket(other.t.key, { progress_msg: 'publish guard: needs owner approval', head_sha: other.head });
+  store.kvSet(`guard:${other.t.key}`, other.head);
   await assert.rejects(sched.ownerRefreshBase(other.t.key), /Remote branch changed/);
+  assert.equal(store.kvGet(`guard:${other.t.key}`), other.head, 'the parked commit can still be approved');
   const after = store.getTicket(other.t.key);
   assert.equal(after.progress_msg, 'publish guard: needs owner approval', 'the hold stays recognisable');
   assert.match(store.listComments(other.t.key).at(-1).body, /branch refresh did not run/);
@@ -187,4 +189,14 @@ test('the owner\'s priority is pinned: the manager cannot override it; unpinning
   // Created with a deliberate priority: pinned; the form's default P2 is not.
   assert.equal(sched.ownerCreate({ title: 'urgent thing', priority: 'P0' }).priority_pinned, 1);
   assert.equal(sched.ownerCreate({ title: 'normal thing', priority: 'P2' }).priority_pinned, 0);
+});
+
+test('while the desk refreshes a branch, the doctor leaves it alone and a guard approval waits', async () => {
+  const t = store.createTicket({ title: 'refreshing', status: 'needs_human', assignee: 'junior' });
+  store.updateTicket(t.key, { head_sha: 'f'.repeat(40), pr_url: 'https://github.com/test/repo/pull/12', active_run: -1, progress_msg: 'desk refreshing remote base' });
+  store.kvSet(`published:${t.key}`, 'e'.repeat(40)); store.kvSet(`guard:${t.key}`, 'f'.repeat(40));
+  sched.repairGuardHolds();
+  assert.equal(store.getTicket(t.key).progress_msg, 'desk refreshing remote base');
+  await assert.rejects(sched.ownerApprovePublish(t.key), /working on this branch/);
+  assert.equal(store.kvGet(`guard:${t.key}`), 'f'.repeat(40), 'the refused approval used nothing up');
 });

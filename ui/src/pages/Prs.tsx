@@ -134,7 +134,7 @@ function MergeBox({ p, d, field, onMerged }: { p: Pr; d: Record<string, string>;
         <p>{hold.note ? `${hold.note.replace(/^which workflows deploy is unknown$/, 'The desk could not tell which workflow deploys it')}. ` : ''}Merging this deploys again on top of it.{hold.overridable ? ' Check the runs, then clear the hold, or merge anyway with a reason (posted on the PR and the earlier ticket).' : ' Wait for it to finish.'}</p>
         <div className="flex flex-wrap gap-2">
           {hold.runs_url && <Button size="sm" variant="secondary" asChild><a href={hold.runs_url} target="_blank" rel="noopener noreferrer"><ExternalLink className="size-4" aria-hidden />See the deploy runs</a></Button>}
-          {hold.overridable && <AsyncButton size="sm" variant="ghost" confirm={`Clear the deploy hold for ${hold.key || 'the last merge'}? Do this after checking its deploy.`} run={async () => { await api('POST', '/api/merge-train/clear-deploy', {}); await load(); }} ok="Deploy hold cleared">Clear the hold</AsyncButton>}
+          {hold.overridable && <AsyncButton size="sm" variant="ghost" confirm={`Clear the deploy hold for ${hold.key || 'the last merge'}? Do this after checking its deploy.`} run={async () => { await api('POST', '/api/merge-train/clear-deploy', { merge_sha: hold.merge_sha }); await load(); }} ok="Deploy hold cleared">Clear the hold</AsyncButton>}
         </div>
         {hold.overridable && <><label htmlFor={`hold-${p.number}`}>Why merge anyway?</label>
           <Textarea id={`hold-${p.number}`} rows={2} placeholder="For example: the UI publish failed on a test; production was not changed and this PR only touches the API." {...field('hold')} />

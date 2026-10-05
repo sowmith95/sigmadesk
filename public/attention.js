@@ -31,12 +31,16 @@ const AUTO_MERGE = { queued: 'Approved; the desk merges it when CI and the deplo
 const HOLDS = [
   [/conflict needs your call/i, 'conflict', 'Decide the conflict', (n) => `Decide how to combine ${n} with the latest code`, 'The engineer could not combine both sides safely; the choice is yours.'],
   [/no eligible code reviewer/i, 'setup', 'Choose a reviewer', (n) => `Nobody can review ${n}`, 'Every reviewer seat built it or is switched off. Switch a reviewer on in Team, or reply to review it yourself.'],
-  [/is switched off/i, 'setup', 'Switch the seat on', (n) => `Switch a seat back on for ${n}`, null],
+  [/^\S.* is switched off$/, 'setup', 'Switch the seat on', (n) => `Switch a seat back on for ${n}`, null],
   [/workspace setup failed/i, 'setup', 'Retry', (n) => `Retry preparing ${n}`, 'The desk could not prepare a workspace (disk, git or network). Reply to retry once it is fixed.'],
   [/base changed — refresh/i, 'refresh', 'Refresh the branch', (n) => `Refresh ${n} onto the latest code`, 'The main branch moved under this change; refresh it and QA runs again.'],
   [/remote branch changed|refresh interrupted/i, 'refresh', 'Look at the branch', (n) => `Check the branch of ${n}`, 'Someone changed the PR branch outside the desk, or a refresh was interrupted. Look at it, then reconcile or refresh.'],
-  [/QA failed repeatedly|review loop limit hit|CI keeps failing/i, 'stuck', 'Give direction', (n) => `${n} is stuck after several attempts`, 'The team tried several times. Give direction, reassign, split or close it.'],
+  [/closed unmerged/i, 'stuck', 'Decide', (n) => `Decide what happens to ${n}`, 'The task it builds on was closed without merging. Continue without it (reply), rescope or close it.'],
+  [/disagree — your call/i, 'conflict', 'Settle the review', (n) => `Settle the review of ${n}`, null],
+  [/QA failed repeatedly|review loop limit|CI keeps failing/i, 'stuck', 'Give direction', (n) => `${n} is stuck after several attempts`, 'The team tried several times. Give direction, reassign, split or close it.'],
 ];
+// A branch refresh the owner started: the desk holds the ticket while it rebases (no step for anyone).
+const REFRESHING = (t) => t.active_run === -1 && /desk refreshing remote base/i.test(t.progress_msg || '');
 const holdOf = (t) => HOLDS.find(([re]) => re.test(t.progress_msg || ''));
 function guardWhy(g) {
   if (!g?.reasons?.length) return 'The change touches protected paths or is unusually large. Review the diff before it is pushed.';
@@ -49,7 +53,7 @@ const firstName = (agents, id) => (agents.find((a) => a.id === id)?.name || '').
  * each pending design proposal, each finished council. `id` is unique per decision; `key` stays the ticket key.
  */
 export function decisionsFor(t, ctx = {}) {
-  const { agents = [], proposals = [], councils = [], productReviews = [], researchReviews = [], featurePlans = [], mergeStates = {}, guardReasons = {} } = ctx;
+  const { agents = [], proposals = [], councils = [], productReviews = [], researchReviews = [], featurePlans = [], mergeStates = {}, guardReasons = {}, publishErrors = {} } = ctx;
   if (['done', 'wontdo'].includes(t.status)) return [];
   // A feature waiting on its plan: the owner reviews a ready plan, or retries a failed grooming round.
   const fp = featurePlans.find((p) => p.ticket_key === t.key);
@@ -73,6 +77,7 @@ export function decisionsFor(t, ctx = {}) {
   const review = productReviews.find(r => r.ticket_key === t.key && (r.stale || ['changes','failed','stale','deferred','rejected'].includes(r.status)));
   if (review) return [{ ...base, id: `${t.key}:product:${review.phase}:${review.revision}`, kind: 'product', action: 'Review feedback', verb: `Resolve review for ${name}`, reason: review.stale ? 'The plan changed; its review must be refreshed.' : `Product/design review: ${review.status}` }];
   if (t.status === 'ready_for_human' && productReviews.some(r => r.ticket_key === t.key && r.phase === 'feedback' && r.status === 'reviewing')) return [];
+  if (t.status === 'needs_human' && REFRESHING(t)) return [];
   if (t.status === 'needs_human') {
     const hold = !isGuard(t) && holdOf(t);
     if (isGuard(t)) out.push({ ...base, id: `${t.key}:guard`, kind: 'guard', action: 'Approve publication', verb: `Approve publishing ${name}`, reason: guardWhy(guardReasons[t.key]) });
@@ -82,8 +87,9 @@ export function decisionsFor(t, ctx = {}) {
     // Only a merge that is the owner's: a queued, scheduled or merging one the desk does by itself.
     const ms = mergeStates[t.key];
     if (t.pr_url && AUTO_MERGE[ms]) { /* the desk's step, shown by attend() */ }
+    else if (publishErrors[t.key]) { /* the desk is retrying the push of this commit, shown by attend() */ }
     else if (t.pr_url) out.push({ ...base, id: `${t.key}:merge`, kind: 'merge', action: 'Review merge', verb: ms === 'held' ? `Release or merge ${name} (you paused it)` : `Merge ${name}`,
-      reason: ms === 'held' ? 'You put its merge on hold. Release it to let the desk merge, or merge it yourself.' : 'QA passed and the reviewers approved. This one needs your merge (risk or policy).' });
+      reason: ms === 'held' ? 'You put its merge on hold. Release it to let the desk merge, or merge it yourself.' : ms === 'owner' ? 'QA passed and the reviewers approved. This one needs your merge (risk or policy).' : 'QA passed. Review the PR and merge it when you are ready.' });
     else out.push({ ...base, id: `${t.key}:publish`, kind: 'publish', action: 'Approve publication', verb: `Publish ${name}`, reason: 'QA passed. Approving pushes the branch and opens a draft PR.' });
   }
   const props = proposals.filter((p) => p.ticket_key === t.key).sort((a, b) => a.id - b.id);
@@ -123,6 +129,7 @@ export function attend(t, ctx = {}) {
     const live = kids.some((k) => agents.some((a) => a.current_ticket === k.key && a.status === 'working'));
     return { ...base, bucket: 'epic', live, verb: name, reason: `${done} of ${kids.length} slices shipped` };
   }
+  if (t.status === 'needs_human' && REFRESHING(t)) return { ...base, bucket: 'working', stage: 'Refreshing', verb: name, reason: 'The desk is moving this branch onto the latest code' };
   if (worker) return { ...base, bucket: 'working', verb: name, reason: `${firstName(agents, worker.id)} · ${stage || 'working'}` };
   // The desk's own steps, said plainly: an automatic merge, or a publish that keeps failing.
   const ms = (ctx.mergeStates || {})[t.key];
@@ -171,7 +178,7 @@ export function board(state, extra = {}) {
   const lock = state.meta?.deploy_lock;
   if (lock && ['failed', 'escalated'].includes(lock.state)) {
     const lt = tickets.find((x) => x.key === lock.key);
-    out.needs_you.push({ key: lock.key || 'deploy', id: `deploy:${lock.merge_sha || lock.key}:${lock.state}`, kind: 'deploy', bucket: 'needs_you', ticket: lt, name: lt ? nameOf(lt) : lock.key,
+    out.needs_you.push({ key: lock.key || 'deploy', id: `deploy:${lock.merge_sha || lock.key || lock.id || 'last'}:${lock.state}`, kind: 'deploy', bucket: 'needs_you', ticket: lt, name: lt ? nameOf(lt) : lock.key || 'the last merge',
       action: 'Check the deploy', verb: `The deploy of ${lt ? nameOf(lt) : lock.key || 'the last merge'} ${lock.state === 'failed' ? 'failed' : 'was never confirmed'}`,
       reason: `${lock.note ? `${lock.note}. ` : ''}Every merge that deploys waits until you check it, then clear the hold (or merge with a reason).`, deploy: lock });
   }

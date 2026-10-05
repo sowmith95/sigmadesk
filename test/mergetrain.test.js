@@ -884,3 +884,13 @@ test('the merge check refuses an older PR head when the desk holds a newer revie
     assert.equal((await prs.mergeCheck(79)).unpublished, null);
   } finally { resetTrain(); }
 });
+
+test('the owner clears only a failed or unconfirmed deploy, and only the one they looked at', () => {
+  resetTrain();
+  store.kvSet('train:deploy', JSON.stringify({ id: 'L1', state: 'running', key: 'SD-1', merge_sha: '1'.repeat(40), at: new Date().toISOString() }));
+  assert.throws(() => train.ownerClearDeploy({ merge_sha: '1'.repeat(40) }), /running now/);
+  store.kvSet('train:deploy', JSON.stringify({ id: 'L2', state: 'failed', key: 'SD-2', merge_sha: '2'.repeat(40), at: new Date().toISOString() }));
+  assert.throws(() => train.ownerClearDeploy({ merge_sha: '1'.repeat(40) }), /changed since you opened it/);
+  assert.equal(train.ownerClearDeploy({ merge_sha: '2'.repeat(40) }).id, 'L2');
+  assert.equal(lockNow(), null);
+});

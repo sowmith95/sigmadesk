@@ -9,7 +9,7 @@ const TONE: Record<string, string> = { shipped: 'text-shipped', blocked: 'text-b
 export function ProgramUpdate({ compact = false }: { compact?: boolean }) {
   const p = programUpdate(S, currentBoard());
   // The Inbox already lists what needs you; its line says what moved and what is stuck.
-  const lines = compact ? p.lines.filter((l) => l.tone !== 'needs' && !(l.tone === 'shipped' && !p.shipped)) : p.lines;
+  const lines = compact ? p.lines.filter((l) => (l.id === 'shipped' && p.shipped) || l.id === 'stuck') : p.lines;
   if (!lines.length) return null;
   const line = (l: (typeof lines)[number], i: number) => l.keys.length === 1
     ? <button key={i} type="button" className={cn('text-left hover:underline', TONE[l.tone])} onClick={() => openTicket(l.keys[0])}>{l.text}</button>

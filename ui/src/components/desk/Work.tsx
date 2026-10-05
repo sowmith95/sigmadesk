@@ -162,7 +162,7 @@ export function DecisionButton({ it, label, className, size }: { it: BoardItem; 
     case 'merge': return <Button size={size} className={className} onClick={() => { const n = prNumber(t.pr_url); if (n) openSheet({ type: 'pr', number: n }); else openTicket(t.key, { decision: it.id }); }}>{text}</Button>;
     case 'page': return <Button size={size} className={className} onClick={() => openSheet({ type: 'desk' })}>{text}</Button>;
     case 'plan': return <Button size={size} className={className} onClick={() => openFeature(t.key)}>{text}</Button>;
-    case 'deploy': return <Button size={size} className={className} onClick={() => (t ? openTicket(t.key, { decision: it.id }) : setView('prs'))}>{text}</Button>;
+    case 'deploy': return <Button size={size} className={className} onClick={() => (it.ticket ? openTicket(it.ticket.key, { decision: it.id }) : setView('prs'))}>{text}</Button>;
     case 'conflict': case 'setup': case 'refresh': case 'stuck': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id, focus: true })}>{text}</Button>;
     case 'owner_task': case 'epic_review': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id })}>{text}</Button>;
     case 'guard': case 'publish':

@@ -63,7 +63,8 @@ test('a publish that fails is the desk\'s until it keeps failing', () => {
   const t = T('P-1', 'ready_for_human', { pr_url: 'https://github.com/o/r/pull/8', head_sha: 'e'.repeat(40) });
   const ms = { 'P-1': 'queued' };
   const once = board({ tickets: [t], meta: { merge_states: {}, publish_errors: { 'P-1': { head: t.head_sha, message: 'network down', count: 1 } } } });
-  assert.equal(once.needs_you[0]?.kind, 'merge', 'no merge state: the merge is still the owner\'s');
+  assert.equal(once.counts.needs_you, 0, 'the PR holds an older commit while the desk retries: nothing to merge yet');
+  assert.match(once.queued[0].reason, /network down/);
   const q = board({ tickets: [{ ...t, status: 'review' }], meta: { publish_errors: { 'P-1': { head: t.head_sha, message: 'network down', count: 1 } } } });
   assert.equal(q.queued[0].key, 'P-1'); assert.match(q.queued[0].reason, /network down.*retries/);
   const stuck = board({ tickets: [{ ...t, status: 'review' }], meta: { merge_states: ms, publish_errors: { 'P-1': { head: t.head_sha, message: 'auth failed', count: 3 } } } });
@@ -96,4 +97,27 @@ test('the program update: shipped, working, stuck with reasons, and the one thin
   assert.deepEqual(p.lines.find((l) => l.tone === 'needs').keys, ['S-5']);
   const quiet = programUpdate({ tickets: [], meta: {} }, board({ tickets: [], meta: {} }), now);
   assert.match(quiet.lines.map((l) => l.text).join(' '), /Nothing shipped .* Nothing needs you right now/);
+});
+
+test('review findings: every desk hold message has its step, free text is not misread, a refresh is the desk\'s', () => {
+  const tickets = [
+    T('R-1', 'needs_human', { progress_msg: 'CI failed (review loop limit)' }),
+    T('R-2', 'needs_human', { progress_msg: 'predecessor SD-3 closed unmerged' }),
+    T('R-3', 'needs_human', { progress_msg: 'Reviewers and Rowan disagree — your call' }),
+    T('R-4', 'needs_human', { progress_msg: 'Sage Kim is switched off' }),
+    T('R-5', 'needs_human', { progress_msg: 'The nightly cron is switched off, should I enable it?', assignee: 'junior' }),
+    T('R-6', 'needs_human', { progress_msg: 'desk refreshing remote base', active_run: -1 }),
+  ];
+  const b = board({ agents: [{ id: 'junior', name: 'Sage Kim' }], tickets, meta: {} });
+  assert.deepEqual(['R-1', 'R-2', 'R-3', 'R-4', 'R-5'].map((k) => kindOf(b, k)), ['stuck', 'stuck', 'conflict', 'setup', 'question']);
+  assert.equal(kindOf(b, 'R-6'), undefined, 'nothing to do while the desk refreshes');
+  assert.equal(b.working.find((x) => x.key === 'R-6').stage, 'Refreshing');
+});
+
+test('a merge waiting on the owner only says "risk or policy" when the train said so; a deploy without a ticket still reads', () => {
+  const t = T('W-1', 'ready_for_human', { pr_url: 'https://github.com/o/r/pull/11' });
+  assert.doesNotMatch(board({ tickets: [t], meta: {} }).needs_you[0].reason, /risk or policy/);
+  assert.match(board({ tickets: [t], meta: { merge_states: { 'W-1': 'owner' } } }).needs_you[0].reason, /risk or policy/);
+  const d = board({ tickets: [], meta: { deploy_lock: { state: 'escalated', key: null, merge_sha: null, id: 'L9' } } }).needs_you[0];
+  assert.equal(d.name, 'the last merge'); assert.equal(d.id, 'deploy:L9:escalated'); assert.match(d.verb, /the last merge was never confirmed/);
 });

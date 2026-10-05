@@ -893,11 +893,12 @@ export async function tick() {
 /**
  * A publish-guard hold whose notice a failed refresh overwrote (before refreshes restored it): the reviewed commit is
  * still local, the PR still has an older one, and the latest guard notice is newer than the last publish. Restore the
- * hold so the owner sees "approve publication" again. Runs once per start; harmless when nothing matches.
+ * hold so the owner sees "approve publication" again. Runs at start and every tick; never touches a ticket the desk is
+ * working on (a branch refresh holds active_run and the ticket reservation).
  */
 export function repairGuardHolds() {
   for (const t of store.ticketsByStatus('needs_human')) {
-    if (/publish guard/i.test(t.progress_msg || '') || !t.head_sha || !t.pr_url) continue;
+    if (/publish guard/i.test(t.progress_msg || '') || !t.head_sha || !t.pr_url || t.active_run || store.reservationOf(t.key)) continue;
     // The desk's own record (set when the guard parks a commit, cleared on approval or refresh) is the only proof.
     if (store.kvGet(`guard:${t.key}`) !== t.head_sha || store.kvGet(`published:${t.key}`) === t.head_sha) continue;
     store.updateTicket(t.key, { progress_msg: 'publish guard: needs owner approval' });
@@ -1393,6 +1394,7 @@ async function publishBranch(key) {
 export async function ownerApprovePublish(key) {
   const t = store.getTicket(key);
   need(t && t.head_sha && store.kvGet(`guard:${key}`) === t.head_sha, 'nothing awaiting publish approval for this commit');
+  if (t.active_run || store.reservationOf(key)) throw Object.assign(new Error('The desk is working on this branch (a refresh or merge); approve once it settles.'), { status: 409 });
   store.kvSet(`guard:${key}`, ''); // one approval per parked commit
   store.kvSet(`publish-approved:${key}`, t.head_sha); // a transient push failure must not re-guard the approved commit
   store.addComment(key, 'owner', `✅ Publish approved for \`${t.head_sha.slice(0, 10)}\` despite the guard.`);
@@ -1498,7 +1500,7 @@ export function ownerCreate(body) {
   }
   const source = body.source === 'hub' ? 'hub' : 'human';
   // A priority the owner chose (anything but the form's default P2) is theirs: grooming and reviews leave it alone.
-  const chosen = PRIORITY.test(body.priority) && body.priority !== 'P2';
+  const chosen = PRIORITY.test(body.priority) && body.priority !== 'P2' && source === 'human';
   const remember = (t) => {
     if (rid) store.kvSet(`request:${rid}`, JSON.stringify({ key: t.key, hash, at: store.now() }));
     if (chosen) store.updateTicket(t.key, { priority_pinned: 1 });
@@ -1521,6 +1523,9 @@ export async function ownerRefreshBase(key, { expected_updated_at } = {}) {
   const res = store.reserve(key, 'refresh', 'owner branch refresh');
   if (!res.ok) throw Object.assign(new Error(`This PR is busy (${res.holder.note || res.holder.kind}); wait for it to finish.`), { status: 409 });
   store.updateTicket(key, { active_run: -1, status: 'needs_human', progress_msg: 'desk refreshing remote base' });
+  // The parked commit is about to be replaced: no approval may push it meanwhile (restored if the refresh fails).
+  const parked = store.kvGet(`guard:${key}`);
+  store.kvSet(`guard:${key}`, '');
   try {
     if (store.getSettings().github_sync === 'true') await prs.assertRefreshable(prNumberOf(t.pr_url), t);
     const r = await refresh.prepare(t, { reservation: res.token });
@@ -1544,6 +1549,7 @@ export async function ownerRefreshBase(key, { expected_updated_at } = {}) {
     if (refresh.current(key)?.reservation !== res.token) store.releaseReservation(key, res.token); // nothing to keep
     // Put the ticket back exactly as it was (a publish-guard hold must stay recognisable); the reason goes in the thread.
     store.updateTicket(key, { active_run: null, status: t.status, progress_msg: t.progress_msg });
+    if (parked) store.kvSet(`guard:${key}`, parked);
     store.addComment(key, 'system', `🔄 The branch refresh did not run: ${store.redact(err.message).slice(0, 300)}. Nothing changed on the branch.`);
     throw err;
   }
@@ -1726,6 +1732,7 @@ export function ownerPatch(key, patch, { by = 'owner' } = {}) {
   if (p.status && ['todo', 'in_progress', 'qa', 'review'].includes(p.status) && researchReview.blocks(t)) need(false, 'this research proposal is waiting on its second review; waive the review or wait for it before moving the ticket');
   if (p.status && t.active_run > 0 && p.status !== t.status) runner.killRun(t.active_run, 'owner moved the ticket');
   if (p.status === 'qa' && !t.head_sha) need(false, 'only submitted work can go to QA');
+  if (!Object.keys(p).length) return t; // nothing this caller may change
   const out = store.updateTicket(key, { ...p, stalls: 0 });
   if (p.description !== undefined && t.issue_number) github.updateIssueBody(key);
   const set = Object.entries(p).filter(([k]) => k !== 'priority_pinned').map(([k, v]) => `${k}=${v}`).join(', ');
