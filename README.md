@@ -313,12 +313,75 @@ Agents run on your machine, so SigmaDesk treats them as untrusted:
 | **Publisher, not agents** | Only the desk pushes, and only the exact commit QA approved. It fetches that commit into a desk-owned bare repo and pushes from there to your remote, so no git command ever runs with an agent clone's config or hooks. PRs are always drafts. Nothing is ever merged automatically. |
 | **Publish guard** | Computed in the publisher against *your* checkout's base commit (an agent cannot move it). Branches touching CI/workflows, Dockerfiles/compose, git hooks, lockfiles or shell scripts — or bigger than the size cap for their complexity — are parked for your explicit approval. An agent-edited workflow would otherwise run on your CI runners with repo secrets. |
 | **Risk limits** | Per-run budget caps (Claude), a daily limit that reserves every working seat's cap (including jobs still preparing), runs without a final cost report charged at their cap, max concurrency, a quieter "busy window" (e.g. market hours), an idle watchdog, a halt switch and a circuit breaker that also cancels jobs still preparing. |
+| **Explicit agent environment** | Agent processes get an allowlisted environment (PATH, locale, terminal, temp dir, HOME/USER, `SHELL=/bin/bash`, proxy/CA settings, the run's desk token/socket/mailbox, the engine's own auth variables) — never your shell's `DATABASE_URL`, `*_DSN`, broker or cloud keys. |
 | **Untrusted text** | Ticket bodies, issue bodies, web pages and log lines are fenced and labelled as untrusted data in prompts. Secrets are redacted from the activity log. |
 
 It is still your machine: read the playbook rules, keep `sandbox.enabled: true`, and review every PR. The design has
 been through two adversarial reviews (findings and fixes are in the commit history); treat it as defence in depth, not
 a guarantee — Codex permission profiles are a beta feature, and anything you add to `readOnlyPaths` is readable by
 every seat.
+
+## Production read access (`desk ops`)
+
+Off by default. When the owner switches it on, a seat that holds a **grant** can ask the desk to run a small set of
+**named, read-only probes** against production. The seat never sees a credential, never gets a shell on the host and
+never writes SQL or URLs: the desk validates every parameter against a fixed schema, runs a fixed template itself, and
+hands back a redacted, byte-capped result labelled as untrusted data.
+
+| Probe | What the desk runs |
+|---|---|
+| `db_health --db NAME` | `pg_stat_activity` grouped by state/application, the 10 longest-running sessions (no query text), `pg_locks` summary, top dead-tuple tables, `pg_stat_replication`, `pg_stat_database` |
+| `ingest_freshness [--db NAME] [--minutes N]` | `max(<partition column>)` per configured source with a half-open window `col >= now() - N min AND col < now() + 5 min` (chunk exclusion) |
+| `timescale_jobs [--db NAME]` | `timescaledb_information.jobs` ⋈ `job_stats`, `continuous_aggregates`, last 24 h of `job_errors` |
+| `container_status` | `docker ps -a`, `docker inspect` with a fixed format (health, restarts, start, OOM — never env), `docker stats --no-stream`, allowlisted containers only |
+| `container_logs --container C [--since 30m] [--grep TEXT] [--tail N]` | `docker logs --timestamps --since … --tail …` on one allowlisted container; literal filter; byte-capped streaming |
+| `app_health [--path health\|cache_quality]` | fixed GETs on the configured base URL; redirects are not followed |
+
+Every DB probe runs as `BEGIN READ ONLY; SET LOCAL statement_timeout / lock_timeout / idle_in_transaction_session_timeout /
+work_mem / temp_file_limit / max_parallel_workers_per_gather = 0; …; ROLLBACK;` through the host `psql` with parameters
+passed as psql variables (never interpolated). One DB probe runs at a time (bounded queue), results are cached for 60 s,
+budgets apply per run and per hour, and the busy window (market hours) tightens timeouts, budgets, log windows and
+limits `ingest_freshness` to the last 2 h. Probes are cancelled when their run ends, when access is revoked, and when you
+switch the setting off. Every call lands in the `ops_audit` table and as a line on the ticket ("Devon checked ingest
+freshness — 0.4s").
+
+**Grants.** Who may probe is decided per grant: a seat, the probes it covers, and an end — a time, a ticket (ends when the
+ticket closes) or a run. A seat asks with `desk ops request <probe…> --why "…" [--for 1h | --ticket]`; the Engineering
+Manager or the SRE (whichever is not asking) approves within your policy (allowed seats, probes, longest duration, active
+grants — Settings → Production read access → Production access), never for themselves. Anything beyond the policy is
+an Inbox card for you ("Grant Devon production read access for 2h?"). You can grant anything (including standing
+grants), revoke any grant, or **Revoke all**. Validity is checked at every probe call. A manager task that only needs a
+production *read* (`desk create-task --verify`, or an `--owner` step that is plainly a check) goes to the SRE, who
+answers it with probes under a ticket-scoped grant; it comes to you only if no probe can answer it.
+
+**Setup (owner, once):**
+1. Create the read-only role on each server: `psql -U postgres -h 127.0.0.1 -p 5433 -d trading_ts -f scripts/create-readonly-role.sql`
+   (and again for the app database), then `\password sigmadesk_ro`. The script grants only catalog statistics, the
+   Timescale job views and the reviewed time columns, and prints what PUBLIC can still execute for you to review.
+2. Put the password in a pgpass file only the desk reads (`chmod 600 ~/.pgpass-sigmadesk`); the sandbox denies it to seats.
+3. Configure the desk (`sigmadesk.config.json`):
+   ```json
+   "ops": {
+     "enabled": true,
+     "psql": "/opt/homebrew/opt/libpq/bin/psql",
+     "pgpassFile": "~/.pgpass-sigmadesk",
+     "databases": {
+       "timescale": { "host": "127.0.0.1", "port": 5433, "dbname": "trading_ts", "user": "sigmadesk_ro" },
+       "app": { "host": "127.0.0.1", "port": 5434, "dbname": "trading_app", "user": "sigmadesk_ro" }
+     },
+     "freshness": [
+       { "label": "bar_ticks 1s", "db": "timescale", "table": "bar_ticks", "column": "timestamp", "filter": { "column": "timeframe", "value": "1s" } },
+       { "label": "whale_trades", "db": "timescale", "table": "whale_trades", "column": "timestamp" },
+       { "label": "bars_1m", "db": "timescale", "table": "bars_1m", "column": "bucket" }
+     ],
+     "containers": ["alpaca-trader", "precompute-worker", "stock-ingestor", "options-whale-ingestor", "timescaledb", "app-postgres"],
+     "appHealth": { "baseUrl": "http://127.0.0.1:8001" }
+   }
+   ```
+   `ops.psql` must be a host psql binary (a path, or `[path, fixed args]`). Wrappers that reach into a container or a
+   shell (`docker exec … psql`, `ssh`, `bash -c`) are refused: credentials stay in your pgpass/service file, and the
+   desk passes psql an environment without any inherited `PG*` variables. Passwords in the config are refused.
+4. Restart the desk, turn on **Settings → Production read access**, and grant (or let the EM approve) access as needed.
 
 ## Quick start
 
