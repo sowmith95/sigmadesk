@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { MoreHorizontal } from 'lucide-react';
 import { nameOf } from '../../../public/names.js';
 import { humanReason } from '../../../public/attention.js';
@@ -56,13 +56,18 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef }:
     return guard(async () => { const r = await api('POST', `/api/tickets/${t.key}/reply`, { body, mode: m, expected_updated_at: m === 'answer' ? t.updated_at : undefined }); done(); await loadDetail(); return r; });
   };
   const menuRun = (fn: () => Promise<unknown>, ok: string) => async () => { if (busy) return; setBusy(true); try { const r = await fn(); if (r !== false) toast(ok); } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); } };
-  const box = (placeholder: string, label: string) => <Textarea id="reply" ref={replyRef} rows={2} aria-label={label} placeholder={placeholder} maxLength={8000} value={text} onChange={(e) => edit(e.target.value)} />;
+  // The reply grows with what you type (up to 40% of the screen), so the whole answer stays readable while writing.
+  const grow = (el: HTMLTextAreaElement | null) => { if (!el) return; el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight + 2, window.innerHeight * 0.4)}px`; };
+  useLayoutEffect(() => { grow(replyRef.current); }, [text, mode, compose]); // eslint-disable-line react-hooks/exhaustive-deps
+  const box = (placeholder: string, label: string) => <Textarea id="reply" ref={replyRef} rows={2} aria-label={label} placeholder={placeholder} maxLength={8000} value={text}
+    className="max-h-[40dvh] min-h-[3.25rem] resize-none overflow-y-auto text-base leading-relaxed" onChange={(e) => { edit(e.target.value); grow(e.target); }} />;
   const More = ({ items }: { items: { label: string; run: () => Promise<unknown>; ok: string; danger?: boolean; disabled?: boolean }[] }) => (
     <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" aria-label="More actions"><MoreHorizontal className="size-4" />More</Button></DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="min-w-60">{items.map((i) => <DropdownMenuItem key={i.label} disabled={i.disabled || busy} variant={i.danger ? 'destructive' : 'default'} onSelect={menuRun(i.run, i.ok)} className="min-h-10">{i.label}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
   );
-  const note = running ? <p className="text-sm text-muted-foreground">The worker is finishing; decisions unlock when its run settles.</p> : null;
-  const row = 'flex flex-wrap items-center gap-2 max-md:[&>[data-primary]]:order-first max-md:[&>[data-primary]]:basis-full';
+  const note = running ? <p className="text-[13px] text-muted-foreground">The worker is finishing; decisions unlock when its run settles.</p> : null;
+  // On a phone the primary action leads and shares its row with More: the reply area stays short.
+  const row = 'flex flex-wrap items-center gap-2 max-md:[&>[data-primary]]:order-first max-md:[&>[data-primary]]:flex-1 max-md:[&>span.flex-1]:hidden';
   const composeUi = <>
     {box('Message the manager about this ticket…', 'Message')}
     <div className={row}>

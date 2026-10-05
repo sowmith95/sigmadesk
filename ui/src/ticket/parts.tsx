@@ -57,9 +57,14 @@ export function Conversation({ d, live, tkey, state, status }: { d: Detail; live
   const seat = (id: string) => !!amap[id];
   const items = all.filter((i) => !st.agent || (st.agent === 'owner' ? i.who === 'owner' : st.agent === 'seats' ? seat(i.who) : st.agent === 'desk' ? !seat(i.who) && i.who !== 'owner' : i.who === st.agent));
   const whoName = (id: string) => amap[id]?.name || ({ owner: 'You', system: 'Desk', github: 'GitHub' } as Record<string, string>)[id] || id;
-  const unseen = st.follow ? 0 : Math.max(0, items.length - (st.seen ?? items.length));
-  if (st.follow || st.seen === undefined) st.seen = items.length;
-  useLayoutEffect(() => { if (log.current) log.current.scrollTop = st.follow ? log.current.scrollHeight : st.top; });
+  // Newest first by default: the latest message sits right under the tabs and the thread scrolls with the panel (no
+  // box inside a box, nothing hidden behind the reply area). "Oldest first" keeps the chat-style log that follows the end.
+  const [order, setOrder] = useState<'newest' | 'oldest'>(() => (localStorage.getItem('sd2.convOrder') === 'oldest' ? 'oldest' : 'newest'));
+  const newest = order === 'newest';
+  const shown = newest ? [...items].reverse() : items;
+  const unseen = newest || st.follow ? 0 : Math.max(0, items.length - (st.seen ?? items.length));
+  if (newest || st.follow || st.seen === undefined) st.seen = items.length;
+  useLayoutEffect(() => { if (log.current && !newest) log.current.scrollTop = st.follow ? log.current.scrollHeight : st.top; });
   const jump = () => { st.follow = true; st.seen = items.length; force((n) => n + 1); };
   let lastDay = '';
   let prev: Item | null = null;
@@ -73,15 +78,19 @@ export function Conversation({ d, live, tkey, state, status }: { d: Detail; live
         </div>
         <span className="flex-1" />
         <span className="text-sm text-muted-foreground" role="status">{!S.connected ? 'Reconnecting…' : live ? 'Live' : ''}</span>
+        <button type="button" data-conv-order={order} className="h-8 rounded-full px-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
+          onClick={() => { const next = newest ? 'oldest' : 'newest'; localStorage.setItem('sd2.convOrder', next); st.follow = true; st.top = 0; setOrder(next); }}>
+          {newest ? 'Newest first' : 'Oldest first'}<span className="sr-only">: switch order</span></button>
       </div>
       <div className="relative">
-        <div ref={log} role="log" aria-label="Task conversation" tabIndex={0} className="grid max-h-[calc(100dvh-19rem)] min-h-56 content-start gap-2.5 overflow-y-auto overscroll-contain pr-1 [overflow-anchor:none] md:max-h-[64vh]"
-          onScroll={(e) => { st.top = e.currentTarget.scrollTop; const f = nearLatest(e.currentTarget); if (f !== st.follow) { st.follow = f; if (f) st.seen = items.length; force((n) => n + 1); } }}>
-          {items.length ? items.map((it) => {
+        <div ref={log} role="log" aria-label="Task conversation" tabIndex={0}
+          className={cn('grid content-start gap-2.5 pr-1', !newest && 'max-h-[calc(100dvh-19rem)] min-h-56 overflow-y-auto overscroll-contain [overflow-anchor:none] md:max-h-[64vh]')}
+          onScroll={newest ? undefined : (e) => { st.top = e.currentTarget.scrollTop; const f = nearLatest(e.currentTarget); if (f !== st.follow) { st.follow = f; if (f) st.seen = items.length; force((n) => n + 1); } }}>
+          {shown.length ? shown.map((it) => {
             const day = dayLabel(it.ts);
             const sep = day && day !== lastDay ? <div key={`day-${it.id}`} className="my-1 flex items-center gap-3 text-xs text-muted-foreground"><span className="h-px flex-1 bg-border" />{day}<span className="h-px flex-1 bg-border" /></div> : null;
             lastDay = day || lastDay;
-            const same = !sep && prev && prev.who === it.who && prev.kind === 'comment' && it.kind === 'comment' && Date.parse(it.ts) - Date.parse(prev.ts) < 10 * 60_000;
+            const same = !sep && prev && prev.who === it.who && prev.kind === 'comment' && it.kind === 'comment' && Math.abs(Date.parse(it.ts) - Date.parse(prev.ts)) < 10 * 60_000; // either order
             prev = it;
             const who = whoName(it.who);
             const time = <time className="text-xs text-muted-foreground" dateTime={it.ts} title={new Date(it.ts).toLocaleString()}>{hhmm(it.ts)}</time>;
@@ -117,7 +126,7 @@ export function Conversation({ d, live, tkey, state, status }: { d: Detail; live
             return <Fragment key={it.id}>{sep}{body}</Fragment>;
           }) : <p className="text-muted-foreground">{st.agent ? 'Nothing from them yet.' : 'No recorded updates yet. Messages appear here as the team works.'}</p>}
         </div>
-        {!st.follow && <Button size="sm" className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-lg" onClick={jump}>{unseen ? `${unseen} new message${unseen === 1 ? '' : 's'}` : 'Jump to latest'}</Button>}
+        {!newest && !st.follow && <Button size="sm" className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-lg" onClick={jump}>{unseen ? `${unseen} new message${unseen === 1 ? '' : 's'}` : 'Jump to latest'}</Button>}
       </div>
     </section>
   );

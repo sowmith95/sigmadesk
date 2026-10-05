@@ -258,3 +258,27 @@ test('a request opens on its tracker: where it stands, step by step, on a phone'
   assert.deepEqual(errors, []);
   await page.close();
 });
+
+test('the conversation reads newest first (toggle kept), the thread scrolls with the page, and the reply grows as you type', { skip, timeout: 60_000 }, async () => {
+  const t = (await api('POST', '/api/tickets', { title: 'Conversation order fixture', description: 'x', type: 'bug' })).body;
+  for (const [i, body] of ['first note', 'second note', 'third note'].entries()) { await api('POST', `/api/tickets/${t.key}/reply`, { body, mode: 'comment' }); await new Promise((r) => setTimeout(r, 15 + i)); }
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox/${t.key}`, { width: 390, height: 844 });
+  await page.waitForSelector('[data-panel]');
+  await page.getByRole('tab', { name: 'Conversation' }).click();
+  await page.waitForSelector('text=third note');
+  const texts = async () => page.$$eval('[role=log] [data-message]', (els) => els.map((e) => e.textContent).filter((x) => /note/.test(x)));
+  assert.match((await texts())[0], /third note/, 'the latest message is first');
+  assert.equal(await page.$eval('[role=log]', (el) => getComputedStyle(el).overflowY), 'visible', 'no box inside a box');
+  await page.click('[data-conv-order]');
+  assert.match((await texts())[0], /first note/, 'oldest first on request');
+  assert.equal(await page.evaluate(() => localStorage.getItem('sd2.convOrder')), 'oldest');
+  await page.click('[data-conv-order]');
+  await page.getByRole('button', { name: 'Comment or ask the manager' }).click();
+  const reply = page.locator('#reply');
+  const before = await reply.evaluate((el) => el.offsetHeight);
+  await reply.fill('line one\nline two\nline three\nline four\nline five');
+  assert.ok((await reply.evaluate((el) => el.offsetHeight)) > before, 'the box grows with the text');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  assert.deepEqual(errors, []);
+  await page.close();
+});
