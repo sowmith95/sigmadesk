@@ -7,6 +7,7 @@ import { ago, money } from '@/lib/format.js';
 import { AsyncButton } from '@/components/desk/AsyncButton';
 import { Tag, SeatAvatar, StatTile, Section } from '@/components/desk/Bits';
 import { Disclose } from '@/components/desk/Work';
+import { ProgramUpdate } from '@/components/desk/Program';
 import { cn } from '@/lib/utils';
 
 type Row = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -58,6 +59,7 @@ export default function DeskPage() {
         </div>
         <p className="text-sm text-muted-foreground">Halt lets running work finish. The breaker stops every running seat immediately.</p>
       </section>
+      <ProgramUpdate />
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatTile label="Spent today" value={money(spend)} sub={`of ${money(limit)} (${limit ? Math.round((spend / limit) * 100) : 0}%)`} />
         <StatTile label="Running" value={`${S.meta.running || 0} of ${S.meta.capacity ?? '?'}`} sub={S.meta.busy_window ? 'Market-hours limit applies' : 'seats'} />

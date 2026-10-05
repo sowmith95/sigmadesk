@@ -19,7 +19,8 @@ export const laneOf = (d) => LANE_OF[d.kind] || 'unblock';
 const PRIORITY = { P0: 0, P1: 1, P2: 2, P3: 3 };
 // A rough sense of the effort, so a spare five minutes finds the right item.
 export const TIME_HINT = { question: 'quick', guard: 'quick', publish: 'quick', epic_review: 'quick', page: 'now', merge: '5 min', research: '5 min',
-  plan: '10 min', design: '10 min', council: '10 min', product: '10 min', owner_task: 'needs time' };
+  plan: '10 min', design: '10 min', council: '10 min', product: '10 min', owner_task: 'needs time',
+  deploy: '5 min', conflict: '10 min', setup: 'quick', refresh: 'quick', stuck: '10 min' };
 const OPEN_INCIDENT = new Set(['watching', 'investigating', 'paged', 'ticketed']);
 export const SNOOZE_MAX_DAYS = 30;
 
@@ -29,7 +30,7 @@ export const SNOOZE_MAX_DAYS = 30;
  * incident, from the server (independent of whether the watch is on or how many incidents are listed).
  */
 export function isProtected(d, incidents = [], protectedKeys = []) {
-  if (d.kind === 'guard' || d.kind === 'page') return true;
+  if (d.kind === 'guard' || d.kind === 'page' || d.kind === 'deploy') return true;
   const keys = [d.ticket?.key, ...(d.waiting || []).map((w) => w.key)].filter(Boolean);
   if (d.ticket && (d.ticket.source === 'watch' || d.ticket.reporter === 'sre')) return true;
   return keys.some((k) => protectedKeys.includes(k) || incidents.some((i) => i.ticket_key === k && OPEN_INCIDENT.has(i.status)));
@@ -67,13 +68,13 @@ export function arrange(rows, ctx = {}) {
   });
   const lane = Object.fromEntries(LANES.map((l, i) => [l.id, i]));
   // Ties: a person waiting (question, guard) before a document to read (plan, design, council), then id.
-  const KIND = { guard: 0, page: 0, question: 1, owner_task: 1, epic_review: 1, merge: 2, publish: 3, plan: 4, product: 4, design: 5, council: 6, research: 7 };
+  const KIND = { guard: 0, page: 0, deploy: 0, conflict: 1, setup: 1, refresh: 1, stuck: 1, question: 1, owner_task: 1, epic_review: 1, merge: 2, publish: 3, plan: 4, product: 4, design: 5, council: 6, research: 7 };
   const within = (a, b) => (PRIORITY[a.priority] ?? 2) - (PRIORITY[b.priority] ?? 2) || b.waits - a.waits
     || String(a.since || '9').localeCompare(String(b.since || '9')) || (KIND[a.kind] ?? 8) - (KIND[b.kind] ?? 8) || String(a.id).localeCompare(String(b.id));
   const byLane = (a, b) => lane[a.lane] - lane[b.lane] || within(a, b);
   const active = rich.filter((d) => !d.snoozed_until).sort(byLane);
   const snoozed = rich.filter((d) => d.snoozed_until).sort((a, b) => String(a.snoozed_until).localeCompare(String(b.snoozed_until)));
-  const urgent = (d) => d.kind === 'guard' || d.kind === 'page' || d.priority === 'P0';
+  const urgent = (d) => d.kind === 'guard' || d.kind === 'page' || d.kind === 'deploy' || d.priority === 'P0';
   const doFirst = [...active].sort((a, b) => Number(urgent(b)) - Number(urgent(a)) || byLane(a, b))[0]?.id || null;
   return { active, snoozed, doFirst };
 }

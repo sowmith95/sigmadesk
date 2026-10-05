@@ -4,7 +4,7 @@ import { ChevronRight } from 'lucide-react';
 import { runCard } from '../../../../public/runcard.js';
 import { humanReason } from '../../../../public/attention.js';
 import { safeGithubUrl } from '../../../../public/prs-model.js';
-import { S, api, agentMap, openTicket, openSheet, prFor, setOpen, openFeature } from '@/store.js';
+import { setView, S, api, agentMap, openTicket, openSheet, prFor, setOpen, openFeature } from '@/store.js';
 import { mergeEvents } from '@/lib/sync.js';
 import { clean, money, mins, hhmm, prNumber } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
@@ -14,7 +14,8 @@ import { cn } from '@/lib/utils';
 import type { BoardItem, Ticket, Comment } from '@/types';
 
 export const STAGE_LABEL: Record<string, string> = { triage: 'Intake', proposed: 'Proposed', todo: 'To do', in_progress: 'Building', qa: 'QA', review: 'Acceptance', needs_human: 'Needs you', ready_for_human: 'Ready for review', done: 'Shipped', wontdo: 'Closed' };
-export const KIND_LABEL: Record<string, string> = { product: 'Product review', question: 'Question', guard: 'Publish guard', merge: 'Ready to merge', publish: 'Ready to publish', design: 'Design decision', council: 'Council verdict', page: 'Production errors', research: 'Research proposal', plan: 'Feature plan', owner_task: 'Your task', epic_review: 'Epic review' };
+export const KIND_LABEL: Record<string, string> = { product: 'Product review', question: 'Question', guard: 'Publish guard', merge: 'Ready to merge', publish: 'Ready to publish', design: 'Design decision', council: 'Council verdict', page: 'Production errors', research: 'Research proposal', plan: 'Feature plan', owner_task: 'Your task', epic_review: 'Epic review',
+  deploy: 'Deploy check', conflict: 'Conflict', setup: 'Setup', refresh: 'Branch', stuck: 'Stuck' };
 export const BUCKET_LABEL: Record<string, string> = { needs_you: 'Needs you', blocked: 'Blocked', working: 'Working', queued: 'Queued', shipped: 'Shipped', closed: 'Closed', epic: 'Epic' };
 export const BUCKET_TONE: Record<string, Tone> = { needs_you: 'needs', blocked: 'blocked', shipped: 'shipped' };
 export const firstName = (id?: string | null) => ((id && agentMap()[id]?.name) || '').split(/\s+/)[0] || 'The engineer';
@@ -161,6 +162,8 @@ export function DecisionButton({ it, label, className, size }: { it: BoardItem; 
     case 'merge': return <Button size={size} className={className} onClick={() => { const n = prNumber(t.pr_url); if (n) openSheet({ type: 'pr', number: n }); else openTicket(t.key, { decision: it.id }); }}>{text}</Button>;
     case 'page': return <Button size={size} className={className} onClick={() => openSheet({ type: 'desk' })}>{text}</Button>;
     case 'plan': return <Button size={size} className={className} onClick={() => openFeature(t.key)}>{text}</Button>;
+    case 'deploy': return <Button size={size} className={className} onClick={() => (t ? openTicket(t.key, { decision: it.id }) : setView('prs'))}>{text}</Button>;
+    case 'conflict': case 'setup': case 'refresh': case 'stuck': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id, focus: true })}>{text}</Button>;
     case 'owner_task': case 'epic_review': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id })}>{text}</Button>;
     case 'guard': case 'publish':
       return <AsyncButton size={size} className={className}

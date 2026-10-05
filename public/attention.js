@@ -21,6 +21,27 @@ const SELF_RESOLVING = /desk paused|seat busy|waiting for \S+ to (merge|finish)|
 const selfResolving = (w) => (w.code ? SELF_CODES.has(w.code) : SELF_RESOLVING.test(w.reason || ''));
 
 const isGuard = (t) => /publish guard/i.test(t.progress_msg || '');
+// The desk merges these by itself (mergetrain.mergeState): not the owner's step.
+const AUTO_MERGE = { queued: 'Approved; the desk merges it when CI and the deploy allow', scheduled: 'Approved; the desk merges it after the busy hours',
+  merging: 'Merging now', conflict: 'Resolving a conflict with the latest code' };
+/**
+ * A held ticket (needs_human) is not always a question: each hold has its own step for the owner. Keyed on the
+ * progress messages the desk writes when it holds work (scheduler, reviews, refresh, merge train).
+ */
+const HOLDS = [
+  [/conflict needs your call/i, 'conflict', 'Decide the conflict', (n) => `Decide how to combine ${n} with the latest code`, 'The engineer could not combine both sides safely; the choice is yours.'],
+  [/no eligible code reviewer/i, 'setup', 'Choose a reviewer', (n) => `Nobody can review ${n}`, 'Every reviewer seat built it or is switched off. Switch a reviewer on in Team, or reply to review it yourself.'],
+  [/is switched off/i, 'setup', 'Switch the seat on', (n) => `Switch a seat back on for ${n}`, null],
+  [/workspace setup failed/i, 'setup', 'Retry', (n) => `Retry preparing ${n}`, 'The desk could not prepare a workspace (disk, git or network). Reply to retry once it is fixed.'],
+  [/base changed — refresh/i, 'refresh', 'Refresh the branch', (n) => `Refresh ${n} onto the latest code`, 'The main branch moved under this change; refresh it and QA runs again.'],
+  [/remote branch changed|refresh interrupted/i, 'refresh', 'Look at the branch', (n) => `Check the branch of ${n}`, 'Someone changed the PR branch outside the desk, or a refresh was interrupted. Look at it, then reconcile or refresh.'],
+  [/QA failed repeatedly|review loop limit hit|CI keeps failing/i, 'stuck', 'Give direction', (n) => `${n} is stuck after several attempts`, 'The team tried several times. Give direction, reassign, split or close it.'],
+];
+const holdOf = (t) => HOLDS.find(([re]) => re.test(t.progress_msg || ''));
+function guardWhy(g) {
+  if (!g?.reasons?.length) return 'The change touches protected paths or is unusually large. Review the diff before it is pushed.';
+  return `Held before pushing: ${g.reasons.join('; ')}. Approving pushes it; the reviewers then check this exact commit.`;
+}
 const firstName = (agents, id) => (agents.find((a) => a.id === id)?.name || '').split(/\s+/)[0] || 'the engineer';
 
 /**
@@ -28,7 +49,7 @@ const firstName = (agents, id) => (agents.find((a) => a.id === id)?.name || '').
  * each pending design proposal, each finished council. `id` is unique per decision; `key` stays the ticket key.
  */
 export function decisionsFor(t, ctx = {}) {
-  const { agents = [], proposals = [], councils = [], productReviews = [], researchReviews = [], featurePlans = [] } = ctx;
+  const { agents = [], proposals = [], councils = [], productReviews = [], researchReviews = [], featurePlans = [], mergeStates = {}, guardReasons = {} } = ctx;
   if (['done', 'wontdo'].includes(t.status)) return [];
   // A feature waiting on its plan: the owner reviews a ready plan, or retries a failed grooming round.
   const fp = featurePlans.find((p) => p.ticket_key === t.key);
@@ -53,10 +74,16 @@ export function decisionsFor(t, ctx = {}) {
   if (review) return [{ ...base, id: `${t.key}:product:${review.phase}:${review.revision}`, kind: 'product', action: 'Review feedback', verb: `Resolve review for ${name}`, reason: review.stale ? 'The plan changed; its review must be refreshed.' : `Product/design review: ${review.status}` }];
   if (t.status === 'ready_for_human' && productReviews.some(r => r.ticket_key === t.key && r.phase === 'feedback' && r.status === 'reviewing')) return [];
   if (t.status === 'needs_human') {
-    if (isGuard(t)) out.push({ ...base, id: `${t.key}:guard`, kind: 'guard', action: 'Approve publication', verb: `Unblock publish guard on ${name}`, reason: 'The change touches protected paths or is unusually large. Review the diff before it is pushed.' });
+    const hold = !isGuard(t) && holdOf(t);
+    if (isGuard(t)) out.push({ ...base, id: `${t.key}:guard`, kind: 'guard', action: 'Approve publication', verb: `Approve publishing ${name}`, reason: guardWhy(guardReasons[t.key]) });
+    else if (hold) out.push({ ...base, id: `${t.key}:${hold[1]}`, kind: hold[1], action: hold[2], verb: hold[3](name), reason: hold[4] || t.progress_msg });
     else out.push({ ...base, id: `${t.key}:question`, kind: 'question', action: 'Answer and continue', verb: `Answer ${firstName(agents, t.assignee)}`, reason: t.progress_msg || 'Waiting for your direction.' });
   } else if (t.status === 'ready_for_human') {
-    if (t.pr_url) out.push({ ...base, id: `${t.key}:merge`, kind: 'merge', action: 'Review merge', verb: `Merge ${name}`, reason: 'QA passed. The draft PR is waiting for your review and merge.' });
+    // Only a merge that is the owner's: a queued, scheduled or merging one the desk does by itself.
+    const ms = mergeStates[t.key];
+    if (t.pr_url && AUTO_MERGE[ms]) { /* the desk's step, shown by attend() */ }
+    else if (t.pr_url) out.push({ ...base, id: `${t.key}:merge`, kind: 'merge', action: 'Review merge', verb: ms === 'held' ? `Release or merge ${name} (you paused it)` : `Merge ${name}`,
+      reason: ms === 'held' ? 'You put its merge on hold. Release it to let the desk merge, or merge it yourself.' : 'QA passed and the reviewers approved. This one needs your merge (risk or policy).' });
     else out.push({ ...base, id: `${t.key}:publish`, kind: 'publish', action: 'Approve publication', verb: `Publish ${name}`, reason: 'QA passed. Approving pushes the branch and opens a draft PR.' });
   }
   const props = proposals.filter((p) => p.ticket_key === t.key).sort((a, b) => a.id - b.id);
@@ -97,6 +124,12 @@ export function attend(t, ctx = {}) {
     return { ...base, bucket: 'epic', live, verb: name, reason: `${done} of ${kids.length} slices shipped` };
   }
   if (worker) return { ...base, bucket: 'working', verb: name, reason: `${firstName(agents, worker.id)} · ${stage || 'working'}` };
+  // The desk's own steps, said plainly: an automatic merge, or a publish that keeps failing.
+  const ms = (ctx.mergeStates || {})[t.key];
+  if (t.status === 'ready_for_human' && AUTO_MERGE[ms]) return { ...base, bucket: 'queued', stage: 'Merging', verb: name, reason: AUTO_MERGE[ms] };
+  const pe = (ctx.publishErrors || {})[t.key];
+  if (pe) return { ...base, bucket: pe.count >= 3 ? 'blocked' : 'queued', verb: pe.count >= 3 ? `Publishing ${name} keeps failing` : name,
+    reason: `Publishing to GitHub failed${pe.count > 1 ? ` ${pe.count} times` : ''}: ${pe.message}. The desk retries every few minutes.` };
 
   const w = waiting.find((x) => x.key === t.key);
   if (w && !selfResolving(w)) return { ...base, bucket: 'blocked', verb: `Unblock ${name}`, reason: w.reason, code: w.code };
@@ -119,7 +152,8 @@ export function humanReason(reason, tickets) {
 export function board(state, extra = {}) {
   const tickets = state.tickets || [];
   const ctx = { agents: state.agents || [], tickets, events: state.events || [], waiting: state.meta?.scheduler?.waiting || [],
-    proposals: extra.proposals || state.meta?.decisions?.proposals || [], councils: state.meta?.council?.councils || [], productReviews: state.meta?.product_reviews || [], researchReviews: state.meta?.research_reviews || [], featurePlans: state.meta?.feature_plans || [] };
+    proposals: extra.proposals || state.meta?.decisions?.proposals || [], councils: state.meta?.council?.councils || [], productReviews: state.meta?.product_reviews || [], researchReviews: state.meta?.research_reviews || [], featurePlans: state.meta?.feature_plans || [],
+    mergeStates: state.meta?.merge_states || {}, guardReasons: state.meta?.guard_reasons || {}, publishErrors: state.meta?.publish_errors || {} };
   const out = Object.fromEntries(BUCKETS.map((b) => [b, []]));
   out.epics = [];
   for (const t of tickets) {
@@ -132,6 +166,14 @@ export function board(state, extra = {}) {
   for (const inc of state.incidents || []) {
     if (inc.status === 'paged' && !inc.ticket_key) out.needs_you.push({ key: `incident-${inc.id}`, id: `incident-${inc.id}`, incident: inc, bucket: 'needs_you', kind: 'page',
       action: 'Look at errors', verb: `Check ${inc.label || 'service'} errors`, reason: String(inc.normalized || '').slice(0, 160), name: inc.label });
+  }
+  // A deploy that failed or never confirmed holds every deploying merge: always the owner's (and never snoozable).
+  const lock = state.meta?.deploy_lock;
+  if (lock && ['failed', 'escalated'].includes(lock.state)) {
+    const lt = tickets.find((x) => x.key === lock.key);
+    out.needs_you.push({ key: lock.key || 'deploy', id: `deploy:${lock.merge_sha || lock.key}:${lock.state}`, kind: 'deploy', bucket: 'needs_you', ticket: lt, name: lt ? nameOf(lt) : lock.key,
+      action: 'Check the deploy', verb: `The deploy of ${lt ? nameOf(lt) : lock.key || 'the last merge'} ${lock.state === 'failed' ? 'failed' : 'was never confirmed'}`,
+      reason: `${lock.note ? `${lock.note}. ` : ''}Every merge that deploys waits until you check it, then clear the hold (or merge with a reason).`, deploy: lock });
   }
   // An epic review's one question (and its proposed closes) is the owner's single decision for that epic.
   const byKey = new Map(tickets.map((t) => [t.key, t]));
@@ -174,7 +216,7 @@ export function board(state, extra = {}) {
   // `decisions` keeps every decision (the ticket sheet, Work page and palette find a ticket's decision there);
   // `needs_you` is the grouped Inbox list the counts describe.
   out.decisions = [...out.needs_you];
-  const rank = { guard: 0, owner_task: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
+  const rank = { guard: 0, deploy: 0, owner_task: 1, conflict: 1, setup: 1, refresh: 1, stuck: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
   out.decisions.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
   // The Inbox: grouped rows in lanes and order (public/inbox.js); snoozed rows are set aside, not resolved, and are
   // not counted as needing you until they wake. Every decision stays in `decisions` for sheets, trackers and search.

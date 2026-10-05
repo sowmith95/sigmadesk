@@ -165,6 +165,17 @@ test('a task edited during the review keeps the owner\'s edit', () => {
   assert.ok(out.applied.skipped.every((s) => s.includes('changed during the review')));
 });
 
+test('an epic review leaves a priority the owner set', () => {
+  const e = epic(); const a = task(e, 'A'); const b = task(e, 'B');
+  sched.ownerPatch(a, { priority: 'P3' }); // the owner chose it earlier: pinned
+  const r = review.start(e);
+  store.kvSet(`epic-review:${e}`, JSON.stringify({ ...r, status: 'running', attempt: 'P1', snapshot: null }));
+  const out = review.complete(r, 'P1', { result: review.parseResult(JSON.stringify({ summary: 's', priorities: [{ key: a, priority: 'P0' }, { key: b, priority: 'P1' }] })) });
+  assert.equal(store.getTicket(a).priority, 'P3'); assert.equal(store.getTicket(b).priority, 'P1');
+  assert.ok(out.applied.skipped.some((s) => s.startsWith(a) && /you set it/.test(s)));
+  assert.equal(store.getTicket(b).priority_pinned, 0, 'the manager\'s priority does not pin');
+});
+
 test('an epic review reads and consults; it cannot change tickets itself', async () => {
   const e = epic();
   const run = store.createRun({ agent_id: 'manager', ticket_key: e, kind: 'epic_review', token: 'review-fixture', model: 'codex:fixture' });

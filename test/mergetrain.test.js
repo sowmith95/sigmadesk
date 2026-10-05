@@ -87,6 +87,7 @@ before(async () => {
   sched = await import('../src/scheduler.js');
   reviews = await import('../src/reviews.js');
   train = await import('../src/mergetrain.js');
+  train.clock.now = offHours; // the dispatch-time window check reads this clock, never the real weekday
   store.setSetting('paused', 'false');
   (await import('../src/prs.js')).setRequiredChecks(['tests']);
 });
@@ -98,6 +99,8 @@ const setGh = (file, v) => fs.writeFileSync(path.join(ghDir, file), JSON.stringi
 const WED_11_ET = new Date('2026-09-30T15:00:00Z'); // EDT
 const WED_AFTER = new Date('2026-09-30T20:16:00Z'); // 4:16 PM EDT
 const SAT = new Date('2026-10-03T15:00:00Z');
+// A fixed weekend instant: the dispatch-time busy-window check reads train.clock, so the suite passes on any day.
+const offHours = () => SAT;
 let seq = 0;
 const run = (agent_id, kind, ticket_key, nonce = null, extra = {}) => store.createRun({ agent_id, kind, ticket_key, token: `t${++seq}${Math.random()}`, model: 'claude:x', nonce, ...extra });
 function startReview(key) {
@@ -458,9 +461,9 @@ test('owner merges of deploying changes and external deploying commits on main t
   const t = await approvedPr('app/owner.py', 'x\n', { risk: 'high' });
   prFor(t, { number: 7 }); setGh('merge.json', { state: 'MERGED', mergeCommit: { oid: '4'.repeat(40) } });
   store.updateTicket(t.key, { pr_url: 'https://github.com/owner/demo/pull/7' });
-  await train.ownerMerge(7, { expectedSha: t.head_sha, method: 'squash' });
+  await train.ownerMerge(7, { expectedSha: t.head_sha, method: 'squash' }, SAT);
   assert.equal(lockNow().by, 'owner'); assert.equal(lockNow().merge_sha, '4'.repeat(40));
-  await assert.rejects(train.ownerMerge(7, { expectedSha: t.head_sha }), /deploy of .* still running/, 'a second deploying merge waits');
+  await assert.rejects(train.ownerMerge(7, { expectedSha: t.head_sha }, SAT), /deploy of .* still running/, 'a second deploying merge waits');
   resetTrain();
   await train.sweep({ now: SAT }); // remember the current base
   landOnMain('app/hotfix.py', 'h\n', 'hotfix merged on GitHub by hand');
@@ -671,7 +674,7 @@ test('market-window boundary: a sweep that started at 09:29:59 ET cannot dispatc
     assert.match(r.reason, /busy window has started/);
     assert.equal(merges().length, before);
     assert.equal(lockNow(), null, 'the lock taken for the attempt is released');
-  } finally { train.clock.now = () => new Date(); }
+  } finally { train.clock.now = offHours; }
 });
 
 test('required checks are learned from base commits only (pull-request workflows), never from owner merges', async () => {

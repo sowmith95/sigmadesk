@@ -143,3 +143,48 @@ test('a guard hold that an old refresh message replaced is restored at start', (
   sched.repairGuardHolds();
   assert.equal(store.getTicket(other.key).progress_msg, 'QA failed repeatedly');
 });
+
+test('SD-77: a guarded review fix is approved once; a failed push neither re-guards it nor hides the error', async () => {
+  const { t, ws, head, branch } = fixture({ conflict: false });
+  store.kvSet(`published:${t.key}`, head);
+  fs.mkdirSync(path.join(ws, '.github', 'workflows'), { recursive: true });
+  fs.writeFileSync(path.join(ws, '.github', 'workflows', 'ci.yml'), 'on: push\n'); git(ws, ['add', '.']); git(ws, ['commit', '-qm', 'review fix touching CI']);
+  const fix = git(ws, ['rev-parse', 'HEAD']);
+  store.updateTicket(t.key, { status: 'ready_for_human', head_sha: fix, qa_sha: fix, issue_number: 1 });
+  await sched.publishOnce(t.key);
+  assert.equal(store.getTicket(t.key).progress_msg, 'publish guard: needs owner approval');
+  assert.equal(store.kvGet(`guard:${t.key}`), fix);
+  const why = JSON.parse(store.kvGet(`guard-reasons:${t.key}`));
+  assert.equal(why.head, fix); assert.match(why.reasons.join(' '), /protected|workflow/i);
+
+  // The owner approves while GitHub is unreachable: the push fails and is recorded for the owner to see.
+  const away = `${remote}.away`; fs.renameSync(remote, away);
+  try { await sched.ownerApprovePublish(t.key); } finally { fs.renameSync(away, remote); }
+  const err = JSON.parse(store.kvGet(`publish-error:${t.key}`));
+  assert.equal(err.head, fix); assert.equal(err.count, 1);
+  assert.notEqual(store.getTicket(t.key).status, 'needs_human', 'approved: no longer held');
+
+  // The retry pushes the approved commit without asking again.
+  await sched.publishOnce(t.key);
+  assert.equal(git(remote, ['rev-parse', branch]), fix);
+  assert.equal(store.kvGet(`guard:${t.key}`), '');
+  assert.equal(store.kvGet(`publish-error:${t.key}`), '');
+  assert.notEqual(store.getTicket(t.key).status, 'needs_human');
+  await assert.rejects(sched.ownerApprovePublish(t.key), /nothing awaiting publish approval/, 'one approval per parked commit');
+});
+
+test('the owner\'s priority is pinned: the manager cannot override it; unpinning hands it back', () => {
+  const t = store.createTicket({ title: 'pin me', status: 'todo' });
+  sched.ownerPatch(t.key, { priority: 'P1' });
+  assert.equal(store.getTicket(t.key).priority_pinned, 1);
+  assert.throws(() => sched.ownerPatch(t.key, { priority: 'P3' }, { by: 'manager' }), /set by the owner/);
+  assert.equal(store.getTicket(t.key).priority, 'P1');
+  sched.ownerPatch(t.key, { unpin_priority: true });
+  assert.equal(store.getTicket(t.key).priority_pinned, 0);
+  sched.ownerPatch(t.key, { priority: 'P3' }, { by: 'manager' });
+  assert.equal(store.getTicket(t.key).priority, 'P3'); assert.equal(store.getTicket(t.key).priority_pinned, 0);
+  assert.equal(sched.ownerPatch(t.key, { unpin_priority: true }, { by: 'manager' }).priority_pinned, 0, 'only the owner unpins');
+  // Created with a deliberate priority: pinned; the form's default P2 is not.
+  assert.equal(sched.ownerCreate({ title: 'urgent thing', priority: 'P0' }).priority_pinned, 1);
+  assert.equal(sched.ownerCreate({ title: 'normal thing', priority: 'P2' }).priority_pinned, 0);
+});

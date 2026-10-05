@@ -11,6 +11,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
 import { Tag, Empty, Section } from '@/components/desk/Bits';
 import { KIND_LABEL, CiTag, Reviews, prReviewsOf, NowLine, cardFor, Clamp, DecisionButton, firstName, reasonText, WorkerLine } from '@/components/desk/Work';
 import { Lineage } from '@/components/desk/Epic';
+import { ProgramUpdate } from '@/components/desk/Program';
 import { LANES, reasons, snoozePresets } from '../../../public/inbox.js';
 import { cn } from '@/lib/utils';
 import type { Board, BoardItem } from '@/types';
@@ -53,10 +54,11 @@ function RowMenu({ it }: { it: Row }) {
         {it.snoozed_until ? <DropdownMenuItem className="min-h-10" onSelect={run(() => snooze(it.id, null))}>Bring back now</DropdownMenuItem>
           : it.protected ? <DropdownMenuLabel className="font-normal text-muted-foreground">Can't snooze: it protects production</DropdownMenuLabel>
             : snoozePresets().map((p) => <DropdownMenuItem key={p.id} className="min-h-10" onSelect={run(() => snooze(it.id, p.until))}>Snooze {p.label.toLowerCase()}{it.waiting?.length ? ` (with ${it.waiting.length} waiting)` : ''}</DropdownMenuItem>)}
-        {t && <><DropdownMenuSeparator /><DropdownMenuLabel className="font-normal text-muted-foreground">Priority (now {t.priority || 'P2'})</DropdownMenuLabel>
+        {t && <><DropdownMenuSeparator /><DropdownMenuLabel className="font-normal text-muted-foreground">Priority (now {t.priority || 'P2'}{t.priority_pinned ? ', set by you' : ''})</DropdownMenuLabel>
           <DropdownMenuRadioGroup value={t.priority || 'P2'} onValueChange={(p) => { if (p !== t.priority) run(() => api('PATCH', `/api/tickets/${t.key}`, { priority: p }).then(() => { loadSnapshot(); toast(`${t.key} is ${p}`); }))(); }}>
             {[['P0', 'P0 · drop everything'], ['P1', 'P1 · high'], ['P2', 'P2 · normal'], ['P3', 'P3 · low']].map(([p, label]) => <DropdownMenuRadioItem key={p} value={p} className="min-h-10">{label}</DropdownMenuRadioItem>)}
-          </DropdownMenuRadioGroup></>}
+          </DropdownMenuRadioGroup>
+          {!!t.priority_pinned && <DropdownMenuItem className="min-h-10" onSelect={run(() => api('PATCH', `/api/tickets/${t.key}`, { unpin_priority: true }).then(() => { loadSnapshot(); toast('The team can set its priority again'); }))}>Let the team set the priority</DropdownMenuItem>}</>}
         {it.kind === 'owner_task' && t && <><DropdownMenuSeparator /><DropdownMenuItem className="min-h-10" onSelect={run(() => api('POST', `/api/tickets/${t.key}/owner-task`, { owner_task: false }).then(() => { loadSnapshot(); toast('Handed back to the team'); }))}>Hand back to the team</DropdownMenuItem></>}
       </DropdownMenuContent>
     </DropdownMenu>
@@ -135,6 +137,7 @@ export function InboxPage() {
   return (
     <div className="grid gap-8 xl:grid-cols-[minmax(0,1fr)_380px] xl:items-start">
       <Section id="needs" title="Needs you" count={c.needs_you} tone="needs">
+        <div className="-mt-2 mb-4"><ProgramUpdate compact /></div>
         {rows.length ? <div className="grid gap-5">
           {first && <div data-do-first className="grid gap-1.5"><span className="text-[13px] font-medium text-needs">Do first</span>
             <div className="overflow-hidden rounded-lg border border-l-[3px] border-l-needs bg-card"><InboxRow key={first.id} it={first} hero /></div></div>}

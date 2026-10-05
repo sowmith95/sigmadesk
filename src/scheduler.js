@@ -157,7 +157,7 @@ export function setStatus(key, status, extra = {}) {
 researchReview.hooks.setStatus = setStatus; // holds, waivers and owner decisions on research proposals go through the same door
 features.hooks.setStatus = setStatus; // approving a feature plan starts the feature through the same door
 // An epic review changes order, priority and owner tasks through the owner's own doors (same checks, same events).
-Object.assign(epicReview.hooks, { ownerTask: (...a) => ownerTask(...a), ownerReply: (...a) => ownerReply(...a), ownerPatch: (...a) => ownerPatch(...a) });
+Object.assign(epicReview.hooks, { ownerTask: (...a) => ownerTask(...a), ownerReply: (...a) => ownerReply(...a), ownerPatch: (k, p, o) => ownerPatch(k, p, o) });
 
 // Order may cross sub-epics within one feature (a slice of SD-30 may wait for SD-29, a task of the parent SD-28): two
 // tickets can be ordered when they share the same top-level ancestor.
@@ -713,6 +713,7 @@ export function workCount() {
 export async function tick() {
   if (ticking) return;
   ticking = true;
+  try { repairGuardHolds(); } catch { /* never let the repair stop a tick */ } // the doctor: a guard hold always shows
   try {
     lastTick = store.now();
     const s = store.getSettings();
@@ -1094,7 +1095,7 @@ export async function deskAction(run, cmd, body = {}) {
       const explicit = kept || explicitSeat(body);
       const assignee = explicit?.seat || routeTicket(body);
       const description = body.body ? `${ticket.description}\n\n## Groomed spec (Engineering Manager)\n${body.body}` : ticket.description;
-      setStatus(ticket.key, 'todo', { complexity: body.complexity, area: body.area, priority: PRIORITY.test(body.priority) ? body.priority : ticket.priority,
+      setStatus(ticket.key, 'todo', { complexity: body.complexity, area: body.area, priority: !ticket.priority_pinned && PRIORITY.test(body.priority) ? body.priority : ticket.priority,
         assignee, assign_pinned: explicit?.pinned ? 1 : 0, description, risk: ['high', 'low'].includes(body.risk) ? body.risk : null, ...(body.title ? { title: body.title } : {}) });
       if (explicit?.rerouted) store.addComment(ticket.key, 'system', `Principals design and slice; this ${body.complexity} task goes to ${agentById[assignee].name} instead of ${agentById[explicit.rerouted].name}.`);
       ev(`groomed ${ticket.key} → ${body.complexity}/${body.area}${body.risk === 'high' ? '/high-risk' : ''}, staffed ${agentById[assignee].role}`);
@@ -1393,6 +1394,7 @@ export async function ownerApprovePublish(key) {
   const t = store.getTicket(key);
   need(t && t.head_sha && store.kvGet(`guard:${key}`) === t.head_sha, 'nothing awaiting publish approval for this commit');
   store.kvSet(`guard:${key}`, ''); // one approval per parked commit
+  store.kvSet(`publish-approved:${key}`, t.head_sha); // a transient push failure must not re-guard the approved commit
   store.addComment(key, 'owner', `✅ Publish approved for \`${t.head_sha.slice(0, 10)}\` despite the guard.`);
   const inReview = reviews.enabled() && t.review_stage === 'reviewing';
   setStatus(key, inReview ? 'review' : 'ready_for_human', { resume_status: null, progress_msg: inReview ? 'owner approved publish — code review continues' : 'owner approved publish' });
@@ -1410,6 +1412,8 @@ export function retryPublications() {
   }
 }
 
+/** One publication attempt, without the settings and retry gates (tests). */
+export const publishOnce = (key) => publishInner(store.getTicket(key), key);
 async function publishInner(t, key, { ownerApproved = false } = {}) {
   const plan = productReview.current(t.parent_key || key);
   if (plan || productReview.current(key, 'feedback')) {
@@ -1425,10 +1429,11 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     store.logEvent({ kind: 'error', ticket_key: key, text: `publish staging failed: ${err.message}` });
     return;
   }
-  if (!ownerApproved) {
+  if (!ownerApproved && store.kvGet(`publish-approved:${key}`) !== t.head_sha) {
     const { files, lines } = staged;
     const reasons = guardReasons(files, lines, t.complexity);
     if (reasons.length) {
+      store.kvSet(`guard-reasons:${key}`, JSON.stringify({ head: t.head_sha, reasons, lines, complexity: t.complexity || null }));
       store.addComment(key, 'system', `🛑 **Publish guard** — not pushed: ${reasons.join('; ')}.\nReview the branch locally (${runner.workspaceDir(key)}) and press "Approve publish" if it is safe.`);
       setStatus(key, 'needs_human', { resume_status: reviews.enabled() && t.review_stage === 'reviewing' ? 'review' : 'ready_for_human', progress_msg: 'publish guard: needs owner approval' });
       store.kvSet(`guard:${key}`, t.head_sha);
@@ -1446,6 +1451,7 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     await runner.pushBranch(key, t.branch, t.head_sha, { lease: refresh.current(key)?.remote_head });
     if (refresh.current(key)) refresh.published(key, t.head_sha);
     store.kvSet(`published:${key}`, t.head_sha);
+    store.kvSet(`publish-error:${key}`, '');
     store.logEvent({ kind: 'github', ticket_key: key, agent_id: 'github', text: `pushed ${t.branch} at ${t.head_sha.slice(0, 7)}` });
     if (t.pr_url) { github.flushOutbox(); return; } // existing PR: the push updated it; its discussion and reviews stay
     const cs = store.listComments(key);
@@ -1457,6 +1463,9 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     if (refresh.current(key) && /stale info|\[rejected\]/i.test(String(err.stderr || err.message)))
       setStatus(key, 'needs_human', { resume_status: 'todo', progress_msg: 'remote branch changed — reconcile before publishing' });
     store.logEvent({ kind: 'error', ticket_key: key, text: `publish failed: ${err.message}` });
+    // Visible to the owner's step and the program update: what failed, how often, for which commit.
+    let prev = null; try { prev = JSON.parse(store.kvGet(`publish-error:${key}`) || 'null'); } catch { prev = null; }
+    store.kvSet(`publish-error:${key}`, JSON.stringify({ head: t.head_sha, message: store.redact(String(err.message)).slice(0, 240), at: store.now(), count: (prev?.head === t.head_sha ? prev.count : 0) + 1 }));
   }
 }
 
@@ -1488,7 +1497,13 @@ export function ownerCreate(body) {
     if (store.getTicket(seen.key)) return { ...store.getTicket(seen.key), duplicate: true };
   }
   const source = body.source === 'hub' ? 'hub' : 'human';
-  const remember = (t) => { if (rid) store.kvSet(`request:${rid}`, JSON.stringify({ key: t.key, hash, at: store.now() })); return store.getTicket(t.key); };
+  // A priority the owner chose (anything but the form's default P2) is theirs: grooming and reviews leave it alone.
+  const chosen = PRIORITY.test(body.priority) && body.priority !== 'P2';
+  const remember = (t) => {
+    if (rid) store.kvSet(`request:${rid}`, JSON.stringify({ key: t.key, hash, at: store.now() }));
+    if (chosen) store.updateTicket(t.key, { priority_pinned: 1 });
+    return store.getTicket(t.key);
+  };
   // A feature is created (and its planning round announced) by features.create on its own, then remembered.
   if (body.kind === 'feature') return remember(features.create({ title: body.title, goal: body.description || body.title, priority: body.priority, area: body.area, source }).ticket);
   return store.transaction(() => remember(store.createTicket({ title: body.title, description: body.description || '', type: body.type || (body.kind ? 'task' : 'feature'), status: 'triage',
@@ -1665,7 +1680,8 @@ export function ownerTaskDone(key, { notes = '' } = {}) {
   return store.getTicket(key);
 }
 
-export function ownerPatch(key, patch) {
+/** `by`: who changes it (the owner through the API; the manager for epic reviews). Only the owner pins priorities. */
+export function ownerPatch(key, patch, { by = 'owner' } = {}) {
   const t = store.getTicket(key);
   need(t, 'no such ticket');
   const p = {};
@@ -1675,7 +1691,13 @@ export function ownerPatch(key, patch) {
     if (patch.status === 'done' && t.status !== 'done') throw Object.assign(new Error('Tickets become done when their PR merges; merge it from the PR console.'), { status: 409 });
     p.status = patch.status;
   }
-  if (patch.priority) { need(PRIORITY.test(patch.priority), 'bad priority'); p.priority = patch.priority; }
+  if (patch.priority) {
+    need(PRIORITY.test(patch.priority), 'bad priority');
+    if (by !== 'owner' && t.priority_pinned) need(false, `${key}'s priority was set by the owner`);
+    p.priority = patch.priority;
+    if (by === 'owner') p.priority_pinned = 1;
+  }
+  if (patch.unpin_priority === true && by === 'owner') p.priority_pinned = 0; // let the team set it again
   if (patch.assignee !== undefined) {
     need(!patch.assignee || ENGINEERS.includes(patch.assignee), 'bad assignee');
     // Reassigning work that is running would leave two seats on one branch: stop it first (or wait).
@@ -1706,7 +1728,8 @@ export function ownerPatch(key, patch) {
   if (p.status === 'qa' && !t.head_sha) need(false, 'only submitted work can go to QA');
   const out = store.updateTicket(key, { ...p, stalls: 0 });
   if (p.description !== undefined && t.issue_number) github.updateIssueBody(key);
-  store.logEvent({ agent_id: 'owner', ticket_key: key, kind: 'action', text: `owner ${p.description !== undefined || p.title !== undefined ? 'edited the request' : `set ${Object.entries(p).map(([k, v]) => `${k}=${v}`).join(', ')}`}` });
+  const set = Object.entries(p).filter(([k]) => k !== 'priority_pinned').map(([k, v]) => `${k}=${v}`).join(', ');
+  store.logEvent({ agent_id: by, ticket_key: key, kind: 'action', text: `${by} ${p.description !== undefined || p.title !== undefined ? 'edited the request' : set ? `set ${set}` : p.priority_pinned === 0 ? 'let the team set the priority' : 'saved no change'}` });
   github.syncIssueState(key);
   return out;
 }

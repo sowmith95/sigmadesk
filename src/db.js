@@ -376,7 +376,9 @@ function migrate() {
       // a task only the owner can do (access no seat has): never dispatched to a seat
       owner_task: 'INTEGER DEFAULT 0',
       // assignment: pinned to one seat (explicit --assign / owner edit), and why the desk picked the seat it did
-      assign_pinned: 'INTEGER DEFAULT 0', assign_reason: 'TEXT' },
+      assign_pinned: 'INTEGER DEFAULT 0', assign_reason: 'TEXT',
+      // the owner set this priority: grooming, epic reviews and the program manager leave it alone
+      priority_pinned: 'INTEGER DEFAULT 0' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     pr_outbox: { next_attempt_at: 'TEXT' },
@@ -536,7 +538,7 @@ export function createTicket(t) {
   return ticket;
 }
 
-const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
+const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', 'priority_pinned', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee',
   'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key',
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
   'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base',

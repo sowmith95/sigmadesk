@@ -151,14 +151,15 @@ export function apply(rootKey, result, snapshot = null) {
           : flow.wouldCycle(o.key, o.after, all, ix) ? 'would make a loop' : '';
     if (why === null) continue;
     if (why) { skipped.push(`${o.key} after ${o.after}: ${why}`); continue; }
-    hooks.ownerPatch(o.key, { after_key: o.after }); touched.add(o.key); applied.push(`${o.key} now waits for ${o.after}`);
+    hooks.ownerPatch(o.key, { after_key: o.after }, { by: 'manager' }); touched.add(o.key); applied.push(`${o.key} now waits for ${o.after}`);
   }
   for (const p of result.priorities) {
     const { ix } = fresh(); const t = inTree(p.key, ix);
     if (!t || !OPEN(t)) { skipped.push(`${p.key} priority: not an open task in this epic`); continue; }
     if (t.priority === p.priority) continue;
     if (changed(t)) { skipped.push(`${p.key} priority: changed during the review`); continue; }
-    hooks.ownerPatch(p.key, { priority: p.priority }); touched.add(p.key); applied.push(`${p.key} priority ${t.priority} → ${p.priority}`);
+    if (t.priority_pinned) { skipped.push(`${p.key} priority: you set it (${t.priority}); left as is`); continue; }
+    hooks.ownerPatch(p.key, { priority: p.priority }, { by: 'manager' }); touched.add(p.key); applied.push(`${p.key} priority ${t.priority} → ${p.priority}`);
   }
   for (const o of result.owner_tasks) {
     const { ix } = fresh(); const t = inTree(o.key, ix);

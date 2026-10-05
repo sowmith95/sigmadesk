@@ -85,7 +85,16 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping 
   const talk = { label: 'Comment or ask the manager…', run: async () => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); return false; }, ok: '' };
   if (compose) return composeUi;
   if (dec?.kind === 'product') return <div className={row}><More items={[talk]} /><p className="text-sm text-muted-foreground">Resolve the objections in the Reviews tab.</p></div>;
-  if (dec?.kind === 'question') return <>
+  if (dec?.kind === 'deploy') {
+    const lock = (dec as BoardItem & { deploy?: { merge_sha?: string } }).deploy;
+    const repo = S.meta.repo;
+    return <div className={row}>
+      {repo && lock?.merge_sha && <Button variant="secondary" asChild><a href={`https://github.com/${repo}/commit/${lock.merge_sha}/checks`} target="_blank" rel="noopener noreferrer">See the deploy runs</a></Button>}
+      <span className="flex-1" />
+      <AsyncButton data-primary size="lg" confirm="Clear the deploy hold? Do this after checking the deploy runs: deploying merges continue." run={async () => { await api('POST', '/api/merge-train/clear-deploy', {}); done(); await refresh(); }} ok="Deploy hold cleared">Clear the hold</AsyncButton>
+    </div>;
+  }
+  if (['question', 'conflict', 'setup', 'refresh', 'stuck'].includes(dec?.kind || '')) return <>
     {box(`Your answer to ${who}…`, 'Your answer')}
     <div className={tight}>
       <More items={[talk, { label: 'Approve as asked (no message)', run: decide('approve'), ok: `Approved; ${who} resumes`, disabled: running },

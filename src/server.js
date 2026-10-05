@@ -92,6 +92,16 @@ export function snapshot({ inbox = true } = {}) {
   // Inbox attention state: real waiting time per decision and the owner's snoozes (public/inbox.js applies them).
   // Tickets linked to an open incident are never snoozable, whether or not the watch lists incidents right now.
   snap.meta.protected_tickets = store.openIncidentTickets();
+  // Facts the owner's step needs that live outside the ticket row: why a guard held, and failing publishes.
+  const json = (k) => { try { return JSON.parse(store.kvGet(k) || 'null'); } catch { return null; } };
+  snap.meta.guard_reasons = {}; snap.meta.publish_errors = {};
+  for (const t of snap.tickets) {
+    if (['done', 'wontdo'].includes(t.status)) continue;
+    const g = /publish guard/i.test(t.progress_msg || '') && json(`guard-reasons:${t.key}`);
+    if (g && g.head === t.head_sha) snap.meta.guard_reasons[t.key] = g;
+    const e = json(`publish-error:${t.key}`);
+    if (e && e.head === t.head_sha) snap.meta.publish_errors[t.key] = e;
+  }
   if (!inbox) return snap;
   // One board per snapshot: computed with the stored state, then the stored state is reconciled with it (new
   // decisions start their clock, invalid snoozes are dropped for good). Routes on this snapshot reuse `snap.board`.
