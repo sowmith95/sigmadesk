@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, closeSheet, loadSnapshot } from '@/store.js';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -30,8 +30,11 @@ export function AccessPanel() {
   const [now, setNow] = useState(Date.now());
   const [g, setG] = useState({ seat: 'sre', probes: '*', minutes: '60', ticket: '', standing: false, reason: '' });
   const [pol, setPol] = useState<Record<string, string> | null>(null);
-  const load = () => api('GET', '/api/access').then((x: Data) => { setD(x); setPol({ approvers: x.policy.approvers.join(', '), seats: x.policy.seats.join(', '), probes: x.policy.probes.join(', '), maxMinutes: String(x.policy.maxMinutes), maxActive: String(x.policy.maxActive), ticketMaxHours: String(x.policy.ticketMaxHours) }); }).catch((e: Error) => setError(e.message));
-  useEffect(() => { load(); const t = setInterval(() => setNow(Date.now()), 30_000); return () => clearInterval(t); }, []);
+  const [edited, setEdited] = useState(false);
+  const editedRef = useRef(false);
+  const load = () => api('GET', '/api/access').then((x: Data) => { setD(x); if (!editedRef.current) setPol({ approvers: x.policy.approvers.join(', '), seats: x.policy.seats.join(', '), probes: x.policy.probes.join(', '), maxMinutes: String(x.policy.maxMinutes), maxActive: String(x.policy.maxActive), ticketMaxHours: String(x.policy.ticketMaxHours) }); }).catch((e: Error) => setError(e.message));
+  // Grants end on their own (expiry, ticket or run end, an approver's revoke): poll the desk's state, not just the clock.
+  useEffect(() => { load(); const t = setInterval(() => { setNow(Date.now()); if (document.visibilityState === 'visible') load(); }, 10_000); return () => clearInterval(t); }, []);
   const after = async () => { await load(); await loadSnapshot(); };
   return (
     <Panel title="Production access" description="Who may run the desk's read-only production probes, and for how long." onClose={closeSheet} wide
@@ -65,12 +68,12 @@ export function AccessPanel() {
           <AsyncButton className="justify-self-start" run={async () => { await api('POST', '/api/access/grant', { seat: g.seat, probes: list(g.probes), minutes: Number(g.minutes) || null, ticket_key: g.ticket || null, standing: g.standing, reason: g.reason }); await after(); }} ok="Granted">Grant</AsyncButton>
         </div></Section>
         {pol && <Section title="What the EM and SRE may approve"><div className="grid gap-2 rounded-lg border bg-card p-4 text-sm">
-          <p className="text-muted-foreground">Requests within this policy are decided by the EM or the SRE (never for themselves). Anything beyond it comes to your Inbox.</p>
+          <p className="text-muted-foreground">Requests within this policy are decided by the EM or the SRE (never for themselves). Access for the EM or SRE themselves, renewals, and anything beyond this policy come to your Inbox.</p>
           {([['approvers', 'Approvers (manager, sre)'], ['seats', 'Seats they may grant'], ['probes', 'Probes (* = all)'], ['maxMinutes', 'Longest grant (minutes)'], ['maxActive', 'Active agent grants at most'], ['ticketMaxHours', 'Ticket-scoped cap (hours)']] as const).map(([k, label]) => (
-            <label key={k} className="flex items-center justify-between gap-3"><span>{label}</span><Input className="w-72" value={pol[k]} onChange={(e) => setPol({ ...pol, [k]: e.target.value })} /></label>))}
+            <label key={k} className="flex items-center justify-between gap-3"><span>{label}</span><Input className="w-72" value={pol[k]} onChange={(e) => { editedRef.current = true; setEdited(true); setPol({ ...pol, [k]: e.target.value }); }} /></label>))}
           <AsyncButton className="justify-self-start" variant="secondary" run={async () => {
-            await api('POST', '/api/access/policy', { policy: { approvers: list(pol.approvers), seats: list(pol.seats), probes: list(pol.probes), maxMinutes: Number(pol.maxMinutes), maxActive: Number(pol.maxActive), ticketMaxHours: Number(pol.ticketMaxHours) } }); await after();
-          }} ok="Policy saved">Save policy</AsyncButton>
+            await api('POST', '/api/access/policy', { policy: { approvers: list(pol.approvers), seats: list(pol.seats), probes: list(pol.probes), maxMinutes: Number(pol.maxMinutes), maxActive: Number(pol.maxActive), ticketMaxHours: Number(pol.ticketMaxHours) } }); editedRef.current = false; setEdited(false); await after();
+          }} ok="Policy saved">{edited ? 'Save policy (unsaved changes)' : 'Save policy'}</AsyncButton>
         </div></Section>}
         <Section title="History"><div className="grid gap-1 text-sm text-muted-foreground">
           {[...d.history.grants.map((x) => ({ at: x.created_at, text: `#${x.id} ${x.seat_name}: ${probesText(x.probes)} by ${x.granted_by}${x.revoked_at ? ` · ended (${x.revoked_by})` : ''}` })),
