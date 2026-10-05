@@ -360,16 +360,31 @@ halted. A `desk verify done` needs at least one successful probe in that run.
 **Seat environments.** Seats get an allowlisted environment (no inherited `DATABASE_URL`, DSNs or keys), and their tool
 shells get an isolated per-run HOME (no dotfiles, histories or credential stores; a `.gitconfig` that includes yours).
 Claude keeps its real HOME for its own login and session transcripts and switches tool shells through
-`CLAUDE_ENV_FILE` (sourced before every Bash command, which also unsets its auth variables); Codex authenticates from its
-desk-owned `CODEX_HOME`, so it runs with the isolated HOME directly. Shell startup files, histories, credential stores,
-`.env*` files and the desk's pgpass/service/verifier files are unreadable in the sandbox. `project.env` entries must be
+`CLAUDE_ENV_FILE` (sourced before every Bash command, which also unsets its auth variables; verified with Claude Code
+2.1.288). Codex authenticates from its desk-owned `CODEX_HOME`, so it runs with the isolated HOME directly.
+
+Reads are allowlisted, not enumerated. For Claude seats the sandbox denies the **whole home folder** to shell commands and
+re-opens only: the seat's clone (and any read-only trees it was given: `project.readOnlyPaths`, review snapshots), the
+desk's `bin/`, the run's socket, toolchains and caches (`~/.local/share/mise`, `~/.local/bin`, `~/.nvm`, `~/.volta`,
+`~/.fnm`, `~/.pyenv`, `~/.rustup`, `~/.cargo/{bin,registry}`, `~/.bun/bin`, `~/.deno/bin`, `~/go/{bin,pkg/mod}`, pip/uv
+and Playwright caches), `~/.gitconfig` and `~/.config/git` (add more with `sandbox.allowRead`); file tools may read only
+inside the working directory and those trees (`blockReadsOutsideWorkingDirectories`). Codex seats read only system and
+toolchain paths, `~/.gitconfig`, read-only paths and their clone. For both engines, secret-looking files inside readable
+trees stay unreadable (`.env*`, `.envrc`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, keystores, SSH keys, `credentials`,
+`*credentials*.json`, service-account JSON, `.npmrc`, `.pypirc`, `.netrc`, `.pgpass*`, `.git-credentials`, `secrets.{yml,yaml,json}`),
+as do the desk's state, credential stores and pgpass/service/verifier files. Still reachable: everything outside the
+home folder that the OS lets any user read (system files, `/opt/homebrew`, `/tmp`), the toolchain trees above, and the
+seat's own clone — keep secrets out of the repository and out of `readOnlyPaths`. `project.env` entries must be
 plain names and values: anything that looks like a credential (URL with a password, DSN, key, token) is withheld. A manager task that only needs a
 production *read* (`desk create-task --verify`, or an `--owner` step that is plainly a check) goes to the SRE, who
 answers it with probes under a ticket-scoped grant; it comes to you only if no probe can answer it.
 
 **Setup (owner, once):**
-1. Provision the read-only role on each database: `psql -U postgres -h 127.0.0.1 -p 5433 -d trading_ts -v ON_ERROR_STOP=1 -f scripts/provision-role.sql`
-   (and again for the app database), then `\password sigmadesk_ro`. It grants only session statistics, CONNECT, the
+1. Provision the read-only role on each database: `psql -X -U postgres -h 127.0.0.1 -p 5433 -d trading_ts -v ON_ERROR_STOP=1 -f scripts/provision-role.sql`
+   (and again for the app database), then `\password sigmadesk_ro`. It prints the PostgreSQL and TimescaleDB versions
+   and runs as one transaction with `lock_timeout 2s` / `statement_timeout 120s`: a hypertable column grant is propagated
+   to every chunk (~2,400 chunks: seconds to a few tens of seconds); on a timeout everything rolls back. Re-running it is
+   safe. It grants only session statistics, CONNECT, the
    Timescale job views and the reviewed time columns, never touches PUBLIC or other roles, and aborts without changes if
    an existing `sigmadesk_ro` holds anything beyond that set. `scripts/audit-public-functions.sql` is a separate,
    optional, read-only report of what PUBLIC can execute; any revocation it prompts is your own reviewed change.

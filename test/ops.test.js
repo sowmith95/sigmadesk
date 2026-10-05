@@ -50,6 +50,10 @@ fs.appendFileSync(${JSON.stringify(dockerLog)}, JSON.stringify(a) + '\\n');
 if (a[0] === 'ps') { console.log('alpaca-trader\\trunning\\tUp 2 hours\\t2 hours ago\\ntimescaledb\\trunning\\tUp 3 days (healthy)\\t3 days ago\\nsomething-else\\texited\\tExited (0)\\t1 day ago'); }
 else if (a[0] === 'inspect') { console.log('/alpaca-trader\\thealthy\\t0\\t2026-10-05T10:00:00Z\\tfalse\\n/timescaledb\\thealthy\\t1\\t2026-10-02T10:00:00Z\\tfalse'); }
 else if (a[0] === 'stats') { console.log('alpaca-trader\\t3.1%\\t512MiB / 2GiB\\t25%\\ntimescaledb\\t40%\\t4GiB / 8GiB\\t50%'); }
+else if (a[0] === 'logs' && a.at(-1) === 'noisy') {
+  console.error('x'.repeat(4100) + ' {"password": "TailSentinel777"} by-value Pgp4ssValueXYZ');
+  console.error('plain line after');
+}
 else if (a[0] === 'logs') {
   console.log('2026-10-05T14:00:00Z INFO started');
   console.log('2026-10-05T14:00:01Z ERROR connect failed DATABASE_URL=postgres://app:hunter2secret@db/trading');
@@ -67,7 +71,7 @@ fs.writeFileSync(cfgFile, JSON.stringify({
     enabled: true, psql: fakePsql, docker: fakeDocker, pgpassFile: path.join(tmp, 'pgpass'),
     databases: { timescale: { host: '127.0.0.1', port: 5433, dbname: 'trading_ts', user: 'sigmadesk_ro' }, app: { host: '127.0.0.1', port: 5434, dbname: 'trading_app', user: 'sigmadesk_ro' } },
     freshness: [{ label: 'bar_ticks 1s', db: 'timescale', table: 'bar_ticks', column: 'timestamp', filter: { column: 'timeframe', value: '1s' } }, { label: 'whale_trades', db: 'timescale', table: 'whale_trades', column: 'timestamp' }],
-    containers: ['alpaca-trader', 'timescaledb'],
+    containers: ['alpaca-trader', 'timescaledb', 'noisy'],
   },
 }));
 process.env.SIGMADESK_CONFIG = cfgFile;
@@ -143,7 +147,7 @@ test('parameters: fixed schemas refuse injection, unknown flags, out-of-range va
     [{ probe: 'db_health', db: 'timescale', query: 'DROP TABLE x' }, /takes no --query/],
     [{ probe: 'ingest_freshness', minutes: '60; DROP TABLE bar_ticks' }, /whole number/],
     [{ probe: 'ingest_freshness', minutes: '5000' }, /from 5 to 1440/],
-    [{ probe: 'container_logs', container: 'alpaca-trader; rm -rf /' }, /must be one of: alpaca-trader, timescaledb/],
+    [{ probe: 'container_logs', container: 'alpaca-trader; rm -rf /' }, /must be one of: alpaca-trader, timescaledb, noisy/],
     [{ probe: 'container_logs', container: 'something-else' }, /must be one of/],
     [{ probe: 'container_logs', container: 'alpaca-trader', since: '7h' }, /at most 6h/],
     [{ probe: 'container_logs', container: 'alpaca-trader', grep: 'a\nb' }, /printable/],
@@ -291,6 +295,11 @@ test('redaction, untrusted wrapping and byte caps on every output', async () => 
   resetPsql({ out: `${'y'.repeat(15990)}Pgp4ssValueXYZ tail\n` });
   const cut = await ops.handle(run, { probe: 'db_health', db: 'timescale' });
   assert.ok(!cut.includes('Pgp4ss'), 'truncation never leaves half a secret');
+  // Docker stderr is the log too: it is captured from the start (never tail-sliced) and each whole line is redacted
+  // before it is shortened, so a key name can never be cut off its value; registered values go regardless of key.
+  const noisy = await ops.handle(run, { probe: 'container_logs', container: 'noisy' });
+  assert.ok(!noisy.includes('TailSentinel777') && !noisy.includes('Pgp4ss'), 'stderr secrets are redacted before truncation');
+  assert.match(noisy, /2 line\(s\)/);
   // A raw read capped mid-line drops the partial line before redaction sees it.
   assert.equal(ops.dropPartialLine('row 1\nrow 2 Pgp4ss'), 'row 1');
 });
@@ -484,13 +493,32 @@ test('revocation is per operation: revoking the DB grant stops the DB probe whil
   await rejects(ops.handle(run, { probe: 'db_health', db: 'app' }), /no production read access grant/);
 });
 
+test('provisioning: one bounded transaction, prints versions, ADMIN OPTION and propagated chunk grants handled, idempotent', () => {
+  const prov = fs.readFileSync(path.join(ROOT, 'scripts', 'provision-role.sql'), 'utf8');
+  const code = prov.split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');
+  assert.equal((code.match(/^BEGIN;$/gm) || []).length, 1);
+  assert.equal((code.match(/^COMMIT;$/gm) || []).length, 1);
+  const begin = code.indexOf('BEGIN;'), commit = code.indexOf('COMMIT;');
+  assert.ok(code.indexOf("SET LOCAL lock_timeout = '2s';") > begin && code.indexOf("SET LOCAL statement_timeout = '120s';") > begin);
+  for (const stmt of ['CREATE ROLE', 'GRANT pg_read_all_stats', 'GRANT SELECT (%I)', 'GRANT USAGE ON SCHEMA public']) { const i = code.indexOf(stmt); assert.ok(i > begin && i < commit, stmt); }
+  assert.ok(code.indexOf("extversion FROM pg_extension WHERE extname = 'timescaledb'") < begin, 'version printed first');
+  assert.match(code, /m\.admin_option/);
+  assert.match(code, /_timescaledb_catalog\.chunk/);
+  assert.match(code, /_timescaledb_catalog\.continuous_agg/);
+  assert.match(code, /aclexplode\(at\.attacl\)/); // column ACLs read from the catalog, chunk grants accepted via the family table
+  assert.match(code, /c\.relname IN \('jobs', 'job_stats', 'job_errors', 'continuous_aggregates'\) AND a\.privilege_type = 'SELECT'/);
+  // The grants and the preflight whitelist come from the same table: what provisioning grants, a re-run accepts.
+  assert.match(code, /FOR g IN SELECT rel, col FROM sigmadesk_approved_cols/);
+  assert.match(prov, /~2,400 chunks/);
+});
+
 test('setup scripts: provisioning never touches PUBLIC and aborts on unexpected privileges; the audit only prints', () => {
   const prov = fs.readFileSync(path.join(ROOT, 'scripts', 'provision-role.sql'), 'utf8');
   const code = prov.split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');
   assert.ok(!/\bREVOKE\b/i.test(code), 'no REVOKE in provisioning');
   assert.ok(!/\bPUBLIC\b/.test(code.replace(/'public'|public\.|SCHEMA public|table_schema = 'public'/g, '')), 'no PUBLIC changes');
   assert.match(code, /RAISE EXCEPTION 'sigmadesk_ro already exists with privileges outside the reviewed set/);
-  for (const check of ['pg_auth_members', 'relowner', 'role_table_grants', 'column_privileges', 'pg_default_acl']) assert.ok(code.includes(check), check);
+  for (const check of ['pg_auth_members', 'relowner', 'relacl', 'attacl', 'pg_default_acl']) assert.ok(code.includes(check), check);
   assert.ok(!fs.existsSync(path.join(ROOT, 'scripts', 'create-readonly-role.sql')));
   const audit = fs.readFileSync(path.join(ROOT, 'scripts', 'audit-public-functions.sql'), 'utf8').split('\n').filter((l) => !/^\s*--/.test(l)).join('\n');
   assert.ok(!/\b(GRANT|REVOKE|ALTER|CREATE|DROP|UPDATE|INSERT|DELETE)\b/i.test(audit));
@@ -515,7 +543,25 @@ test('childEnv: an explicit allowlist, a project.env schema and an isolated tool
   assert.equal(runner.childEnv('tok', 'perplexity', base).ANTHROPIC_API_KEY, 'sk-ant-x', 'the Perplexity relay is Claude');
   const deny = runner.sandboxSettings('/tmp/ws', [], 'investigate').sandbox.filesystem.denyRead;
   for (const p of ['~/.pgpass', '~/.pg_service.conf', '~/.sigmadesk-ro-verifier', '~/.zshrc', '~/.zprofile', '~/.bashrc', '~/.profile', '~/.zsh_history', '~/.aws', '~/.config/gh', '~/.git-credentials',
-    config.ops.pgpassFile, path.join(repo, '.env.production'), path.join(repo, '.env'), '/tmp/ws/.env.local']) assert.ok(deny.includes(p), p);
+    config.ops.pgpassFile, path.join(repo, '**/.env.*'), path.join(repo, '**/.env'), '/tmp/ws/**/.env.*']) assert.ok(deny.includes(p), p);
+  // Reads are allowlisted: the whole home folder is denied to shell commands, then only the seat's trees, the desk CLI,
+  // the socket and toolchains are re-opened; secret-looking files inside readable trees stay denied (both engines).
+  const sb = runner.sandboxSettings('/tmp/ws', ['/tmp/other'], 'implement', '/tmp/r1.sock');
+  assert.equal(sb.sandbox.filesystem.denyRead[0], '~');
+  const allow = sb.sandbox.filesystem.allowRead;
+  for (const p of ['/tmp/ws', '/tmp/other', '/tmp/r1.sock', path.join(config.root, 'bin'), '~/.local/share/mise', '~/.gitconfig']) assert.ok(allow.includes(p), p);
+  assert.ok(!allow.some((p) => p === '~' || p === os.homedir() || /\.ssh|\.aws|\.zsh|\.claude|\.codex/.test(p)), allow.join(','));
+  for (const g of ['/tmp/ws/**/.env', '/tmp/ws/**/.env.*', '/tmp/ws/**/*.pem', '/tmp/ws/**/*.key', path.join(repo, '**/credentials.json')]) assert.ok(sb.sandbox.filesystem.denyRead.includes(g), g);
+  assert.equal(sb.permissions.blockReadsOutsideWorkingDirectories, true);
+  assert.ok(!sb.permissions.deny.includes('Read(~)'), 'file tools keep working in a clone under the home folder');
+  assert.ok(sb.permissions.deny.includes('Read(//tmp/ws/**/.env.*)'));
+  const savedRoot = config.root; config.root = tmp;
+  try {
+    const { codexHome } = await import('../src/engines/codex.js');
+    const toml = fs.readFileSync(path.join(codexHome(), 'config.toml'), 'utf8');
+    for (const g of ['"**/.env.*" = "none"', '"**/*.pem" = "none"', '"**/credentials.json" = "none"']) assert.equal(toml.split(g).length - 1, 2, `${g} in both profiles`);
+    assert.ok(!toml.includes(`"${os.homedir()}" = "read"`), 'codex never reads the whole home folder');
+  } finally { config.root = savedRoot; }
   // project.env schema: credential-looking names or values never reach a seat.
   config.project.env = { TZ: 'UTC', DB_URI: 'x', LOG_LEVEL: 'debug', UPSTREAM: 'https://user:pa55word@api.example/x', CONN: 'postgresql://a@b/c', LONG: 'Zm9vYmFyYmF6cXV4cXV1eHF1dXhxdXV4cXV1eA', lower_case: 'x', NOTE: 'token=abc' };
   const e2 = runner.childEnv('tok', 'codex', { ...base, HTTPS_PROXY: 'http://u:secretpw@proxy:8080' });

@@ -276,7 +276,7 @@ function runProcess(op, bin, args, { input = null, env = process.env, timeoutMs,
     if (op.cancelled) return resolve({ code: null, stdout: '', stderr: '', reason: 'cancelled', ms: 0 });
     const started = Date.now();
     const child = spawn(bin, args, { env, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
-    let out = [], outBytes = 0, err = '', ended = false, reason = null;
+    let out = [], outBytes = 0, err = [], errBytes = 0, ended = false, reason = null;
     const stop = (why) => {
       if (ended || reason) return;
       reason = why;
@@ -291,16 +291,19 @@ function runProcess(op, bin, args, { input = null, env = process.env, timeoutMs,
       out.push(d); outBytes += d.length;
       if (outBytes >= rawCap) stop('capped');
     });
-    child.stderr.on('data', (d) => { err = (err + d).slice(-4000); });
-    child.on('error', (e) => { err += String(e.message); });
+    // stderr is captured from the START and byte-capped like stdout (never tail-sliced: cutting the front of a line can
+    // remove a credential's key name and leave its value, which pattern redaction then cannot recognise).
+    child.stderr.on('data', (d) => { if (errBytes >= rawCap) return; err.push(d); errBytes += d.length; if (errBytes >= rawCap) stop('capped'); });
+    child.on('error', (e) => { err.push(Buffer.from(`\n${e.message}`)); });
     child.stdin.on('error', () => {});
     child.stdin.end(input ?? '');
     child.on('close', (code) => {
       ended = true; clearTimeout(timer); op.handles.delete(handle);
       let stdout = Buffer.concat(out).toString('utf8');
       // A capped read may end inside a secret: drop the partial last line BEFORE any redaction sees it.
-      if (reason === 'capped') stdout = dropPartialLine(stdout);
-      resolve({ code, stdout, stderr: err, reason, ms: Date.now() - started });
+      let stderr = Buffer.concat(err).toString('utf8');
+      if (reason === 'capped') { stdout = dropPartialLine(stdout); stderr = dropPartialLine(stderr); }
+      resolve({ code, stdout, stderr, reason, ms: Date.now() - started });
     });
   });
 }
@@ -372,7 +375,7 @@ async function containerLogs(op, p) {
   if (r.reason && r.reason !== 'capped') return finishProcess(r, op);
   if (r.code !== 0 && r.reason !== 'capped') return finishProcess(r, op);
   // docker logs writes the container's stderr to stderr: both are the log.
-  const lines = `${r.stdout}\n${r.reason ? '' : r.stderr}`.split('\n').filter((l) => l.trim());
+  const lines = `${r.stdout}\n${r.stderr}`.split('\n').filter((l) => l.trim());
   const needle = p.grep?.toLowerCase();
   // Redact each whole line first, then shorten: truncation must never cut a secret in half before redaction.
   const hits = (needle ? lines.filter((l) => l.toLowerCase().includes(needle)) : lines).slice(-p.tail).map(clean).map((l) => (l.length > 500 ? `${l.slice(0, 499)}…` : l));
