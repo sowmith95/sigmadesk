@@ -165,7 +165,7 @@ const DEFAULTS = {
   },
   // Production read access ("desk ops"): named, read-only probes the DESK runs for SRE/DBA seats. Seats never get
   // credentials or a shell on the host. Off unless ops.enabled here AND the owner's Settings toggle (ops_enabled).
-  // See README "Production read access" and scripts/create-readonly-role.sql.
+  // See README "Production read access" and scripts/provision-role.sql.
   ops: {
     enabled: false,
     // Run kinds in which a seat holding a grant may probe. WHO may probe is decided by grants (access.*), not here.
@@ -181,7 +181,10 @@ const DEFAULTS = {
     freshness: [],
     docker: '', // docker CLI path; empty = `docker` on PATH
     containers: [], // the only containers container_status / container_logs may name
-    appHealth: { baseUrl: 'http://127.0.0.1:8001', paths: { health: '/health', cache_quality: '/diag/cache/quality' } },
+    // app_health GETs only this liveness path (never diagnostics that make the app query its database).
+    appHealth: { baseUrl: 'http://127.0.0.1:8001', path: '/health' },
+    // Extra files whose values must never appear in probe output (besides pgpassFile / pgServiceFile).
+    secretFiles: ['~/.sigmadesk-ro-verifier'],
     maxBytes: 16000, // per probe result handed to a seat
     cacheSeconds: 60,
     queueMax: 4, // DB probes waiting behind the one in flight
@@ -337,6 +340,28 @@ export function wrapperProblem(bin) {
   return null;
 }
 
+// project.env reaches every seat: an explicit schema. Names are plain env names that do not look secret; values are short
+// plain strings that do not look like credentials (URLs with passwords, DSNs, API keys, private keys, long tokens).
+const AGENT_ENV_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+const SECRET_ENV_NAME = /(SECRET|TOKEN|PASSWORD|PASSWD|_KEY$|^KEY$|_KEY_|DSN|DATABASE_URL|_URI$|_URL$|CREDENTIAL|PRIVATE|COOKIE|SESSION|^PG|^AWS_|^GCP_|^AZURE_|^APCA_|^ALPACA_|^POLYGON_|^MASSIVE_|^IBKR_|^GH_|^GITHUB_|^NPM_|^OPENAI_|^ANTHROPIC_)/;
+export function credentialLike(value) {
+  const v = String(value ?? '');
+  return /:\/\/[^\s/@]*:[^\s/@]*@/.test(v) // scheme://user:password@
+    || /^(postgres(ql)?|mysql|mariadb|mongodb(\+srv)?|redis|rediss|amqps?|mssql|sqlserver|clickhouse|snowflake|jdbc:[a-z]+):/i.test(v)
+    || /\b(sk-[A-Za-z0-9_-]{16,}|gh[opusr]_[A-Za-z0-9]{16,}|github_pat_\w{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[\w-]{10,}|AIza[\w-]{30,})/.test(v)
+    || /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(v)
+    || /\b(password|passwd|pwd|secret|token|api[_-]?key)\s*=/i.test(v)
+    || /^[A-Za-z0-9+/_=-]{32,}$/.test(v); // a long opaque token
+}
+/** Why a project.env entry may not reach seats, or null. */
+export function agentEnvProblem(name, value) {
+  if (!AGENT_ENV_NAME.test(name)) return `project.env.${name}: names must be UPPER_SNAKE_CASE`;
+  if (SECRET_ENV_NAME.test(name)) return `project.env.${name}: looks like a credential name; seats never get credentials`;
+  if (!['string', 'number', 'boolean'].includes(typeof value) || String(value).length > 1000) return `project.env.${name}: must be a short string`;
+  if (credentialLike(value)) return `project.env.${name}: the value looks like a credential (URL with a password, DSN, key or token)`;
+  return null;
+}
+
 export function validateConfig(c = config) {
   const problems = [];
   if (!c.project.repoPath || !fs.existsSync(path.join(c.project.repoPath, '.git'))) problems.push('project.repoPath must point at a git checkout');
@@ -347,6 +372,9 @@ export function validateConfig(c = config) {
     const w = wrapperProblem(c.bins.claude);
     if (w) problems.push(w);
   }
+  for (const [k, v] of Object.entries(c.project.env || {})) { const why = agentEnvProblem(k, v); if (why) problems.push(`${why} (it is withheld from seats)`); }
+  const home = os.homedir();
+  for (const p of c.project.readOnlyPaths || []) if (path.resolve(p) === home || home.startsWith(`${path.resolve(p)}/`)) problems.push(`project.readOnlyPaths: ${p} would expose your home folder to every seat`);
   if (c.github.sync && !c.project.githubRepo) problems.push('github.sync is on but project.githubRepo is unknown');
   if (!fs.existsSync(c.project.playbook)) problems.push(`playbook not found: ${c.project.playbook}`);
   if (!(c.engines.fallbackCooldownMinutes >= 1 && c.engines.fallbackCooldownMinutes <= 1440)) problems.push('engines.fallbackCooldownMinutes must be between 1 and 1440');
