@@ -7,7 +7,7 @@ import { ChevronDown, ChevronRight, MoreHorizontal } from 'lucide-react';
 import { S, api, currentBoard, openTicket, questionFor, loadPrs, openFeature, loadSnapshot, toast, prFor } from '@/store.js';
 import { clean } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Tag, Empty, Section } from '@/components/desk/Bits';
 import { KIND_LABEL, CiTag, Reviews, prReviewsOf, NowLine, cardFor, Clamp, DecisionButton, firstName, reasonText, WorkerLine } from '@/components/desk/Work';
 import { Lineage } from '@/components/desk/Epic';
@@ -54,8 +54,9 @@ function RowMenu({ it }: { it: Row }) {
           : it.protected ? <DropdownMenuLabel className="font-normal text-muted-foreground">Can't snooze: it protects production</DropdownMenuLabel>
             : snoozePresets().map((p) => <DropdownMenuItem key={p.id} className="min-h-10" onSelect={run(() => snooze(it.id, p.until))}>Snooze {p.label.toLowerCase()}{it.waiting?.length ? ` (with ${it.waiting.length} waiting)` : ''}</DropdownMenuItem>)}
         {t && <><DropdownMenuSeparator /><DropdownMenuLabel className="font-normal text-muted-foreground">Priority (now {t.priority || 'P2'})</DropdownMenuLabel>
-          <div className="flex gap-1 px-2 pb-1.5">{['P0', 'P1', 'P2', 'P3'].map((p) => <Button key={p} size="sm" variant={t.priority === p ? 'default' : 'secondary'} className="flex-1"
-            onClick={() => api('PATCH', `/api/tickets/${t.key}`, { priority: p }).then(() => { loadSnapshot(); toast(`${t.key} is ${p}`); }, (e) => toast(e.message, true))}>{p}</Button>)}</div></>}
+          <DropdownMenuRadioGroup value={t.priority || 'P2'} onValueChange={(p) => { if (p !== t.priority) run(() => api('PATCH', `/api/tickets/${t.key}`, { priority: p }).then(() => { loadSnapshot(); toast(`${t.key} is ${p}`); }))(); }}>
+            {[['P0', 'P0 · drop everything'], ['P1', 'P1 · high'], ['P2', 'P2 · normal'], ['P3', 'P3 · low']].map(([p, label]) => <DropdownMenuRadioItem key={p} value={p} className="min-h-10">{label}</DropdownMenuRadioItem>)}
+          </DropdownMenuRadioGroup></>}
         {it.kind === 'owner_task' && t && <><DropdownMenuSeparator /><DropdownMenuItem className="min-h-10" onSelect={run(() => api('POST', `/api/tickets/${t.key}/owner-task`, { owner_task: false }).then(() => { loadSnapshot(); toast('Handed back to the team'); }))}>Hand back to the team</DropdownMenuItem></>}
       </DropdownMenuContent>
     </DropdownMenu>
@@ -81,7 +82,7 @@ function InboxRow({ it, hero = false }: { it: Row; hero?: boolean }) {
           {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}</button>
         <h3 className={cn('min-w-0 flex-1 font-semibold leading-snug', hero ? 'text-[17px]' : 'truncate text-[15px]')}>{t ? <button type="button" className="block w-full truncate text-left hover:underline" title={it.verb} onClick={openIt}>{it.verb}</button> : it.verb}</h3>
         {/* On a phone the title opens the decision; the button would crowd the title off the row. */}
-        {!hero && <DecisionButton it={it} size="sm" className="shrink-0 max-md:hidden" />}
+        {!hero && <DecisionButton it={it} size="sm" className={cn('shrink-0', it.kind !== 'page' && 'max-md:hidden')} />}
         {t && <RowMenu it={it} />}
       </div>
       <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pl-9 text-[13px]">
@@ -99,7 +100,8 @@ function InboxRow({ it, hero = false }: { it: Row; hero?: boolean }) {
         {!!it.waiting?.length && <p className="text-sm text-muted-foreground">
           {it.kind === 'epic_review' ? 'Also answers: ' : `${it.waiting.length} more question${it.waiting.length === 1 ? '' : 's'} wait${it.waiting.length === 1 ? 's' : ''} on this: `}
           {it.waiting.map((w, i) => <span key={w.id}>{i > 0 && ', '}<button type="button" className="hover:text-foreground hover:underline" onClick={() => openTicket(w.key, { decision: w.id })}>{w.name}</button></span>)}</p>}
-        {hero && <div className="flex flex-wrap gap-2">{t && <Button variant="ghost" onClick={openIt}>Details</Button>}<DecisionButton it={it} className="max-md:flex-1" /></div>}
+        {/* The action is always reachable from an open row (on a phone the collapsed row shows only the title). */}
+        {(hero || open) && <div className={cn('flex flex-wrap gap-2', !hero && 'md:hidden')}>{t && <Button variant="ghost" onClick={openIt}>Details</Button>}<DecisionButton it={it} className="max-md:flex-1" /></div>}
       </div>}
     </article>
   );
@@ -135,7 +137,7 @@ export function InboxPage() {
       <Section id="needs" title="Needs you" count={c.needs_you} tone="needs">
         {rows.length ? <div className="grid gap-5">
           {first && <div data-do-first className="grid gap-1.5"><span className="text-[13px] font-medium text-needs">Do first</span>
-            <div className="overflow-hidden rounded-lg border border-l-[3px] border-l-needs bg-card"><InboxRow it={first} hero /></div></div>}
+            <div className="overflow-hidden rounded-lg border border-l-[3px] border-l-needs bg-card"><InboxRow key={first.id} it={first} hero /></div></div>}
           {LANES.map((l) => <Lane key={l.id} {...l} rows={rest.filter((r) => r.lane === l.id)} open={!!lanes[l.id]} onToggle={() => toggle(l.id)} />)}
         </div> : <Empty title={snoozed.length ? 'Nothing due now.' : 'Nothing needs you.'}>{snoozed.length ? `${snoozed.length} snoozed. ` : ''}{c.working} working, {c.queued} queued.</Empty>}
         {snoozed.length > 0 && <div className="mt-5 grid gap-1.5" data-snoozed>

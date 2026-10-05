@@ -178,7 +178,7 @@ export function board(state, extra = {}) {
   out.decisions.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
   // The Inbox: grouped rows in lanes and order (public/inbox.js); snoozed rows are set aside, not resolved, and are
   // not counted as needing you until they wake. Every decision stays in `decisions` for sheets, trackers and search.
-  const arranged = inbox.arrange(grouped, { tickets, ix, snoozes: state.meta?.snoozes || {}, since: state.meta?.waiting_since || {}, incidents: state.incidents || [], now: extra.now || Date.now() });
+  const arranged = inbox.arrange(grouped, { tickets, ix, snoozes: state.meta?.snoozes || {}, since: state.meta?.waiting_since || {}, incidents: state.incidents || [], protectedKeys: state.meta?.protected_tickets || [], now: extra.now || Date.now() });
   out.needs_you = arranged.active;
   out.snoozed = arranged.snoozed;
   out.do_first = arranged.doFirst;

@@ -23,16 +23,27 @@ export const TIME_HINT = { question: 'quick', guard: 'quick', publish: 'quick', 
 const OPEN_INCIDENT = new Set(['watching', 'investigating', 'paged', 'ticketed']);
 export const SNOOZE_MAX_DAYS = 30;
 
-/** Never deferred: a publish guard, a production page, or a decision on a ticket linked to an open incident. */
-export function isProtected(d, incidents = []) {
+/**
+ * Never deferred: a publish guard, a production page, a ticket the on-call engineer filed from the error watch, or
+ * any ticket (including folded questions) linked to an open incident. `protectedKeys`: tickets with an open
+ * incident, from the server (independent of whether the watch is on or how many incidents are listed).
+ */
+export function isProtected(d, incidents = [], protectedKeys = []) {
   if (d.kind === 'guard' || d.kind === 'page') return true;
-  const key = d.ticket?.key;
-  return !!key && incidents.some((i) => i.ticket_key === key && OPEN_INCIDENT.has(i.status));
+  const keys = [d.ticket?.key, ...(d.waiting || []).map((w) => w.key)].filter(Boolean);
+  if (d.ticket && (d.ticket.source === 'watch' || d.ticket.reporter === 'sre')) return true;
+  return keys.some((k) => protectedKeys.includes(k) || incidents.some((i) => i.ticket_key === k && OPEN_INCIDENT.has(i.status)));
 }
-/** What makes a decision "new again": its status, commit, QA and review rounds, and what it says. */
+/**
+ * What makes a decision "new again": its status, commit, QA and review rounds, what it asks (its action, and for an
+ * epic review which question is open), and any newly folded question. A merge's progress note is left out: the merge
+ * train rewrites it as it waits, which is not news for the owner.
+ */
 export function versionOf(d) {
   const t = d.ticket || {};
-  return [d.id, t.status || '', t.head_sha || '', t.qa_loops || 0, t.review_round || 0, t.progress_msg || ''].join('|');
+  const said = d.kind === 'merge' || d.kind === 'publish' ? '' : t.progress_msg || '';
+  return [d.id, d.action || '', t.status || '', t.head_sha || '', t.qa_loops || 0, t.review_round || 0, t.review_stage || '', said,
+    d.review ? `${d.review.question_state || ''}/${d.review.close_state || ''}` : '', (d.waiting || []).map((w) => w.id).sort().join(',')].join('|');
 }
 
 /**
@@ -41,13 +52,13 @@ export function versionOf(d) {
  *   protected, snoozed_until, version, time_hint.
  */
 export function arrange(rows, ctx = {}) {
-  const { tickets = [], snoozes = {}, since = {}, incidents = [], now = Date.now() } = ctx;
+  const { tickets = [], snoozes = {}, since = {}, incidents = [], protectedKeys = [], now = Date.now() } = ctx;
   const ix = ctx.ix || flow.index(tickets);
   const rich = rows.map((d) => {
     // Unique tasks waiting on it: the dependency graph and the folded questions name some of the same tickets.
     const keys = new Set([...(d.ticket ? flow.waitingOn(d.ticket.key, tickets, ix).map((w) => w.key) : []), ...(d.waiting || []).map((w) => w.key)]);
     keys.delete(d.ticket?.key);
-    const prot = isProtected(d, incidents);
+    const prot = isProtected(d, incidents, protectedKeys);
     const version = versionOf(d);
     const s = snoozes[d.id];
     const until = !prot && s && Date.parse(s.until) > now && s.version === version ? s.until : null;

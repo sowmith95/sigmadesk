@@ -81,10 +81,11 @@ export async function loadSnapshot() {
     Object.assign(S, snap);
     S.loadError = null; S.loaded = true;
     // Replayed messages keep their follow-ups (they used to be dropped).
-    let research = false;
-    for (const m of pending.splice(0)) research = applyDelta(S, m).research || research;
+    let research = false, meta = false;
+    for (const m of pending.splice(0)) { const r = applyDelta(S, m); research = r.research || research; meta = r.meta || meta; }
     if (S.feature && S.featureDetail?.key === S.feature) loadFeature().catch(() => {});
     if (research && researchVisible()) loadResearch().catch(() => {});
+    if (meta) refreshMeta(); // e.g. a snooze from another device arrived while this snapshot was in flight
     emit();
   } catch (e) {
     if (seq === snapshotSeq) { S.loadError = e.message; for (const m of pending.splice(0)) applyDelta(S, m); emit(); }

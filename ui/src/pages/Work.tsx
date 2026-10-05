@@ -89,7 +89,8 @@ export function WorkPage() {
   const topEpics = B.epics.filter((it) => !openParent(it.ticket));
   const engineers = S.agents.filter((a: { id: string }) => (S.meta.engineers || []).includes(a.id));
   const lanes: [string, string, BoardItem[], number, 'needs' | 'shipped' | undefined][] = [
-    ['wait', 'Waiting on you', B.needs_you, B.counts.needs_you, 'needs'], ['working', 'Working', B.working, B.counts.working, undefined],
+    // Everything waiting on you, snoozed or folded included: Work is where you find any ticket.
+    ['wait', 'Waiting on you', B.decisions || B.needs_you, (B.decisions || B.needs_you).length, 'needs'], ['working', 'Working', B.working, B.counts.working, undefined],
     ['queued', 'Queued', [...B.blocked, ...B.queued], B.counts.blocked + B.counts.queued, undefined], ['shipped', 'Shipped', B.shipped, B.counts.shipped, 'shipped'],
   ];
   return (

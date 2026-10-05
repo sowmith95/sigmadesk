@@ -52,7 +52,7 @@ export function applyDelta(S, m) {
       break;
     }
     case 'lessons': out.meta = true; break;
-    case 'inbox': out.meta = true; break; // a snooze changed on another device // a lesson was proposed or decided: refresh the snapshot
+    case 'inbox': out.meta = true; break; // a snooze changed on another device
     case 'epic-review': {
       const list = (S.meta.epic_reviews ||= []);
       const i = list.findIndex((r) => r.key === m.data.key);

@@ -82,7 +82,39 @@ test('server: waiting time starts when the decision appears and survives ticket 
   assert.throws(() => inboxState.setSnooze({ id: 'Q-1:question', until: '2027-10-05T00:00:00Z' }, ctx), /At most 30 days/);
   const s = inboxState.setSnooze({ id: 'Q-1:question', until: '2026-10-06T09:00:00Z' }, ctx);
   assert.equal(s.version, versionOf(q));
-  assert.ok(inboxState.snoozes(new Set(['Q-1:question']), NOW)['Q-1:question']);
+  assert.ok(inboxState.snoozes([q], { now: NOW })['Q-1:question']);
   inboxState.setSnooze({ id: 'Q-1:question', until: null }, ctx);
-  assert.deepEqual(inboxState.snoozes(null, NOW), {});
+  assert.deepEqual(inboxState.snoozes(null, { now: NOW }), {});
+  // A snooze that a change woke is gone for good: the change going back does not hide the row again.
+  inboxState.setSnooze({ id: 'Q-1:question', until: '2026-10-06T09:00:00Z' }, ctx);
+  const changed = { ...q, ticket: { ...q.ticket, progress_msg: 'B' } };
+  assert.deepEqual(inboxState.snoozes([changed], { now: NOW }), {});
+  assert.deepEqual(inboxState.snoozes([q], { now: NOW }), {}, 'not revived');
+});
+
+test('review fixes: protection without the watch list, wake on real changes only, explicit bring-back, seeded ages', () => {
+  const watchTicket = T('W-1', { status: 'needs_human', source: 'watch' });
+  assert.ok(isProtected(row('W-1:question', 'question', watchTicket)), 'an on-call ticket is protected even with the watch off');
+  const host = row('H-1:question', 'question', T('H-1', { status: 'needs_human' }));
+  host.waiting = [{ key: 'I-1', name: 'x', id: 'I-1:question' }];
+  assert.ok(isProtected(host, [], ['I-1']), 'a folded question on an incident ticket protects its host');
+  const plain = row('P-1:question', 'question', T('P-1'));
+  const withNew = { ...plain, waiting: [{ key: 'N-1', name: 'n', id: 'N-1:question' }] };
+  assert.notEqual(versionOf(plain), versionOf(withNew), 'a newly folded question brings the row back');
+  const er = (q, c) => ({ id: 'E-1:epic-review:1', kind: 'epic_review', action: q === 'open' ? 'Answer once' : 'Decide closes', review: { question_state: q, close_state: c }, ticket: T('E-1') });
+  assert.notEqual(versionOf(er('open', 'open')), versionOf(er('answered', 'open')), 'answering the question surfaces the closes');
+  const m1 = row('M-1:merge', 'merge', T('M-1', { status: 'ready_for_human', progress_msg: 'waiting for the deploy lock' }));
+  const m2 = { ...m1, ticket: { ...m1.ticket, progress_msg: 'queued behind SD-3' } };
+  assert.equal(versionOf(m1), versionOf(m2), 'the merge train rewording its note is not news');
+  const q = row('Q-9:question', 'question', T('Q-9', { status: 'needs_human' }));
+  assert.throws(() => inboxState.setSnooze({ id: 'Q-9:question' }, { decisions: [q], now: NOW }), /until is required/);
+  const seeded = inboxState.trackSince([{ id: 'old', ticket: { updated_at: '2026-10-01T00:00:00.000Z' } }], '2026-10-05T12:00:00.000Z', { seed: true });
+  assert.equal(seeded.old, '2026-10-01T00:00:00.000Z', 'existing decisions start from their ticket, not from the upgrade');
+});
+
+test('Do first skips a snoozed row and falls back to the next one', () => {
+  const p0 = T('Z-1', { priority: 'P0' }), q = T('Z-2');
+  const r0 = row('Z-1:question', 'question', p0), r1 = row('Z-2:question', 'question', q);
+  const out = arrange([r0, r1], { tickets: [p0, q], snoozes: { 'Z-1:question': { until: '2999-01-01T00:00:00Z', version: versionOf(r0) } }, now: NOW });
+  assert.equal(out.doFirst, 'Z-2:question');
 });

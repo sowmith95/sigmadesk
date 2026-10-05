@@ -59,7 +59,7 @@ async function readBody(req) {
 // Display name: an explicit alias (owner rename) or one derived from the title. Stored in kv: no schema change.
 const withName = (t) => ({ ...t, name: nameOf({ ...t, name: store.kvGet(`name:${t.key}`) || '' }) });
 
-export function snapshot() {
+export function snapshot({ inbox = true } = {}) {
   const states = Object.fromEntries(store.listAgentStates().map((a) => [a.id, a]));
   const spend = store.spendByAgentSince(sched.startOfToday());
   const settings = store.getSettings();
@@ -90,9 +90,17 @@ export function snapshot() {
     },
   };
   // Inbox attention state: real waiting time per decision and the owner's snoozes (public/inbox.js applies them).
-  const decisions = board(snap).decisions || [];
-  snap.meta.waiting_since = inboxState.trackSince(decisions);
-  snap.meta.snoozes = inboxState.snoozes(new Set(decisions.map((d) => d.id)));
+  // Tickets linked to an open incident are never snoozable, whether or not the watch lists incidents right now.
+  snap.meta.protected_tickets = store.openIncidentTickets();
+  if (!inbox) return snap;
+  // One board per snapshot: computed with the stored state, then the stored state is reconciled with it (new
+  // decisions start their clock, invalid snoozes are dropped for good). Routes on this snapshot reuse `snap.board`.
+  snap.meta.waiting_since = inboxState.readSince();
+  snap.meta.snoozes = inboxState.readSnoozes();
+  const B = board(snap);
+  snap.meta.waiting_since = inboxState.trackSince(B.decisions || []);
+  snap.meta.snoozes = inboxState.snoozes(B.decisions || [], { incidents: snap.incidents || [], protectedKeys: snap.meta.protected_tickets });
+  Object.defineProperty(snap, 'board', { value: B, enumerable: false });
   return snap;
 }
 
@@ -217,21 +225,22 @@ async function ownerRoute(req, res) {
   // Versioned summary for the Projects home: enough to show a project card, nothing more.
   if (req.method === 'GET' && p === '/api/summary') {
     const snap = snapshot();
-    const B = board(snap);
+    const B = snap.board || board(snap);
     const recent = requestsOf(snap, B, 5);
     return send(res, 200, { version: 1, id: config.projectId, project: config.project.name, repo: config.project.githubRepo || config.project.repoPath,
       paused: snap.settings.paused === 'true', team_confirmed: snap.settings.team_confirmed === 'true', needs_you: B.counts.needs_you, working: B.counts.working,
       blocked: B.counts.blocked, queued: B.counts.queued, spend_today: snap.meta.spend_today, budget: Number(snap.settings.daily_budget_usd), recent_requests: recent, snoozed: B.counts.snoozed || 0, at: store.now() });
   }
-  if (req.method === 'GET' && p === '/api/health') return send(res, 200, { at: store.now(), providers: dispatch.providerHealth(), scheduler: sched.health(), watch: snapshot().meta.watch });
+  if (req.method === 'GET' && p === '/api/health') return send(res, 200, { at: store.now(), providers: dispatch.providerHealth(), scheduler: sched.health(), watch: snapshot({ inbox: false }).meta.watch });
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
     return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), research_reviews: researchReview.forTicket(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'POST' && p === '/api/inbox/snooze') {
+    const body = await readBody(req); // read first: validate against the state after the request arrived
     const snap = snapshot();
-    const out = inboxState.setSnooze(await readBody(req), { decisions: board(snap).decisions || [], incidents: snap.incidents || [] });
+    const out = inboxState.setSnooze(body, { decisions: snap.board?.decisions || [], incidents: snap.incidents || [], protectedKeys: snap.meta.protected_tickets || [] });
     store.bus.emit('msg', { type: 'inbox', data: null });
     return send(res, 200, out);
   }

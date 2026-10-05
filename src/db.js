@@ -400,6 +400,8 @@ export function recordQaVerdict(v) {
     .run(v.ticket_key, v.run_id ?? null, v.sha ?? null, v.verdict, v.reason ?? null, v.lesson_id ?? null, v.builder ?? null, v.model ?? null, v.complexity ?? null, v.area ?? null);
 }
 /** The run that produced what QA judged: the builder's latest implement/respond run on the ticket. */
+/** Tickets linked to an incident that is still open (never snoozable in the Inbox). */
+export const openIncidentTickets = () => db.prepare("SELECT DISTINCT ticket_key FROM incidents WHERE ticket_key IS NOT NULL AND status IN ('watching','investigating','paged','ticketed')").all().map((r) => r.ticket_key);
 export const lastBuildRun = (ticketKey, agentId) => db.prepare("SELECT * FROM runs WHERE ticket_key = ? AND agent_id = ? AND kind IN ('implement','respond','resolve') ORDER BY id DESC LIMIT 1").get(ticketKey, agentId) || null;
 export const qaVerdicts = (ticketKey) => db.prepare('SELECT * FROM qa_verdicts WHERE ticket_key = ? ORDER BY id').all(ticketKey);
 export const getLesson = (id) => db.prepare('SELECT * FROM lessons WHERE id = ?').get(id) || null;
