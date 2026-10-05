@@ -27,7 +27,8 @@ const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; cha
 const CSP = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'";
 
 function send(res, code, body, type = 'application/json', headers = {}) {
-  res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...headers });
+  // no-referrer: desk links carry the desk's owner token; it must never leak through a Referer header.
+  res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', ...headers });
   res.end(typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body));
 }
 async function readBody(req) {
@@ -43,15 +44,57 @@ function authed(req) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-const tokenOf = (p) => { try { return JSON.parse(fs.readFileSync(path.join(p.home, 'config.json'), 'utf8')).server?.ownerToken || ''; } catch { return ''; } };
+// null = the desk's config could not be read (never treated as "no token": that would send an unauthenticated request).
+const tokenOf = (p) => { try { return JSON.parse(fs.readFileSync(path.join(p.home, 'config.json'), 'utf8')).server?.ownerToken || ''; } catch { return null; } };
 async function summaryOf(port, token) {
   try {
     const r = await fetch(`http://127.0.0.1:${port}/api/summary`, { headers: token ? { 'x-sigmadesk-token': token } : {}, signal: AbortSignal.timeout(1500) });
     return r.ok ? { online: true, ...(await r.json()) } : { online: true, error: `HTTP ${r.status}` };
   } catch { return { online: false }; }
 }
-// The desk link for the browser that asked: same host it reached the hub on, the project's port, its token once.
-const deskUrl = (req, port, token) => `http://${(req.headers.host || '127.0.0.1').replace(/:\d+$/, '')}:${port}/${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+// The desk link for the browser that asked: same host it reached the hub on, the project's port, its token once, and
+// optionally a desk page to land on (`next`, e.g. #/inbox/SD-12; the desk only accepts a strict page/ticket pattern).
+const deskUrl = (req, port, token, next = '') => `http://${(req.headers.host || '127.0.0.1').replace(/:\d+$/, '')}:${port}/${token ? `?token=${encodeURIComponent(token)}${next ? `&next=${encodeURIComponent(next)}` : ''}` : next}`;
+const loopback = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket?.remoteAddress);
+
+// ---------------- instructions: the owner asks a desk for work from the Projects home ----------------
+/** The desk a request goes to: registered projects plus the classic desk. */
+function deskFor(id) {
+  if (id === 'classic') return { id: config.projectId, name: config.project.name, port: config.server.port, token: config.server.ownerToken || '' };
+  const p = getProject(String(id || ''));
+  return p ? { id: p.id, name: p.name, port: p.port, token: tokenOf(p) } : null;
+}
+const titleOf = (text) => {
+  const first = String(text).split('\n').map((l) => l.trim()).find(Boolean) || '';
+  return first.length <= 120 ? first : `${first.slice(0, 119).replace(/\s+\S*$/, '')}…`;
+};
+async function sendInstruction(req, b) {
+  // The hub can create work on every desk: from another device it must be signed in (no open write gateway).
+  if (!TOKEN && !loopback(req)) return [403, { error: 'Set a Projects home token before sending instructions from another device' }];
+  const text = String(b.text || '').trim();
+  if (text.length < 3 || text.length > 8000) return [400, { error: 'Write the instruction (3 to 8000 characters)' }];
+  if (b.kind !== undefined && !['auto', 'feature'].includes(b.kind)) return [400, { error: 'kind must be auto or feature' }];
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(String(b.request_id || ''))) return [400, { error: 'request_id required' }];
+  const desk = deskFor(b.project);
+  if (!desk) return [404, { error: 'No such project' }];
+  if (desk.token === null) return [500, { error: `Could not read ${desk.name}'s settings to sign in to it` }];
+  // Ready means this desk answered as itself: a stopped desk is offline; another service on the port is refused.
+  const sum = await summaryOf(desk.port, desk.token);
+  if (!sum.online) return [409, { error: `${desk.name} is not running. Start it, then send again.`, offline: true }];
+  if (sum.error || (sum.id && sum.id !== desk.id && b.project !== 'classic')) return [409, { error: `${desk.name} did not answer as expected (${sum.error || 'another desk is on its port'})` }];
+  let r;
+  try {
+    r = await fetch(`http://127.0.0.1:${desk.port}/api/tickets`, { method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(10_000),
+      headers: { 'Content-Type': 'application/json', ...(desk.token ? { 'x-sigmadesk-token': desk.token } : {}) },
+      body: JSON.stringify({ title: titleOf(text), description: text, kind: b.kind === 'feature' ? 'feature' : 'auto', priority: /^P[0-3]$/.test(b.priority) ? b.priority : undefined, request_id: b.request_id, source: 'hub' }) });
+  } catch {
+    // The desk may have created it before the answer was lost: the same request id never makes a second ticket.
+    return [502, { error: `${desk.name} did not answer in time. Send again: it will not create a second ticket.`, unknown: true }];
+  }
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) return [r.status === 401 ? 502 : r.status, { error: r.status === 401 ? `${desk.name} refused the Projects home's sign-in` : out.error || `HTTP ${r.status}` }];
+  return [r.status, { key: out.key, project: b.project, name: desk.name, duplicate: !!out.duplicate, url: deskUrl(req, desk.port, desk.token, `#/inbox/${out.key}`) }];
+}
 
 async function state(req) {
   const projects = await Promise.all(listProjects().map(async (p) => { const token = tokenOf(p); return { ...p, home: undefined, summary: await summaryOf(p.port, token), url: deskUrl(req, p.port, token) }; }));
@@ -93,6 +136,7 @@ async function route(req, res) {
   if (req.method === 'GET' && p === '/api/hub/repos') return send(res, 200, { repos: suggestions() });
   if (req.method === 'POST' && p === '/api/hub/scan') { const b = await readBody(req); return send(res, 200, scanRepo(String(b.repoPath || '').replace(/^~(?=\/)/, os.homedir()))); }
   if (req.method === 'POST' && p === '/api/hub/recommend') { const b = await readBody(req); return send(res, 200, recommendTeam(b.scan || {}, b.answers || {})); }
+  if (req.method === 'POST' && p === '/api/hub/instructions') { const [code, body] = await sendInstruction(req, await readBody(req)); return send(res, code, body); }
   if (req.method === 'POST' && p === '/api/hub/projects') {
     const b = await readBody(req);
     const team = b.team || manifestFrom(recommendTeam(b.scan || {}, b.answers || {}));

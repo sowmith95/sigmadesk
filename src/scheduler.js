@@ -1453,10 +1453,34 @@ export function prChecksFailed(t, names) {
 }
 
 // ---------------- owner (UI) actions ----------------
+/**
+ * The owner asks for work (the New ticket dialog, or an instruction sent from the Projects home).
+ * `kind`: 'feature' → a feature planned with Codex before anything starts; 'task' (and any instruction) → a task that
+ * triage routes. `request_id` makes a retry (double tap, hub timeout, hub restart) return the ticket it already made.
+ */
 export function ownerCreate(body) {
   need(body.title, 'title required');
-  return store.createTicket({ title: body.title, description: body.description || '', type: body.type || 'feature', status: 'triage',
-    priority: PRIORITY.test(body.priority) ? body.priority : 'P2', reporter: 'owner', source: 'human' });
+  need(typeof body.title === 'string' && body.title.trim().length <= 200, 'a title of at most 200 characters');
+  need(body.description === undefined || (typeof body.description === 'string' && body.description.length <= 12_000), 'at most 12000 characters');
+  need(body.kind === undefined || ['auto', 'task', 'feature'].includes(body.kind), 'kind must be auto, task or feature');
+  const rid = typeof body.request_id === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(body.request_id) ? body.request_id : null;
+  // The same request id with the same request returns its ticket; with a different request it is refused.
+  const hash = crypto.createHash('sha256').update(JSON.stringify([body.title, body.description || '', body.kind || '', body.priority || '', body.type || ''])).digest('hex');
+  const seen = rid ? (() => { try { return JSON.parse(store.kvGet(`request:${rid}`) || 'null'); } catch { return null; } })() : null;
+  if (seen) {
+    if (seen.hash !== hash) throw Object.assign(new Error('That request id was already used for a different request'), { status: 409 });
+    if (store.getTicket(seen.key)) return { ...store.getTicket(seen.key), duplicate: true };
+  }
+  const source = body.source === 'hub' ? 'hub' : 'human';
+  return store.transaction(() => {
+    const t = body.kind === 'feature'
+      ? features.create({ title: body.title, goal: body.description || body.title, priority: body.priority, area: body.area }).ticket
+      : store.createTicket({ title: body.title, description: body.description || '', type: body.type || (body.kind ? 'task' : 'feature'), status: 'triage',
+        priority: PRIORITY.test(body.priority) ? body.priority : 'P2', reporter: 'owner', source });
+    if (source === 'hub') store.updateTicket(t.key, { source });
+    if (rid) store.kvSet(`request:${rid}`, JSON.stringify({ key: t.key, hash, at: store.now() }));
+    return store.getTicket(t.key);
+  });
 }
 
 export async function ownerRefreshBase(key, { expected_updated_at } = {}) {

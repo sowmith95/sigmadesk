@@ -24,7 +24,7 @@ else {process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringi
 `); fs.chmodSync(cli, 0o755);
 const log = path.join(tmp, 'application.log'); fs.writeFileSync(log, 'INFO preview ready\n');
 const cfg = path.join(tmp, 'config.json');
-fs.writeFileSync(cfg, JSON.stringify({ server: { port: Number(process.env.SIGMADESK_PORT || 8791), hosts: ['127.0.0.1'], preventIdleSleep: false, preview: true },
+fs.writeFileSync(cfg, JSON.stringify({ server: { port: Number(process.env.SIGMADESK_PORT || 8791), hosts: ['127.0.0.1'], preventIdleSleep: false, preview: true, ...(process.env.SIGMADESK_PREVIEW_TOKEN ? { ownerToken: process.env.SIGMADESK_PREVIEW_TOKEN } : {}) /* tests of the sign-in link */ },
   project: { name: 'SigmaDesk · local preview', repoPath: repo, githubRepo: 'test/fixture', playbook: path.join(root, 'playbooks/default.md') },
   bins: { claude: cli }, engines: { codex: { bin: cli } }, github: { sync: false, openDraftPrs: false }, pm: { enabled: false },
   watch: { enabled: true, intervalSeconds: 5, sources: [{ type: 'file', path: log, label: 'Preview service' }] }, notify: { webhookUrl: '' } }));

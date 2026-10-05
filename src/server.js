@@ -11,6 +11,8 @@ import { config, validateConfig } from './config.js';
 import { AGENTS, ENGINEERS, STATUSES, applyTeamOverrides, agentById , TEAM_PROBLEMS } from './team.js';
 import { teamCoverage } from './team-catalog.js';
 import { board } from '../public/attention.js';
+import { stageOf } from '../public/stages.js';
+import * as flow from '../public/flow.js';
 import { ENGINES, detectEngines, presets, suggestFor, SEAT_TIER, TIER_TEXT } from './engines/index.js';
 import * as store from './db.js';
 import * as runner from './runner.js';
@@ -78,6 +80,7 @@ export function snapshot() {
       feature_plans: features.summaries(),
       epic_reviews: epicReview.summaries(),
       team_stats: teamStats.current(),
+      deploy_lock: mergetrain.deployState(), // as stored (refreshed by the PR sync loop): the request tracker reads it
       lessons: store.listLessons(),
       groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
       research: research.status(settings), research_reviews: researchReview.summaries(),
@@ -94,6 +97,25 @@ store.bus.on('msg', (m) => {
   for (const res of clients) res.write(line);
 });
 setInterval(() => { for (const res of clients) res.write(': ping\n\n'); }, 20_000).unref();
+
+// The owner's own requests (newest first) and where each stands: the Projects home lists them across desks.
+// What needs the owner comes from the board (one source of truth); the deploy lock is read as stored, never polled.
+export function requestStage(t, snap, B, ix = flow.index(snap.tickets)) {
+  const names = Object.fromEntries(AGENTS.map((a) => [a.id, a.name]));
+  const tree = new Set([t.key, ...flow.descendants(t.key, ix).map((k) => k.key)]);
+  return stageOf(t, { kids: ix.kids.get(t.key) || [], plan: features.current(t.key), deploy: mergetrain.deployState(), names,
+    merge: t.status === 'ready_for_human' ? mergetrain.mergeState(t) : null, decisions: (B.decisions || B.needs_you).filter((d) => tree.has(d.key)) });
+}
+function requestsOf(snap, B, limit = 5) {
+  const names = Object.fromEntries(AGENTS.map((a) => [a.id, a.name]));
+  const ix = flow.index(snap.tickets);
+  return snap.tickets.filter((t) => t.reporter === 'owner' && !t.parent_key).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, limit)
+    .map((t) => {
+      const st = requestStage(t, snap, B, ix);
+      return { key: t.key, title: t.title, name: nameOf(t), created_at: t.created_at, at: st.at, line: st.line, closed: st.closed, done: st.done,
+        who: st.who, who_name: names[st.who] || (st.who === 'you' ? 'You' : null), needs_you: st.actions.length > 0, step: st.at ? st.steps.findIndex((x) => x.id === st.at) + 1 : 0, of: st.steps.length };
+    });
+}
 
 // ---------------- owner auth (optional shared token → HttpOnly cookie) ----------------
 // One cookie per project: desks on the same host but different ports would otherwise overwrite each other's token.
@@ -119,7 +141,10 @@ async function ownerRoute(req, res) {
 
   if (url.searchParams.get('token') && config.server.ownerToken) {
     if (url.searchParams.get('token') !== config.server.ownerToken) return send(res, 401, 'bad token', 'text/plain');
-    return send(res, 302, '', 'text/plain', { Location: '/', 'Set-Cookie': `${COOKIE}=${config.server.ownerToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000` });
+    // `next` (a desk page, optionally a ticket) lets the Projects home land on a request; anything else goes home.
+    const next = url.searchParams.get('next') || '';
+    const to = /^#\/[a-z]+(\/[A-Z][A-Z0-9]*-\d+)?$/.test(next) ? `/${next}` : '/';
+    return send(res, 302, '', 'text/plain', { Location: to, 'Referrer-Policy': 'no-referrer', 'Set-Cookie': `${COOKIE}=${config.server.ownerToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000` });
   }
   const isApi = p.startsWith('/api/');
   if (isApi && !ownerAuthed(req)) return send(res, 401, { error: 'open /?token=<ownerToken> once on this device' });
@@ -169,9 +194,10 @@ async function ownerRoute(req, res) {
   if (req.method === 'GET' && p === '/api/summary') {
     const snap = snapshot();
     const B = board(snap);
+    const recent = requestsOf(snap, B, 5);
     return send(res, 200, { version: 1, id: config.projectId, project: config.project.name, repo: config.project.githubRepo || config.project.repoPath,
       paused: snap.settings.paused === 'true', team_confirmed: snap.settings.team_confirmed === 'true', needs_you: B.counts.needs_you, working: B.counts.working,
-      blocked: B.counts.blocked, queued: B.counts.queued, spend_today: snap.meta.spend_today, budget: Number(snap.settings.daily_budget_usd), at: store.now() });
+      blocked: B.counts.blocked, queued: B.counts.queued, spend_today: snap.meta.spend_today, budget: Number(snap.settings.daily_budget_usd), recent_requests: recent, at: store.now() });
   }
   if (req.method === 'GET' && p === '/api/health') return send(res, 200, { at: store.now(), providers: dispatch.providerHealth(), scheduler: sched.health(), watch: snapshot().meta.watch });
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
@@ -191,7 +217,7 @@ async function ownerRoute(req, res) {
       tickets: store.listTickets().filter((t) => t.assignee === mm[1] || t.reporter === mm[1]).slice(0, 30) });
   }
 
-  if (req.method === 'POST' && p === '/api/tickets') return send(res, 201, sched.ownerCreate(await readBody(req)));
+  if (req.method === 'POST' && p === '/api/tickets') { const t = sched.ownerCreate(await readBody(req)); return send(res, t.duplicate ? 200 : 201, t); }
   if (req.method === 'POST' && p === '/api/features') return send(res, 201, features.create(await readBody(req)));
   if (req.method === 'GET' && (mm = m('^/api/features/KEY$'))) {
     const t = store.getTicket(mm[1]);

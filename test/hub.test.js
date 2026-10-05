@@ -74,6 +74,27 @@ test('scan, recommend, create and open: a new project gets a desk with the team 
   assert.ok(desk.agents.some((a) => a.id === 'security') && !desk.agents.some((a) => a.id === 'trading-advisor'));
   assert.equal(desk.agents.find((a) => a.id === 'sre').enabled, false);
 
+  // Instructions: the Projects home creates the ticket on that desk and links straight to it; a retry never duplicates.
+  const say = { project: 'mug-shop', text: 'Show the shipping cost before checkout\nBuyers abandon carts when it appears late.', request_id: 'req-abc12345' };
+  assert.equal((await post('/api/hub/instructions', { ...say, project: 'nope' })).status, 404);
+  assert.equal((await post('/api/hub/instructions', { ...say, request_id: undefined })).status, 400);
+  const sent = await post('/api/hub/instructions', say);
+  assert.equal(sent.status, 201, JSON.stringify(sent.body));
+  assert.match(sent.body.url, new RegExp(`:${made.body.port}/`)); assert.match(decodeURIComponent(sent.body.url), new RegExp(`#/inbox/${sent.body.key}$`));
+  const again = await post('/api/hub/instructions', say);
+  assert.equal(again.status, 200); assert.equal(again.body.key, sent.body.key); assert.equal(again.body.duplicate, true);
+  assert.equal((await post('/api/hub/instructions', { ...say, text: 'Something else entirely' })).status, 409, 'a reused id with another request is refused');
+  const created = (await (await fetch(`http://127.0.0.1:${made.body.port}/api/state`, { headers: cfg.server?.ownerToken ? { 'x-sigmadesk-token': cfg.server.ownerToken } : {} })).json()).tickets.find((t) => t.key === sent.body.key);
+  assert.equal(created.title, 'Show the shipping cost before checkout'); assert.equal(created.type, 'task'); assert.equal(created.source, 'hub'); assert.equal(created.status, 'triage');
+  const listed = (await (await fetch(`${base}/api/hub/state`)).json()).projects.find((p) => p.id === 'mug-shop').summary.recent_requests;
+  assert.equal(listed[0].key, sent.body.key); assert.equal(listed[0].at, 'received'); assert.equal(listed[0].step, 1);
+  if (cfg.server?.ownerToken) {
+    const go = (next) => fetch(`http://127.0.0.1:${made.body.port}/?token=${encodeURIComponent(cfg.server.ownerToken)}&next=${encodeURIComponent(next)}`, { redirect: 'manual' });
+    assert.equal((await go(`#/inbox/${sent.body.key}`)).headers.get('location'), `/#/inbox/${sent.body.key}`);
+    assert.equal((await go('//evil.example/x')).headers.get('location'), '/', 'anything but a desk page goes home');
+    assert.equal((await go(`#/inbox/${sent.body.key}`)).headers.get('referrer-policy'), 'no-referrer');
+  }
+
   if (!findChromium()) return;
   const browser = await launch();
   try {

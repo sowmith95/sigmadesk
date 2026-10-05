@@ -243,3 +243,18 @@ test('a stuck epic shows its next step, records a written gate in one tap, and t
   assert.deepEqual(errors, []);
   await page.close();
 });
+
+test('a request opens on its tracker: where it stands, step by step, on a phone', { skip, timeout: 60_000 }, async () => {
+  const made = await api('POST', '/api/tickets', { title: 'Show the shipping cost before checkout', description: 'Buyers abandon carts.', kind: 'auto', request_id: 'e2e-tracker-1', source: 'hub' });
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox/${made.body.key}`, { width: 390, height: 844 });
+  const tracker = page.locator(`[data-tracker="${made.body.key}"]`);
+  await tracker.waitFor();
+  assert.match(await tracker.textContent(), /Received[\s\S]*step 1 of 8[\s\S]*Waiting to be triaged/);
+  await tracker.getByText('All steps').click();
+  assert.equal(await tracker.locator('ol li').count(), 8);
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'fits a phone');
+  assert.equal((await api('POST', '/api/tickets', { title: 'Show the shipping cost before checkout', description: 'Buyers abandon carts.', kind: 'auto', request_id: 'e2e-tracker-1', source: 'hub' })).status, 200, 'a retry returns the same ticket');
+  assert.deepEqual(errors, []);
+  await page.close();
+});

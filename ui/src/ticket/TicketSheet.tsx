@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { MoreHorizontal } from 'lucide-react';
 import { nameOf } from '../../../public/names.js';
 import { humanReason } from '../../../public/attention.js';
-import { S, api, ticketByKey, currentBoard, closeSheet, openSheet, openFeature, loadDetail, loadSnapshot, loadPrs, councilFor, draftKey, setDraft, toast } from '@/store.js';
+import { S, api, ticketByKey, currentBoard, closeSheet, openSheet, openFeature, openTicket, loadDetail, loadSnapshot, loadPrs, councilFor, draftKey, setDraft, toast } from '@/store.js';
 import { clean, prNumber } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -15,6 +15,7 @@ import { KIND_LABEL, BUCKET_LABEL, BUCKET_TONE, cardFor, RunCard, Reviews, prRev
 import { Conversation, Brief, PrSummary, ProductReview, ResearchReview, Details, Block, type ConvState } from './parts';
 import { Lineage, EpicTree, EpicProgress, childrenOf, isFeatureRoot } from '@/components/desk/Epic';
 import { NextStep, GateSuggestions, EpicReview, OwnerTaskActions } from '@/components/desk/Flow';
+import { Tracker } from '@/components/desk/Tracker';
 import type { Board, BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -148,6 +149,7 @@ export function TicketSheet() {
   return (
     <Panel wide label={nameOf(t)} title={nameOf(t)} head={head} onClose={closeSheet}
       footer={(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); }}>Comment or ask the manager</Button></div>}>
+      {t.reporter === 'owner' && !t.parent_key && <Tracker t={t} B={B} mergeState={d?.merge_state} onDecision={(id, key) => { if (key === t.key) { setDecisionId(id); setTab('decision'); } else openTicket(key, { decision: id }); }} />}
       {decisions.length > 1 && <div role="group" aria-label="Decisions on this ticket" className="flex flex-wrap gap-2">
         {decisions.map((x) => <Button key={x.id} size="sm" variant={dec?.id === x.id ? 'default' : 'secondary'} aria-pressed={dec?.id === x.id} onClick={() => { setDecisionId(x.id); setTab('decision'); }}>{label(x)}</Button>)}</div>}
       {isFeatureRoot(t) && <div className="flex flex-wrap items-center gap-3 rounded-md bg-primary/10 px-3 py-2"><span className="min-w-0 flex-1 text-sm">This is a feature. Its plan, tasks and grooming session are on its feature page.</span><Button size="sm" variant="secondary" onClick={() => openFeature(t.key)}>Open the feature</Button></div>}

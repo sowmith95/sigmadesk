@@ -15,6 +15,7 @@ import { Tag, Empty, Section } from '@/components/desk/Layout';
 import { toast } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import { teamCoverage } from '../../../src/team-catalog.js';
+import { Composer, Recent } from './Instructions';
 
 type Any = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 async function api(method: string, url: string, body?: unknown) {
@@ -54,6 +55,8 @@ function Home({ onNew }: { onNew: () => void }) {
   return (
     <div className="grid grid-cols-[minmax(0,1fr)] gap-6">
       {st.error && <p className="text-blocked">{st.error}</p>}
+      {projects.length > 0 && <Composer projects={projects} onSent={load} />}
+      <Recent projects={projects} />
       <Section title="Projects" count={projects.length} actions={<Button onClick={onNew}><Plus className="size-4" aria-hidden />Add a project</Button>}>
         {projects.length ? <div className="grid grid-cols-[minmax(0,1fr)] gap-3 md:grid-cols-2 xl:grid-cols-3">{projects.map((p: Any) => <ProjectCard key={p.id} p={p} onChanged={load} />)}</div>
           : <Empty title="No projects yet" action={<Button onClick={onNew}>Add your first project</Button>}>Point SigmaDesk at a repository; it asks what you are building and recommends a team.</Empty>}
