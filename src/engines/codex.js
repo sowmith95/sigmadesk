@@ -14,6 +14,24 @@ const short = (s, n = 180) => { const t = String(s ?? '').replace(/\s+/g, ' ').t
 // codex wraps commands as `/bin/bash -lc '<cmd>'`; show just the command
 const unwrap = (cmd) => String(cmd || '').replace(/^\/bin\/(ba|z)?sh -l?c\s+(['"])([\s\S]*)\2$/, '$3');
 
+// A read-only path that holds a secret-looking file is not handed to Codex at all (fail closed): Codex's deny globs are
+// verified inside workspace roots only. Scans a bounded tree (depth 5, 20k entries); an unreadable or oversized tree
+// counts as containing secrets.
+const SECRET_NAME = /^(\.env(\..*)?|\.envrc|.*\.(pem|key|p12|pfx|keystore|jks)|id_(rsa|ecdsa|ed25519).*|credentials(\.json)?|.*credentials.*\.json|service-account.*\.json|\.npmrc|\.pypirc|\.netrc|\.pgpass.*|\.git-credentials|secrets\.(ya?ml|json))$/;
+export function secretFileUnder(root, limit = 20000) {
+  let seen = 0;
+  const walk = (dir, depth) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return fs.existsSync(dir); }
+    for (const e of entries) {
+      if (++seen > limit) return true;
+      if (SECRET_NAME.test(e.name) && !e.isDirectory()) return true;
+      if (e.isDirectory() && depth < 5 && e.name !== '.git' && walk(path.join(dir, e.name), depth + 1)) return true;
+    }
+    return false;
+  };
+  try { return fs.statSync(root).isDirectory() ? walk(root, 0) : SECRET_NAME.test(path.basename(root)); } catch { return false; }
+}
 export function codexHome() {
   const home = path.join(config.home ? config.dataDir : path.join(config.root, 'data'), 'codex-home');
   fs.mkdirSync(home, { recursive: true });
@@ -31,7 +49,7 @@ export function codexHome() {
   const hm = os.homedir();
   const readable = ['/System', '/usr', '/private/etc', '/opt/homebrew', '/Library/Developer/CommandLineTools',
     path.dirname(path.dirname(process.execPath)), path.join(config.root, 'bin'), path.join(hm, '.gitconfig'), path.join(hm, '.config', 'git'),
-    ...config.project.readOnlyPaths].filter((p, i, a) => p && a.indexOf(p) === i && fs.existsSync(p));
+    ...config.project.readOnlyPaths.filter((p) => !secretFileUnder(p))].filter((p, i, a) => p && a.indexOf(p) === i && fs.existsSync(p));
   const q = (p) => JSON.stringify(p);
   fs.writeFileSync(path.join(home, 'config.toml'), [
     'approval_policy = "never"',

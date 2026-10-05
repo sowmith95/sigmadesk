@@ -46,16 +46,49 @@ BEGIN
       SELECT format('%I.%I', ch.schema_name, ch.table_name)::regclass, h.table_name
         FROM _timescaledb_catalog.chunk ch JOIN _timescaledb_catalog.hypertable h ON h.id = ch.hypertable_id
        WHERE h.schema_name = 'public' AND h.table_name IN (SELECT rel FROM sigmadesk_approved_cols) AND to_regclass(format('%I.%I', ch.schema_name, ch.table_name)) IS NOT NULL;
-    -- materialization hypertables of approved continuous aggregates, and their chunks
-    IF to_regclass('_timescaledb_catalog.continuous_agg') IS NOT NULL THEN
+    -- An approved continuous aggregate: Timescale propagates the user view's grant to its DIRECT and PARTIAL views and
+    -- to its materialization hypertable (and that hypertable's chunks). Those names live in the internal catalog
+    -- (_timescaledb_catalog.continuous_agg, e.g. TimescaleDB 2.25: _timescaledb_internal._direct_view_19 /
+    -- _partial_view_19, mat_hypertable_id 19 for bars_1m); some versions also expose them in
+    -- timescaledb_information.continuous_aggregates. Use whichever shape this server has; if neither, abort here, before
+    -- any change.
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'v'
+               AND c.relname IN (SELECT rel FROM sigmadesk_approved_cols)) THEN
+      IF (SELECT count(*) FROM information_schema.columns WHERE table_schema = '_timescaledb_catalog' AND table_name = 'continuous_agg'
+            AND column_name IN ('user_view_schema', 'user_view_name', 'direct_view_schema', 'direct_view_name', 'partial_view_schema', 'partial_view_name', 'mat_hypertable_id')) = 7 THEN
+        EXECUTE $q$CREATE TEMP TABLE sigmadesk_caggs ON COMMIT DROP AS
+          SELECT ca.user_view_name::text AS parent, ca.direct_view_schema::text AS dschema, ca.direct_view_name::text AS dname,
+                 ca.partial_view_schema::text AS pschema, ca.partial_view_name::text AS pname, ca.mat_hypertable_id AS mat_id
+            FROM _timescaledb_catalog.continuous_agg ca
+           WHERE ca.user_view_schema = 'public' AND ca.user_view_name IN (SELECT rel FROM sigmadesk_approved_cols)$q$;
+      ELSIF (SELECT count(*) FROM information_schema.columns WHERE table_schema = 'timescaledb_information' AND table_name = 'continuous_aggregates'
+            AND column_name IN ('view_schema', 'view_name', 'direct_view_schema', 'direct_view_name', 'partial_view_schema', 'partial_view_name', 'materialization_hypertable_schema', 'materialization_hypertable_name')) = 8 THEN
+        EXECUTE $q$CREATE TEMP TABLE sigmadesk_caggs ON COMMIT DROP AS
+          SELECT v.view_name::text AS parent, v.direct_view_schema::text AS dschema, v.direct_view_name::text AS dname,
+                 v.partial_view_schema::text AS pschema, v.partial_view_name::text AS pname, h.id AS mat_id
+            FROM timescaledb_information.continuous_aggregates v
+            JOIN _timescaledb_catalog.hypertable h ON h.schema_name = v.materialization_hypertable_schema AND h.table_name = v.materialization_hypertable_name
+           WHERE v.view_schema = 'public' AND v.view_name IN (SELECT rel FROM sigmadesk_approved_cols)$q$;
+      ELSE
+        RAISE EXCEPTION 'cannot find continuous-aggregate direct/partial view names in this TimescaleDB catalog; nothing was changed';
+      END IF;
       INSERT INTO sigmadesk_family
-        SELECT format('%I.%I', mh.schema_name, mh.table_name)::regclass, ca.user_view_name
-          FROM _timescaledb_catalog.continuous_agg ca JOIN _timescaledb_catalog.hypertable mh ON mh.id = ca.mat_hypertable_id
-         WHERE ca.user_view_schema = 'public' AND ca.user_view_name IN (SELECT rel FROM sigmadesk_approved_cols)
+        SELECT to_regclass(format('%I.%I', dschema, dname)), parent FROM sigmadesk_caggs WHERE to_regclass(format('%I.%I', dschema, dname)) IS NOT NULL
         UNION ALL
-        SELECT format('%I.%I', ch.schema_name, ch.table_name)::regclass, ca.user_view_name
-          FROM _timescaledb_catalog.continuous_agg ca JOIN _timescaledb_catalog.chunk ch ON ch.hypertable_id = ca.mat_hypertable_id
-         WHERE ca.user_view_schema = 'public' AND ca.user_view_name IN (SELECT rel FROM sigmadesk_approved_cols) AND to_regclass(format('%I.%I', ch.schema_name, ch.table_name)) IS NOT NULL;
+        SELECT to_regclass(format('%I.%I', pschema, pname)), parent FROM sigmadesk_caggs WHERE to_regclass(format('%I.%I', pschema, pname)) IS NOT NULL
+        UNION ALL
+        SELECT format('%I.%I', mh.schema_name, mh.table_name)::regclass, cg.parent
+          FROM sigmadesk_caggs cg JOIN _timescaledb_catalog.hypertable mh ON mh.id = cg.mat_id
+         WHERE to_regclass(format('%I.%I', mh.schema_name, mh.table_name)) IS NOT NULL
+        UNION ALL
+        SELECT format('%I.%I', ch.schema_name, ch.table_name)::regclass, cg.parent
+          FROM sigmadesk_caggs cg JOIN _timescaledb_catalog.chunk ch ON ch.hypertable_id = cg.mat_id
+         WHERE to_regclass(format('%I.%I', ch.schema_name, ch.table_name)) IS NOT NULL;
+      -- Every approved view in public must be a known continuous aggregate (else we cannot vet what its grant touched).
+      IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'v'
+                 AND c.relname IN (SELECT rel FROM sigmadesk_approved_cols) AND c.relname NOT IN (SELECT parent FROM sigmadesk_caggs)) THEN
+        RAISE EXCEPTION 'an approved view is not a continuous aggregate this script understands; nothing was changed';
+      END IF;
     END IF;
   END IF;
 END $$;

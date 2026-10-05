@@ -505,6 +505,17 @@ test('provisioning: one bounded transaction, prints versions, ADMIN OPTION and p
   assert.match(code, /m\.admin_option/);
   assert.match(code, /_timescaledb_catalog\.chunk/);
   assert.match(code, /_timescaledb_catalog\.continuous_agg/);
+  // A cagg grant lands on the user view, its direct and partial views, the materialization hypertable and its chunks:
+  // every one of them is in the family the preflight accepts.
+  // Both catalog shapes: the internal catalog (TimescaleDB 2.25: _direct_view_19/_partial_view_19, mat_hypertable_id 19
+  // for bars_1m) and an information view that exposes the names; neither → abort before any change.
+  for (const part of ["table_schema = '_timescaledb_catalog' AND table_name = 'continuous_agg'", 'ca.direct_view_name::text AS dname', 'ca.partial_view_name::text AS pname',
+    'ca.mat_hypertable_id AS mat_id', "table_schema = 'timescaledb_information' AND table_name = 'continuous_aggregates'", 'v.direct_view_name::text AS dname',
+    "RAISE EXCEPTION 'cannot find continuous-aggregate direct/partial view names", 'format(\'%I.%I\', dschema, dname)', 'format(\'%I.%I\', pschema, pname)',
+    'mh.id = cg.mat_id', 'ch.hypertable_id = cg.mat_id', "RAISE EXCEPTION 'an approved view is not a continuous aggregate"])
+    assert.ok(code.includes(part), part);
+  // The family is built (and may abort) before the preflight and before any GRANT.
+  assert.ok(code.indexOf('sigmadesk_caggs ON COMMIT DROP') < code.indexOf('CREATE ROLE'));
   assert.match(code, /aclexplode\(at\.attacl\)/); // column ACLs read from the catalog, chunk grants accepted via the family table
   assert.match(code, /c\.relname IN \('jobs', 'job_stats', 'job_errors', 'continuous_aggregates'\) AND a\.privilege_type = 'SELECT'/);
   // The grants and the preflight whitelist come from the same table: what provisioning grants, a re-run accepts.
@@ -561,6 +572,16 @@ test('childEnv: an explicit allowlist, a project.env schema and an isolated tool
     const toml = fs.readFileSync(path.join(codexHome(), 'config.toml'), 'utf8');
     for (const g of ['"**/.env.*" = "none"', '"**/*.pem" = "none"', '"**/credentials.json" = "none"']) assert.equal(toml.split(g).length - 1, 2, `${g} in both profiles`);
     assert.ok(!toml.includes(`"${os.homedir()}" = "read"`), 'codex never reads the whole home folder');
+    // A read-only path holding a secret-looking file is never handed to Codex.
+    const { secretFileUnder } = await import('../src/engines/codex.js');
+    const clean = path.join(tmp, 'ro-clean'), dirty = path.join(tmp, 'ro-dirty');
+    fs.mkdirSync(path.join(clean, 'lib'), { recursive: true }); fs.writeFileSync(path.join(clean, 'lib', 'a.py'), 'x');
+    fs.mkdirSync(path.join(dirty, 'a', 'b'), { recursive: true }); fs.writeFileSync(path.join(dirty, 'a', 'b', '.env.local'), 'K=v');
+    assert.equal(secretFileUnder(clean), false); assert.equal(secretFileUnder(dirty), true);
+    const savedRo = config.project.readOnlyPaths; config.project.readOnlyPaths = [clean, dirty];
+    const toml2 = fs.readFileSync(path.join(codexHome(), 'config.toml'), 'utf8');
+    config.project.readOnlyPaths = savedRo;
+    assert.ok(toml2.includes(`${JSON.stringify(clean)} = "read"`) && !toml2.includes(JSON.stringify(dirty)));
   } finally { config.root = savedRoot; }
   // project.env schema: credential-looking names or values never reach a seat.
   config.project.env = { TZ: 'UTC', DB_URI: 'x', LOG_LEVEL: 'debug', UPSTREAM: 'https://user:pa55word@api.example/x', CONN: 'postgresql://a@b/c', LONG: 'Zm9vYmFyYmF6cXV4cXV1eHF1dXhxdXV4cXV1eA', lower_case: 'x', NOTE: 'token=abc' };
