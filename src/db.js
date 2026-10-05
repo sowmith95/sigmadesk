@@ -324,6 +324,62 @@ CREATE TABLE IF NOT EXISTS lesson_exposures (
   ts TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (run_id, lesson_id)
 );
+-- Production read probes ("desk ops") run by the desk for a seat: what ran, for whom, how long, how much, outcome.
+CREATE TABLE IF NOT EXISTS ops_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  run_id INTEGER,
+  agent_id TEXT,
+  ticket_key TEXT,
+  incident_id INTEGER,
+  probe TEXT NOT NULL,
+  params TEXT,
+  duration_ms INTEGER,
+  bytes INTEGER,
+  outcome TEXT NOT NULL,          -- ok | cached | error | timeout | cancelled | refused
+  detail TEXT
+);
+CREATE INDEX IF NOT EXISTS ops_audit_ts ON ops_audit(ts);
+CREATE INDEX IF NOT EXISTS ops_audit_run ON ops_audit(run_id);
+-- Production read access grants: who may run which probes, until when (or for one ticket/run), granted and revoked by whom.
+CREATE TABLE IF NOT EXISTS ops_grants (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  seat TEXT NOT NULL,
+  probes TEXT NOT NULL,           -- JSON list of probe ids, or ["*"]
+  expires_at TEXT,                -- null only for standing grants (owner) — ticket/run scoped grants carry a hard cap
+  ticket_key TEXT,                -- ticket-scoped: ends when the ticket closes
+  run_id INTEGER,                 -- run-scoped: ends when the run ends
+  standing INTEGER NOT NULL DEFAULT 0,
+  granted_by TEXT NOT NULL,       -- owner | manager | sre
+  request_id INTEGER,
+  reason TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  revoked_at TEXT,
+  revoked_by TEXT,                -- owner | manager | sre | expired | ticket closed | run ended
+  revoke_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS ops_grants_seat ON ops_grants(seat, revoked_at);
+CREATE TABLE IF NOT EXISTS ops_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  seat TEXT NOT NULL,
+  probes TEXT NOT NULL,
+  why TEXT,
+  minutes INTEGER,                -- null with ticket_scoped
+  ticket_scoped INTEGER NOT NULL DEFAULT 0,
+  ticket_key TEXT,
+  run_id INTEGER,
+  filed_by TEXT,                  -- the seat, or 'desk' (a verify task waiting for access)
+  status TEXT NOT NULL DEFAULT 'pending', -- pending (EM/SRE) | reviewing | owner | approved | denied | withdrawn
+  approver TEXT,                  -- seat asked to decide (null = the owner)
+  review_run INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  owner_reason TEXT,              -- why it needs the owner (beyond policy, no approver, escalated)
+  decided_by TEXT,
+  decided_at TEXT,
+  note TEXT,
+  grant_id INTEGER,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -487,6 +543,11 @@ export function settingDefaults() {
     assign_mode: 'balanced',
     // '' = not configured: research programs derive from config.research + the legacy pm_* rows. Saved JSON wins.
     research_programs: '',
+    // Production read access for seats holding a grant (also needs ops.enabled in the config). Off by default;
+    // switching it off is the emergency stop: probes in flight are cancelled.
+    ops_enabled: 'false',
+    // Owner's access policy (JSON, '' = config access.policy). Edited through the Access sheet (validated as a whole).
+    access_policy: '',
   };
 }
 
@@ -495,6 +556,7 @@ export function getSettings() {
 }
 export function setSetting(key, value) {
   if (!(key in settingDefaults())) throw Object.assign(new Error(`unknown setting ${key}`), { status: 400 });
+  if (key === 'access_policy') throw Object.assign(new Error('the access policy is edited through the Access sheet (validated as a whole)'), { status: 400 });
   if (key === 'research_programs') throw Object.assign(new Error('research programs are edited through Settings → Research (validated as a whole)'), { status: 400 });
   const ranges = { max_concurrent: [1, 20], daily_budget_usd: [0, 100000], pm_interval_min: [1, 525600], max_open_proposals: [1, 100] };
   if (ranges[key]) {
@@ -504,7 +566,7 @@ export function setSetting(key, value) {
   }
   if (key === 'assign_mode' && !['balanced', 'fixed'].includes(String(value))) throw Object.assign(new Error('assign_mode must be balanced or fixed'), { status: 400 });
   if (key === 'groom_engine' && !['codex', 'seat'].includes(String(value))) throw Object.assign(new Error('groom_engine must be codex or seat'), { status: 400 });
-  if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'draft_prs', 'team_confirmed', 'auto_fallback'].includes(key) && !['true', 'false'].includes(String(value)))
+  if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'draft_prs', 'team_confirmed', 'auto_fallback', 'ops_enabled'].includes(key) && !['true', 'false'].includes(String(value)))
     throw Object.assign(new Error(`${key} must be true or false`), { status: 400 });
   writeSetting(key, value);
 }
@@ -602,6 +664,48 @@ export function redact(text) {
 }
 /** For anything posted to GitHub: pattern redaction plus the configured secret values from the target repo's .env. */
 export const sanitizeForGithub = (text) => redact(scrubValues(text));
+
+// ---------- ops audit ----------
+export function insertOpsAudit(a) {
+  const info = q('INSERT INTO ops_audit(run_id,agent_id,ticket_key,incident_id,probe,params,duration_ms,bytes,outcome,detail) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
+    a.run_id ?? null, a.agent_id ?? null, a.ticket_key ?? null, a.incident_id ?? null, String(a.probe), redact(JSON.stringify(a.params ?? {})).slice(0, 1000),
+    a.duration_ms ?? null, a.bytes ?? null, String(a.outcome), a.detail == null ? null : redact(String(a.detail)).slice(0, 500));
+  return Number(info.lastInsertRowid);
+}
+/** Probes that actually reached production (cache hits and refusals excluded), optionally for one run. */
+export function opsExecutedSince(sinceIso, runId = null) {
+  const sql = `SELECT COUNT(*) n FROM ops_audit WHERE outcome IN ('ok','error','timeout','cancelled') AND ts > ?${runId == null ? '' : ' AND run_id = ?'}`;
+  return q(sql).get(...(runId == null ? [sinceIso] : [sinceIso, runId])).n;
+}
+export function insertGrant(g) {
+  const info = q('INSERT INTO ops_grants(seat,probes,expires_at,ticket_key,run_id,standing,granted_by,request_id,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(
+    g.seat, JSON.stringify(g.probes), g.expires_at ?? null, g.ticket_key ?? null, g.run_id ?? null, g.standing ? 1 : 0, g.granted_by, g.request_id ?? null, g.reason ?? null);
+  return getGrant(Number(info.lastInsertRowid));
+}
+export const getGrant = (id) => q('SELECT * FROM ops_grants WHERE id=?').get(id) || null;
+export const openGrants = (seat = null) => (seat ? q('SELECT * FROM ops_grants WHERE revoked_at IS NULL AND seat=? ORDER BY id').all(seat) : q('SELECT * FROM ops_grants WHERE revoked_at IS NULL ORDER BY id').all());
+export function endGrant(id, by, reason = null) {
+  return q('UPDATE ops_grants SET revoked_at=?, revoked_by=?, revoke_reason=? WHERE id=? AND revoked_at IS NULL').run(now(), by, reason, id).changes > 0;
+}
+/** Shorten (or, for the owner, set) a grant's end. */
+export function setGrantExpiry(id, iso) { q('UPDATE ops_grants SET expires_at=? WHERE id=?').run(iso, id); }
+export const grantHistory = (limit = 50) => q('SELECT * FROM ops_grants ORDER BY id DESC LIMIT ?').all(limit);
+export function insertAccessRequest(r) {
+  const info = q('INSERT INTO ops_requests(seat,probes,why,minutes,ticket_scoped,ticket_key,run_id,filed_by,status,approver,owner_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(
+    r.seat, JSON.stringify(r.probes), r.why ?? null, r.minutes ?? null, r.ticket_scoped ? 1 : 0, r.ticket_key ?? null, r.run_id ?? null, r.filed_by ?? null, r.status, r.approver ?? null, r.owner_reason ?? null);
+  return getAccessRequest(Number(info.lastInsertRowid));
+}
+export const getAccessRequest = (id) => q('SELECT * FROM ops_requests WHERE id=?').get(id) || null;
+export function updateAccessRequest(id, patch) {
+  const keys = Object.keys(patch);
+  if (keys.length) q(`UPDATE ops_requests SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=?`).run(...keys.map((k) => patch[k] ?? null), id);
+  return getAccessRequest(id);
+}
+export const openAccessRequests = () => q("SELECT * FROM ops_requests WHERE status IN ('pending','reviewing','owner') ORDER BY id").all();
+export const accessRequestHistory = (limit = 50) => q('SELECT * FROM ops_requests ORDER BY id DESC LIMIT ?').all(limit);
+export function listOpsAudit(limit = 50) {
+  return q('SELECT * FROM ops_audit ORDER BY id DESC LIMIT ?').all(limit);
+}
 
 export function logEvent(e) {
   const info = q('INSERT INTO events(run_id,agent_id,ticket_key,kind,text) VALUES (?,?,?,?,?)').run(

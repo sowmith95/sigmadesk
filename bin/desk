@@ -38,7 +38,11 @@ const USAGE = `usage:
   desk resolve done "<how you combined both sides>" | desk resolve stuck "<why the owner must decide>"
   desk context-file <path> [--page N]   (Perplexity seats: a desk-built file/diff block to send verbatim on the same thread)
   desk incident file --title T --severity P0-P3 --area A   (analysis on stdin)
-  desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>"`;
+  desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>"
+  desk ops list | desk ops <probe> [--param value]   (seats holding a production read access grant)
+  desk ops request <probe…|all> --why "<what you must check>" [--for 1h | --ticket]
+  desk access list | desk access approve <id> [--for 1h | --ticket] "<why>" | desk access deny|owner <id> "<why>" | desk access revoke <id> "<why>"   (EM/SRE)
+  desk verify done "<what production shows>" | desk verify owner "<why no read-only probe can answer>"   (SRE verify runs)`;
 
 const [cmd, ...rest] = process.argv.slice(2);
 // Help must exit before parsing flags, reading stdin or sending a mutating request.
@@ -76,7 +80,9 @@ switch (cmd) {
   case 'route': takeKey(); body.to = pos.shift(); body.body = pos.join(' '); break;
   case 'consult': body.agent = pos.shift(); body.body = pos.join(' '); break;
   case 'qa': case 'accept': case 'review': body.verdict = pos.shift(); body.body = pos.join(' '); break;
-  case 'respond': case 'resolve': body.action = pos.shift(); body.body = pos.join(' '); break;
+  case 'ops': body.probe = pos.shift() || 'list'; if (body.probe === 'request') body.probes = pos.splice(0); break;
+  case 'access': body.action = pos.shift() || 'list'; if (/^\d+$/.test(pos[0] || '')) body.id = pos.shift(); body.body = pos.join(' '); break;
+  case 'respond': case 'resolve': case 'verify': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'incident': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'context-file': body.path = pos.join(' '); break;
   case 'lesson': body.body = pos.join(' '); break;
@@ -87,7 +93,7 @@ switch (cmd) {
 if (typeof body.findings === 'string' && body.findings.startsWith('@')) {
   try { body.findings = fs.readFileSync(path.resolve(body.findings.slice(1)), 'utf8'); } catch (e) { console.error(`desk: cannot read ${body.findings.slice(1)} (${e.message})`); process.exit(2); }
 }
-if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file'].includes(cmd)) body.body = await stdinText();
+if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file', 'ops', 'access'].includes(cmd)) body.body = await stdinText();
 else if (['groom', 'propose', 'create-task', 'incident', 'design', 'revise', 'connector-propose'].includes(cmd) && !body.body) body.body = await stdinText();
 
 const token = process.env.DESK_RUN_TOKEN;

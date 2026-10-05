@@ -23,6 +23,8 @@ import * as researchReview from './research-review.js';
 import * as connectors from './connectors.js';
 import * as features from './features.js';
 import * as epicReview from './epic-review.js';
+import * as ops from './ops.js';
+import * as access from './access.js';
 import * as flow from '../public/flow.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
@@ -311,6 +313,41 @@ async function readonlyJob(agentId, ticket, kind) {
     throw err;
   }
   return { cwd };
+}
+
+// ---------------- production verification (SRE + desk ops) ----------------
+/** A read-only production check (verify/confirm/check … in production), not a write, restart, credential or decision. */
+export function isVerifyAsk(text) {
+  const t = String(text || '');
+  return /\b(verify|verif\w*|confirm\w*|check\w*|establish\w*|inspect\w*|investigat\w*|diagnos\w*|look (at|into)|measure\w*|query|read)\b/i.test(t)
+    && /\b(prod|production|live|timescale\w*|database|db|postgres\w*|container\w*|logs?|ingest\w*|hypertable\w*|jobs?|incident|health|freshness)\b/i.test(t)
+    && !/\b(restart\w*|redeploy\w*|deploy\w*|writes?|insert\w*|updat\w*|delet\w*|drop\w*|truncat\w*|alter\w*|migrat\w*|grant\w*|revok\w*|credential\w*|password\w*|secret\w*|tokens?|api key|rotat\w*|vacuum|reindex\w*|kill\w*|terminat\w*|backfill\w*|account\w*|billing|business decision|approv\w*|purchas\w*)\b/i.test(t);
+}
+export const verifyReady = () => ops.enabled() && (config.ops.kinds || []).includes('verify') && agentById.sre?.enabled !== false;
+/** A verify task without a grant: ask once (ticket-scoped, reviewed by the EM within policy). False = keep waiting. */
+function verifyAccess(t) {
+  const mine = store.accessRequestHistory(200).filter((r) => r.seat === 'sre' && r.ticket_key === t.key);
+  if (mine.some((r) => ['pending', 'reviewing', 'owner'].includes(r.status))) return false;
+  if (mine[0]?.status === 'denied') { verifyToOwner(t, `${mine[0].decided_by === 'owner' ? 'You' : agentById[mine[0].decided_by]?.name || mine[0].decided_by} declined production read access for it (${mine[0].note || 'no reason'}).`); return false; }
+  access.request({ seat: 'sre', probes: ['*'], why: `verify in production: ${t.title}`, ticketScoped: true, ticketKey: t.key, filedBy: 'desk' });
+  return false;
+}
+async function launchAccessReview(r, approver, fence) {
+  const { cwd } = await readonlyJob(approver, null);
+  try {
+    await launch({ fence, agentId: approver, kind: 'access_review', ticket: null, cwd, prompt: access.reviewPrompt(r), onStart: (run) => access.startReview(r, approver, run.id) });
+  } finally { access.reviewEnded(r.id); }
+}
+function verifyToOwner(t, why = 'a read-only production check, and production read access is off (Settings → Production read access).') {
+  store.kvSet(`verify:${t.key}`, '');
+  store.updateTicket(t.key, { owner_task: 1, assignee: null });
+  store.addComment(t.key, 'system', `🙋 **This is your task**: ${why}`);
+}
+async function launchVerify(t, fence) {
+  const { cwd } = await readonlyJob('sre', t);
+  store.logEvent({ agent_id: 'sre', ticket_key: t.key, kind: 'pickup', text: `verifying in production: ${t.title.slice(0, 120)}` });
+  await launch({ fence, agentId: 'sre', kind: 'verify', ticket: t, cwd, prompt: promptFor('verify', { ticket: t, comments: store.listComments(t.key) }),
+    outcome: (after) => after.status !== 'todo' || !!after.owner_task });
 }
 
 async function launchTriage(t, fence) {
@@ -762,6 +799,12 @@ export async function tick() {
     // 1. Support triages owner/GitHub tickets (cheap, fast).
     const triage = store.ticketsByStatus('triage').find((t) => !t.active_run && !features.holds(t));
     if (triage && slots > 0 && agentIdle('support')) go('support', (f) => launchTriage(triage, f), null, 'triage');
+    // 1a. Production access: end grants whose time/ticket/run is over; the EM/SRE reviews pending requests.
+    access.sweep();
+    if (verifyReady() || ops.enabled(s)) {
+      const rv = slots > 0 ? access.nextReview((id) => agentIdle(id)) : null;
+      if (rv) go(rv.approver, (f) => launchAccessReview(rv.request, rv.approver, f), null, 'access_review');
+    }
     // 1b. On-call SRE investigates new recurring error signatures (rate-limited).
     if (config.watch.enabled && slots > 0 && agentIdle('sre')) {
       const recentCount = store.investigationsSince(new Date(Date.now() - 3600_000).toISOString());
@@ -850,6 +893,12 @@ export async function tick() {
       if (t.after_key && store.getTicket(t.after_key)?.status !== 'done') continue; // waits for its predecessor to merge
       if (t.owner_task) continue; // the owner's own task: never a seat's
       if (ancestorWaits(t)) continue; // an epic that waits holds its tasks too
+      if (store.kvGet(`verify:${t.key}`) === '1') { // a read-only production check: the SRE with desk ops, never a builder
+        if (!verifyReady()) { verifyToOwner(t); continue; }
+        if (!access.seatHasAccess('sre', t.key) && !verifyAccess(t)) continue; // waits for a grant (EM or owner decides)
+        if (agentIdle('sre')) go('sre', (f) => launchVerify(t, f), null, 'verify');
+        continue;
+      }
       const parent = t.parent_key && store.getTicket(t.parent_key);
       if (parent && productReview.required(parent) && ['proposed','todo'].includes(parent.status)) {
         if (parent.active_run || parent.status==='proposed') continue;
@@ -943,7 +992,7 @@ const PERMS = {
   route: ['support'], submit: ENGINEERS, lesson: BUILDERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
   review: ['manager', ...ENGINEERS], respond: ENGINEERS, resolve: ENGINEERS,
-  'continue-rebase': BUILDERS,
+  'continue-rebase': BUILDERS, verify: ['sre'], access: ['manager', 'sre'],
 };
 const PRIORITY = /^P[0-3]$/;
 const consultsByRun = new Map();
@@ -971,6 +1020,8 @@ export async function deskAction(run, cmd, body = {}) {
     need(['list', 'show', 'comment', 'consult', 'discussion-result', 'context-file'].includes(cmd), 'design discussions can only read, consult and respond');
     need(!body.key || body.key === run.ticket_key, 'discussion belongs to its original ticket');
   }
+  if (run.kind === 'access_review') need(['show', 'list', 'access'].includes(cmd), 'an access review decides one request: desk access approve|deny|owner');
+  if (run.kind === 'verify') need(['show', 'list', 'comment', 'progress', 'ops', 'verify', 'context-file'].includes(cmd), 'a verify run reads production through desk ops and finishes with desk verify done|owner');
   if (PERMS[cmd]) need(PERMS[cmd].includes(agentId), `${agentById[agentId].role} cannot run "${cmd}"`);
   const key = body.key || run.ticket_key;
   const ticket = key ? store.getTicket(key) : null;
@@ -1127,11 +1178,23 @@ export async function deskAction(run, cmd, body = {}) {
       if (body.after) { const host = store.getTicket(parentOf); const ix = flow.index(store.listTickets()); need(!host || ![host, ...flow.ancestors(host, ix)].some((a) => a.key === body.after), `--after ${body.after} contains this task; it would wait forever`); }
       // --owner "<why>": a step only the owner can do (access no seat has). It goes to the owner, never to a seat.
       const ownerWhy = typeof body.owner === 'string' && body.owner.trim() ? body.owner.trim().slice(0, 500) : body.owner === true ? 'Only the owner can do this step.' : null;
+      // --verify (or an --owner step that is really a read-only production check): the SRE answers it with desk ops
+      // probes; the owner only gets it when production read access is off or the probes cannot answer.
+      const verifyAsk = body.verify === true || (!!ownerWhy && isVerifyAsk(`${body.title}\n${ownerWhy}`));
+      const toSre = verifyAsk && verifyReady();
+      const ownerReason = ownerWhy || (verifyAsk ? 'Read-only production check, and production read access for the SRE is off (Settings → Production read access).' : null);
       const asOwnerTask = (k) => {
-        if (!ownerWhy) return;
+        if (toSre) {
+          store.updateTicket(k, { owner_task: 0, assignee: 'sre', assign_pinned: 1 });
+          store.kvSet(`verify:${k}`, '1');
+          store.addComment(k, 'system', `🔎 Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes${ownerWhy ? ` instead of the owner (asked: ${ownerWhy})` : ''}. It reaches the owner only if no probe can answer it.`);
+          return;
+        }
+        if (!ownerReason) return;
         store.updateTicket(k, { owner_task: 1, assignee: null });
-        store.addComment(k, agentId, `🙋 **This is your task**: ${ownerWhy}`);
+        store.addComment(k, agentId, `🙋 **This is your task**: ${ownerReason}`);
       };
+      const whoFor = (seat) => (toSre ? 'sre (read-only production check)' : ownerReason ? 'the owner' : seat);
       if (PRINCIPALS.includes(agentId)) {
         // A principal's slices: small, built by cheaper seats, attached to the ticket being designed.
         need(run.kind === 'design' && run.ticket_key, 'slices are created during a design run');
@@ -1145,9 +1208,9 @@ export async function deskAction(run, cmd, body = {}) {
         // The slicer is the context reviewer later; slices inherit the parent's risk.
         store.updateTicket(slice.key, { designer: agentId, risk: parent.risk || null, assign_pinned: body.assign ? 1 : 0, ...(body.after ? { after_key: body.after } : {}) });
         asOwnerTask(slice.key);
-        ev(`sliced ${slice.key} (${body.complexity}) for ${ownerWhy ? 'the owner' : agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
+        ev(`sliced ${slice.key} (${body.complexity}) for ${toSre ? agentById.sre.role : ownerReason ? 'the owner' : agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
         github.createIssue(slice.key);
-        return `created ${slice.key} → ${ownerWhy ? 'owner' : slice.assignee}${gateNote}`;
+        return `created ${slice.key} → ${whoFor(slice.assignee)}${gateNote}`;
       }
       const parentKey = body.parent || key;
       // The reroute decision uses the risk the task will actually carry (inherited from its parent when not given).
@@ -1162,9 +1225,9 @@ export async function deskAction(run, cmd, body = {}) {
       store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null, assign_pinned: explicit?.pinned ? 1 : 0, ...(body.after ? { after_key: body.after } : {}) });
       if (explicit?.rerouted) store.addComment(t.key, 'system', `Principals design and slice; this ${body.complexity} task goes to ${agentById[assignee].name} instead of ${agentById[explicit.rerouted].name}.`);
       asOwnerTask(t.key);
-      ev(`created task ${t.key} for ${ownerWhy ? 'the owner' : agentById[assignee].role}${body.after ? ` after ${body.after}` : ''}`, t.key);
+      ev(`created task ${t.key} for ${toSre ? agentById.sre.role : ownerReason ? 'the owner' : agentById[assignee].role}${body.after ? ` after ${body.after}` : ''}`, t.key);
       github.createIssue(t.key);
-      return `created ${t.key} assigned to ${ownerWhy ? 'the owner' : assignee}${gateNote}`;
+      return `created ${t.key} assigned to ${whoFor(assignee)}${gateNote}`;
     }
     case 'design':
       need(ticket && ticket.key === run.ticket_key && run.kind === 'design', 'design only on the ticket you are designing');
@@ -1339,6 +1402,39 @@ export async function deskAction(run, cmd, body = {}) {
       github.flushComments();
       publishBranch(ticket.key);
       return 'Recorded. Stop now.';
+    }
+    case 'ops':
+      // Production read probes: gating (setting, seat, run kind), budgets and redaction live in ops.js, so the socket
+      // and the mailbox transport get exactly the same answer.
+      return ops.handle(run, body);
+    case 'access': {
+      // EM and SRE review who has production read access: list, decide requests within the owner's policy, revoke.
+      const a = String(body.action || 'list');
+      if (a === 'list') return access.listText();
+      need(body.id && /^\d+$/.test(String(body.id)), `desk access ${a} <id> "<why>"`);
+      if (a === 'revoke') { need(body.body, 'say why'); return access.revoke(body.id, agentId, String(body.body)); }
+      need(['approve', 'deny', 'owner'].includes(a), 'desk access list|approve|deny|owner|revoke');
+      const ticketScoped = body.ticket === true || body.ticket === 'true' ? true : null;
+      return access.decide(agentId, body.id, a, { minutes: ticketScoped ? null : access.parseDuration(body.for), ticketScoped, note: String(body.body || '') });
+    }
+    case 'verify': {
+      need(run.kind === 'verify' && ticket && ticket.key === run.ticket_key, 'desk verify only works inside a verify run on its own ticket');
+      need(['done', 'owner'].includes(body.action), 'desk verify done|owner "<text>"');
+      need(body.body, 'say what you found (done) or why no read-only probe can answer it (owner)');
+      if (body.action === 'done') {
+        store.addComment(ticket.key, agentId, `🔎 **Verified in production (read-only probes):** ${body.body}`);
+        store.kvSet(`verify:${ticket.key}`, 'done');
+        setStatus(ticket.key, 'done', { progress: 100, progress_msg: 'verified in production' });
+        ev(`verified in production: ${String(body.body).slice(0, 140)}`);
+        github.flushComments();
+        return 'Recorded; the tasks waiting on this check can start. Stop now.';
+      }
+      store.kvSet(`verify:${ticket.key}`, '');
+      store.updateTicket(ticket.key, { owner_task: 1, assignee: null });
+      store.addComment(ticket.key, agentId, `🙋 **This is your task**: ${body.body}\n\n_(The SRE's read-only production probes could not answer it.)_`);
+      ev(`handed to the owner: ${String(body.body).slice(0, 140)}`);
+      github.flushComments();
+      return 'Handed to the owner. Stop now.';
     }
     case 'review':
       return reviews.reviewVerdict(run, ticket, body);

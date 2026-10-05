@@ -13,6 +13,7 @@ import { describeToolUse } from './engines/claude.js';
 import { selectionFor, reviewSelection, pinnedSelection, classifyProviderFailure, holdProvider } from './dispatch.js';
 import * as store from './db.js';
 import * as context from './context.js';
+import * as ops from './ops.js';
 
 const pexec = promisify(execFile);
 const children = new Map(); // runId -> ChildProcess
@@ -304,6 +305,8 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
     ...(config.appRoot ? [path.join(config.appRoot, 'projects'), path.join(config.appRoot, 'projects.json'), ...siblingWorkspaces()] : [])];
   if (config.advisors.keyFile) deny.push(config.advisors.keyFile);
   if (config.project.repoPath) deny.push(path.join(config.project.repoPath, '.env'));
+  // Production read credentials belong to the desk (desk ops), never to a seat.
+  deny.push('~/.pgpass', '~/.pg_service.conf', ...[config.ops?.pgpassFile, config.ops?.pgServiceFile].filter(Boolean));
   const asRule = (p) => (p.startsWith('~') ? p : `/${p}`);
   return {
     sandbox: {
@@ -547,6 +550,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (idleTimer) clearInterval(idleTimer);
       children.delete(run.id);
       mailboxes.delete(run.id);
+      ops.cancelRun(run.id); // production probes never outlive their run
       setTimeout(() => evidence.delete(run.id), 60_000).unref();
       sock?.close();
       if (buf.trim()) applyEvents(engine.parse(buf, cwd, ctx.state), ctx);
