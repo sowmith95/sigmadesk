@@ -108,3 +108,33 @@ test('seat commands are limited to the current implementer; interrupted preparat
   sched.recoverOrphans(); assert.equal(store.getTicket(t.key).status, 'needs_human');
   assert.match(store.getTicket(t.key).progress_msg, /interrupted/);
 });
+
+test('a commit held by the publish guard is ours: refresh accepts the desk\'s own last publish, and a failed refresh keeps the guard', async () => {
+  const { t, ws, head } = fixture({ conflict: false });
+  store.kvSet(`published:${t.key}`, head); // the desk published this commit
+  fs.writeFileSync(path.join(ws, 'review-fix.txt'), 'fix\n'); git(ws, ['add', '.']); git(ws, ['commit', '-qm', 'review fix (held by the guard)']);
+  const held = git(ws, ['rev-parse', 'HEAD']);
+  const ticket = store.updateTicket(t.key, { head_sha: held, qa_sha: held, progress_msg: 'publish guard: needs owner approval' });
+  const done = await refresh.prepare(ticket);
+  assert.equal(done.status, 'rebased', 'GitHub having our earlier publish is not "someone else changed the branch"');
+
+  // Someone else's commit on GitHub is still refused, and the guard hold survives the failed refresh.
+  const other = fixture({ conflict: false });
+  store.kvSet(`published:${other.t.key}`, other.head);
+  git(owner, ['push', '-q', '--force', 'origin', `main:refs/heads/${other.branch}`]);
+  store.updateTicket(other.t.key, { progress_msg: 'publish guard: needs owner approval' });
+  await assert.rejects(sched.ownerRefreshBase(other.t.key), /Remote branch changed/);
+  const after = store.getTicket(other.t.key);
+  assert.equal(after.progress_msg, 'publish guard: needs owner approval', 'the hold stays recognisable');
+  assert.match(store.listComments(other.t.key).at(-1).body, /branch refresh did not run/);
+});
+
+test('a guard hold that an old refresh message replaced is restored at start', () => {
+  const t = store.createTicket({ title: 'guard repair', status: 'needs_human', assignee: 'junior' });
+  store.updateTicket(t.key, { head_sha: 'b'.repeat(40), pr_url: 'https://github.com/test/repo/pull/9', progress_msg: 'Branch refresh held: Remote branch changed' });
+  store.kvSet(`published:${t.key}`, 'a'.repeat(40));
+  store.addComment(t.key, 'qa', '✅ **QA passed** at `bbbbbbb`');
+  store.addComment(t.key, 'system', '🛑 **Publish guard** — not pushed: diff is 411 lines (cap for S is 400).');
+  sched.repairGuardHolds();
+  assert.equal(store.getTicket(t.key).progress_msg, 'publish guard: needs owner approval');
+});

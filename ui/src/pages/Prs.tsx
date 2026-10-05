@@ -78,7 +78,8 @@ export default function PrsPage() {
 }
 
 type DeployHold = { key: string | null; state: string; note: string | null; merge_sha: string | null; overridable: boolean; runs_url: string | null };
-type MergeCheck = { head: string; ready: boolean; blockers: string[]; overridable: string[]; ci_gap: string[]; busy_window: boolean; deploy_hold: DeployHold | null;
+type Unpublished = { key: string; head: string; pr_head: string; qa_passed: boolean; guard: boolean; updated_at: string };
+type MergeCheck = { head: string; ready: boolean; blockers: string[]; overridable: string[]; ci_gap: string[]; busy_window: boolean; deploy_hold: DeployHold | null; unpublished?: Unpublished | null;
   coverage: { rows: { name: string; state: string; workflows: { file: string; name: string; paths: string[] | null }[] }[]; uncovered: boolean; gap: boolean; firing: string[]; areas: string[]; files: number } };
 const sentence = (s: string) => { const t = s.replace(/ — or give an owner override reason.*$/, ''); return `${t[0]?.toUpperCase() || ''}${t.slice(1)}${/[.!?]$/.test(t) ? '' : '.'}`; };
 const CHECK_STATE: Record<string, { icon: typeof CheckCircle2; tone: string; word: string }> = {
@@ -100,6 +101,7 @@ function MergeBox({ p, d, field, onMerged }: { p: Pr; d: Record<string, string>;
   const phraseOk = !chk?.busy_window || (d.override || '').trim().toLowerCase() === String(P.meta.override_phrase || '').toLowerCase();
   const can = !!chk && !chk.blockers.length && (!chk.overridable.length || reasonOk) && (!chk.ci_gap.length || ackOk) && holdOk && phraseOk && chk.head === p.head_sha;
   const status = !chk ? { icon: Loader2, tone: 'text-muted-foreground', text: err || 'Checking whether it can merge…' }
+    : chk.unpublished ? { icon: AlertTriangle, tone: 'text-needs', text: chk.unpublished.guard ? 'Publish the fix first' : 'A newer commit is on its way' }
     : chk.blockers.length ? { icon: XCircle, tone: 'text-blocked', text: "Can't merge yet" }
       : hold ? { icon: AlertTriangle, tone: 'text-needs', text: 'The last deploy was not confirmed: merging needs your reason' }
         : chk.overridable.length || chk.ci_gap.length ? { icon: AlertTriangle, tone: 'text-needs', text: chk.ci_gap.length ? 'Nothing tested this change: merging needs your reason' : 'Merging needs your reason' }
@@ -109,7 +111,13 @@ function MergeBox({ p, d, field, onMerged }: { p: Pr; d: Record<string, string>;
     <section aria-label="Merge readiness" data-merge-check className="grid gap-4 rounded-lg border bg-card p-4">
       <div className="flex items-center gap-2"><S1 className={cn('size-5 shrink-0', status.tone, !chk && !err && 'animate-spin')} aria-hidden /><h3 className="text-base font-semibold">{status.text}</h3>
         <span className="flex-1" /><Button variant="ghost" size="sm" onClick={load}><RefreshCw className="size-4" aria-hidden />Recheck</Button></div>
-      {chk && chk.blockers.length > 0 && <ul className="grid list-disc gap-1 pl-5">{chk.blockers.map((b, i) => <li key={i}>{sentence(b)}</li>)}</ul>}
+      {chk?.unpublished && <div data-unpublished className="grid gap-2 rounded-md border border-needs/40 bg-needs/10 p-3 text-sm">
+        <p><b>This PR still has the older commit ({chk.unpublished.pr_head.slice(0, 7)}).</b> The team's newer commit ({chk.unpublished.head.slice(0, 7)}){chk.unpublished.qa_passed ? ', which QA passed,' : ''} is not on GitHub yet{chk.unpublished.guard ? ': the publish guard held it because the change grew past the size limit for this task' : ''}. Merging now would ship the older code.</p>
+        <p className="text-muted-foreground">{chk.unpublished.guard ? 'Your one step: approve publishing it. The reviewers then re-check the new commit and it merges as usual.' : 'Nothing to do: the desk publishes it, the reviewers re-check it, then it can merge.'}</p>
+        {chk.unpublished.guard && <AsyncButton className="justify-self-start" confirm={`Publish ${chk.unpublished.head.slice(0, 7)} to PR #${p.number}?\n\nThe reviewers re-check the new commit before it can merge.`}
+          run={async () => { await api('POST', `/api/tickets/${chk.unpublished!.key}/decision`, { decision: 'approve', message: '', expected_updated_at: chk.unpublished!.updated_at }); await load(); }} ok="Publishing the fix; the reviewers re-check it next">Approve publication</AsyncButton>}
+      </div>}
+      {chk && !chk.unpublished && chk.blockers.length > 0 && <ul className="grid list-disc gap-1 pl-5">{chk.blockers.map((b, i) => <li key={i}>{sentence(b)}</li>)}</ul>}
       {chk && <div className="grid gap-2">
         <h4 className="text-sm text-muted-foreground">Checks on this commit</h4>
         {chk.coverage.rows.length ? <ul className="grid gap-1.5">{chk.coverage.rows.map((r) => { const st = CHECK_STATE[r.state] || CHECK_STATE.waiting; const I = st.icon; const wf = r.workflows[0]; return (

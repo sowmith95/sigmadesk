@@ -341,7 +341,14 @@ export async function mergeCheck(number, { inBusyWindow = false, halted = false 
       runs_url: lock.merge_sha && config.project.githubRepo ? `https://github.com/${config.project.githubRepo}/commit/${lock.merge_sha}/checks` : null };
   }
   if (deploy_hold && !deploy_hold.overridable) probe.blockers.push(`the deploy of ${deploy_hold.key || String(deploy_hold.merge_sha || '').slice(0, 7)} is still running; merge after it finishes`);
-  return { number: p.number, head: p.headRefOid, blockers: probe.blockers, overridable: probe.overridden, ci_gap: probe.acknowledged, busy_window: inBusyWindow, deploy_hold,
+  // The desk holds a newer commit than the PR has (for example a review fix QA passed, kept back by the publish guard):
+  // merging now would ship the older code. Not overridable: publish it first, then the reviewers re-check it.
+  let unpublished = null;
+  if (t?.head_sha && t.head_sha !== p.headRefOid && store.kvGet(`published:${t.key}`) !== t.head_sha) {
+    unpublished = { key: t.key, head: t.head_sha, pr_head: p.headRefOid, qa_passed: t.qa_sha === t.head_sha, guard: /publish guard/i.test(t.progress_msg || ''), updated_at: t.updated_at };
+    probe.blockers.unshift(`a newer commit (${t.head_sha.slice(0, 7)})${unpublished.qa_passed ? ' that QA passed' : ''} is not on this PR yet; ${unpublished.guard ? 'approve publishing it' : 'it is published automatically'}, then the reviewers re-check it`);
+  }
+  return { number: p.number, head: p.headRefOid, blockers: probe.blockers, overridable: unpublished ? [] : probe.overridden, ci_gap: unpublished ? [] : probe.acknowledged, busy_window: inBusyWindow, deploy_hold, unpublished,
     ready: !probe.blockers.length && !probe.overridden.length && !probe.acknowledged.length && !deploy_hold,
     coverage: { rows: cov.rows, uncovered: cov.uncovered, gap: cov.gap, firing: cov.firing, areas: cov.areas, files: cov.files.length } };
 }

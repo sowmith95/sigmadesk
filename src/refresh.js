@@ -149,7 +149,12 @@ async function prepareClaimed(ticket, previous, reservation) {
     await git(dir, ['fetch', '-q', '--no-tags', 'origin', `+refs/heads/${config.project.baseBranch}:refs/remotes/origin/${config.project.baseBranch}`, `+refs/heads/${ticket.branch}:refs/remotes/origin/${ticket.branch}`]);
     const base = (await git(dir, ['rev-parse', `origin/${config.project.baseBranch}`])).stdout.trim();
     const remote_head = (await git(dir, ['rev-parse', `origin/${ticket.branch}`])).stdout.trim();
-    if (remote_head !== ticket.head_sha && remote_head !== previous?.published_head) fail('Remote branch changed; reconcile its commits before rebasing');
+    // GitHub's branch is ours when it is the submitted commit, a commit a previous refresh published, or the desk's own
+    // last publish that the held commit builds on (a publish guard keeps newer reviewed commits local until approved).
+    const published = store.kvGet(`published:${ticket.key}`);
+    const ancestor = async (a, b) => { try { await git(dir, ['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; } };
+    const ours = remote_head === ticket.head_sha || remote_head === previous?.published_head || (remote_head === published && await ancestor(remote_head, ticket.head_sha));
+    if (!ours) fail('Remote branch changed; reconcile its commits before rebasing');
     // Trusted index/config, seat worktree. This checks edits without executing seat hooks or filters.
     const names = lines((await git(dir, ['ls-files', '-z'])).stdout);
     const manifest = Object.fromEntries(names.map((n) => [n, fingerprint(ws, n)]));
