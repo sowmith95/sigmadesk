@@ -117,6 +117,19 @@ test('owner tasks: never picked up, finished only with notes and never when code
   assert.equal(store.getTicket(b).owner_task, 0); assert.ok(store.getTicket(b).assignee);
 });
 
+test('handing back a read-only production check routes it to the SRE when production read access is on', async () => {
+  const { config } = await import('../src/config.js');
+  const prev = config.ops.enabled; config.ops.enabled = true; store.setSetting('ops_enabled', 'true');
+  try {
+    const e = epic(); const v = task(e, 'Establish Timescale incident cause from production logs');
+    sched.ownerTask(v, { owner_task: true });
+    sched.ownerTask(v, { owner_task: false, why: 'the SRE can check it' });
+    assert.equal(store.getTicket(v).assignee, 'sre'); assert.equal(store.kvGet(`verify:${v}`), '1');
+    const w = task(e, 'Rotate the broker key'); sched.ownerTask(w, { owner_task: true }); sched.ownerTask(w, { owner_task: false });
+    assert.notEqual(store.getTicket(w).assignee, 'sre', 'a write/credential task is never routed as a check');
+  } finally { config.ops.enabled = prev; store.setSetting('ops_enabled', 'false'); }
+});
+
 test('epic review: parse, apply only safe changes, one answer resumes every covered question', () => {
   const e = epic('Fill-cost journal'); const a = task(e, 'Verify'); const b = task(e, 'DDL'); const c = task(e, 'Backfill', { after_key: b }); const d = task(e, 'Started', { status: 'in_progress' });
   store.updateTicket(a, { status: 'needs_human', resume_status: 'todo' }); store.updateTicket(b, { status: 'needs_human', resume_status: 'todo' });

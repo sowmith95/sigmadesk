@@ -1768,9 +1768,16 @@ export function ownerTask(key, { owner_task, why = '', by = 'owner' } = {}) {
     else store.addComment(key, 'owner', `🙋 **I will do this one myself**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'}`);
   } else {
     need(t.owner_task, 'this is not an owner task');
-    const assignee = routeTicket({ area: t.area, complexity: t.complexity || 'M', risk: t.risk });
-    store.updateTicket(key, { owner_task: 0, assignee, status: 'todo', progress_msg: null });
-    store.addComment(key, 'owner', `↩️ **Handed back to the team**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'}`);
+    // A read-only production check goes to the SRE (desk ops probes) when production read access is on.
+    if (isVerifyAsk(`${t.title}\n${t.description || ''}`) && verifyReady()) {
+      store.updateTicket(key, { owner_task: 0, assignee: 'sre', assign_pinned: 1, status: 'todo', progress_msg: null });
+      store.kvSet(`verify:${key}`, '1');
+      store.addComment(key, 'owner', `↩️ **Handed back to the team**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'} Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes.`);
+    } else {
+      const assignee = routeTicket({ area: t.area, complexity: t.complexity || 'M', risk: t.risk });
+      store.updateTicket(key, { owner_task: 0, assignee, status: 'todo', progress_msg: null });
+      store.addComment(key, 'owner', `↩️ **Handed back to the team**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'}`);
+    }
   }
   github.syncIssueState(key); github.flushComments();
   return store.getTicket(key);
