@@ -61,7 +61,7 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping 
   const grow = (el: HTMLTextAreaElement | null) => { if (!el) return; el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight + 2, window.innerHeight * (window.innerWidth < 768 ? 0.22 : 0.4))}px`; };
   useLayoutEffect(() => { grow(replyRef.current); }, [text, mode, compose]); // eslint-disable-line react-hooks/exhaustive-deps
   const box = (placeholder: string, label: string) => <Textarea id="reply" ref={replyRef} rows={2} aria-label={label} placeholder={placeholder} maxLength={8000} value={text}
-    className="max-h-[40dvh] min-h-[3.25rem] resize-none overflow-y-auto text-base leading-relaxed max-md:max-h-[22dvh]" onChange={(e) => { edit(e.target.value); grow(e.target); }}
+    className="max-h-[40dvh] min-h-[3.25rem] resize-none overflow-y-auto leading-relaxed max-md:max-h-[22dvh]" onChange={(e) => edit(e.target.value)}
     // Typing on a phone: the header shrinks to one line and the thread scrolls so the newest message starts at the top.
     onFocus={() => { if (window.innerWidth >= 768) return; onTyping(true); setTimeout(() => document.querySelector('[data-panel] [role="log"]')?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 250); }}
     onBlur={() => onTyping(false)} />;
@@ -71,7 +71,9 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping 
   );
   const note = running ? <p className="text-[13px] text-muted-foreground">The worker is finishing; decisions unlock when its run settles.</p> : null;
   // On a phone the primary action leads and shares its row with More: the reply area stays short.
-  const row = 'flex flex-wrap items-center gap-2 max-md:[&>[data-primary]]:order-first max-md:[&>[data-primary]]:flex-1 max-md:[&>span.flex-1]:hidden';
+  const row = 'flex flex-wrap items-center gap-2 max-md:[&>[data-primary]]:order-first max-md:[&>[data-primary]]:basis-full';
+  // The answer footer is the common one on a phone: its primary shares one row with More.
+  const tight = 'flex flex-wrap items-center gap-2 max-md:[&>[data-primary]]:order-first max-md:[&>[data-primary]]:flex-1 max-md:[&>span.flex-1]:hidden';
   const composeUi = <>
     {box('Message the manager about this ticket…', 'Message')}
     <div className={row}>
@@ -85,7 +87,7 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping 
   if (dec?.kind === 'product') return <div className={row}><More items={[talk]} /><p className="text-sm text-muted-foreground">Resolve the objections in the Reviews tab.</p></div>;
   if (dec?.kind === 'question') return <>
     {box(`Your answer to ${who}…`, 'Your answer')}
-    <div className={row}>
+    <div className={tight}>
       <More items={[talk, { label: 'Approve as asked (no message)', run: decide('approve'), ok: `Approved; ${who} resumes`, disabled: running },
         { label: 'I will do this one myself', run: async () => { if (!window.confirm(`Take ${t.key} yourself? No engineer will pick it up; the tasks after it wait until you mark it done.`)) return false; await guard(() => api('POST', `/api/tickets/${t.key}/owner-task`, { owner_task: true })); done(); await refresh(); }, ok: 'It is your task now', disabled: running || !!t.head_sha || !!t.pr_url }, { label: 'Reject ticket…', run: decide('reject'), ok: 'Rejected; ticket closed, local work kept', danger: true, disabled: running }]} />
       <span className="flex-1" />

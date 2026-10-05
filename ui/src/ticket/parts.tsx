@@ -59,7 +59,7 @@ export function Conversation({ d, live, tkey, state, status }: { d: Detail; live
   const whoName = (id: string) => amap[id]?.name || ({ owner: 'You', system: 'Desk', github: 'GitHub' } as Record<string, string>)[id] || id;
   // Newest first by default: the latest message sits right under the tabs and the thread scrolls with the panel (no
   // box inside a box, nothing hidden behind the reply area). "Oldest first" keeps the chat-style log that follows the end.
-  const [order, setOrder] = useState<'newest' | 'oldest'>(() => (localStorage.getItem('sd2.convOrder') === 'oldest' ? 'oldest' : 'newest'));
+  const [order, setOrder] = useState<'newest' | 'oldest'>(() => ((() => { try { return localStorage.getItem('sd2.convOrder'); } catch { return null; } })() === 'oldest' ? 'oldest' : 'newest'));
   const newest = order === 'newest';
   const shown = newest ? [...items].reverse() : items;
   const unseen = newest || st.follow ? 0 : Math.max(0, items.length - (st.seen ?? items.length));
@@ -79,19 +79,19 @@ export function Conversation({ d, live, tkey, state, status }: { d: Detail; live
         </div>
         <span className="flex-1" />
         <span className="shrink-0 text-sm text-muted-foreground" role="status">{!S.connected ? 'Reconnecting…' : live ? 'Live' : ''}</span>
-        <button type="button" data-conv-order={order} className="h-8 shrink-0 whitespace-nowrap rounded-full px-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
-          onClick={() => { const next = newest ? 'oldest' : 'newest'; localStorage.setItem('sd2.convOrder', next); st.follow = true; st.top = 0; setOrder(next); }}>
-          {newest ? '↓ Newest' : '↑ Oldest'}<span className="sr-only"> first</span><span className="sr-only">: switch order</span></button>
+        <button type="button" data-conv-order={order} aria-label={newest ? 'Order: newest first. Switch to oldest first' : 'Order: oldest first. Switch to newest first'} className="h-8 shrink-0 whitespace-nowrap rounded-full px-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
+          onClick={() => { const next = newest ? 'oldest' : 'newest'; try { localStorage.setItem('sd2.convOrder', next); } catch { /* private mode: still switch */ } st.follow = true; st.top = 0; setOrder(next); }}>
+          {newest ? '↓ Newest' : '↑ Oldest'}</button>
       </div>
       <div className="relative">
-        <div ref={log} role="log" aria-label="Task conversation" tabIndex={0}
+        <div ref={log} role="log" aria-label="Task conversation" tabIndex={newest ? undefined : 0}
           className={cn('grid content-start gap-2.5 pr-1', !newest && 'max-h-[calc(100dvh-19rem)] min-h-56 overflow-y-auto overscroll-contain [overflow-anchor:none] md:max-h-[64vh]')}
           onScroll={newest ? undefined : (e) => { st.top = e.currentTarget.scrollTop; const f = nearLatest(e.currentTarget); if (f !== st.follow) { st.follow = f; if (f) st.seen = items.length; force((n) => n + 1); } }}>
           {shown.length ? shown.map((it) => {
             const day = dayLabel(it.ts);
             const sep = day && day !== lastDay ? <div key={`day-${it.id}`} className="my-1 flex items-center gap-3 text-xs text-muted-foreground"><span className="h-px flex-1 bg-border" />{day}<span className="h-px flex-1 bg-border" /></div> : null;
             lastDay = day || lastDay;
-            const same = !sep && prev && prev.who === it.who && prev.kind === 'comment' && it.kind === 'comment' && Math.abs(Date.parse(it.ts) - Date.parse(prev.ts)) < 10 * 60_000; // either order
+            const same = !sep && prev && prev.who === it.who && prev.kind === 'comment' && it.kind === 'comment' && !it.ask && !prev.ask && Math.abs(Date.parse(it.ts) - Date.parse(prev.ts)) < 10 * 60_000; // either order
             prev = it;
             const who = whoName(it.who);
             const time = <time className="text-xs text-muted-foreground" dateTime={it.ts} title={new Date(it.ts).toLocaleString()}>{hhmm(it.ts)}</time>;
