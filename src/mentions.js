@@ -18,6 +18,7 @@ const settings = () => config.mentions || {};
 export const enabled = () => settings().enabled !== false;
 export const maxPerHour = () => Number(settings().maxPerTicketPerHour) || 6;
 export const maxAttempts = () => Number(settings().maxAttempts) || 3;
+export const maxActions = () => Number(settings().maxActions) || 30;
 const firstName = (id) => String(agentById[id]?.name || id).split(/\s+/)[0];
 const err = (msg, status = 400, code = null) => Object.assign(new Error(msg), { status, ...(code ? { code } : {}) });
 
@@ -86,6 +87,22 @@ export function boundFor(seat) {
   if (runner.capsSpend(seat, 'mention')) return { kind: 'usd', usd: Number(settings().budgetUsd) || 2 };
   if (billingOf(seat.engine || 'claude') === 'plan') return { kind: 'time', minutes: Number(settings().maxMinutes) || 10, steps: Number(settings().maxSteps) || 60 };
   return null;
+}
+/**
+ * What is left of a delivery's allowance, across every attempt: the bound is per tag, not per run. Spend, time and
+ * steps are persisted on the delivery after each run. { refuse } when nothing is left; else { limits } for the run.
+ */
+const round = (x, d = 2) => Math.floor(x * 10 ** d) / 10 ** d;
+export function remaining(m, b) {
+  const name = firstName(m.seat_id);
+  if (b.kind === 'usd') {
+    const usd = round(b.usd - (m.spent_usd || 0));
+    return usd < 0.05 ? { refuse: `${name} used this tag's whole $${b.usd} allowance across attempts. Tag ${name} again in a new message to continue.`, exhausted: true }
+      : { limits: { usd }, bound: { ...b, usd } };
+  }
+  const minutes = round(b.minutes - (m.spent_ms || 0) / 60_000, 3), steps = b.steps - (m.steps_used || 0);
+  return minutes < 0.01 || steps < 1 ? { refuse: `${name} used this tag's whole allowance (${b.minutes} minutes, ${b.steps} steps) across attempts. Tag ${name} again in a new message to continue.`, exhausted: true }
+    : { limits: { minutes, steps }, bound: { ...b, minutes, steps } };
 }
 /** "Rowan has 10 minutes for this" / "… up to $2 for this": said in the thread when the run starts. */
 export function boundText(seat, b) {

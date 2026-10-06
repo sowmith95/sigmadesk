@@ -398,7 +398,8 @@ process.stdin.resume(); process.stdin.on('end', () => {
     assert.ok(Date.now() - started < 7000, 'stopped well before the engine finished');
     const killed = store.recentRuns(1)[0];
     assert.deepEqual([killed.kind, killed.status, store.getRun(killed.id).result_text], ['mention', 'killed', 'timeout']);
-    assert.equal(m2.status, 'queued', 'an interrupted tag is retried (bounded by maxAttempts)');
+    assert.equal(m2.status, 'failed', 'the time allowance is per tag: a run that used all of it is not retried');
+    assert.match(m2.reason, /used this tag's whole allowance/);
     // Steps: the run is stopped once it exceeds mentions.maxSteps tool calls.
     const live = store.createRun({ agent_id: 'principal-be', ticket_key: t.key, kind: 'mention', token: 'step-tok', model: 'codex:' });
     const ctx = { run: live, state: {}, presence: false };
@@ -407,4 +408,120 @@ process.stdin.resume(); process.stdin.on('end', () => {
     runner.applyEvents([{ type: 'tool', text: 'one more' }], ctx);
     assert.deepEqual([store.getRun(live.id).status, store.getRun(live.id).result_text], ['killed', 'step limit (60)']);
   } finally { config.engines.codex.bin = oldBin; config.mentions.maxMinutes = oldMin; fs.rmSync(path.join(tmp, 'codex-wait'), { force: true }); team.applyTeamOverrides({}); }
+});
+
+test('review fixes: tagged runs are read-only in both engines, and scratch clones are scrubbed before git runs', async () => {
+  const cwd = path.join(tmp, 'ro-probe'); fs.mkdirSync(cwd, { recursive: true });
+  const sb = runner.sandboxSettings(cwd, [], 'mention').sandbox.filesystem;
+  assert.deepEqual(sb.allowWrite, []); assert.ok(sb.denyWrite.includes(cwd));
+  const cx = runner.buildCommand({ ...team.agentById['principal-be'], engine: 'codex', model: '' }, 'mention', cwd);
+  assert.ok(cx.args.includes('default_permissions="sigmadesk_tagged"'));
+  const toml = fs.readFileSync(path.join(cx.env.CODEX_HOME, 'config.toml'), 'utf8');
+  const tagged = toml.slice(toml.indexOf('[permissions.sigmadesk_tagged.filesystem.":workspace_roots"]')).split('\n').slice(0, 4).join('\n');
+  assert.match(tagged, /"\." = "read"\n"\.git" = "read"\n"\.desk-mailbox" = "write"/);
+  // A seat that ran in the shared scratch clone plants a hook, a filter and an fsmonitor: none of them run.
+  const dir = await runner.ensureReadonlyWorkspace('principal-be');
+  const marker = path.join(tmp, 'pwned');
+  fs.writeFileSync(path.join(dir, '.git', 'hooks', 'post-checkout'), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+  fs.appendFileSync(path.join(dir, '.git', 'config'), `[core]\n\tfsmonitor = touch ${marker}-fs\n[filter "evil"]\n\tsmudge = sh -c 'touch ${marker}-smudge; cat'\n`);
+  fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), '* filter=evil\n');
+  fs.writeFileSync(path.join(dir, 'README.md'), 'dirty');
+  await runner.ensureReadonlyWorkspace('principal-be');
+  for (const f of [marker, `${marker}-fs`, `${marker}-smudge`]) assert.equal(fs.existsSync(f), false, `${path.basename(f)} ran`);
+  assert.doesNotMatch(fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8'), /evil|fsmonitor/);
+  assert.equal(fs.readFileSync(path.join(dir, 'README.md'), 'utf8'), 'fixture', 'reset to the base branch');
+});
+
+test('review fixes: the engine bound is checked before any run exists, and a run refused in onStart never spawns', async () => {
+  fresh();
+  team.applyTeamOverrides({ 'principal-fe': { engine: 'codex', model: '' } });
+  const t = ticket(); const r = tag(t, ['principal-fe']);
+  config.engines.codex.billing = 'api'; // the provider changes to metered while the tag waits
+  try {
+    const runsBefore = store.recentRuns(1)[0]?.id || 0;
+    await sched.launchMention(store.getMention(r.mentions[0].id));
+    const m = store.getMention(r.mentions[0].id);
+    assert.equal(m.status, 'blocked'); assert.match(m.reason, /did not start it/);
+    assert.equal(store.recentRuns(1)[0]?.id || 0, runsBefore, 'no run was created');
+    assert.equal(store.getAgentState('principal-fe').status, 'idle');
+  } finally { config.engines.codex.billing = 'plan'; team.applyTeamOverrides({}); }
+  fs.rmSync(path.join(tmp, 'argv.log'), { force: true });
+  const cwd = path.join(tmp, 'spawn-probe'); fs.mkdirSync(cwd, { recursive: true });
+  const out = await runner.startRun({ agentId: 'principal-be', kind: 'mention', cwd, prompt: 'x', onStart: (run) => runner.killRun(run.id, 'refused in onStart') });
+  assert.equal(out.run.status, 'killed'); assert.equal(fs.existsSync(path.join(tmp, 'argv.log')), false, 'the engine never started');
+});
+
+test('review fixes: killing or cancelling a tagged run retires its token, grant and pending access at once', () => {
+  fresh(); store.setSetting('ops_enabled', 'true');
+  const t = ticket(); const r = tag(t, ['principal-fe']); const m = store.getMention(r.mentions[0].id); const run = taggedRun(m);
+  const g = access.request({ seat: 'principal-fe', probes: ['app_health'], why: 'check', runId: run.id, ticketKey: t.key }).grant;
+  assert.ok(access.grantFor(store.getRun(run.id), 'app_health'));
+  // Cancelled tag: the grant stops covering probes even before the run is killed.
+  store.updateMention(m.id, { status: 'cancelled' });
+  assert.equal(access.grantFor(store.getRun(run.id), 'app_health'), null);
+  assert.ok(store.getGrant(g.id).revoked_at);
+  assert.equal(access.ownerMentionDecision({ seat: 'principal-fe', probes: ['app_health'], minutes: 30, runId: run.id }), null, 'no automatic access for a cancelled tag');
+  runner.killRun(run.id, 'owner cancelled');
+  const after = store.getRun(run.id);
+  assert.deepEqual([after.status, after.token], ['killed', null], 'the token is retired by the kill, not by the process exit');
+  store.setSetting('ops_enabled', 'false');
+});
+
+test('review fixes: every command counts toward the step cap (desk calls Codex hides too), and the desk caps actions per run', async () => {
+  fresh();
+  const { codex } = await import('../src/engines/codex.js');
+  const t = ticket(); const r = tag(t, ['principal-be']); const run = taggedRun(store.getMention(r.mentions[0].id));
+  const ctx = { run, state: {}, presence: false };
+  for (let i = 0; i < 61; i++) {
+    const item = { id: `c${i}`, type: 'command_execution', command: `bash -lc 'desk show'`, exit_code: 0, aggregated_output: '' };
+    runner.applyEvents(codex.parse(JSON.stringify({ type: 'item.started', item }), tmp, ctx.state), ctx);
+    runner.applyEvents(codex.parse(JSON.stringify({ type: 'item.completed', item }), tmp, ctx.state), ctx);
+  }
+  assert.equal(ctx.state.steps, 61); assert.deepEqual([store.getRun(run.id).status, store.getRun(run.id).result_text], ['killed', 'step limit (60)']);
+  const r2 = tag(t, ['principal-fe']); const run2 = taggedRun(store.getMention(r2.mentions[0].id));
+  for (let i = 0; i < mentions.maxActions(); i++) await sched.deskAction(run2, 'show', {});
+  await assert.rejects(sched.deskAction(run2, 'show', {}), /used its 30 desk actions/);
+  // A stopped run has no more say, even with a live-looking request.
+  const r3 = tag(t, ['manager']); const run3 = taggedRun(store.getMention(r3.mentions[0].id));
+  runner.killRun(run3.id, 'stopped');
+  await assert.rejects(sched.deskAction(run3, 'reply', { body: 'late' }), /no longer active/);
+});
+
+test('review fixes: a handoff and its routing commit together; a crash-then-retry files exactly one task', async () => {
+  fresh();
+  const t = ticket(); const r = tag(t, ['manager']); const run = taggedRun(store.getMention(r.mentions[0].id));
+  const db = store.handle();
+  db.exec("CREATE TRIGGER fail_routing BEFORE UPDATE OF routed ON mention_deliveries WHEN NEW.routed IS NOT NULL BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+  const count = () => store.listTickets().filter((x) => x.title === 'Cover TICK in retries').length;
+  try { await assert.rejects(sched.deskAction(run, 'handoff', { action: 'task', title: 'Cover TICK in retries', body: 'the owner asked' }), /disk full/); }
+  finally { db.exec('DROP TRIGGER fail_routing'); }
+  assert.equal(count(), 0, 'nothing was left behind');
+  await sched.deskAction(run, 'handoff', { action: 'task', title: 'Cover TICK in retries', body: 'the owner asked' });
+  await assert.rejects(sched.deskAction(run, 'handoff', { action: 'task', title: 'Cover TICK in retries', body: 'again' }), /one handoff per tag/);
+  assert.equal(count(), 1);
+});
+
+test('review fixes: a tag\'s allowance is cumulative across attempts; retries get only what is left', async () => {
+  fresh();
+  const b = mentions.boundFor({ ...team.agentById['principal-be'], engine: 'claude', model: 'fable' });
+  assert.deepEqual(mentions.remaining({ seat_id: 'principal-be', spent_usd: 1.5 }, b).limits, { usd: 0.5 });
+  assert.equal(mentions.remaining({ seat_id: 'principal-be', spent_usd: 1.97 }, b).exhausted, true);
+  const tb = { kind: 'time', minutes: 10, steps: 60 };
+  assert.deepEqual(mentions.remaining({ seat_id: 'sre', spent_ms: 6 * 60_000, steps_used: 50 }, tb).limits, { minutes: 4, steps: 10 });
+  // A retry runs under the remaining $0.50, and its spend is added to the tag.
+  fs.rmSync(path.join(tmp, 'argv.log'), { force: true }); fs.writeFileSync(path.join(tmp, 'final.txt'), 'answer');
+  const t = ticket(); const r = tag(t, ['principal-be']);
+  store.updateMention(r.mentions[0].id, { spent_usd: 1.5, attempts: 1 });
+  await sched.launchMention(store.getMention(r.mentions[0].id));
+  const argv = JSON.parse(fs.readFileSync(path.join(tmp, 'argv.log'), 'utf8').trim().split('\n').at(-1));
+  assert.equal(argv[argv.indexOf('--max-budget-usd') + 1], '0.5');
+  const m = store.getMention(r.mentions[0].id);
+  assert.equal(m.status, 'replied'); assert.ok(Math.abs(m.spent_usd - 1.51) < 1e-9);
+  assert.ok(store.listComments(t.key).some((c) => /⏱ Rowan has up to \$0\.5 for this reply/.test(c.body)));
+  // Nothing left: the owner's Retry is refused with the reason, and a launch fails without a run.
+  const r2 = tag(ticket(), ['principal-be']); store.updateMention(r2.mentions[0].id, { spent_usd: 2, status: 'failed' });
+  assert.throws(() => sched.ownerMention(r2.mentions[0].id, 'retry'), /whole \$2 allowance/);
+  store.updateMention(r2.mentions[0].id, { status: 'queued' });
+  await sched.launchMention(store.getMention(r2.mentions[0].id));
+  assert.deepEqual([store.getMention(r2.mentions[0].id).status, store.getMention(r2.mentions[0].id).run_id], ['failed', null]);
 });

@@ -587,7 +587,7 @@ test('childEnv: an explicit allowlist, a project.env schema and an isolated tool
   try {
     const { codexHome } = await import('../src/engines/codex.js');
     const toml = fs.readFileSync(path.join(codexHome(), 'config.toml'), 'utf8');
-    for (const g of ['"**/.env.*" = "none"', '"**/*.pem" = "none"', '"**/credentials.json" = "none"']) assert.equal(toml.split(g).length - 1, 2, `${g} in both profiles`);
+    for (const g of ['"**/.env.*" = "none"', '"**/*.pem" = "none"', '"**/credentials.json" = "none"']) assert.equal(toml.split(g).length - 1, 3, `${g} in every profile (seat, review, tagged)`);
     assert.ok(!toml.includes(`"${os.homedir()}" = "read"`), 'codex never reads the whole home folder');
     // A read-only path holding a secret-looking file is never handed to Codex.
     const { secretFileUnder } = await import('../src/engines/codex.js');

@@ -109,6 +109,7 @@ const DEFAULTS = {
     // time and steps instead. The desk stops the run at either limit. API-billed engines without a cap are refused.
     maxMinutes: 10,
     maxSteps: 60, // tool calls and commands in one tagged run
+    maxActions: 30, // desk commands one tagged run may send (counted by the desk itself)
   },
   resolve: {
     budgetUsd: 1.5, // per conflict-resolution run (Claude CLI hard cap)

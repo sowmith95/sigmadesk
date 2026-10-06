@@ -38,11 +38,15 @@ export function todoProgress(todos) {
 const evidence = new Map(); // runId -> { pending: Map(id -> cmd), done: [{cmd, ok}] }
 export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
 
-/** A tagged run (@mention) stops after mentions.maxSteps tool calls: the desk-side bound when dollars cannot be capped. */
-function stepLimit(ctx) {
+/**
+ * A tagged run (@mention) stops after its step allowance: every tool call and every command (desk calls too), each
+ * counted once whatever the engine chooses to display. The desk-side bound when dollars cannot be capped.
+ */
+function stepLimit(ctx, id) {
   if (ctx.run.kind !== 'mention') return;
+  if (id != null) { const seen = (ctx.state.stepIds ||= new Set()); if (seen.has(id)) return; seen.add(id); }
   ctx.state.steps = (ctx.state.steps || 0) + 1;
-  const max = Number(config.mentions?.maxSteps) || 60;
+  const max = ctx.maxSteps ?? (Number(config.mentions?.maxSteps) || 60);
   if (ctx.state.steps === max + 1) {
     store.logEvent({ run_id: ctx.run.id, agent_id: ctx.run.agent_id, ticket_key: ctx.run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for a tagged reply)` });
     killRun(ctx.run.id, `step limit (${max})`);
@@ -63,7 +67,7 @@ export function applyEvents(events, ctx) {
         break;
       case 'tool':
         store.logEvent({ ...base, kind: 'tool', text: e.text });
-        stepLimit(ctx);
+        if (!/^\$ /.test(e.text)) stepLimit(ctx, null); // commands are counted once, by their cmd-start id
         if (ctx.presence !== false) store.updateAgent(run.agent_id, { last_action: e.text, last_action_at: store.now() });
         break;
       case 'todos': {
@@ -77,6 +81,7 @@ export function applyEvents(events, ctx) {
       case 'error': ctx.state.lastError = e.text; store.logEvent({ ...base, kind: 'error', text: short(e.text, 300) }); break;
       case 'wait': store.logEvent({ ...base, kind: 'system', text: e.text }); break;
       case 'cmd-start': {
+        stepLimit(ctx, e.id); // every command, including desk calls an engine does not display
         const ev = evidence.get(run.id) || { pending: new Map(), done: [] };
         ev.pending.set(e.id, e.cmd);
         evidence.set(run.id, ev);
@@ -130,6 +135,20 @@ export function withGitLock(fn) {
   return p;
 }
 const git = (args, opts = {}) => pexec(config.bins.git, args, { timeout: 180_000, maxBuffer: 16 << 20, ...opts });
+// Git on a clone a seat has touched: no hooks, no fsmonitor, no external diff (the seat may have planted any of them).
+const sgit = (args, opts = {}) => git([...SAFE, ...args], opts);
+/**
+ * A desk-owned scratch clone is reset before every use, and seats ran in it: its repository config, hooks and
+ * attributes are rewritten to the desk's own before git touches it (a planted filter, alias or hook never runs).
+ */
+export function scrubScratchGit(dir, origin = '') {
+  const g = path.join(dir, '.git');
+  if (!fs.existsSync(g) || fs.lstatSync(g).isSymbolicLink()) throw new Error(`scratch clone ${dir} has no real .git`);
+  fs.writeFileSync(path.join(g, 'config'), ['[core]', '\trepositoryformatversion = 0', '\tfilemode = true', '\tbare = false', '\tlogallrefupdates = true',
+    ...(origin ? ['[remote "origin"]', `\turl = ${origin}`, '\tfetch = +refs/heads/*:refs/remotes/origin/*'] : []), ''].join('\n'));
+  fs.rmSync(path.join(g, 'hooks'), { recursive: true, force: true }); fs.mkdirSync(path.join(g, 'hooks'));
+  for (const f of ['info/attributes', 'info/sparse-checkout', 'config.worktree']) fs.rmSync(path.join(g, f), { force: true });
+}
 
 export const workspaceDir = (key) => path.join(config.workspaceRoot, key);
 
@@ -165,18 +184,18 @@ export function ensureWorkspace(ticket) {
     if (!fs.existsSync(path.join(dir, '.git'))) {
       fs.mkdirSync(config.workspaceRoot, { recursive: true });
       // --no-hardlinks: a hardlinked object edited in a clone would corrupt the owner's checkout.
-      await git(['clone', '--quiet', '--no-hardlinks', config.project.repoPath, dir]);
+      await sgit(['clone', '--quiet', '--no-hardlinks', config.project.repoPath, dir]);
       const { stdout: origin } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
       if (origin.trim()) {
-        await git(['-C', dir, 'remote', 'set-url', 'origin', origin.trim()]);
-        await git(['-C', dir, 'fetch', '--quiet', 'origin', base]);
+        await sgit(['-C', dir, 'remote', 'set-url', 'origin', origin.trim()]);
+        await sgit(['-C', dir, 'fetch', '--quiet', 'origin', base]);
       }
-      const remoteBranch = await git(['-C', dir, 'ls-remote', '--heads', 'origin', branch]).then((r) => r.stdout.trim()).catch(() => '');
+      const remoteBranch = await sgit(['-C', dir, 'ls-remote', '--heads', 'origin', branch]).then((r) => r.stdout.trim()).catch(() => '');
       if (remoteBranch) {
-        await git(['-C', dir, 'fetch', '--quiet', 'origin', branch]);
-        await git(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${branch}`]);
+        await sgit(['-C', dir, 'fetch', '--quiet', 'origin', branch]);
+        await sgit(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${branch}`]);
       } else {
-        await git(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${base}`]);
+        await sgit(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${base}`]);
       }
       for (const p of config.project.copyPaths) {
         const src = path.join(config.project.repoPath, p);
@@ -200,19 +219,20 @@ export function ensureReadonlyWorkspace(seatId = 'scratch') {
     if (!/^[a-z0-9-]+$/.test(seatId)) throw new Error('invalid scratch seat');
     const dir = path.join(config.workspaceRoot, `_desk-${seatId}`);
     const base = config.project.baseBranch;
+    const { stdout: ownerOrigin } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
+    const origin = ownerOrigin.trim() || config.project.repoPath; // the owner's remote, else the local checkout
     if (!fs.existsSync(path.join(dir, '.git'))) {
       fs.mkdirSync(config.workspaceRoot, { recursive: true });
-      await git(['clone', '--quiet', '--no-hardlinks', config.project.repoPath, dir]);
-      const { stdout: origin } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
-      if (origin.trim()) await git(['-C', dir, 'remote', 'set-url', 'origin', origin.trim()]);
+      await sgit(['clone', '--quiet', '--no-hardlinks', '--no-checkout', config.project.repoPath, dir]);
     }
+    scrubScratchGit(dir, origin);
     breakHardlinks(dir);
-    const hasOrigin = await git(['-C', dir, 'remote']).then((r) => r.stdout.includes('origin'));
     const lastFetch = fs.existsSync(path.join(dir, '.git', 'FETCH_HEAD')) ? fs.statSync(path.join(dir, '.git', 'FETCH_HEAD')).mtimeMs : 0;
-    if (hasOrigin && Date.now() - lastFetch > 10 * 60_000) await git(['-C', dir, 'fetch', '--quiet', 'origin', base]).catch(() => {});
-    await git(['-C', dir, 'checkout', '-q', '--detach', `origin/${base}`]).catch(() => git(['-C', dir, 'checkout', '-q', base]));
-    await git(['-C', dir, 'reset', '-q', '--hard']);
-    await git(['-C', dir, 'clean', '-qfd']);
+    if (Date.now() - lastFetch > 10 * 60_000 || !(await sgit(['-C', dir, 'rev-parse', '-q', '--verify', `origin/${base}`]).then(() => true, () => false)))
+      await sgit(['-c', 'protocol.file.allow=always', '-C', dir, 'fetch', '--quiet', 'origin', base]).catch(() => {});
+    await sgit(['-C', dir, 'checkout', '-q', '-f', '--detach', `origin/${base}`]).catch(() => sgit(['-C', dir, 'checkout', '-q', '-f', base]));
+    await sgit(['-C', dir, 'reset', '-q', '--hard']);
+    await sgit(['-C', dir, 'clean', '-qfd']);
     return dir;
   });
 }
@@ -230,11 +250,11 @@ export async function ensureProductReviewWorkspace(seatId, ticket) {
   return dir;
 }
 
-export const headSha = async (dir) => (await git(['-C', dir, 'rev-parse', 'HEAD'])).stdout.trim();
+export const headSha = async (dir) => (await sgit(['-C', dir, 'rev-parse', 'HEAD'])).stdout.trim();
 
 export async function commitsAhead(dir) {
   try {
-    const { stdout } = await git(['-C', dir, 'rev-list', '--count', `origin/${config.project.baseBranch}..HEAD`]);
+    const { stdout } = await sgit(['-C', dir, 'rev-list', '--count', `origin/${config.project.baseBranch}..HEAD`]);
     return Number(stdout.trim());
   } catch { return 0; }
 }
@@ -424,7 +444,7 @@ export function jobPermissions(kind, job) {
   if (kind === 'research_review' || kind === 'connector_assessment') return { web: !!job?.web };
   return {};
 }
-export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath, job = null } = {}) {
+export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath, job = null, capUsd = null } = {}) {
   const charter = kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.'
     : kind === 'product_review' ? productReviewCharter(agent.id)
       : kind === 'feature_groom' ? featureGroomCharter()
@@ -437,8 +457,8 @@ export function buildCommand(agent, kind, cwd, { resume = null, fork = false, ex
     perms: permissionsFor(kind, cwd, jobPermissions(kind, job)), denyRules: DENY_RULES, charter, settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
   });
   // Conflict resolutions (merge train, #3) and tagged runs (@mentions) get their own, lower hard spend cap.
-  const cap = kindCap(kind);
-  const capAt = cap ? cmd.args.indexOf('--max-budget-usd') : -1;
+  const cap = Math.min(kindCap(kind) ?? Infinity, capUsd ?? Infinity); // capUsd: what is left of a job's allowance
+  const capAt = Number.isFinite(cap) ? cmd.args.indexOf('--max-budget-usd') : -1;
   if (capAt >= 0) cmd.args[capAt + 1] = String(Math.min(Number(cmd.args[capAt + 1]) || Infinity, cap));
   return cmd;
 }
@@ -498,7 +518,7 @@ export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: St
  * Start one agent run. Resolves when the process exits with {run, result}.
  * The prompt goes over stdin so the variadic tool flags cannot swallow it.
  */
-export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null, job = null, pinEngine = null }) {
+export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null, job = null, pinEngine = null, admit = null }) {
   if (fence != null && fence !== epoch) return Promise.resolve({ run: null, result: null, aborted: true });
   if (reviewProfile && (kind !== 'council_review' || track || resume)) throw new Error('Per-job review models are restricted to fresh, untracked council calls');
   // A research job's requirements (web, connectors) travel into provider selection: fallback may not drop them.
@@ -507,12 +527,17 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : pinEngine ? pinnedSelection(agentId, pinEngine, kind) : selectionFor(agentId, Date.now(), requirements, kind);
   if (!selected.seat) throw Object.assign(new Error(`${agentId}: ${selected.reason}`), { status: 409, providerUnavailable: true });
   const agent = selected.seat;
+  // admit(agent): the job checks the engine it actually got BEFORE any run exists: { refuse } stops here, { limits }
+  // ({ usd, minutes, steps }) bounds the run (a lower spend cap, a shorter timeout, a step allowance).
+  const admitted = admit ? admit(agent) : null;
+  if (admitted?.refuse) return Promise.resolve({ run: null, result: null, refused: admitted.refuse });
+  const limits = admitted?.limits || null;
   if (ENGINES[agent.engine || 'claude']?.supports && !ENGINES[agent.engine || 'claude'].supports(kind)) throw Object.assign(new Error(`${agentId}: ${ENGINES[agent.engine].label} cannot run ${kind}`), { status: 409 });
   const token = crypto.randomBytes(18).toString('hex');
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job });
   // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
   if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
-  store.updateRun(run.id, { reserve_usd: capped(kind, engineOf(agent).budgetUsd(agent)) });
+  store.updateRun(run.id, { reserve_usd: Math.min(capped(kind, engineOf(agent).budgetUsd(agent)), limits?.usd ?? Infinity) });
   // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
   // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
   if (kind !== 'mention') access.bindRun(agentId, ticketKey, run.id);
@@ -530,9 +555,12 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
   // Covers the first answer, follow-ups and every permitted page round (bounded by engines.perplexity.maxRunMinutes).
   // A tagged run on a plan-billed engine without a dollar cap is bounded by time instead (mentions.maxMinutes).
-  const timeoutMin = kind === 'mention' && !capsSpend(agent, 'mention') ? Number(config.mentions?.maxMinutes) || 10
-    : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0);
+  const timeoutMin = limits?.minutes ?? (kind === 'mention' && !capsSpend(agent, 'mention') ? Number(config.mentions?.maxMinutes) || 10
+    : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0));
   const deadlineAt = Date.now() + timeoutMin * 60_000;
+  if (limits?.steps != null) ctx.maxSteps = limits.steps;
+  // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
+  if (store.getRun(run.id)?.status !== 'running') return Promise.resolve(endBeforeSpawn('killed', store.getRun(run.id)?.result_text || 'refused before start'));
   if (!pplx) return spawnChild();
 
   // Perplexity thinking seats: the desk builds the context pack (not the relay) before the relay starts. Cancellation
@@ -568,7 +596,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   let sock, cmd, env;
   try {
     sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
-    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job });
+    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job, capUsd: limits?.usd ?? null });
     env = { ...childEnv(token, engine.id), ...cmd.env };
     isolateTools(env, engine.id, toolHome(run.id));
     if (kind === 'council_review') { delete env.DESK_RUN_TOKEN; delete env.DESK_SOCKET; }
@@ -648,7 +676,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (failure) holdProvider(engine.id, failure, r?.result || stderr || ctx.state.lastError);
       // No terminal result (killed, crashed, timed out): charge the full per-run cap so the risk limit stays honest.
       const knownCost = r?.cost_known !== false && r && (r.total_cost_usd || !r.is_error);
-      const cost = knownCost ? (r.total_cost_usd ?? 0) : capped(kind, engine.budgetUsd(agent));
+      const cost = knownCost ? (r.total_cost_usd ?? 0) : Math.min(capped(kind, engine.budgetUsd(agent)), limits?.usd ?? Infinity);
       store.updateRun(run.id, {
         status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
         result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
@@ -660,7 +688,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: status !== 'success' ? 'error' : blocked ? 'system' : 'done',
         text: `${outcome}${r?.subtype && r.subtype !== 'success' ? ` (${r.subtype})` : ''}${costTxt}${status !== 'success' && stderr ? ` — ${short(stderr, 200)}` : ''}` });
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
-      resolve({ run: store.getRun(run.id), result: r, failure });
+      resolve({ run: store.getRun(run.id), result: r, failure, steps: ctx.state.steps || 0 });
     };
     child.on('close', finish);
     child.on('error', (err) => {
@@ -700,7 +728,9 @@ const preparing = new Map(); // runId -> AbortController while a Perplexity pack
 export function killRun(runId, reason = 'killed') {
   const run = store.getRun(runId);
   if (!run || run.status !== 'running') return false;
-  store.updateRun(runId, { status: 'killed', result_text: reason });
+  // The run's authorization ends now, not when its process exits: no desk call, grant or probe outlives the kill.
+  store.updateRun(runId, { status: 'killed', result_text: reason, token: null });
+  ops.cancelRun(runId);
   preparing.get(runId)?.abort();
   const pid = children.get(runId)?.pid ?? run.pid;
   if (pid) {

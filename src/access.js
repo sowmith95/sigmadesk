@@ -118,6 +118,8 @@ export function grantFor(run, probe, at = nowIso()) {
     if (why) { if (why !== 'revoked') { endGrant(g, why); } continue; }
     if (!covers(json(g.probes, []), probe)) continue;
     if (g.run_id && g.run_id !== run.id) continue; // run-bound: that run only
+    // A grant the owner's tag gave lives only while that tag is live (re-checked at every probe call).
+    if (g.granted_by === 'owner_mention' && !liveTag(store.getRun(run.id))) { endGrant(g, 'run ended'); continue; }
     if (g.ticket_key && (!g.run_id || g.ticket_key !== run.ticket_key)) continue; // ticket grants: only once bound, on that ticket
     return g;
   }
@@ -163,12 +165,18 @@ export const OWNER_MENTION_MAX_MINUTES = 60;
  * recorded for the owner's message (never text, never inherited by work the run creates). Returns null when the request
  * does not come from an owner-tagged run, { why } when the rule does not apply, or { minutes } when it does.
  */
-export function ownerMentionDecision({ seat, probes, minutes, ticketScoped, runId }, pol = policy()) {
-  const run = runId ? store.getRun(runId) : null;
-  if (!run || run.kind !== 'mention' || !run.token || run.agent_id !== seat) return null;
+/** The live owner-origin delivery a tagged run serves: the run is running, holds its token, and its tag is not cancelled. */
+function liveTag(run) {
+  if (!run || run.kind !== 'mention' || !run.token || run.status !== 'running') return null;
   const job = json(run.job || 'null', null);
   const m = job?.mention ? store.getMention(job.mention) : null;
-  if (!m || m.origin !== 'owner' || m.seat_id !== seat || m.run_id !== run.id) return null;
+  return m && m.origin === 'owner' && m.seat_id === run.agent_id && m.run_id === run.id && ['working', 'replied'].includes(m.status) ? m : null;
+}
+export function ownerMentionDecision({ seat, probes, minutes, ticketScoped, runId }, pol = policy()) {
+  const run = runId ? store.getRun(runId) : null;
+  if (!run || run.agent_id !== seat) return null;
+  const m = liveTag(run);
+  if (!m) return null;
   if (pol.ownerMentionAutoGrant === false) return { why: ['automatic access for tagged seats is off in the access policy'] };
   if (ticketScoped) return { why: ['a tagged run gets access for itself only, not for the whole ticket'] };
   const mins = Math.min(minutes || OWNER_MENTION_MAX_MINUTES, OWNER_MENTION_MAX_MINUTES);
@@ -176,6 +184,7 @@ export function ownerMentionDecision({ seat, probes, minutes, ticketScoped, runI
   return v.length ? { why: v } : { minutes: mins, mention: m };
 }
 function ownerMentionGrant({ seat, probes, why, minutes, run, mention }) {
+  if (!liveTag(store.getRun(run.id))) throw err('this tag is no longer active', 409);
   const r = store.insertAccessRequest({ seat, probes, why: String(why).slice(0, 500), minutes, ticket_scoped: false, ticket_key: run.ticket_key || null,
     run_id: run.id, filed_by: seat, status: 'approved', approver: null, owner_reason: null });
   const g = store.insertGrant({ seat, probes, expires_at: new Date(Date.now() + minutes * 60_000).toISOString(), ticket_key: null, run_id: run.id,

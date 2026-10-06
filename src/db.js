@@ -166,6 +166,9 @@ CREATE TABLE IF NOT EXISTS mention_deliveries (
   reply_comment_id INTEGER,
   routed TEXT,
   attempts INTEGER DEFAULT 0,
+  spent_usd REAL DEFAULT 0,       -- the tag's allowance is cumulative across attempts
+  spent_ms INTEGER DEFAULT 0,
+  steps_used INTEGER DEFAULT 0,
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   started_at TEXT,
   ended_at TEXT,
@@ -466,6 +469,7 @@ function migrate() {
       done_at: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
+    mention_deliveries: { spent_usd: 'REAL DEFAULT 0', spent_ms: 'INTEGER DEFAULT 0', steps_used: 'INTEGER DEFAULT 0' },
     pr_outbox: { next_attempt_at: 'TEXT' },
     runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT',
       thread_id: 'TEXT', context_hash: 'TEXT', context_meta: 'TEXT', job_hash: 'TEXT',
@@ -1150,7 +1154,7 @@ export function createMention(m) {
   announce({ type: 'mention', data: row });
   return row;
 }
-const MENTION_FIELDS = ['status', 'reason', 'run_id', 'reply_comment_id', 'routed', 'attempts', 'started_at', 'ended_at'];
+const MENTION_FIELDS = ['status', 'reason', 'run_id', 'reply_comment_id', 'routed', 'attempts', 'started_at', 'ended_at', 'spent_usd', 'spent_ms', 'steps_used'];
 export function updateMention(id, patch) {
   const cols = Object.keys(patch).filter((k) => MENTION_FIELDS.includes(k));
   if (cols.length) q(`UPDATE mention_deliveries SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);

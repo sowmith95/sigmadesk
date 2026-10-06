@@ -413,8 +413,10 @@ function blockMention(m, why) {
 }
 function requeueMention(id, why) {
   const m = store.getMention(id);
-  const failed = (m.attempts || 0) >= mentions.maxAttempts();
-  store.updateMention(id, failed ? { status: 'failed', run_id: null, reason: `${why}; tried ${m.attempts} times`, ended_at: store.now() } : { status: 'queued', run_id: null, reason: why });
+  const b = mentions.boundFor(store.getRun(m.run_id) ? { ...agentById[m.seat_id], engine: String(store.getRun(m.run_id).model).split(':')[0] } : agentById[m.seat_id]);
+  const left = b ? mentions.remaining(m, b) : null;
+  const failed = (m.attempts || 0) >= mentions.maxAttempts() || !!left?.exhausted;
+  store.updateMention(id, failed ? { status: 'failed', run_id: null, reason: left?.exhausted ? left.refuse : `${why}; tried ${m.attempts} times`, ended_at: store.now() } : { status: 'queued', run_id: null, reason: why });
   store.logEvent({ agent_id: 'system', kind: failed ? 'error' : 'system',
     text: failed ? `${m.ticket_key}: ${agentById[m.seat_id]?.name}'s answer to your tag failed after ${m.attempts} attempts (${why}). Retry it from the message.` : `${m.ticket_key}: ${agentById[m.seat_id]?.name}'s answer to your tag was interrupted (${why}); it will run again.` });
 }
@@ -447,24 +449,37 @@ export async function launchMention(m, fence) {
     if (store.getMention(m.id)?.status !== 'working') { store.updateAgent(seat, { status: 'idle', current_ticket: null }); return; } // cancelled meanwhile
     store.updateAgent(seat, { current_ticket: m.ticket_key, current_kind: 'mention', last_action: 'reading what the owner asked' });
     const message = store.listComments(m.ticket_key).find((c) => c.id === m.comment_id)?.body || '';
+    let bound = null, exhausted = false;
     const p = runner.startRun({ fence, agentId: seat, kind: 'mention', ticketKey: m.ticket_key, cwd, job: { mention: m.id, origin: m.origin },
       prompt: mentions.prompt({ ticket: store.getTicket(m.ticket_key), comments: store.listComments(m.ticket_key).filter((c) => c.id <= m.comment_id), message, seat }),
+      // Checked on the engine the run actually got, before any run exists: a capped engine, or a plan-billed one bounded
+      // by time and steps; and only against what is left of this tag's allowance after earlier attempts.
+      admit: (agent) => {
+        const b = mentions.boundFor(agent);
+        if (!b) return { refuse: `${agentById[seat].name}'s available engine (${agent.engine}) is billed per use with no hard spend cap, so the desk did not start it. Retry when a capped or plan-billed engine is available.` };
+        const left = mentions.remaining(store.getMention(m.id), b);
+        if (left.refuse) { exhausted = true; return left; }
+        bound = { seat: agent, b: left.bound };
+        return { limits: left.limits };
+      },
       onStart: (run) => {
         runId = run.id;
-        // The engine the run actually got must enforce the hard spend cap (a fallback could pick one that does not).
-        const [engine, ...model] = String(run.model || '').split(':');
-        const got = { ...agentById[seat], engine, model: model.join(':') };
-        const bound = mentions.boundFor(got);
-        if (!bound) {
-          store.updateMention(m.id, { status: 'blocked', run_id: run.id, reason: `${agentById[seat].name}'s available engine (${engine}) is billed per use with no hard spend cap, so the desk stopped the run. Retry when a capped or plan-billed engine is available.`, ended_at: store.now() });
-          runner.killRun(run.id, 'tagged work needs a bounded engine');
-          return;
-        }
+        if (store.getMention(m.id)?.status !== 'working') { runner.killRun(run.id, 'the tag was cancelled'); return; } // never spawns
         store.updateMention(m.id, { run_id: run.id });
-        store.addComment(m.ticket_key, 'system', `⏱ ${mentions.boundText(got, bound)}`);
+        store.addComment(m.ticket_key, 'system', `⏱ ${mentions.boundText(bound.seat, bound.b)}`);
       } });
-    const { run, aborted, failure } = await p;
+    const { run, aborted, failure, refused, steps } = await p;
+    if (refused) {
+      store.updateAgent(seat, { status: 'idle', current_ticket: null, current_run: null, current_kind: null });
+      if (store.getMention(m.id)?.status === 'working') { if (exhausted) store.updateMention(m.id, { status: 'failed', reason: refused, ended_at: store.now() }); else blockMention(m, refused); }
+      return;
+    }
     if (aborted) store.updateAgent(seat, { status: 'idle', current_ticket: null, current_run: null, current_kind: null });
+    if (run) { // the tag's allowance is cumulative: what this attempt used counts against every retry
+      const used = store.getMention(m.id);
+      store.updateMention(m.id, { spent_usd: (used.spent_usd || 0) + (run.cost_usd || 0), steps_used: (used.steps_used || 0) + (steps || 0),
+        spent_ms: (used.spent_ms || 0) + Math.max(0, Date.parse(run.ended_at || store.now()) - Date.parse(run.started_at || store.now())) });
+    }
     const now = store.getMention(m.id);
     if (!['working', 'replied'].includes(now.status)) return; // cancelled or blocked while it ran
     if (now.reply_comment_id) return; // answered in the thread
@@ -1068,6 +1083,8 @@ export function recoverOrphans() {
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
   // A tagged seat interrupted by the restart answers again (attempts already counted; bounded by mentions.maxAttempts).
   for (const m of store.openMentions()) if (m.status === 'working') {
+    const r = m.run_id && store.getRun(m.run_id); // an interrupted attempt still counts against the tag's allowance
+    if (r && !r.ended_at) store.updateMention(m.id, { spent_usd: (m.spent_usd || 0) + (r.cost_usd || runner.reservationFor(r)), spent_ms: (m.spent_ms || 0) + Math.max(0, Date.now() - Date.parse(r.started_at)) });
     if (m.reply_comment_id || m.routed) store.updateMention(m.id, { status: 'replied', run_id: null });
     else if ((m.attempts || 0) >= mentions.maxAttempts()) store.updateMention(m.id, { status: 'failed', run_id: null, reason: 'interrupted by desk restarts', ended_at: store.now() });
     else store.updateMention(m.id, { status: 'queued', run_id: null, reason: 'interrupted by a desk restart' });
@@ -1104,6 +1121,7 @@ const PERMS = {
 };
 const PRIORITY = /^P[0-3]$/;
 const consultsByRun = new Map();
+const mentionActions = new Map(); // desk actions per tagged run (server-side allowance)
 const consultTargets = new Map();
 const peerReviewsByRun = new Set();
 
@@ -1131,6 +1149,13 @@ export async function deskAction(run, cmd, body = {}) {
   if (run.kind === 'mention') {
     need(['show', 'list', 'reply', 'comment', 'handoff', 'ops', 'context-file'].includes(cmd), 'a tagged run reads, answers with desk reply and routes real work with desk handoff; it cannot do that itself');
     need(!body.key || body.key === run.ticket_key, 'answer on the ticket you were tagged in');
+    // Bound to a live delivery of THIS run (a cancelled tag or a stopped run has no more say), with an action allowance
+    // the desk counts itself, whatever the engine reports (socket and mailbox requests alike).
+    const m = mentions.forRun(run);
+    need(m && m.run_id === run.id && ['working', 'replied'].includes(m.status) && store.getRun(run.id)?.status === 'running', 'this tag is no longer active; stop now');
+    const used = (mentionActions.get(run.id) || 0) + 1;
+    mentionActions.set(run.id, used);
+    need(used <= mentions.maxActions(), `this tagged run used its ${mentions.maxActions()} desk actions; reply with what you have and stop`);
   } else need(!['reply', 'handoff'].includes(cmd), `desk ${cmd} only works in a run where the owner tagged you`);
   if (run.kind === 'access_review') need(['show', 'list', 'access'].includes(cmd), 'an access review decides one request: desk access approve|deny|owner');
   if (run.kind === 'verify') need(['show', 'list', 'comment', 'progress', 'ops', 'verify', 'context-file'].includes(cmd), 'a verify run reads production through desk ops and finishes with desk verify done|owner');
@@ -1616,13 +1641,22 @@ function mentionHandoff(run, m, t, body, ev) {
   need(what, 'say what should be done');
   need(!m.routed, `you already routed this tag (${m.routed}); one handoff per tag`);
   const closed = ['done', 'wontdo'].includes(t.status);
-  const routed = (kind, note) => {
-    store.transaction(() => {
-      store.addComment(t.key, 'system', note);
-      store.updateMention(m.id, { routed: kind, status: 'replied', ended_at: store.now() });
+  // Everything a handoff writes (new ticket, its routing, comments, the delivery's routing) commits in ONE transaction,
+  // and the delivery's routing is the handoff's identity: re-checked inside it, so a retry after a crash or a repeated
+  // call can never create a second task. work() returns { kind, note }.
+  const routed = (work) => {
+    const out = store.transaction(() => {
+      const fresh = store.getMention(m.id);
+      need(!fresh.routed, `you already routed this tag (${fresh.routed}); one handoff per tag`);
+      need(['working', 'replied'].includes(fresh.status) && fresh.run_id === run.id, `this tag is ${fresh.status}; it takes no handoff now`);
+      const o = work();
+      store.addComment(t.key, 'system', o.note);
+      store.updateMention(m.id, { routed: o.kind, status: 'replied', ended_at: store.now() });
+      return o;
     });
-    ev(`routed the owner's tag: ${kind}`);
+    ev(`routed the owner's tag: ${out.kind}`);
     github.flushComments();
+    return out;
   };
   if (action === 'implement' || action === 'design') {
     if (closed) gate('closed', `${name} can't change ${t.key}: it is closed. Reopen it first.`);
@@ -1636,40 +1670,45 @@ function mentionHandoff(run, m, t, body, ev) {
     if (action === 'design') {
       if (!PRINCIPALS.includes(seat)) gate('design', `Designing and slicing is a principal's job (${PRINCIPALS.map((p) => agentById[p].name).join(' or ')}); ${name} can't take it.`);
       if (author || (t.assign_pinned && t.assignee && t.assignee !== seat)) gate('assigned', `${t.key} is ${author ? `already built by ${agentById[author]?.name || author}` : `pinned to ${agentById[t.assignee]?.name || t.assignee}`}; ${name} can't take its design over.`);
-      store.updateTicket(t.key, { assignee: seat, assign_pinned: 1 });
-      routed('design', `📐 ${name} takes the design of ${t.key}, as the owner asked: ${what}\n\nThey design and slice it in a design run; the slices are built, QA'd and reviewed as usual.`);
+      routed(() => { store.updateTicket(t.key, { assignee: seat, assign_pinned: 1 });
+        return { kind: 'design', note: `📐 ${name} takes the design of ${t.key}, as the owner asked: ${what}\n\nThey design and slice it in a design run; the slices are built, QA'd and reviewed as usual.` }; });
       return `Routed: you design ${t.key} in a design run once this run ends. Reply to the owner now, then stop.`;
     }
     // A builder takes the change when the ticket is free (nobody built it, not pinned to someone else). Otherwise the
     // ticket's own builder gets it; principals and other seats pass it on.
     const free = !author && (!t.assign_pinned || t.assignee === seat);
     if (BUILDERS.includes(seat) && (free || author === seat)) {
-      store.updateTicket(t.key, { assignee: seat, assign_pinned: 1 });
-      routed('implement', `🛠 ${name} takes the change the owner asked for on ${t.key}: ${what}\n\nIt goes through QA, two code reviews and the merge train as usual.`);
+      routed(() => { store.updateTicket(t.key, { assignee: seat, assign_pinned: 1 });
+        return { kind: 'implement', note: `🛠 ${name} takes the change the owner asked for on ${t.key}: ${what}\n\nIt goes through QA, two code reviews and the merge train as usual.` }; });
       return `Routed: you build it in an implementation run once this run ends (submit → QA → reviews). Reply to the owner now, then stop.`;
     }
     const owner = author || t.assignee;
-    routed('implement', `🛠 ${name} passed the owner's change to ${owner ? agentById[owner]?.name || owner : 'the team'}: ${what}\n\nIt is built on ${t.key} and goes through QA, two code reviews and the merge train as usual.`);
+    routed(() => ({ kind: 'implement', note: `🛠 ${name} passed the owner's change to ${owner ? agentById[owner]?.name || owner : 'the team'}: ${what}\n\nIt is built on ${t.key} and goes through QA, two code reviews and the merge train as usual.` }));
     return `Routed to ${owner ? agentById[owner]?.name || owner : 'the team'}; the change is in the thread they read. Reply to the owner now, then stop.`;
   }
   if (action === 'verify') {
     if (!verifyReady()) gate('verify', `Nobody on the team can read production right now (production read access is off, or the SRE is switched off), so this check is yours: ${what}`);
-    const v = store.createTicket({ title: String(body.title || `Verify in production: ${what}`).slice(0, 200), description: `${what}\n\nAsked by the owner on ${t.key} (tagged ${agentById[seat].name}).`,
-      type: 'task', status: 'todo', area: 'infra', complexity: 'S', priority: t.priority, assignee: 'sre', reporter: seat, source: 'agent' });
-    store.updateTicket(v.key, { assign_pinned: 1 });
-    store.kvSet(`verify:${v.key}`, '1');
-    store.addComment(v.key, 'system', `🔎 Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes. Asked from ${t.key}.`);
-    routed(`verify:${v.key}`, `🔎 ${agentById.sre.name} checks it in production with read-only probes: ${v.key}. Its answer lands there.`);
-    return `Filed ${v.key} for the SRE. Reply to the owner now, then stop.`;
+    const { kind } = routed(() => {
+      const v = store.createTicket({ title: String(body.title || `Verify in production: ${what}`).slice(0, 200), description: `${what}\n\nAsked by the owner on ${t.key} (tagged ${agentById[seat].name}).`,
+        type: 'task', status: 'todo', area: 'infra', complexity: 'S', priority: t.priority, assignee: 'sre', reporter: seat, source: 'agent' });
+      store.updateTicket(v.key, { assign_pinned: 1 });
+      store.kvSet(`verify:${v.key}`, '1');
+      store.addComment(v.key, 'system', `🔎 Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes. Asked from ${t.key}.`);
+      return { kind: `verify:${v.key}`, note: `🔎 ${agentById.sre.name} checks it in production with read-only probes: ${v.key}. Its answer lands there.` };
+    });
+    return `Filed ${kind.slice(7)} for the SRE. Reply to the owner now, then stop.`;
   }
   // New work: the manager and principals file it as a proposal the manager grooms (normal routing, every gate intact).
   if (!['manager', ...PRINCIPALS].includes(seat)) gate('task', `${name} can't file new work; the manager (${agentById.manager.name}) plans new work. Tag ${agentById.manager.name} to file it.`);
   need(body.title, '--title required');
-  const n = store.createTicket({ title: String(body.title).slice(0, 200), description: `${what}\n\nAsked by the owner on ${t.key} (tagged ${agentById[seat].name}).`, type: 'task', status: 'proposed',
-    priority: t.priority || 'P2', reporter: seat, source: 'agent' });
-  routed(`task:${n.key}`, `🗂 ${name} filed the new work as ${n.key}; the manager grooms and staffs it as usual.`);
-  github.createIssue(n.key);
-  return `Filed ${n.key}; the manager grooms it. Reply to the owner now, then stop.`;
+  const { kind } = routed(() => {
+    const n = store.createTicket({ title: String(body.title).slice(0, 200), description: `${what}\n\nAsked by the owner on ${t.key} (tagged ${agentById[seat].name}).`, type: 'task', status: 'proposed',
+      priority: t.priority || 'P2', reporter: seat, source: 'agent' });
+    return { kind: `task:${n.key}`, note: `🗂 ${name} filed the new work as ${n.key}; the manager grooms and staffs it as usual.` };
+  });
+  const key = kind.slice(5);
+  github.createIssue(key);
+  return `Filed ${key}; the manager grooms it. Reply to the owner now, then stop.`;
 }
 
 const publishing = new Set();
@@ -1928,6 +1967,9 @@ export function ownerMention(id, action) {
     if (['done', 'wontdo'].includes(t?.status)) throw Object.assign(new Error(`${m.ticket_key} is closed. Reopen it first.`), { status: 409, code: 'ticket_closed' });
     const why = mentions.blockReason(m.seat_id);
     need(!why, why);
+    const b = mentions.boundFor(agentById[m.seat_id]);
+    const left = b && mentions.remaining(m, b);
+    need(!left?.refuse, left?.refuse);
     store.logEvent({ agent_id: 'owner', kind: 'system', text: `${m.ticket_key}: retried your tag for ${agentById[m.seat_id]?.name}.` });
     return store.updateMention(m.id, { status: 'queued', reason: null, attempts: 0, run_id: null, ended_at: null });
   }
