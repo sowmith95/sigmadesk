@@ -474,7 +474,9 @@ function migrate() {
     runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT',
       thread_id: 'TEXT', context_hash: 'TEXT', context_meta: 'TEXT', job_hash: 'TEXT',
       // research programs: the program a run belongs to and its server-owned job metadata (allowances, connectors)
-      program: 'TEXT', job: 'TEXT' },
+      program: 'TEXT', job: 'TEXT',
+      // tool calls and commands counted for a step-bounded run (tagged runs), persisted as they happen
+      steps: 'INTEGER DEFAULT 0' },
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -792,6 +794,8 @@ export function updateRun(id, patch) {
   q(`UPDATE runs SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
   announce({ type: 'run', data: publicRun(getRun(id)) });
 }
+/** A run's step count, written as it climbs (no stream announcement: it is bookkeeping, not news). */
+export function setRunSteps(id, n) { q('UPDATE runs SET steps=? WHERE id=?').run(n, id); }
 export function unfinishedRuns() {
   return q('SELECT * FROM runs WHERE ended_at IS NULL').all();
 }

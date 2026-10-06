@@ -574,3 +574,73 @@ test('review fixes: a crash between a run\'s final record and the tag\'s account
   sched.recoverOrphans(); // idempotent
   assert.ok(Math.abs(store.getMention(m.id).spent_usd - 1.6) < 1e-9);
 });
+
+test('final check: a run takes its whole process group with it, even a descendant holding its output open', async () => {
+  const cli = path.join(tmp, 'orphan.mjs'), pidFile = path.join(tmp, 'orphan.pid');
+  fs.writeFileSync(cli, `#!/usr/bin/env node
+import { spawn } from 'node:child_process'; import fs from 'node:fs';
+process.stdin.resume(); process.stdin.on('end', () => {
+  const kid = spawn('sleep', ['300'], { stdio: 'inherit' }); fs.writeFileSync(${JSON.stringify(pidFile)}, String(kid.pid)); kid.unref();
+  console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0, num_turns: 1 }));
+  process.exit(0);
+});`); fs.chmodSync(cli, 0o755);
+  const old = config.bins.claude; config.bins.claude = cli;
+  try {
+    const cwd = path.join(tmp, 'orphan-cwd'); fs.mkdirSync(cwd, { recursive: true });
+    const started = Date.now();
+    const out = await runner.startRun({ agentId: 'principal-be', kind: 'consult', cwd, prompt: 'x', track: false });
+    assert.equal(out.run.status, 'success');
+    assert.ok(Date.now() - started < 10_000, 'the run did not wait for its background child');
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    for (let i = 0; i < 60 && alive(); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(alive(), false, 'no descendant survives the run');
+  } finally { config.bins.claude = old; }
+});
+
+test('final check: workspace paths stay inside the workspaces root, and the template is verified and keyed on its filters', async () => {
+  assert.throws(() => runner.guardWorkspacePath(config.dataDir), /refusing/);
+  assert.throws(() => runner.guardWorkspacePath(path.join(tmp, 'elsewhere')), /refusing/);
+  assert.throws(() => runner.guardWorkspacePath(config.workspaceRoot), /refusing/);
+  fs.mkdirSync(config.workspaceRoot, { recursive: true });
+  const link = path.join(config.workspaceRoot, 'M-777');
+  fs.rmSync(link, { force: true }); fs.symlinkSync(runner.templateDir(), link);
+  assert.throws(() => runner.guardWorkspacePath(link), /refusing/);
+  runner.removeWorkspace('M-777');
+  assert.ok(fs.existsSync(path.join(runner.templateDir(), '.git')), 'removing a planted link never deletes the template');
+  fs.unlinkSync(link);
+  // Seats can never read the data dir (where the template lives), in either engine.
+  const cwd = path.join(tmp, 'ro-probe');
+  assert.ok(runner.sandboxSettings(cwd, [], 'mention').sandbox.filesystem.denyRead.includes(config.dataDir));
+  const cx = runner.buildCommand({ ...team.agentById['principal-be'], engine: 'codex', model: '' }, 'mention', cwd);
+  assert.doesNotMatch(fs.readFileSync(path.join(cx.env.CODEX_HOME, 'config.toml'), 'utf8'), new RegExp(config.dataDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  // A tampered template is rebuilt before it is copied.
+  await runner.ensureReadonlyWorkspace('principal-fe');
+  fs.writeFileSync(path.join(runner.templateDir(), 'README.md'), 'tampered');
+  const dir = await runner.ensureReadonlyWorkspace('principal-fe');
+  assert.equal(fs.readFileSync(path.join(dir, 'README.md'), 'utf8'), 'fixture');
+  assert.equal(fs.readFileSync(path.join(runner.templateDir(), 'README.md'), 'utf8'), 'fixture');
+  // The owner changes a filter at the same commit: the template is rebuilt with it.
+  const g = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8' });
+  g('config', 'filter.upper.smudge', 'tr q Q');
+  assert.equal(fs.readFileSync(path.join(await runner.ensureReadonlyWorkspace('principal-fe'), 'note.up'), 'utf8'), 'Quiet text\n');
+  g('config', 'filter.upper.smudge', 'tr a-z A-Z');
+  // Local-only checkout: a new base commit shows up on the very next use (origin/main never goes stale).
+  fs.writeFileSync(path.join(repo, 'later.txt'), 'later\n'); g('add', '.'); g('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'later');
+  const fresh2 = await runner.ensureReadonlyWorkspace('principal-fe');
+  assert.equal(fs.readFileSync(path.join(fresh2, 'later.txt'), 'utf8'), 'later\n');
+  assert.equal(execFileSync('git', ['-C', fresh2, 'rev-parse', 'origin/main'], { encoding: 'utf8' }).trim(), g('rev-parse', 'main').trim());
+});
+
+test('final check: a restart rebuilds the tag\'s used steps from its runs, so 59 recorded steps leave 1', () => {
+  fresh();
+  const t = ticket(); const r = tag(t, ['principal-fe']); const m = store.getMention(r.mentions[0].id);
+  const run = store.createRun({ agent_id: 'principal-fe', ticket_key: t.key, kind: 'mention', token: 'steps-tok', model: 'codex:', job: { mention: m.id, origin: 'owner' } });
+  const ctx = { run, state: {}, presence: false };
+  runner.applyEvents(Array.from({ length: 59 }, (_, i) => ({ type: 'cmd-start', id: `k${i}`, cmd: 'desk show' })), ctx);
+  store.updateMention(m.id, { status: 'working', run_id: run.id, attempts: 1 });
+  sched.recoverOrphans(); // the desk died mid-run: nothing but the run row knows the steps
+  const after = store.getMention(m.id);
+  assert.equal(after.steps_used, 59);
+  assert.equal(mentions.remaining(after, { kind: 'time', minutes: 10, steps: 60 }).limits.steps, 1);
+});

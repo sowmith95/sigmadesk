@@ -1104,7 +1104,9 @@ export function recoverOrphans() {
     const runs = store.runsOfMention(m.id);
     const usd = runs.reduce((a, r) => a + (r.cost_usd || 0), 0);
     const ms = runs.reduce((a, r) => a + Math.max(0, Date.parse(r.ended_at || store.now()) - Date.parse(r.started_at || store.now())), 0);
-    if (usd > (m.spent_usd || 0) + 1e-9 || ms > (m.spent_ms || 0)) store.updateMention(m.id, { spent_usd: Math.max(usd, m.spent_usd || 0), spent_ms: Math.max(ms, m.spent_ms || 0) });
+    const steps = runs.reduce((a, r) => a + (r.steps || 0), 0);
+    if (usd > (m.spent_usd || 0) + 1e-9 || ms > (m.spent_ms || 0) || steps > (m.steps_used || 0))
+      store.updateMention(m.id, { spent_usd: Math.max(usd, m.spent_usd || 0), spent_ms: Math.max(ms, m.spent_ms || 0), steps_used: Math.max(steps, m.steps_used || 0) });
     for (const r of runs) store.kvSet(`mention-charged:${r.id}`, '1');
     if (m.status !== 'working') continue;
     if (m.reply_comment_id || m.routed) store.updateMention(m.id, { status: 'replied', run_id: null });

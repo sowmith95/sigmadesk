@@ -46,6 +46,7 @@ function stepLimit(ctx, id) {
   if (ctx.run.kind !== 'mention') return;
   if (id != null) { const seen = (ctx.state.stepIds ||= new Set()); if (seen.has(id)) return; seen.add(id); }
   ctx.state.steps = (ctx.state.steps || 0) + 1;
+  store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the tag's steps from it
   const max = ctx.maxSteps ?? (Number(config.mentions?.maxSteps) || 60);
   if (ctx.state.steps === max + 1) {
     store.logEvent({ run_id: ctx.run.id, agent_id: ctx.run.agent_id, ticket_key: ctx.run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for a tagged reply)` });
@@ -140,6 +141,24 @@ const git = (args, opts = {}) => pexec(config.bins.git, args, { timeout: 180_000
 const LOCAL_SAFE = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'diff.external='];
 const sgit = (args, opts = {}) => git([...LOCAL_SAFE, ...args], opts);
 
+/**
+ * A workspace path the desk deletes or hands to a seat: directly inside the workspaces root (resolved through links),
+ * and never the data dir, the scratch template, or anything containing them. Throws otherwise.
+ */
+export function guardWorkspacePath(p) {
+  const real = (x) => { try { return fs.realpathSync(x); } catch { return path.resolve(x); } };
+  fs.mkdirSync(config.workspaceRoot, { recursive: true });
+  const root = real(config.workspaceRoot);
+  const parent = real(path.dirname(p));
+  let target = path.join(parent, path.basename(p));
+  try { if (fs.lstatSync(target).isSymbolicLink()) target = real(target); } catch { /* not there yet */ }
+  const inside = (a, b) => a === b || a.startsWith(`${b}${path.sep}`);
+  if (parent !== root || !inside(target, root) || target === root) throw new Error(`refusing workspace path outside ${root}: ${p}`);
+  for (const bad of [config.dataDir, templateDir()].map(real)) if (inside(target, bad) || inside(bad, target)) throw new Error(`refusing workspace path that touches desk data: ${p}`);
+  return target;
+}
+export const templateDir = () => path.join(config.dataDir, 'scratch-template');
+
 /** Remove a tree without ever following a link in it (a seat may have planted one anywhere inside). */
 export function removeTree(p) {
   let st; try { st = fs.lstatSync(p); } catch { return; }
@@ -214,7 +233,7 @@ export function ensureWorkspace(ticket) {
 export function ensureReadonlyWorkspace(seatId = 'scratch') {
   return withGitLock(async () => {
     if (!/^[a-z0-9-]+$/.test(seatId)) throw new Error('invalid scratch seat');
-    const dir = path.join(config.workspaceRoot, `_desk-${seatId}`);
+    const dir = guardWorkspacePath(path.join(config.workspaceRoot, `_desk-${seatId}`));
     // Seats ran in the previous copy and may have planted anything in it (hooks, config, filters, links): it is never
     // reused or written through. It is deleted (links are removed, never followed) and copied fresh from the desk's
     // template, which only the desk ever touches.
@@ -224,8 +243,8 @@ export function ensureReadonlyWorkspace(seatId = 'scratch') {
     // APFS: a copy-on-write clone (new inodes; a seat's write never reaches the template). Elsewhere a reflink or copy.
     await pexec('cp', os.platform() === 'darwin' ? ['-cR', tpl, dir] : ['-R', '--reflink=auto', tpl, dir], { timeout: 600_000 })
       .catch(() => pexec('cp', ['-R', tpl, dir], { timeout: 600_000 }));
-    fs.rmSync(path.join(dir, '.git', 'desk-template-base'), { force: true });
-    return dir;
+    fs.rmSync(path.join(dir, '.git', 'desk-template'), { force: true });
+    return guardWorkspacePath(dir);
   });
 }
 
@@ -257,26 +276,53 @@ export async function scratchTemplate({ force = false } = {}) {
     templateFetchedAt = Date.now();
   }
   const sha = (await git(['-C', pub, 'rev-parse', ref])).stdout.trim();
-  const tpl = path.join(config.dataDir, 'scratch-template');
-  const stamp = path.join(tpl, '.git', 'desk-template-base');
-  if (fs.existsSync(stamp) && fs.readFileSync(stamp, 'utf8').trim() === sha) return tpl;
+  const tpl = templateDir();
+  // Trusted filter definitions are part of the template's identity: a filter change at the same commit rebuilds it.
+  const { stdout: filters } = await git(['-C', config.project.repoPath, 'config', '--local', '--get-regexp', '^filter\\.']).catch(() => ({ stdout: '' }));
+  const filterHash = crypto.createHash('sha256').update(filters).digest('hex');
+  if (templateIntact(tpl, sha, filterHash)) return tpl;
   const tmp = `${tpl}.building-${process.pid}`;
   removeTree(tmp);
   await git(['init', '-q', tmp]);
   await git(['-C', tmp, 'remote', 'add', 'origin', url.trim() || config.project.repoPath]);
   // Filters (Git LFS and the like) come from the owner's own checkout config, the trusted source; the attributes that
   // select them come from the base commit itself.
-  const { stdout: filters } = await git(['-C', config.project.repoPath, 'config', '--local', '--get-regexp', '^filter\\.']).catch(() => ({ stdout: '' }));
   for (const line of filters.split('\n').filter(Boolean)) {
     const at = line.indexOf(' ');
     await git(['-C', tmp, 'config', '--add', at > 0 ? line.slice(0, at) : line, at > 0 ? line.slice(at + 1) : '']);
   }
   await git(['-c', 'protocol.file.allow=always', '-C', tmp, 'fetch', '-q', '--no-tags', pub, `+${ref}:refs/remotes/origin/${base}`]);
   await git(['-C', tmp, 'checkout', '-q', '--detach', `refs/remotes/origin/${base}`]);
-  fs.writeFileSync(path.join(tmp, '.git', 'desk-template-base'), sha);
+  fs.writeFileSync(path.join(tmp, '.git', 'desk-template'), JSON.stringify({ sha, filterHash, manifest: treeManifest(tmp) }));
   removeTree(tpl);
   fs.renameSync(tmp, tpl);
   return tpl;
+}
+/** Every entry of a tree (never following links): path, type, mode, size, mtime, plus .git's config/HEAD/hooks. */
+export function treeManifest(dir) {
+  const h = crypto.createHash('sha256');
+  const walk = (d, rel) => {
+    for (const name of fs.readdirSync(d).sort()) {
+      const p = path.join(d, name), r = rel ? `${rel}/${name}` : name;
+      if (r === '.git/desk-template' || r === '.git/index' || (r.startsWith('.git/') && /^\.git\/(objects|logs|refs|FETCH_HEAD|ORIG_HEAD)/.test(r))) continue;
+      const st = fs.lstatSync(p);
+      h.update(`${r}\0${st.isSymbolicLink() ? 'l' : st.isDirectory() ? 'd' : 'f'}\0${st.mode}\0${st.size}\0${Math.floor(st.mtimeMs)}\n`);
+      if (st.isSymbolicLink()) h.update(fs.readlinkSync(p));
+      else if (st.isDirectory()) walk(p, r);
+      else if (/^\.git\/(config|HEAD)$/.test(r)) h.update(fs.readFileSync(p));
+    }
+  };
+  walk(dir, '');
+  return h.digest('hex');
+}
+/** The template is reused only when its stamp matches the trusted base and filters, and its tree is untouched. */
+export function templateIntact(tpl, sha, filterHash) {
+  try {
+    const g = path.join(tpl, '.git');
+    if (fs.lstatSync(tpl).isSymbolicLink() || fs.lstatSync(g).isSymbolicLink()) return false;
+    const stamp = JSON.parse(fs.readFileSync(path.join(g, 'desk-template'), 'utf8'));
+    return stamp.sha === sha && stamp.filterHash === filterHash && stamp.manifest === treeManifest(tpl);
+  } catch { return false; }
 }
 
 // Reviewers inspect a separate clone pinned to the submitted object; no worker checkout is reused.
@@ -349,7 +395,8 @@ export function pushBranch(key, branch, sha, { lease } = {}) {
 
 export function removeWorkspace(key) {
   const dir = workspaceDir(key);
-  if (dir.startsWith(config.workspaceRoot) && fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  let safe; try { safe = guardWorkspacePath(dir); } catch { return; }
+  if (fs.existsSync(safe)) removeTree(safe);
 }
 
 // ---------------- sandbox + CLI arguments ----------------
@@ -736,7 +783,10 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
       resolve({ run: store.getRun(run.id), result: r, failure, steps: ctx.state.steps || 0 });
     };
-    child.on('close', finish);
+    // The run ends when its engine exits: its whole process group goes with it (anything it backgrounded, even a
+    // process holding our pipes open), SIGTERM first, SIGKILL after a grace period. No descendant outlives a run.
+    child.on('exit', () => killGroup(child.pid));
+    child.on('close', (c) => { killGroup(child.pid); finish(c); });
     child.on('error', (err) => {
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `spawn failed: ${err.message}` });
       finish(-1);
@@ -771,6 +821,12 @@ async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, in
 
 const preparing = new Map(); // runId -> AbortController while a Perplexity pack is being built
 
+/** End a run's process group: SIGTERM now, SIGKILL after the grace period (a no-op once the group is gone). */
+export function killGroup(pid, graceMs = 5000) {
+  if (!pid) return;
+  try { process.kill(-pid, 'SIGTERM'); } catch { return; } // group already gone
+  setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } }, graceMs).unref();
+}
 export function killRun(runId, reason = 'killed') {
   const run = store.getRun(runId);
   if (!run || run.status !== 'running') return false;
