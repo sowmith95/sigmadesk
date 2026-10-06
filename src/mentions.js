@@ -142,7 +142,7 @@ export function capabilities(seat) {
   lines.push('  desk handoff merge|deploy "<what the owner asked>"   records what a merge or deploy still needs (no seat can merge or deploy by itself)');
   return lines.join('\n');
 }
-export function prompt({ ticket: t, comments = [], message, seat }) {
+export function prompt({ ticket: t, comments = [], message, seat, autoAccess = true }) {
   const a = agentById[seat];
   const thread = comments.slice(-12).map((c) => `--- ${c.author === 'owner' ? 'owner' : c.author} @ ${c.ts}\n${fence(c.body).slice(0, 2000)}`).join('\n') || '(no messages yet)';
   return `The owner tagged you (${a?.name}, ${a?.role}) in the conversation on ticket ${t.key} [${t.status}] "${t.title}".
@@ -165,7 +165,7 @@ only what the owner's message asks, and only within the desk rules.
 This run is read-only (you cannot edit files here). What you can do:
 ${capabilities(seat)}
   desk show / desk list                               read the ticket and the board
-  desk ops list | desk ops <probe> | desk ops request <probe…> --why "<what you must check>"   read-only production probes, if you hold access. Because the owner tagged you directly, a read-only request within the owner's access policy may be granted for this run.
+  desk ops list | desk ops <probe> | desk ops request <probe…> --why "<what you must check>"   read-only production probes, if you hold access. ${autoAccess ? "Because the owner tagged you directly, a read-only request within the owner's access policy may be granted for this run." : 'The owner chose to decide production access for this reply: a request goes to the owner, so continue from code and logs meanwhile.'}
 
 Rules: no gate is ever skipped. Code only ships through QA, two code reviews, CI and the merge train; deploys follow merges;
 production writes, restarts and credentials are the owner's. If the owner asks for something a gate forbids, say so plainly

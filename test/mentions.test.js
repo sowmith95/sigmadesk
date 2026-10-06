@@ -310,6 +310,38 @@ test('owner-mention auto-grant: run-bound, read-only, ≤60 min, counted; refuse
   store.setSetting('ops_enabled', 'false');
 });
 
+test('per-delivery access choice: "ask me in my Inbox" turns off the auto-grant for that delivery only, validated and idempotent', async () => {
+  fresh();
+  store.setSetting('ops_enabled', 'true');
+  // A seat no other test grants (a recent grant makes the next one a renewal, which is always the owner's).
+  access.setPolicy({ ...access.policy(), seats: [...access.policy().seats, 'senior-be'] });
+  const req = (run) => access.request({ seat: run.agent_id, probes: ['app_health'], why: 'check the API', minutes: 30, ticketKey: run.ticket_key, runId: run.id });
+  // Validation: a list of seat ids this message tags.
+  const t = ticket();
+  assert.throws(() => tag(t, ['senior-be'], 'x', { no_access: 'senior-be' }), /no_access must be a list/);
+  assert.throws(() => tag(t, ['senior-be'], 'x', { no_access: ['principal-be'] }), /does not tag/);
+  // The preview the picker shows: policy seats get access; approvers and the policy flag say why not.
+  assert.deepEqual(access.ownerMentionPreview('senior-be'), []);
+  assert.match(access.ownerMentionPreview('sre').join(), /Devon approves access/);
+  assert.match(access.ownerMentionPreview('junior').join(), /not a seat the policy allows/);
+  assert.ok(access.details().mention_access.dba, 'the access details carry the preview per seat');
+  // One message, two seats: Jordan keeps automatic access, Rowan's requests go to the owner.
+  const r = tag(t, ['senior-be', 'principal-be'], 'Check the API please', { no_access: ['principal-be'], request_id: 'access-choice-1' });
+  const [jordan, rowan] = ['senior-be', 'principal-be'].map((s) => store.getMention(r.mentions.find((m) => m.seat_id === s).id));
+  assert.deepEqual([jordan.prod_access, rowan.prod_access], [1, 0]);
+  // The same request id with the same choice is a duplicate; with a different choice it is a different message.
+  assert.equal(tag(t, ['senior-be', 'principal-be'], 'Check the API please', { no_access: ['principal-be'], request_id: 'access-choice-1' }).duplicate, true);
+  assert.throws(() => tag(t, ['senior-be', 'principal-be'], 'Check the API please', { request_id: 'access-choice-1' }), /already used for a different message/);
+  const rr = req(taggedRun(rowan));
+  assert.equal(rr.request.status, 'owner');
+  assert.match(rr.request.owner_reason, /you chose to decide Rowan's access yourself/);
+  assert.ok(req(taggedRun(jordan)).grant, 'the other seat on the same message still gets its run-bound grant');
+  // The tagged run is told, in its instructions, that access is the owner's call.
+  assert.match(mentions.prompt({ ticket: t, comments: [], message: 'x', seat: 'principal-be', autoAccess: false }), /The owner chose to decide production access for this reply/);
+  assert.match(mentions.prompt({ ticket: t, comments: [], message: 'x', seat: 'principal-be' }), /may be granted for this run/);
+  store.setSetting('ops_enabled', 'false');
+});
+
 test('restart recovery and owner retry/cancel are bounded and keep answers', () => {
   fresh();
   const t = ticket();

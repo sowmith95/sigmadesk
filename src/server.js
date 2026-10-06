@@ -304,7 +304,7 @@ async function ownerRoute(req, res) {
     store.bus.emit('msg', { type: 'ticket', data: withName(store.getTicket(t.key)) });
     return send(res, 200, withName(store.getTicket(t.key)));
   }
-  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode, { expected_updated_at: b.expected_updated_at, mentions: b.mentions, request_id: b.request_id })); }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode, { expected_updated_at: b.expected_updated_at, mentions: b.mentions, request_id: b.request_id, no_access: b.no_access })); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/participants$'))) { const b = await readBody(req); return send(res, 200, { participants: sched.ownerParticipants(mm[1], { add: b.add || [], remove: b.remove || [] }) }); }
   if (req.method === 'POST' && (mm = m('^/api/mentions/(\\d+)/(retry|cancel)$'))) return send(res, 200, sched.ownerMention(mm[1], mm[2]));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));

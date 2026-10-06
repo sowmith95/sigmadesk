@@ -459,7 +459,7 @@ export async function launchMention(m, fence) {
     const message = store.listComments(m.ticket_key).find((c) => c.id === m.comment_id)?.body || '';
     let bound = null, exhausted = false;
     const p = runner.startRun({ fence, agentId: seat, kind: 'mention', ticketKey: m.ticket_key, cwd, job: { mention: m.id, origin: m.origin },
-      prompt: mentions.prompt({ ticket: store.getTicket(m.ticket_key), comments: store.listComments(m.ticket_key).filter((c) => c.id <= m.comment_id), message, seat }),
+      prompt: mentions.prompt({ ticket: store.getTicket(m.ticket_key), comments: store.listComments(m.ticket_key).filter((c) => c.id <= m.comment_id), message, seat, autoAccess: m.prod_access !== 0 }),
       // Checked on the engine the run actually got, before any run exists: a capped engine, or a plan-billed one bounded
       // by time and steps; and only against what is left of this tag's allowance after earlier attempts.
       admit: (agent) => {
@@ -1910,7 +1910,7 @@ export async function ownerRefreshBase(key, { expected_updated_at } = {}) {
  * for @Name / @seat-id. Tagging saves the comment, the participants and one delivery per seat in one transaction, and
  * preserves any hold (an answer still goes through the answer path). `request_id` makes a retry return what it made.
  */
-export function ownerReply(key, text, mode = 'auto', { expected_updated_at, mentions: explicit, request_id } = {}) {
+export function ownerReply(key, text, mode = 'auto', { expected_updated_at, mentions: explicit, request_id, no_access } = {}) {
   const t = store.getTicket(key);
   need(t, 'no such ticket');
   need(typeof text === 'string' && text.trim(), 'empty reply');
@@ -1918,7 +1918,11 @@ export function ownerReply(key, text, mode = 'auto', { expected_updated_at, ment
   need(['auto', 'discussion', 'answer', 'comment'].includes(mode), 'invalid message destination');
   need(request_id === undefined || request_id === null || (typeof request_id === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(request_id)), 'request_id must be 8-64 letters, digits, - or _');
   const tagged = mentions.resolveMentions(text, explicit);
-  const hash = crypto.createHash('sha256').update(JSON.stringify([key, text, mode, tagged])).digest('hex');
+  // Per tagged seat, the owner may turn off the automatic read access a tag can give ("ask me in my Inbox" instead).
+  need(no_access === undefined || no_access === null || (Array.isArray(no_access) && no_access.every((id) => typeof id === 'string')), 'no_access must be a list of seat ids');
+  const noAccess = [...new Set(no_access || [])];
+  for (const id of noAccess) need(tagged.includes(id), `no_access names "${id.slice(0, 40)}", who this message does not tag`);
+  const hash = crypto.createHash('sha256').update(JSON.stringify([key, text, mode, tagged, ...(noAccess.length ? [noAccess.sort()] : [])])).digest('hex');
   if (request_id) {
     let seen = null; try { seen = JSON.parse(store.kvGet(`reply-request:${request_id}`) || 'null'); } catch { seen = null; }
     if (seen) {
@@ -1945,7 +1949,7 @@ export function ownerReply(key, text, mode = 'auto', { expected_updated_at, ment
       store.addParticipants(key, tagged, 'owner');
       deliveries = tagged.map((seat) => {
         const why = mentions.blockReason(seat);
-        return store.createMention({ ticket_key: key, comment_id: comment.id, seat_id: seat, origin: 'owner', status: why ? 'blocked' : 'queued', reason: why });
+        return store.createMention({ ticket_key: key, comment_id: comment.id, seat_id: seat, origin: 'owner', status: why ? 'blocked' : 'queued', reason: why, prod_access: !noAccess.includes(seat) });
       });
     }
     if (discussion) request = store.createDiscussion(key, String(text).slice(0, 8000));

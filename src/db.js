@@ -469,7 +469,8 @@ function migrate() {
       done_at: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
-    mention_deliveries: { spent_usd: 'REAL DEFAULT 0', spent_ms: 'INTEGER DEFAULT 0', steps_used: 'INTEGER DEFAULT 0' },
+    // prod_access 0: the owner chose "ask me in my Inbox" for this delivery, so its run never gets automatic access
+    mention_deliveries: { spent_usd: 'REAL DEFAULT 0', spent_ms: 'INTEGER DEFAULT 0', steps_used: 'INTEGER DEFAULT 0', prod_access: 'INTEGER DEFAULT 1' },
     pr_outbox: { next_attempt_at: 'TEXT' },
     runs: { resumed_from: 'TEXT', cwd: 'TEXT', incident_id: 'INTEGER', nonce: 'TEXT', cost_estimated: 'INTEGER DEFAULT 0', provenance: 'TEXT', reserve_usd: 'REAL DEFAULT 0', usage_json: 'TEXT',
       thread_id: 'TEXT', context_hash: 'TEXT', context_meta: 'TEXT', job_hash: 'TEXT',
@@ -1155,8 +1156,8 @@ export const runsOfMention = (id) => q("SELECT * FROM runs WHERE kind='mention' 
 export const mentionsSince = (key, iso) => q('SELECT COUNT(*) n FROM mention_deliveries WHERE ticket_key=? AND created_at>=?').get(key, iso).n;
 /** One delivery per (comment, seat): a repeat is ignored and the existing row returned. */
 export function createMention(m) {
-  q('INSERT OR IGNORE INTO mention_deliveries(ticket_key,comment_id,seat_id,origin,status,reason) VALUES(?,?,?,?,?,?)')
-    .run(m.ticket_key, m.comment_id, m.seat_id, m.origin || 'owner', m.status || 'queued', m.reason ?? null);
+  q('INSERT OR IGNORE INTO mention_deliveries(ticket_key,comment_id,seat_id,origin,status,reason,prod_access) VALUES(?,?,?,?,?,?,?)')
+    .run(m.ticket_key, m.comment_id, m.seat_id, m.origin || 'owner', m.status || 'queued', m.reason ?? null, m.prod_access === false || m.prod_access === 0 ? 0 : 1);
   const row = q('SELECT * FROM mention_deliveries WHERE comment_id=? AND seat_id=?').get(m.comment_id, m.seat_id);
   announce({ type: 'mention', data: row });
   return row;
