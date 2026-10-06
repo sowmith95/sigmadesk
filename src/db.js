@@ -1145,6 +1145,8 @@ export const getMention = (id) => q('SELECT * FROM mention_deliveries WHERE id=?
 export const mentionsFor = (key) => q('SELECT * FROM mention_deliveries WHERE ticket_key=? ORDER BY id').all(key);
 export const mentionsOfComment = (commentId) => q('SELECT * FROM mention_deliveries WHERE comment_id=? ORDER BY id').all(commentId);
 export const openMentions = () => q("SELECT * FROM mention_deliveries WHERE status IN ('queued','working') ORDER BY id").all();
+/** Every run that served this delivery (the server-owned run job names it): the source of truth for its allowance. */
+export const runsOfMention = (id) => q("SELECT * FROM runs WHERE kind='mention' AND json_extract(job, '$.mention') = ? ORDER BY id").all(id);
 export const mentionsSince = (key, iso) => q('SELECT COUNT(*) n FROM mention_deliveries WHERE ticket_key=? AND created_at>=?').get(key, iso).n;
 /** One delivery per (comment, seat): a repeat is ignored and the existing row returned. */
 export function createMention(m) {

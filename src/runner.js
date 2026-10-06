@@ -135,19 +135,16 @@ export function withGitLock(fn) {
   return p;
 }
 const git = (args, opts = {}) => pexec(config.bins.git, args, { timeout: 180_000, maxBuffer: 16 << 20, ...opts });
-// Git on a clone a seat has touched: no hooks, no fsmonitor, no external diff (the seat may have planted any of them).
-const sgit = (args, opts = {}) => git([...SAFE, ...args], opts);
-/**
- * A desk-owned scratch clone is reset before every use, and seats ran in it: its repository config, hooks and
- * attributes are rewritten to the desk's own before git touches it (a planted filter, alias or hook never runs).
- */
-export function scrubScratchGit(dir, origin = '') {
-  const g = path.join(dir, '.git');
-  if (!fs.existsSync(g) || fs.lstatSync(g).isSymbolicLink()) throw new Error(`scratch clone ${dir} has no real .git`);
-  fs.writeFileSync(path.join(g, 'config'), ['[core]', '\trepositoryformatversion = 0', '\tfilemode = true', '\tbare = false', '\tlogallrefupdates = true',
-    ...(origin ? ['[remote "origin"]', `\turl = ${origin}`, '\tfetch = +refs/heads/*:refs/remotes/origin/*'] : []), ''].join('\n'));
-  fs.rmSync(path.join(g, 'hooks'), { recursive: true, force: true }); fs.mkdirSync(path.join(g, 'hooks'));
-  for (const f of ['info/attributes', 'info/sparse-checkout', 'config.worktree']) fs.rmSync(path.join(g, f), { force: true });
+// Local git on a clone a seat has touched (reads like rev-parse/rev-list): no hooks, no fsmonitor, no external diff.
+// Network operations against the owner's remotes never use this set: they keep the owner's trusted configuration.
+const LOCAL_SAFE = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'diff.external='];
+const sgit = (args, opts = {}) => git([...LOCAL_SAFE, ...args], opts);
+
+/** Remove a tree without ever following a link in it (a seat may have planted one anywhere inside). */
+export function removeTree(p) {
+  let st; try { st = fs.lstatSync(p); } catch { return; }
+  if (st.isSymbolicLink() || !st.isDirectory()) { fs.unlinkSync(p); return; }
+  fs.rmSync(p, { recursive: true, force: true }); // Node's recursive rm unlinks symlinks; it never descends through them
 }
 
 export const workspaceDir = (key) => path.join(config.workspaceRoot, key);
@@ -184,18 +181,18 @@ export function ensureWorkspace(ticket) {
     if (!fs.existsSync(path.join(dir, '.git'))) {
       fs.mkdirSync(config.workspaceRoot, { recursive: true });
       // --no-hardlinks: a hardlinked object edited in a clone would corrupt the owner's checkout.
-      await sgit(['clone', '--quiet', '--no-hardlinks', config.project.repoPath, dir]);
+      await git(['clone', '--quiet', '--no-hardlinks', config.project.repoPath, dir]);
       const { stdout: origin } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
       if (origin.trim()) {
-        await sgit(['-C', dir, 'remote', 'set-url', 'origin', origin.trim()]);
-        await sgit(['-C', dir, 'fetch', '--quiet', 'origin', base]);
+        await git(['-C', dir, 'remote', 'set-url', 'origin', origin.trim()]);
+        await git(['-C', dir, 'fetch', '--quiet', 'origin', base]);
       }
-      const remoteBranch = await sgit(['-C', dir, 'ls-remote', '--heads', 'origin', branch]).then((r) => r.stdout.trim()).catch(() => '');
+      const remoteBranch = await git(['-C', dir, 'ls-remote', '--heads', 'origin', branch]).then((r) => r.stdout.trim()).catch(() => '');
       if (remoteBranch) {
-        await sgit(['-C', dir, 'fetch', '--quiet', 'origin', branch]);
-        await sgit(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${branch}`]);
+        await git(['-C', dir, 'fetch', '--quiet', 'origin', branch]);
+        await git(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${branch}`]);
       } else {
-        await sgit(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${base}`]);
+        await git(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${base}`]);
       }
       for (const p of config.project.copyPaths) {
         const src = path.join(config.project.repoPath, p);
@@ -218,23 +215,68 @@ export function ensureReadonlyWorkspace(seatId = 'scratch') {
   return withGitLock(async () => {
     if (!/^[a-z0-9-]+$/.test(seatId)) throw new Error('invalid scratch seat');
     const dir = path.join(config.workspaceRoot, `_desk-${seatId}`);
-    const base = config.project.baseBranch;
-    const { stdout: ownerOrigin } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
-    const origin = ownerOrigin.trim() || config.project.repoPath; // the owner's remote, else the local checkout
-    if (!fs.existsSync(path.join(dir, '.git'))) {
-      fs.mkdirSync(config.workspaceRoot, { recursive: true });
-      await sgit(['clone', '--quiet', '--no-hardlinks', '--no-checkout', config.project.repoPath, dir]);
-    }
-    scrubScratchGit(dir, origin);
-    breakHardlinks(dir);
-    const lastFetch = fs.existsSync(path.join(dir, '.git', 'FETCH_HEAD')) ? fs.statSync(path.join(dir, '.git', 'FETCH_HEAD')).mtimeMs : 0;
-    if (Date.now() - lastFetch > 10 * 60_000 || !(await sgit(['-C', dir, 'rev-parse', '-q', '--verify', `origin/${base}`]).then(() => true, () => false)))
-      await sgit(['-c', 'protocol.file.allow=always', '-C', dir, 'fetch', '--quiet', 'origin', base]).catch(() => {});
-    await sgit(['-C', dir, 'checkout', '-q', '-f', '--detach', `origin/${base}`]).catch(() => sgit(['-C', dir, 'checkout', '-q', '-f', base]));
-    await sgit(['-C', dir, 'reset', '-q', '--hard']);
-    await sgit(['-C', dir, 'clean', '-qfd']);
+    // Seats ran in the previous copy and may have planted anything in it (hooks, config, filters, links): it is never
+    // reused or written through. It is deleted (links are removed, never followed) and copied fresh from the desk's
+    // template, which only the desk ever touches.
+    const tpl = await scratchTemplate();
+    removeTree(dir);
+    fs.mkdirSync(config.workspaceRoot, { recursive: true });
+    // APFS: a copy-on-write clone (new inodes; a seat's write never reaches the template). Elsewhere a reflink or copy.
+    await pexec('cp', os.platform() === 'darwin' ? ['-cR', tpl, dir] : ['-R', '--reflink=auto', tpl, dir], { timeout: 600_000 })
+      .catch(() => pexec('cp', ['-R', tpl, dir], { timeout: 600_000 }));
+    fs.rmSync(path.join(dir, '.git', 'desk-template-base'), { force: true });
     return dir;
   });
+}
+
+// The scratch template: a checkout of the trusted base, built by the desk from its own publisher repo, never given to a
+// seat (it lives in the desk's data dir, which seats cannot read). Rebuilt when the base moves.
+const TEMPLATE_FETCH_MS = 10 * 60_000;
+let templateFetchedAt = 0;
+/** The owner's own SSH command for their remote, if their checkout sets one (trusted; never a seat's). */
+async function ownerRemoteFlags() {
+  const { stdout } = await git(['-C', config.project.repoPath, 'config', '--get', 'core.sshCommand']).catch(() => ({ stdout: '' }));
+  return stdout.trim() ? ['-c', `core.sshCommand=${stdout.trim()}`] : [];
+}
+export async function scratchTemplate({ force = false } = {}) {
+  const pub = await publisher();
+  const base = config.project.baseBranch;
+  const ref = 'refs/sigmadesk/scratch-base';
+  const have = await git(['-C', pub, 'rev-parse', '-q', '--verify', ref]).then((r) => r.stdout.trim(), () => '');
+  const { stdout: url } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
+  // A local-only checkout is read every time (cheap); a remote at most every 10 minutes.
+  if (force || !have || !url.trim() || Date.now() - templateFetchedAt > TEMPLATE_FETCH_MS) {
+    // Trusted base: the owner's remote with the owner's own configuration, else the owner's local checkout.
+    const fromRemote = url.trim()
+      ? await git([...(await ownerRemoteFlags()), '-C', pub, 'fetch', '-q', '--no-tags', url.trim(), `+refs/heads/${base}:${ref}`], { timeout: 120_000 }).then(() => true, () => false)
+      : false;
+    if (!fromRemote) {
+      const sha = await git(['-C', config.project.repoPath, 'rev-parse', `refs/remotes/origin/${base}`]).catch(() => git(['-C', config.project.repoPath, 'rev-parse', base])).then((r) => r.stdout.trim(), () => '');
+      if (sha) await git(['-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', config.project.repoPath, `+${sha}:${ref}`]).catch(() => {});
+    }
+    templateFetchedAt = Date.now();
+  }
+  const sha = (await git(['-C', pub, 'rev-parse', ref])).stdout.trim();
+  const tpl = path.join(config.dataDir, 'scratch-template');
+  const stamp = path.join(tpl, '.git', 'desk-template-base');
+  if (fs.existsSync(stamp) && fs.readFileSync(stamp, 'utf8').trim() === sha) return tpl;
+  const tmp = `${tpl}.building-${process.pid}`;
+  removeTree(tmp);
+  await git(['init', '-q', tmp]);
+  await git(['-C', tmp, 'remote', 'add', 'origin', url.trim() || config.project.repoPath]);
+  // Filters (Git LFS and the like) come from the owner's own checkout config, the trusted source; the attributes that
+  // select them come from the base commit itself.
+  const { stdout: filters } = await git(['-C', config.project.repoPath, 'config', '--local', '--get-regexp', '^filter\\.']).catch(() => ({ stdout: '' }));
+  for (const line of filters.split('\n').filter(Boolean)) {
+    const at = line.indexOf(' ');
+    await git(['-C', tmp, 'config', '--add', at > 0 ? line.slice(0, at) : line, at > 0 ? line.slice(at + 1) : '']);
+  }
+  await git(['-c', 'protocol.file.allow=always', '-C', tmp, 'fetch', '-q', '--no-tags', pub, `+${ref}:refs/remotes/origin/${base}`]);
+  await git(['-C', tmp, 'checkout', '-q', '--detach', `refs/remotes/origin/${base}`]);
+  fs.writeFileSync(path.join(tmp, '.git', 'desk-template-base'), sha);
+  removeTree(tpl);
+  fs.renameSync(tmp, tpl);
+  return tpl;
 }
 
 // Reviewers inspect a separate clone pinned to the submitted object; no worker checkout is reused.
@@ -518,7 +560,7 @@ export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: St
  * Start one agent run. Resolves when the process exits with {run, result}.
  * The prompt goes over stdin so the variadic tool flags cannot swallow it.
  */
-export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null, job = null, pinEngine = null, admit = null }) {
+export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null, job = null, pinEngine = null, admit = null, onEnd = null }) {
   if (fence != null && fence !== epoch) return Promise.resolve({ run: null, result: null, aborted: true });
   if (reviewProfile && (kind !== 'council_review' || track || resume)) throw new Error('Per-job review models are restricted to fresh, untracked council calls');
   // A research job's requirements (web, connectors) travel into provider selection: fallback may not drop them.
@@ -677,9 +719,13 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       // No terminal result (killed, crashed, timed out): charge the full per-run cap so the risk limit stays honest.
       const knownCost = r?.cost_known !== false && r && (r.total_cost_usd || !r.is_error);
       const cost = knownCost ? (r.total_cost_usd ?? 0) : Math.min(capped(kind, engine.budgetUsd(agent)), limits?.usd ?? Infinity);
-      store.updateRun(run.id, {
-        status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
-        result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
+      // The run's final record and the job's own accounting (onEnd: e.g. a tag's cumulative allowance) commit together.
+      store.transaction(() => {
+        store.updateRun(run.id, {
+          status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
+          result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
+        });
+        onEnd?.(store.getRun(run.id), { steps: ctx.state.steps || 0 });
       });
       const estimated = !knownCost;
       const costTxt = cost ? ` · $${cost.toFixed(2)}${estimated ? ' estimated charge (provider cost unreported)' : ''}` : '';

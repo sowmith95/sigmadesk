@@ -92,7 +92,7 @@ export function boundFor(seat) {
  * What is left of a delivery's allowance, across every attempt: the bound is per tag, not per run. Spend, time and
  * steps are persisted on the delivery after each run. { refuse } when nothing is left; else { limits } for the run.
  */
-const round = (x, d = 2) => Math.floor(x * 10 ** d) / 10 ** d;
+const round = (x, d = 2) => Math.floor(x * 10 ** d + 1e-6) / 10 ** d; // floor, without float dust (2 - 1.6)
 export function remaining(m, b) {
   const name = firstName(m.seat_id);
   if (b.kind === 'usd') {

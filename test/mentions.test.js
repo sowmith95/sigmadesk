@@ -410,7 +410,7 @@ process.stdin.resume(); process.stdin.on('end', () => {
   } finally { config.engines.codex.bin = oldBin; config.mentions.maxMinutes = oldMin; fs.rmSync(path.join(tmp, 'codex-wait'), { force: true }); team.applyTeamOverrides({}); }
 });
 
-test('review fixes: tagged runs are read-only in both engines, and scratch clones are scrubbed before git runs', async () => {
+test('review fixes: tagged runs are read-only in both engines, and scratch clones are replaced, never reused', async () => {
   const cwd = path.join(tmp, 'ro-probe'); fs.mkdirSync(cwd, { recursive: true });
   const sb = runner.sandboxSettings(cwd, [], 'mention').sandbox.filesystem;
   assert.deepEqual(sb.allowWrite, []); assert.ok(sb.denyWrite.includes(cwd));
@@ -419,17 +419,50 @@ test('review fixes: tagged runs are read-only in both engines, and scratch clone
   const toml = fs.readFileSync(path.join(cx.env.CODEX_HOME, 'config.toml'), 'utf8');
   const tagged = toml.slice(toml.indexOf('[permissions.sigmadesk_tagged.filesystem.":workspace_roots"]')).split('\n').slice(0, 4).join('\n');
   assert.match(tagged, /"\." = "read"\n"\.git" = "read"\n"\.desk-mailbox" = "write"/);
-  // A seat that ran in the shared scratch clone plants a hook, a filter and an fsmonitor: none of them run.
+  // A seat that ran in the shared scratch clone plants a hook, a filter, an fsmonitor and a config symlink to a file
+  // outside: the next use deletes the copy (never following a link) and starts from the desk's own template.
   const dir = await runner.ensureReadonlyWorkspace('principal-be');
-  const marker = path.join(tmp, 'pwned');
+  const marker = path.join(tmp, 'pwned'), outside = path.join(tmp, 'outside-config');
+  fs.writeFileSync(outside, 'owner config\n');
   fs.writeFileSync(path.join(dir, '.git', 'hooks', 'post-checkout'), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
-  fs.appendFileSync(path.join(dir, '.git', 'config'), `[core]\n\tfsmonitor = touch ${marker}-fs\n[filter "evil"]\n\tsmudge = sh -c 'touch ${marker}-smudge; cat'\n`);
   fs.writeFileSync(path.join(dir, '.git', 'info', 'attributes'), '* filter=evil\n');
+  fs.rmSync(path.join(dir, '.git', 'config'));
+  fs.writeFileSync(path.join(tmp, 'evil-config'), `[core]\n\tfsmonitor = touch ${marker}-fs\n[filter "evil"]\n\tsmudge = sh -c 'touch ${marker}-smudge; cat'\n`);
+  fs.symlinkSync(outside, path.join(dir, '.git', 'config'));
+  fs.symlinkSync(tmp, path.join(dir, 'link-out'));
   fs.writeFileSync(path.join(dir, 'README.md'), 'dirty');
-  await runner.ensureReadonlyWorkspace('principal-be');
+  const again = await runner.ensureReadonlyWorkspace('principal-be');
+  assert.equal(again, dir);
   for (const f of [marker, `${marker}-fs`, `${marker}-smudge`]) assert.equal(fs.existsSync(f), false, `${path.basename(f)} ran`);
-  assert.doesNotMatch(fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8'), /evil|fsmonitor/);
-  assert.equal(fs.readFileSync(path.join(dir, 'README.md'), 'utf8'), 'fixture', 'reset to the base branch');
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'owner config\n', 'nothing was written through the planted link');
+  assert.ok(fs.existsSync(path.join(tmp, 'evil-config')) && fs.existsSync(path.join(tmp, 'repo', 'README.md')), 'deleting the copy never followed a link out');
+  assert.equal(fs.lstatSync(path.join(dir, '.git', 'config')).isSymbolicLink(), false);
+  assert.equal(fs.existsSync(path.join(dir, 'link-out')), false);
+  assert.equal(fs.readFileSync(path.join(dir, 'README.md'), 'utf8'), 'fixture', 'a fresh copy of the base');
+  assert.match(execFileSync('git', ['-C', dir, 'rev-parse', 'origin/main'], { encoding: 'utf8' }), /^[0-9a-f]{40}/);
+});
+
+test('review fixes: scratch copies keep the owner\'s trusted filters and SSH command, never a seat\'s', async () => {
+  const g = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8' });
+  // A smudge filter the OWNER defined (repo config) and selected in the base commit still smudges in a fresh copy.
+  g('config', 'filter.upper.smudge', 'tr a-z A-Z'); g('config', 'filter.upper.clean', 'cat');
+  fs.writeFileSync(path.join(repo, '.gitattributes'), '*.up filter=upper\n'); fs.writeFileSync(path.join(repo, 'note.up'), 'quiet text\n');
+  g('add', '.'); g('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'filtered file');
+  const dir = await runner.ensureReadonlyWorkspace('principal-fe');
+  assert.equal(fs.readFileSync(path.join(dir, 'note.up'), 'utf8'), 'QUIET TEXT\n', 'the owner\'s filter ran');
+  // A filter a seat plants in its copy never runs: the copy is replaced, not reused.
+  const marker = path.join(tmp, 'seat-filter');
+  execFileSync('git', ['-C', dir, 'config', 'filter.upper.smudge', `sh -c 'touch ${marker}; cat'`]);
+  await runner.ensureReadonlyWorkspace('principal-fe');
+  assert.equal(fs.existsSync(marker), false);
+  // The owner's own core.sshCommand is used for the owner's remote (not overridden with plain ssh).
+  const ssh = path.join(tmp, 'owner-ssh'), used = path.join(tmp, 'owner-ssh-used');
+  fs.writeFileSync(ssh, `#!/bin/sh\necho "$@" > ${used}\nexit 1\n`, { mode: 0o755 });
+  g('remote', 'add', 'origin', 'ssh://git@fixture.invalid/owner/repo.git'); g('config', 'core.sshCommand', ssh);
+  try {
+    await runner.scratchTemplate({ force: true });
+    assert.match(fs.readFileSync(used, 'utf8'), /fixture\.invalid/, 'the owner\'s SSH command reached the owner\'s remote');
+  } finally { g('remote', 'remove', 'origin'); g('config', '--unset', 'core.sshCommand'); }
 });
 
 test('review fixes: the engine bound is checked before any run exists, and a run refused in onStart never spawns', async () => {
@@ -524,4 +557,20 @@ test('review fixes: a tag\'s allowance is cumulative across attempts; retries ge
   store.updateMention(r2.mentions[0].id, { status: 'queued' });
   await sched.launchMention(store.getMention(r2.mentions[0].id));
   assert.deepEqual([store.getMention(r2.mentions[0].id).status, store.getMention(r2.mentions[0].id).run_id], ['failed', null]);
+});
+
+test('review fixes: a crash between a run\'s final record and the tag\'s accounting never grants a fresh allowance', () => {
+  fresh();
+  const t = ticket(); const r = tag(t, ['principal-be']); const m = store.getMention(r.mentions[0].id);
+  // The run finished and was recorded ($1.60), then the desk died before the tag was charged.
+  const run = store.createRun({ agent_id: 'principal-be', ticket_key: t.key, kind: 'mention', token: null, model: 'claude:fable', job: { mention: m.id, origin: 'owner' } });
+  store.updateRun(run.id, { status: 'success', cost_usd: 1.6, started_at: new Date(Date.now() - 60_000).toISOString(), ended_at: store.now() });
+  store.updateMention(m.id, { status: 'working', run_id: run.id, attempts: 1 });
+  sched.recoverOrphans();
+  const after = store.getMention(m.id);
+  assert.ok(Math.abs(after.spent_usd - 1.6) < 1e-9, 'rebuilt from the run rows');
+  const b = mentions.boundFor({ ...team.agentById['principal-be'], engine: 'claude', model: 'fable' });
+  assert.deepEqual(mentions.remaining(after, b).limits, { usd: 0.4 });
+  sched.recoverOrphans(); // idempotent
+  assert.ok(Math.abs(store.getMention(m.id).spent_usd - 1.6) < 1e-9);
 });

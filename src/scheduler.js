@@ -411,6 +411,14 @@ function blockMention(m, why) {
   // The message itself shows Blocked with the reason; the activity log keeps the record (not the thread: no echo).
   store.logEvent({ agent_id: 'system', kind: 'system', text: `${m.ticket_key}: your tag for ${agentById[m.seat_id]?.name || m.seat_id} was not delivered: ${why}` });
 }
+/** Add one finished attempt to the tag's cumulative allowance, once per run. */
+function chargeMention(id, run, steps = 0) {
+  if (store.kvGet(`mention-charged:${run.id}`)) return;
+  store.kvSet(`mention-charged:${run.id}`, '1');
+  const m = store.getMention(id);
+  store.updateMention(id, { spent_usd: (m.spent_usd || 0) + (run.cost_usd || 0), steps_used: (m.steps_used || 0) + (steps || 0),
+    spent_ms: (m.spent_ms || 0) + Math.max(0, Date.parse(run.ended_at || store.now()) - Date.parse(run.started_at || store.now())) });
+}
 function requeueMention(id, why) {
   const m = store.getMention(id);
   const b = mentions.boundFor(store.getRun(m.run_id) ? { ...agentById[m.seat_id], engine: String(store.getRun(m.run_id).model).split(':')[0] } : agentById[m.seat_id]);
@@ -462,6 +470,8 @@ export async function launchMention(m, fence) {
         bound = { seat: agent, b: left.bound };
         return { limits: left.limits };
       },
+      // The attempt's spend, time and steps land on the tag in the same transaction that finalizes the run.
+      onEnd: (run, { steps }) => chargeMention(m.id, run, steps),
       onStart: (run) => {
         runId = run.id;
         if (store.getMention(m.id)?.status !== 'working') { runner.killRun(run.id, 'the tag was cancelled'); return; } // never spawns
@@ -475,11 +485,7 @@ export async function launchMention(m, fence) {
       return;
     }
     if (aborted) store.updateAgent(seat, { status: 'idle', current_ticket: null, current_run: null, current_kind: null });
-    if (run) { // the tag's allowance is cumulative: what this attempt used counts against every retry
-      const used = store.getMention(m.id);
-      store.updateMention(m.id, { spent_usd: (used.spent_usd || 0) + (run.cost_usd || 0), steps_used: (used.steps_used || 0) + (steps || 0),
-        spent_ms: (used.spent_ms || 0) + Math.max(0, Date.parse(run.ended_at || store.now()) - Date.parse(run.started_at || store.now())) });
-    }
+    if (run && !store.kvGet(`mention-charged:${run.id}`)) chargeMention(m.id, run, steps); // ended before spawning
     const now = store.getMention(m.id);
     if (!['working', 'replied'].includes(now.status)) return; // cancelled or blocked while it ran
     if (now.reply_comment_id) return; // answered in the thread
@@ -1081,14 +1087,6 @@ export function recoverOrphans() {
   repairSplitEpics();
   connectors.recover();
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
-  // A tagged seat interrupted by the restart answers again (attempts already counted; bounded by mentions.maxAttempts).
-  for (const m of store.openMentions()) if (m.status === 'working') {
-    const r = m.run_id && store.getRun(m.run_id); // an interrupted attempt still counts against the tag's allowance
-    if (r && !r.ended_at) store.updateMention(m.id, { spent_usd: (m.spent_usd || 0) + (r.cost_usd || runner.reservationFor(r)), spent_ms: (m.spent_ms || 0) + Math.max(0, Date.now() - Date.parse(r.started_at)) });
-    if (m.reply_comment_id || m.routed) store.updateMention(m.id, { status: 'replied', run_id: null });
-    else if ((m.attempts || 0) >= mentions.maxAttempts()) store.updateMention(m.id, { status: 'failed', run_id: null, reason: 'interrupted by desk restarts', ended_at: store.now() });
-    else store.updateMention(m.id, { status: 'queued', run_id: null, reason: 'interrupted by a desk restart' });
-  }
   for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });
   for (const run of store.unfinishedRuns()) {
     if (run.pid) {
@@ -1099,6 +1097,19 @@ export function recoverOrphans() {
     store.updateRun(run.id, { status: 'killed', ended_at: store.now(), result_text: 'desk restarted', token: null,
       cost_usd: run.cost_usd || runner.reservationFor(run), cost_estimated: run.cost_usd ? 0 : 1 });
     store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: 'run interrupted by a desk restart' });
+  }
+  // Tags: the allowance is rebuilt from the run rows (the source of truth), so a crash between a run's final record and
+  // the tag's own accounting can never hand out a fresh allowance. Then an interrupted tag answers again (bounded).
+  for (const m of store.openMentions()) {
+    const runs = store.runsOfMention(m.id);
+    const usd = runs.reduce((a, r) => a + (r.cost_usd || 0), 0);
+    const ms = runs.reduce((a, r) => a + Math.max(0, Date.parse(r.ended_at || store.now()) - Date.parse(r.started_at || store.now())), 0);
+    if (usd > (m.spent_usd || 0) + 1e-9 || ms > (m.spent_ms || 0)) store.updateMention(m.id, { spent_usd: Math.max(usd, m.spent_usd || 0), spent_ms: Math.max(ms, m.spent_ms || 0) });
+    for (const r of runs) store.kvSet(`mention-charged:${r.id}`, '1');
+    if (m.status !== 'working') continue;
+    if (m.reply_comment_id || m.routed) store.updateMention(m.id, { status: 'replied', run_id: null });
+    else if ((m.attempts || 0) >= mentions.maxAttempts()) store.updateMention(m.id, { status: 'failed', run_id: null, reason: 'interrupted by desk restarts', ended_at: store.now() });
+    else store.updateMention(m.id, { status: 'queued', run_id: null, reason: 'interrupted by a desk restart' });
   }
   mergetrain.recover(); // interrupted conflict resolutions go back to pending (durable, keyed by PR/base/head)
   for (const a of store.listAgentStates()) store.updateAgent(a.id, { status: 'idle', current_ticket: null, current_run: null, current_kind: null, meeting: null });
