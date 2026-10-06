@@ -821,7 +821,7 @@ export function health() {
 function mentionQueue(settings) {
   return store.openMentions().filter((m) => m.status === 'queued').map((m) => {
     const [code, reason] = settings.paused === 'true' ? ['paused', 'Desk paused'] : !agentIdle(m.seat_id) ? ['seat_busy', 'Seat busy']
-      : !selectionFor(m.seat_id, Date.now(), null, 'mention').seat ? ['provider_hold', 'No engine available'] : ['tick', 'Ready for next scheduler tick'];
+      : !mentions.launchable(m.seat_id) ? ['provider_hold', 'Waiting for an engine with a hard spend cap'] : ['tick', 'Ready for next scheduler tick'];
     return { key: m.ticket_key, seat: m.seat_id, code, reason, mention: m.id };
   });
 }
@@ -912,7 +912,7 @@ export async function tick() {
       if (!mt || ['done', 'wontdo'].includes(mt.status)) { store.updateMention(m.id, { status: 'cancelled', reason: 'the ticket closed before they started', ended_at: store.now() }); continue; }
       const why = mentions.blockReason(m.seat_id);
       if (why) { blockMention(m, why); continue; }
-      if (agentIdle(m.seat_id)) go(m.seat_id, (f) => launchMention(m, f), null, 'mention');
+      if (agentIdle(m.seat_id) && mentions.launchable(m.seat_id)) go(m.seat_id, (f) => launchMention(m, f), null, 'mention');
     }
     const discussion = store.pendingDiscussions().find((d) => d.status === 'queued');
     if (discussion && slots > 0 && agentIdle('manager')) go('manager', (f) => launchDiscussion(discussion, f), null, 'owner_discussion');

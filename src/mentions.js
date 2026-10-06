@@ -61,12 +61,21 @@ export function blockReason(seat, now = Date.now()) {
   if (!a) return 'that seat no longer exists';
   if (!enabled()) return 'tagging is switched off on this desk (mentions.enabled in the config)';
   if (a.enabled === false) return `${name} is switched off (Settings → Team), so nobody would read this. Switch ${name} on, or tag someone else.`;
-  const sel = selectionFor(seat, now, null, 'mention');
-  if (sel.seat && !runner.capsSpend(sel.seat, 'mention')) {
-    const label = ENGINES[sel.seat.engine || 'claude']?.label || sel.seat.engine;
+  // The seat's own engine decides; an engine that cannot run this kind of work (Perplexity) is replaced by the engine
+  // the desk would pick for it. A temporary fallback (the seat's engine is out of credits) only makes the tag wait.
+  const own = { ...a, engine: a.engine || 'claude' };
+  const engine = ENGINES[own.engine];
+  const seatToCheck = !engine?.supports || engine.supports('mention') ? own : selectionFor(seat, now, null, 'mention').seat;
+  if (seatToCheck && !runner.capsSpend(seatToCheck, 'mention')) {
+    const label = ENGINES[seatToCheck.engine || 'claude']?.label || seatToCheck.engine;
     return `${name} runs on ${label}, which has no hard spend cap, and tagged work must stay under $${Number(settings().budgetUsd) || 2} a reply. Move ${name} to a Claude engine (Settings → Team), or tag someone else.`;
   }
   return null;
+}
+/** Can this seat start a tagged run right now: an engine is ready AND that engine enforces the hard spend cap. */
+export function launchable(seat, now = Date.now()) {
+  const sel = selectionFor(seat, now, null, 'mention');
+  return !!sel.seat && runner.capsSpend(sel.seat, 'mention');
 }
 
 /** Tagged deliveries on this ticket in the last hour (every tagged seat counts: each one starts a run). */
