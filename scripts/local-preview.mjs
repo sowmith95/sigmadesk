@@ -145,3 +145,21 @@ if (process.env.SIGMADESK_PRESENCE_DEMO === '1') {
   const step = () => { for (const k of [0, 1]) { const [agent_id, run, kind, text] = steps[(i + k) % steps.length]; store.logEvent({ run_id: run.id, agent_id, ticket_key: composer.key, kind, text }); } i += 2; };
   step(); setInterval(step, 15_000).unref();
 }
+
+// Mentions demo (SIGMADESK_MENTIONS_DEMO=1): Rowan and Devon are switched on (the desk stays paused, so nothing runs),
+// and one ticket carries an owner message that tagged three seats, one delivery in each finished state.
+if (process.env.SIGMADESK_MENTIONS_DEMO === '1') {
+  const overrides = JSON.parse(store.getSettings().team);
+  for (const id of ['principal-be', 'sre']) overrides[id] = { ...overrides[id], enabled: true };
+  store.setSetting('team', JSON.stringify(overrides)); team.applyTeamOverrides(overrides);
+  const t = store.createTicket({ title: 'Retry fix for the NYSE TICK feed', status: 'todo', assignee: 'senior-be', priority: 'P1', area: 'backend', complexity: 'M', reporter: 'owner',
+    description: 'The tick feed drops after a reconnect. Make the retry cover NYSE TICK.' });
+  const c = store.addComment(t.key, 'owner', '@Rowan @Devon @Quinn does the retry fix also cover NYSE TICK?');
+  store.addParticipants(t.key, ['principal-be', 'sre', 'senior-fe'], 'owner');
+  const reply = store.addComment(t.key, 'principal-be', 'Yes: the guard lives in the shared fetcher, so NYSE TICK is covered. A test for it is worth adding.');
+  const r = store.createMention({ ticket_key: t.key, comment_id: c.id, seat_id: 'principal-be' });
+  store.updateMention(r.id, { status: 'replied', reply_comment_id: reply.id, attempts: 1, ended_at: store.now() });
+  const f = store.createMention({ ticket_key: t.key, comment_id: c.id, seat_id: 'sre' });
+  store.updateMention(f.id, { status: 'failed', reason: 'Devon ended without an answer; tried 3 times', attempts: 3, ended_at: store.now() });
+  store.createMention({ ticket_key: t.key, comment_id: c.id, seat_id: 'senior-fe', status: 'blocked', reason: 'Quinn is switched off (Settings → Team), so nobody would read this. Switch Quinn on, or tag someone else.' });
+}

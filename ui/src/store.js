@@ -65,7 +65,7 @@ export { toast } from './lib/toast.ts';
 export async function api(method, url, body, timeoutMs = 20000) {
   const res = await fetch(url, { method, signal: AbortSignal.timeout(timeoutMs), headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
   const j = await res.json().catch(() => ({}));
-  if (!res.ok) throw Object.assign(new Error(j.message || j.error || `HTTP ${res.status}`), { status: res.status, code: j.error });
+  if (!res.ok) throw Object.assign(new Error(j.message || j.error || `HTTP ${res.status}`), { status: res.status, code: j.code || j.error });
   return j;
 }
 

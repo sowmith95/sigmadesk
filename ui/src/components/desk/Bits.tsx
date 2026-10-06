@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef } from 'react';
 import { GitPullRequest, Sigma } from 'lucide-react';
 import { portrait, presenceOf } from '../../../../public/avatars.js';
 import { linkKeys } from '../../../../public/names.js';
+import { tokensIn } from '../../../../public/mentions.js';
 import { agentMap, ticketByKey, openTicket } from '@/store.js';
 import { cn } from '@/lib/utils';
 import type { Agent } from '@/types';
@@ -26,8 +27,22 @@ export function SeatAvatar({ id, size = 'sm', className }: { id: string | null |
   return <span ref={ref} className={cn('inline-flex shrink-0 leading-none [&_svg]:block [&_svg]:!size-full', className)} style={{ width: px, height: px }} title={`${a.name}, ${a.role}, ${pr!.text}`} />;
 }
 
-/** Text where ticket keys become named chips that open the ticket. */
+/** A seat tag (@Rowan) in a message: a name chip, never the raw handle. */
+export function MentionChip({ seat, text }: { seat: string; text?: string }) {
+  const a = agentMap()[seat] as Agent | undefined;
+  return <span data-mention-chip={seat} title={a ? `${a.name}, ${a.role}` : seat} className="whitespace-nowrap rounded-md bg-primary/15 px-1 font-medium text-primary">{text || `@${a?.name.split(/\s+/)[0] || seat}`}</span>;
+}
+
+/** Text where ticket keys become named chips that open the ticket, and seat tags become name chips. */
 export function Named({ text, self }: { text: string | null | undefined; self?: string }) {
+  const s = String(text ?? '');
+  if (s.includes('@')) {
+    const parts = tokensIn(s, Object.values(agentMap()));
+    if (parts.some((p) => p.seat)) return <>{parts.map((p, i) => (p.seat ? <MentionChip key={i} seat={p.seat} text={p.text} /> : <NamedKeys key={i} text={p.text} self={self} />))}</>;
+  }
+  return <NamedKeys text={s} self={self} />;
+}
+function NamedKeys({ text, self }: { text: string; self?: string }) {
   // Inside a ticket's own thread its key stays plain text: a chip that reopens the same ticket only adds noise.
   return linkKeys(String(text ?? ''), ticketByKey).map((p: string | { key: string; name: string }, i: number) => (typeof p === 'string' ? <span key={i}>{p}</span>
     : p.key === self ? <span key={i} className="font-mono text-[0.9em] text-muted-foreground">{p.key}</span>

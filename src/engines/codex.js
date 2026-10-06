@@ -77,6 +77,14 @@ export function codexHome() {
     '"." = "read"', '".git" = "read"', ...SECRET_GLOBS.map((g) => `${q(g)} = "none"`),
     '[permissions.sigmadesk_review.network]', 'enabled = false',
     '',
+    // A tagged run (@mention): read-only like a review, except its own desk mailbox (its only way to answer).
+    '[permissions.sigmadesk_tagged.filesystem]',
+    '":minimal" = "read"', '":tmpdir" = "write"',
+    ...readable.map((p) => `${q(p)} = "read"`),
+    '[permissions.sigmadesk_tagged.filesystem.":workspace_roots"]',
+    '"." = "read"', '".git" = "read"', '".desk-mailbox" = "write"', ...SECRET_GLOBS.map((g) => `${q(g)} = "none"`),
+    '[permissions.sigmadesk_tagged.network]', 'enabled = false',
+    '',
     '[features]',
     ...off.map((f) => `${f} = false`),
     '',
@@ -138,6 +146,7 @@ export const codex = {
     const model = seat.model || userModel();
     const common = ['--json', '--skip-git-repo-check', ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : []),
       ...(['council_review','product_review','feature_groom'].includes(kind) ? ['-c', 'default_permissions="sigmadesk_review"'] : []),
+      ...(kind === 'mention' ? ['-c', 'default_permissions="sigmadesk_tagged"'] : []),
       ...(kind === 'council_review' ? ['-c', 'features.shell_tool=false'] : [])];
     const args = resume
       ? ['exec', 'resume', ...common, resume, '-']

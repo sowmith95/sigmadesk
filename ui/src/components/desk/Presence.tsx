@@ -26,7 +26,9 @@ export const usePresenceClock = () => useSyncExternalStore(subscribeClock, () =>
 export function ticketPresence(key: string, drafts: Record<string, string> = {}): Presence {
   const d = S.detail;
   const events = d && d.key === key && d.data ? mergeEvents(S.events, d.data.events) : S.events;
-  return presenceFor({ key, agents: S.agents, runs: S.runs, events, waiting: S.meta.scheduler?.waiting || [], drafts, now: Date.now() });
+  // A tagged seat waiting for its turn is "up next" too (the scheduler keeps tags apart from the ticket's own reasons).
+  const waiting = [...(S.meta.scheduler?.waiting || []), ...(S.meta.scheduler?.mention_queue || [])];
+  return presenceFor({ key, agents: S.agents, runs: S.runs, events, waiting, drafts, now: Date.now() });
 }
 
 /** Screen-reader announcement: only when who is writing changes, and at most every 15 s. */

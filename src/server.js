@@ -253,7 +253,7 @@ async function ownerRoute(req, res) {
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
-    return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), research_reviews: researchReview.forTicket(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
+    return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), research_reviews: researchReview.forTicket(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), mentions: store.mentionsFor(t.key), participants: store.participantsOf(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'POST' && p === '/api/inbox/snooze') {
     const body = await readBody(req); // read first: validate against the state after the request arrived
@@ -304,7 +304,9 @@ async function ownerRoute(req, res) {
     store.bus.emit('msg', { type: 'ticket', data: withName(store.getTicket(t.key)) });
     return send(res, 200, withName(store.getTicket(t.key)));
   }
-  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode, { expected_updated_at: b.expected_updated_at })); }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/reply$'))) { const b = await readBody(req); return send(res, 200, sched.ownerReply(mm[1], b.body, b.mode, { expected_updated_at: b.expected_updated_at, mentions: b.mentions, request_id: b.request_id })); }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/participants$'))) { const b = await readBody(req); return send(res, 200, { participants: sched.ownerParticipants(mm[1], { add: b.add || [], remove: b.remove || [] }) }); }
+  if (req.method === 'POST' && (mm = m('^/api/mentions/(\\d+)/(retry|cancel)$'))) return send(res, 200, sched.ownerMention(mm[1], mm[2]));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/decision$'))) return send(res, 200, await sched.ownerDecision(mm[1], await readBody(req)));
   if (req.method === 'POST' && (mm = m('^/api/discussions/(\\d+)/(retry|cancel)$'))) return send(res, 200, sched.ownerDiscussion(mm[1], mm[2]));
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/refresh-base$'))) return send(res, 200, await sched.ownerRefreshBase(mm[1], await readBody(req)));
@@ -576,7 +578,7 @@ export function pollMailboxes() {
 }
 
 const handler = (route) => (req, res) => {
-  route(req, res).catch((err) => { if (!res.headersSent) send(res, err.status || 500, { error: err.message }); });
+  route(req, res).catch((err) => { if (!res.headersSent) send(res, err.status || 500, { error: err.message, ...(typeof err.code === 'string' && /^[a-z_]+$/.test(err.code) ? { code: err.code } : {}) }); });
 };
 
 // ---------------- main ----------------

@@ -27,14 +27,16 @@ function echoes(e, c) {
 const DISCUSSION_STATE = { queued: 'Waiting for the manager', running: 'The manager is working on it', complete: 'Response ready',
   approved: 'You approved the response', rejected: 'You rejected the response', changes_requested: 'You asked for changes', failed: 'Failed', cancelled: 'Cancelled' };
 
-export function conversationItems({ comments = [], events = [], discussions = [], status = '', agent = '' } = {}) {
+export function conversationItems({ comments = [], events = [], discussions = [], mentions = [], status = '', agent = '' } = {}) {
   const items = new Map();
   const lastAsk = [...comments].filter((c) => String(c.body).startsWith('❓')).sort((a, b) => String(a.ts).localeCompare(String(b.ts)) || a.id - b.id).at(-1);
   for (const c of comments) {
     const ask = String(c.body).startsWith('❓');
     items.set(`c${c.id}`, { id: `c${c.id}`, ts: c.ts, who: c.author, text: c.body, kind: 'comment', ask,
       // Open while the ticket is still held for the owner: a comment is not an answer; answering resumes the ticket.
-      open: ask && c === lastAsk && status === 'needs_human' });
+      open: ask && c === lastAsk && status === 'needs_human',
+      // The owner's message that tagged seats carries each recipient's delivery (Queued … Replied) under it.
+      ...(c.author === 'owner' && mentions.some((m) => m.comment_id === c.id) ? { deliveries: mentions.filter((m) => m.comment_id === c.id) } : {}) });
   }
   for (const e of events) {
     if (comments.some((c) => echoes(e, c))) continue;

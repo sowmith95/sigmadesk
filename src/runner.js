@@ -1,4 +1,4 @@
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -38,6 +38,22 @@ export function todoProgress(todos) {
 const evidence = new Map(); // runId -> { pending: Map(id -> cmd), done: [{cmd, ok}] }
 export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
 
+/**
+ * A tagged run (@mention) stops after its step allowance: every tool call and every command (desk calls too), each
+ * counted once whatever the engine chooses to display. The desk-side bound when dollars cannot be capped.
+ */
+function stepLimit(ctx, id) {
+  if (ctx.run.kind !== 'mention') return;
+  if (id != null) { const seen = (ctx.state.stepIds ||= new Set()); if (seen.has(id)) return; seen.add(id); }
+  ctx.state.steps = (ctx.state.steps || 0) + 1;
+  store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the tag's steps from it
+  const max = ctx.maxSteps ?? (Number(config.mentions?.maxSteps) || 60);
+  if (ctx.state.steps === max + 1) {
+    store.logEvent({ run_id: ctx.run.id, agent_id: ctx.run.agent_id, ticket_key: ctx.run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for a tagged reply)` });
+    killRun(ctx.run.id, `step limit (${max})`);
+  }
+}
+
 // Apply an engine's normalized events to the desk (activity log, presence, progress, result).
 export function applyEvents(events, ctx) {
   const { run } = ctx;
@@ -52,6 +68,7 @@ export function applyEvents(events, ctx) {
         break;
       case 'tool':
         store.logEvent({ ...base, kind: 'tool', text: e.text });
+        if (!/^\$ /.test(e.text)) stepLimit(ctx, null); // commands are counted once, by their cmd-start id
         if (ctx.presence !== false) store.updateAgent(run.agent_id, { last_action: e.text, last_action_at: store.now() });
         break;
       case 'todos': {
@@ -65,6 +82,7 @@ export function applyEvents(events, ctx) {
       case 'error': ctx.state.lastError = e.text; store.logEvent({ ...base, kind: 'error', text: short(e.text, 300) }); break;
       case 'wait': store.logEvent({ ...base, kind: 'system', text: e.text }); break;
       case 'cmd-start': {
+        stepLimit(ctx, e.id); // every command, including desk calls an engine does not display
         const ev = evidence.get(run.id) || { pending: new Map(), done: [] };
         ev.pending.set(e.id, e.cmd);
         evidence.set(run.id, ev);
@@ -118,22 +136,55 @@ export function withGitLock(fn) {
   return p;
 }
 const git = (args, opts = {}) => pexec(config.bins.git, args, { timeout: 180_000, maxBuffer: 16 << 20, ...opts });
+// Local git on a clone a seat has touched (reads like rev-parse/rev-list): no hooks, no fsmonitor, no external diff.
+// Network operations against the owner's remotes never use this set: they keep the owner's trusted configuration.
+const LOCAL_SAFE = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'diff.external='];
+const sgit = (args, opts = {}) => git([...LOCAL_SAFE, ...args], opts);
+
+/**
+ * A workspace path the desk deletes or hands to a seat: directly inside the workspaces root (resolved through links),
+ * and never the data dir, the scratch template, or anything containing them. Throws otherwise.
+ */
+export function guardWorkspacePath(p) {
+  const real = (x) => { try { return fs.realpathSync(x); } catch { return path.resolve(x); } };
+  fs.mkdirSync(config.workspaceRoot, { recursive: true });
+  const root = real(config.workspaceRoot);
+  const parent = real(path.dirname(p));
+  const target = path.join(parent, path.basename(p));
+  // The desk only ever creates real directories here: a link in a workspace's place was planted (a seat may delete
+  // and recreate its own workspace entry), so it is refused, never resolved.
+  try { if (!fs.lstatSync(target).isDirectory()) throw new Error(`refusing workspace path that is not a real directory: ${p}`); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const inside = (a, b) => a === b || a.startsWith(`${b}${path.sep}`);
+  if (parent !== root || !inside(target, root) || target === root) throw new Error(`refusing workspace path outside ${root}: ${p}`);
+  for (const bad of [config.dataDir, templateDir()].map(real)) if (inside(target, bad) || inside(bad, target)) throw new Error(`refusing workspace path that touches desk data: ${p}`);
+  return target;
+}
+export const templateDir = () => path.join(config.dataDir, 'scratch-template');
+const templateStamp = () => `${templateDir()}.stamp.json`; // outside the copied tree: a copy never carries or touches it
+
+/** Remove a tree without ever following a link in it (a seat may have planted one anywhere inside). */
+export function removeTree(p) {
+  let st; try { st = fs.lstatSync(p); } catch { return; }
+  if (st.isSymbolicLink() || !st.isDirectory()) { fs.unlinkSync(p); return; }
+  fs.rmSync(p, { recursive: true, force: true }); // Node's recursive rm unlinks symlinks; it never descends through them
+}
 
 export const workspaceDir = (key) => path.join(config.workspaceRoot, key);
 
 // Clones made before --no-hardlinks share object files with the owner's repo. Give every such file its own inode
 // (copy + atomic rename), which leaves the owner's file untouched and is safe while the clone is in use.
 export function breakHardlinks(dir) {
-  const root = path.join(dir, '.git', 'objects');
-  if (!fs.existsSync(root)) return 0;
+  const root = seatDir(dir, ['.git', 'objects'], { create: false }); // a planted link at .git or .git/objects is refused
+  if (!root) return 0;
   let fixed = 0;
   const walk = (d) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) { // Dirent types come from lstat: links are skipped
       const p = path.join(d, e.name);
       if (e.isDirectory()) walk(p);
-      else if (e.isFile() && fs.statSync(p).nlink > 1) {
+      else if (e.isFile() && fs.lstatSync(p).nlink > 1) {
         const tmp = `${p}.unlink-${process.pid}`;
-        fs.copyFileSync(p, tmp);
+        try { if (fs.lstatSync(tmp)) fs.unlinkSync(tmp); } catch { /* none */ } // never copy onto a planted link
+        fs.copyFileSync(p, tmp, fs.constants.COPYFILE_EXCL);
         fs.chmodSync(tmp, fs.statSync(p).mode);
         fs.renameSync(tmp, p);
         fixed += 1;
@@ -147,7 +198,7 @@ export function breakHardlinks(dir) {
 // A clone (not a worktree): its own .git inside the sandbox-writable dir, and none of the main checkout's hooks.
 export function ensureWorkspace(ticket) {
   return withGitLock(async () => {
-    const dir = workspaceDir(ticket.key);
+    const dir = guardWorkspacePath(workspaceDir(ticket.key)); // a seat may have replaced its workspace entry with a link
     const branch = ticket.branch || `${config.project.branchPrefix}${ticket.key.toLowerCase()}-${slugify(ticket.title)}`;
     const base = config.project.baseBranch;
     if (!fs.existsSync(path.join(dir, '.git'))) {
@@ -186,23 +237,101 @@ export function ensureWorkspace(ticket) {
 export function ensureReadonlyWorkspace(seatId = 'scratch') {
   return withGitLock(async () => {
     if (!/^[a-z0-9-]+$/.test(seatId)) throw new Error('invalid scratch seat');
-    const dir = path.join(config.workspaceRoot, `_desk-${seatId}`);
-    const base = config.project.baseBranch;
-    if (!fs.existsSync(path.join(dir, '.git'))) {
-      fs.mkdirSync(config.workspaceRoot, { recursive: true });
-      await git(['clone', '--quiet', '--no-hardlinks', config.project.repoPath, dir]);
-      const { stdout: origin } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
-      if (origin.trim()) await git(['-C', dir, 'remote', 'set-url', 'origin', origin.trim()]);
-    }
-    breakHardlinks(dir);
-    const hasOrigin = await git(['-C', dir, 'remote']).then((r) => r.stdout.includes('origin'));
-    const lastFetch = fs.existsSync(path.join(dir, '.git', 'FETCH_HEAD')) ? fs.statSync(path.join(dir, '.git', 'FETCH_HEAD')).mtimeMs : 0;
-    if (hasOrigin && Date.now() - lastFetch > 10 * 60_000) await git(['-C', dir, 'fetch', '--quiet', 'origin', base]).catch(() => {});
-    await git(['-C', dir, 'checkout', '-q', '--detach', `origin/${base}`]).catch(() => git(['-C', dir, 'checkout', '-q', base]));
-    await git(['-C', dir, 'reset', '-q', '--hard']);
-    await git(['-C', dir, 'clean', '-qfd']);
-    return dir;
+    const dir = guardWorkspacePath(path.join(config.workspaceRoot, `_desk-${seatId}`));
+    // Seats ran in the previous copy and may have planted anything in it (hooks, config, filters, links): it is never
+    // reused or written through. It is deleted (links are removed, never followed) and copied fresh from the desk's
+    // template, which only the desk ever touches.
+    const tpl = await scratchTemplate();
+    removeTree(dir);
+    fs.mkdirSync(config.workspaceRoot, { recursive: true });
+    // APFS: a copy-on-write clone (new inodes; a seat's write never reaches the template). Elsewhere a reflink or copy.
+    await pexec('cp', os.platform() === 'darwin' ? ['-cR', tpl, dir] : ['-R', '--reflink=auto', tpl, dir], { timeout: 600_000 })
+      .catch(() => pexec('cp', ['-R', tpl, dir], { timeout: 600_000 }));
+    return guardWorkspacePath(dir); // the template's stamp lives outside it, so nothing is written after the copy
   });
+}
+
+// The scratch template: a checkout of the trusted base, built by the desk from its own publisher repo, never given to a
+// seat (it lives in the desk's data dir, which seats cannot read). Rebuilt when the base moves.
+const TEMPLATE_FETCH_MS = 10 * 60_000;
+let templateFetchedAt = 0;
+/** The owner's own SSH command for their remote, if their checkout sets one (trusted; never a seat's). */
+async function ownerRemoteFlags() {
+  const { stdout } = await git(['-C', config.project.repoPath, 'config', '--get', 'core.sshCommand']).catch(() => ({ stdout: '' }));
+  return stdout.trim() ? ['-c', `core.sshCommand=${stdout.trim()}`] : [];
+}
+export async function scratchTemplate({ force = false } = {}) {
+  const pub = await publisher();
+  const base = config.project.baseBranch;
+  const ref = 'refs/sigmadesk/scratch-base';
+  const have = await git(['-C', pub, 'rev-parse', '-q', '--verify', ref]).then((r) => r.stdout.trim(), () => '');
+  const { stdout: url } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
+  // A local-only checkout is read every time (cheap); a remote at most every 10 minutes.
+  if (force || !have || !url.trim() || Date.now() - templateFetchedAt > TEMPLATE_FETCH_MS) {
+    // Trusted base: the owner's remote with the owner's own configuration, else the owner's local checkout.
+    const fromRemote = url.trim()
+      ? await git([...(await ownerRemoteFlags()), '-C', pub, 'fetch', '-q', '--no-tags', url.trim(), `+refs/heads/${base}:${ref}`], { timeout: 120_000 }).then(() => true, () => false)
+      : false;
+    if (!fromRemote) {
+      // Local-only: the owner's own base branch is the truth; a retained origin/<base> ref may be stale. With a remote
+      // that could not be reached, the last known origin/<base> is used first, as the publisher does.
+      const order = url.trim() ? [`refs/remotes/origin/${base}`, `refs/heads/${base}`] : [`refs/heads/${base}`, `refs/remotes/origin/${base}`];
+      let sha = '';
+      for (const refName of order) { sha = await git(['-C', config.project.repoPath, 'rev-parse', '-q', '--verify', `${refName}^{commit}`]).then((r) => r.stdout.trim(), () => ''); if (sha) break; }
+      if (sha) await git(['-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', config.project.repoPath, `+${sha}:${ref}`]).catch(() => {});
+    }
+    templateFetchedAt = Date.now();
+  }
+  const sha = (await git(['-C', pub, 'rev-parse', ref])).stdout.trim();
+  const tpl = templateDir();
+  // Trusted filter definitions are part of the template's identity: a filter change at the same commit rebuilds it.
+  const { stdout: filters } = await git(['-C', config.project.repoPath, 'config', '--local', '--get-regexp', '^filter\\.']).catch(() => ({ stdout: '' }));
+  const filterHash = crypto.createHash('sha256').update(filters).digest('hex');
+  if (templateIntact(tpl, sha, filterHash)) return tpl;
+  const tmp = `${tpl}.building-${process.pid}`;
+  removeTree(tmp);
+  await git(['init', '-q', tmp]);
+  await git(['-C', tmp, 'remote', 'add', 'origin', url.trim() || config.project.repoPath]);
+  // Filters (Git LFS and the like) come from the owner's own checkout config, the trusted source; the attributes that
+  // select them come from the base commit itself.
+  for (const line of filters.split('\n').filter(Boolean)) {
+    const at = line.indexOf(' ');
+    await git(['-C', tmp, 'config', '--add', at > 0 ? line.slice(0, at) : line, at > 0 ? line.slice(at + 1) : '']);
+  }
+  await git(['-c', 'protocol.file.allow=always', '-C', tmp, 'fetch', '-q', '--no-tags', pub, `+${ref}:refs/remotes/origin/${base}`]);
+  await git(['-C', tmp, 'checkout', '-q', '--detach', `refs/remotes/origin/${base}`]);
+  const manifest = treeManifest(tmp);
+  fs.rmSync(templateStamp(), { force: true });
+  removeTree(tpl);
+  fs.renameSync(tmp, tpl);
+  fs.writeFileSync(templateStamp(), JSON.stringify({ sha, filterHash, manifest }));
+  return tpl;
+}
+/** Every entry of a tree (never following links): path, type, mode, size, mtime, plus .git's config/HEAD/hooks. */
+export function treeManifest(dir) {
+  const h = crypto.createHash('sha256');
+  const walk = (d, rel) => {
+    for (const name of fs.readdirSync(d).sort()) {
+      const p = path.join(d, name), r = rel ? `${rel}/${name}` : name;
+      if (r === '.git/index' || (r.startsWith('.git/') && /^\.git\/(objects|logs|refs|FETCH_HEAD|ORIG_HEAD)/.test(r))) continue;
+      const st = fs.lstatSync(p);
+      h.update(`${r}\0${st.isSymbolicLink() ? 'l' : st.isDirectory() ? 'd' : 'f'}\0${st.mode}\0${st.size}\0${Math.floor(st.mtimeMs)}\n`);
+      if (st.isSymbolicLink()) h.update(fs.readlinkSync(p));
+      else if (st.isDirectory()) walk(p, r);
+      else if (/^\.git\/(config|HEAD)$/.test(r)) h.update(fs.readFileSync(p));
+    }
+  };
+  walk(dir, '');
+  return h.digest('hex');
+}
+/** The template is reused only when its stamp matches the trusted base and filters, and its tree is untouched. */
+export function templateIntact(tpl, sha, filterHash) {
+  try {
+    const g = path.join(tpl, '.git');
+    if (fs.lstatSync(tpl).isSymbolicLink() || fs.lstatSync(g).isSymbolicLink()) return false;
+    const stamp = JSON.parse(fs.readFileSync(templateStamp(), 'utf8'));
+    return stamp.sha === sha && stamp.filterHash === filterHash && stamp.manifest === treeManifest(tpl);
+  } catch { return false; }
 }
 
 // Reviewers inspect a separate clone pinned to the submitted object; no worker checkout is reused.
@@ -218,11 +347,11 @@ export async function ensureProductReviewWorkspace(seatId, ticket) {
   return dir;
 }
 
-export const headSha = async (dir) => (await git(['-C', dir, 'rev-parse', 'HEAD'])).stdout.trim();
+export const headSha = async (dir) => (await sgit(['-C', dir, 'rev-parse', 'HEAD'])).stdout.trim();
 
 export async function commitsAhead(dir) {
   try {
-    const { stdout } = await git(['-C', dir, 'rev-list', '--count', `origin/${config.project.baseBranch}..HEAD`]);
+    const { stdout } = await sgit(['-C', dir, 'rev-list', '--count', `origin/${config.project.baseBranch}..HEAD`]);
     return Number(stdout.trim());
   } catch { return 0; }
 }
@@ -275,7 +404,8 @@ export function pushBranch(key, branch, sha, { lease } = {}) {
 
 export function removeWorkspace(key) {
   const dir = workspaceDir(key);
-  if (dir.startsWith(config.workspaceRoot) && fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  let safe; try { safe = guardWorkspacePath(dir); } catch { return; }
+  if (fs.existsSync(safe)) removeTree(safe);
 }
 
 // ---------------- sandbox + CLI arguments ----------------
@@ -412,7 +542,7 @@ export function jobPermissions(kind, job) {
   if (kind === 'research_review' || kind === 'connector_assessment') return { web: !!job?.web };
   return {};
 }
-export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath, job = null } = {}) {
+export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath, job = null, capUsd = null } = {}) {
   const charter = kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.'
     : kind === 'product_review' ? productReviewCharter(agent.id)
       : kind === 'feature_groom' ? featureGroomCharter()
@@ -424,11 +554,20 @@ export function buildCommand(agent, kind, cwd, { resume = null, fork = false, ex
     seat: agent, kind, cwd, resume, fork, extraDirs, mcpServers,
     perms: permissionsFor(kind, cwd, jobPermissions(kind, job)), denyRules: DENY_RULES, charter, settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
   });
-  // Conflict resolutions get their own hard spend cap (merge train, #3).
-  const capAt = kind === 'resolve' ? cmd.args.indexOf('--max-budget-usd') : -1;
-  if (capAt >= 0) cmd.args[capAt + 1] = String(Math.min(Number(cmd.args[capAt + 1]) || Infinity, Number(config.resolve?.budgetUsd) || 1.5));
+  // Conflict resolutions (merge train, #3) and tagged runs (@mentions) get their own, lower hard spend cap.
+  const cap = Math.min(kindCap(kind) ?? Infinity, capUsd ?? Infinity); // capUsd: what is left of a job's allowance
+  const capAt = Number.isFinite(cap) ? cmd.args.indexOf('--max-budget-usd') : -1;
+  if (capAt >= 0) cmd.args[capAt + 1] = String(Math.min(Number(cmd.args[capAt + 1]) || Infinity, cap));
   return cmd;
 }
+
+/** A per-kind hard spend cap below the seat's own (null = the seat's cap applies). */
+export function kindCap(kind) {
+  if (kind === 'resolve') return Number(config.resolve?.budgetUsd) || 1.5;
+  if (kind === 'mention') return Number(config.mentions?.budgetUsd) || 2;
+  return null;
+}
+const capped = (kind, usd) => (kindCap(kind) ? Math.min(usd, kindCap(kind)) : usd);
 
 // Provenance: which charter/playbook/engine/model produced this run, so scorecards can be split by version.
 const engineVersions = {};
@@ -452,14 +591,47 @@ export const buildArgs = (agent, kind, cwd, opts) => buildCommand({ ...agent, en
 
 // ---------------- file mailbox (desk transport for engines whose sandbox blocks unix sockets) ----------------
 const mailboxes = new Map(); // runId -> dir
-function openMailbox(runId, cwd) {
-  // One subfolder per run inside that seat's own clone.
-  const dir = path.join(cwd, '.desk-mailbox', `r${runId}`);
-  fs.mkdirSync(dir, { recursive: true });
-  const exclude = path.join(cwd, '.git', 'info', 'exclude');
+/**
+ * A directory the desk writes in, inside a seat workspace: every component from the workspace down is checked with
+ * lstat and must be a real directory (a seat may have planted a link anywhere in its own tree); missing ones are
+ * created one at a time (mkdir never follows a link, and fails if one appears meanwhile). Throws a plain refusal.
+ */
+export function seatDir(root, parts, { create = true } = {}) {
+  const refuse = (p) => { throw Object.assign(new Error(`refusing to write through a link in the seat's workspace: ${p}`), { status: 409 }); };
+  if (!fs.lstatSync(root).isDirectory()) refuse(root);
+  let at = root;
+  for (const part of parts) {
+    if (!part || part === '.' || part === '..' || part.includes('/')) refuse(path.join(at, String(part)));
+    at = path.join(at, part);
+    let st = null; try { st = fs.lstatSync(at); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (!st) { if (!create) return null; try { fs.mkdirSync(at, { mode: 0o755 }); } catch (e) { if (e.code !== 'EEXIST') throw e; } st = fs.lstatSync(at); }
+    if (!st.isDirectory()) refuse(at);
+  }
+  return at;
+}
+/** Append to a file inside a seat workspace without following a link (O_NOFOLLOW; created exclusively if missing). */
+export function seatAppend(dir, name, text, { unless } = {}) {
+  const file = path.join(dir, name);
+  const C = fs.constants;
+  let fd;
+  try { fd = fs.openSync(file, C.O_RDWR | C.O_APPEND | C.O_NOFOLLOW); }
+  catch (e) {
+    if (e.code === 'ELOOP') throw Object.assign(new Error(`refusing to write through a link in the seat's workspace: ${file}`), { status: 409 });
+    if (e.code !== 'ENOENT') throw e;
+    fd = fs.openSync(file, C.O_RDWR | C.O_APPEND | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o644);
+  }
   try {
-    if (fs.existsSync(path.dirname(exclude)) && !fs.readFileSync(exclude, 'utf8').includes('.desk-mailbox')) fs.appendFileSync(exclude, '\n.desk-mailbox/\n');
-  } catch { /* not a clone */ }
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`not a regular file: ${file}`);
+    if (unless && fs.readFileSync(fd, 'utf8').includes(unless)) return false;
+    fs.writeSync(fd, text);
+    return true;
+  } finally { fs.closeSync(fd); }
+}
+export function openMailbox(runId, cwd) {
+  // One subfolder per run inside that seat's own clone; never through a link the seat planted.
+  const dir = seatDir(cwd, ['.desk-mailbox', `r${runId}`]);
+  const info = seatDir(cwd, ['.git', 'info'], { create: false }) ?? (fs.existsSync(path.join(cwd, '.git')) ? seatDir(cwd, ['.git', 'info']) : null);
+  if (info) seatAppend(info, 'exclude', '\n.desk-mailbox/\n', { unless: '.desk-mailbox' });
   mailboxes.set(runId, dir);
   return dir;
 }
@@ -469,7 +641,7 @@ export const runCwd = (runId) => store.getRun(runId)?.cwd;
 // The reservation follows the engine the job will actually use (a capability fallback can cost more than the seat's own).
 export const runBudget = (agentId, kind = null) => {
   const seat = selectionFor(agentId, Date.now(), null, kind).seat || agentById[agentId] || {};
-  return engineOf(seat).budgetUsd(seat);
+  return capped(kind, engineOf(seat).budgetUsd(seat));
 };
 export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: String(run?.model || '').split(':')[0] }).budgetUsd({ model: String(run?.model || '').split(':').slice(1).join(':') });
 
@@ -477,7 +649,7 @@ export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: St
  * Start one agent run. Resolves when the process exits with {run, result}.
  * The prompt goes over stdin so the variadic tool flags cannot swallow it.
  */
-export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null, job = null, pinEngine = null }) {
+export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track = true, resume = null, fork = false, extraDirs = [], incidentId = null, nonce = null, fence = null, onStreamLine = null, reviewProfile = null, onStart = null, job = null, pinEngine = null, admit = null, onEnd = null }) {
   if (fence != null && fence !== epoch) return Promise.resolve({ run: null, result: null, aborted: true });
   if (reviewProfile && (kind !== 'council_review' || track || resume)) throw new Error('Per-job review models are restricted to fresh, untracked council calls');
   // A research job's requirements (web, connectors) travel into provider selection: fallback may not drop them.
@@ -486,13 +658,20 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const selected = reviewProfile ? reviewSelection(agentId, reviewProfile) : pinEngine ? pinnedSelection(agentId, pinEngine, kind) : selectionFor(agentId, Date.now(), requirements, kind);
   if (!selected.seat) throw Object.assign(new Error(`${agentId}: ${selected.reason}`), { status: 409, providerUnavailable: true });
   const agent = selected.seat;
+  // admit(agent): the job checks the engine it actually got BEFORE any run exists: { refuse } stops here, { limits }
+  // ({ usd, minutes, steps }) bounds the run (a lower spend cap, a shorter timeout, a step allowance).
+  const admitted = admit ? admit(agent) : null;
+  if (admitted?.refuse) return Promise.resolve({ run: null, result: null, refused: admitted.refuse });
+  const limits = admitted?.limits || null;
   if (ENGINES[agent.engine || 'claude']?.supports && !ENGINES[agent.engine || 'claude'].supports(kind)) throw Object.assign(new Error(`${agentId}: ${ENGINES[agent.engine].label} cannot run ${kind}`), { status: 409 });
   const token = crypto.randomBytes(18).toString('hex');
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job });
   // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
   if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
-  store.updateRun(run.id, { reserve_usd: engineOf(agent).budgetUsd(agent) });
-  access.bindRun(agentId, ticketKey, run.id); // dormant ticket-scoped production access becomes this run's
+  store.updateRun(run.id, { reserve_usd: Math.min(capped(kind, engineOf(agent).budgetUsd(agent)), limits?.usd ?? Infinity) });
+  // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
+  // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
+  if (kind !== 'mention') access.bindRun(agentId, ticketKey, run.id);
   onStart?.(run);
   const ctx = { run, cwd, result: null, state: {}, presence: track };
   if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
@@ -506,8 +685,13 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const px = context.packSettings();
   // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
   // Covers the first answer, follow-ups and every permitted page round (bounded by engines.perplexity.maxRunMinutes).
-  const timeoutMin = Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0);
+  // A tagged run on a plan-billed engine without a dollar cap is bounded by time instead (mentions.maxMinutes).
+  const timeoutMin = limits?.minutes ?? (kind === 'mention' && !capsSpend(agent, 'mention') ? Number(config.mentions?.maxMinutes) || 10
+    : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0));
   const deadlineAt = Date.now() + timeoutMin * 60_000;
+  if (limits?.steps != null) ctx.maxSteps = limits.steps;
+  // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
+  if (store.getRun(run.id)?.status !== 'running') return Promise.resolve(endBeforeSpawn('killed', store.getRun(run.id)?.result_text || 'refused before start'));
   if (!pplx) return spawnChild();
 
   // Perplexity thinking seats: the desk builds the context pack (not the relay) before the relay starts. Cancellation
@@ -543,7 +727,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   let sock, cmd, env;
   try {
     sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
-    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job });
+    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job, capUsd: limits?.usd ?? null });
     env = { ...childEnv(token, engine.id), ...cmd.env };
     isolateTools(env, engine.id, toolHome(run.id));
     if (kind === 'council_review') { delete env.DESK_RUN_TOKEN; delete env.DESK_SOCKET; }
@@ -560,6 +744,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const child = spawn(cmd.bin, cmd.args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
   children.set(run.id, child);
   store.updateRun(run.id, { pid: child.pid });
+  // The process's start time identifies it after a restart (a recorded pid alone may have been reused meanwhile).
+  if (child.pid) processStart(child.pid).then((at) => { if (at) store.updateRun(run.id, { pid_start: at }); });
   if (child.pid) lessons.delivered(run.id, ticketKey); // lessons count as given only once the prompt reaches a process
   child.stdin.on('error', () => {});
   child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt);
@@ -623,10 +809,14 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (failure) holdProvider(engine.id, failure, r?.result || stderr || ctx.state.lastError);
       // No terminal result (killed, crashed, timed out): charge the full per-run cap so the risk limit stays honest.
       const knownCost = r?.cost_known !== false && r && (r.total_cost_usd || !r.is_error);
-      const cost = knownCost ? (r.total_cost_usd ?? 0) : engine.budgetUsd(agent);
-      store.updateRun(run.id, {
-        status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
-        result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
+      const cost = knownCost ? (r.total_cost_usd ?? 0) : Math.min(capped(kind, engine.budgetUsd(agent)), limits?.usd ?? Infinity);
+      // The run's final record and the job's own accounting (onEnd: e.g. a tag's cumulative allowance) commit together.
+      store.transaction(() => {
+        store.updateRun(run.id, {
+          status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
+          result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
+        });
+        onEnd?.(store.getRun(run.id), { steps: ctx.state.steps || 0 });
       });
       const estimated = !knownCost;
       const costTxt = cost ? ` · $${cost.toFixed(2)}${estimated ? ' estimated charge (provider cost unreported)' : ''}` : '';
@@ -635,7 +825,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: status !== 'success' ? 'error' : blocked ? 'system' : 'done',
         text: `${outcome}${r?.subtype && r.subtype !== 'success' ? ` (${r.subtype})` : ''}${costTxt}${status !== 'success' && stderr ? ` — ${short(stderr, 200)}` : ''}` });
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
-      resolve({ run: store.getRun(run.id), result: r, failure });
+      resolve({ run: store.getRun(run.id), result: r, failure, steps: ctx.state.steps || 0 });
     };
     child.on('close', finish);
     child.on('error', (err) => {
@@ -672,16 +862,66 @@ async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, in
 
 const preparing = new Map(); // runId -> AbortController while a Perplexity pack is being built
 
+// ---------------- process groups ----------------
+// Every seat run is its own process group (detached spawn: pgid = the engine's pid). Ending a run ends its group. A
+// pgid can only be reused once EVERY member of the group is gone, so the group is watched until it is empty and is
+// never signalled again after that moment: the SIGKILL fallback is skipped (and its timer cleared) as soon as the
+// group is seen empty, re-checked live right before the signal, and never sent to a pgid that now belongs to another
+// live run, to pgid <= 1, or to the desk's own process group.
+const groupWatch = new Map(); // pgid -> interval
+let deskPgid = null;
+function ownPgid() {
+  if (deskPgid === null) { try { deskPgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).trim()) || 0; } catch { deskPgid = 0; } }
+  return deskPgid;
+}
+const groupAlive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+const signallable = (pgid) => Number.isInteger(pgid) && pgid > 1 && pgid !== process.pid && pgid !== ownPgid();
+/** Is this pgid the group of a live run other than `owner` (a reused pgid that now belongs to a replacement seat)? */
+const otherRunsGroup = (pgid, owner) => [...children.entries()].some(([id, c]) => c.pid === pgid && id !== owner);
+/** End a run's process group: SIGTERM now, SIGKILL after the grace period only if that same group still has members. */
+export function killGroup(pgid, { graceMs = 5000, pollMs = 100, owner = null } = {}) {
+  if (!signallable(pgid) || otherRunsGroup(pgid, owner) || !groupAlive(pgid)) return false;
+  try { process.kill(-pgid, 'SIGTERM'); } catch { return false; }
+  if (groupWatch.has(pgid)) return true;
+  const deadline = Date.now() + graceMs;
+  const stop = () => { clearInterval(groupWatch.get(pgid)); groupWatch.delete(pgid); };
+  groupWatch.set(pgid, setInterval(() => {
+    if (!groupAlive(pgid) || otherRunsGroup(pgid, owner)) return stop(); // gone (the pgid may be reused from now on)
+    if (Date.now() < deadline) return;
+    stop();
+    if (signallable(pgid) && !otherRunsGroup(pgid, owner) && groupAlive(pgid)) { try { process.kill(-pgid, 'SIGKILL'); } catch { /* gone */ } }
+  }, pollMs));
+  groupWatch.get(pgid).unref?.();
+  return true;
+}
+/** A process's start time as the OS reports it (`ps -o lstart=`), or '' when it is not running. */
+export function processStart(pid) {
+  return new Promise((resolve) => execFile('ps', ['-o', 'lstart=', '-p', String(pid)], { timeout: 5000 }, (e, out) => resolve(e ? '' : String(out).trim())));
+}
+/**
+ * Restart cleanup for a run recorded by a previous desk lifetime: its group is signalled only when the recorded
+ * process is provably the same one (same pid AND same start time). Anything else is skipped: the pid may be reused.
+ */
+export async function killRecordedGroup(run) {
+  if (!run?.pid || !run.pid_start) return false;
+  const now = await processStart(run.pid);
+  if (!now || now !== run.pid_start) return false;
+  return killGroup(run.pid);
+}
+/** Groups still being watched for their SIGKILL fallback (tests). */
+export const watchedGroups = () => [...groupWatch.keys()];
+/** Test hook: register a stand-in "other live run" owning a pgid (the reuse replay). */
+export function _claimGroup(runId, pid) { if (pid) children.set(runId, { pid }); else children.delete(runId); }
 export function killRun(runId, reason = 'killed') {
   const run = store.getRun(runId);
   if (!run || run.status !== 'running') return false;
-  store.updateRun(runId, { status: 'killed', result_text: reason });
+  // The run's authorization ends now, not when its process exits: no desk call, grant or probe outlives the kill.
+  store.updateRun(runId, { status: 'killed', result_text: reason, token: null });
+  ops.cancelRun(runId);
   preparing.get(runId)?.abort();
-  const pid = children.get(runId)?.pid ?? run.pid;
-  if (pid) {
-    try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
-    setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } }, 5000).unref();
-  }
+  // Only a group the desk spawned in this lifetime is signalled here (a pid read back from the database may be reused).
+  const pid = children.get(runId)?.pid;
+  if (pid) killGroup(pid, { owner: runId });
   return true;
 }
 
@@ -696,7 +936,7 @@ export async function shutdownAll(reason) {
   killAll(reason);
   const deadline = Date.now() + 6000;
   while (children.size && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
-  for (const c of children.values()) { try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ } }
+  for (const c of children.values()) if (signallable(c.pid) && groupAlive(c.pid)) { try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ } }
 }
 
 export const runningCount = () => children.size;
@@ -830,8 +1070,8 @@ export async function remoteHead(branch) {
   const { stdout } = await git(['ls-remote', url, `refs/heads/${branch}`], { timeout: 60_000 });
   return stdout.split('\t')[0].trim() || null;
 }
-/** Does this seat's engine enforce a hard per-run spend cap for a resolve run? (Claude CLI: --max-budget-usd.) */
-export function capsSpend(seat) {
+/** Does this seat's engine enforce a hard per-run spend cap for this kind of run? (Claude CLI: --max-budget-usd.) */
+export function capsSpend(seat, kind = 'resolve') {
   if (!seat) return false;
-  try { return buildCommand(seat, 'resolve', path.join(config.workspaceRoot, '_cap-probe')).args.includes('--max-budget-usd'); } catch { return false; }
+  try { return buildCommand(seat, kind, path.join(config.workspaceRoot, '_cap-probe')).args.includes('--max-budget-usd'); } catch { return false; }
 }

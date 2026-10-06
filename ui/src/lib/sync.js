@@ -13,7 +13,7 @@ export const byId = (...lists) => {
 };
 export const mergeEvents = (a, b) => { const m = new Map(); for (const e of [...(b || []), ...(a || [])]) m.set(e.id, e); return [...m.values()].sort((x, y) => x.id - y.id); };
 
-export const emptyPending = () => ({ comments: [], events: [], discussions: [], product_reviews: [], research_reviews: [], refresh: null });
+export const emptyPending = () => ({ comments: [], events: [], discussions: [], mentions: [], product_reviews: [], research_reviews: [], refresh: null, participants: null });
 /**
  * Apply one stream message.
  * S.detail = { key, data, pending, seq } is the open ticket's detail (or null). Until `data` arrives, every detail-scoped
@@ -39,6 +39,9 @@ export function applyDelta(S, m) {
     case 'incident': upsert(S.incidents, m.data); break;
     case 'quota': out.meta = true; break;
     case 'discussion': into('discussions', m.data); out.meta = true; break;
+    // @mentions: one delivery per tagged seat (its state under the owner's message), and who is on the ticket.
+    case 'mention': into('mentions', m.data); out.meta = true; break;
+    case 'participants': if (mine(m.data.ticket_key)) { if (d.data) d.data.participants = m.data.participants; else d.pending.participants = m.data.participants; } break;
     case 'branch-refresh': if (mine(m.data.ticket_key)) { if (d.data) d.data.refresh = m.data; else d.pending.refresh = m.data; } break;
     case 'product-review': if (mine(m.data.ticket_key)) upsert(d.data ? (d.data.product_reviews ||= []) : d.pending.product_reviews, m.data, 'phase'); out.meta = true; break;
     case 'research-review': into('research_reviews', m.data); out.meta = true; break;
@@ -83,5 +86,6 @@ export function mergeDetail(prev, fetched, pending) {
   for (const r of pending.product_reviews || []) upsert(reviews, r, 'phase');
   return { ...fetched, comments: byId(prev?.comments, fetched.comments, pending.comments), events: byId(prev?.events, fetched.events, pending.events),
     discussions: byId(prev?.discussions, fetched.discussions, pending.discussions), research_reviews: byId(fetched.research_reviews, pending.research_reviews),
+    mentions: byId(prev?.mentions, fetched.mentions, pending.mentions), participants: pending.participants || fetched.participants || [],
     product_reviews: reviews, refresh: pending.refresh || fetched.refresh || null };
 }

@@ -12,6 +12,7 @@ import { Tag, Named, SeatAvatar } from '@/components/desk/Bits';
 import { Markdown, Inline } from '@/components/desk/Markdown';
 import { cardFor, EvidenceList, CiTag, Disclose, STAGE_LABEL, firstName } from '@/components/desk/Work';
 import { cn } from '@/lib/utils';
+import { Deliveries } from './Mentions';
 import type { BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -23,7 +24,8 @@ export function Block({ title, children, tone, className }: { title?: ReactNode;
 const Row = ({ k, children }: { k: string; children: ReactNode }) => <div className="grid gap-1 border-t pt-3 first:border-t-0 first:pt-0 md:grid-cols-[132px_1fr] md:gap-4"><span className="text-sm text-muted-foreground">{k}</span><div className="grid min-w-0 gap-2">{children}</div></div>;
 
 type Item = { id: string; who: string; text: string; kind: string; ts: string; runId?: number; ask?: boolean; open?: boolean; raw?: string;
-  discussionId?: number; status?: string; error?: string | null; steps?: { id: string; ts: string; raw: string }[] };
+  discussionId?: number; status?: string; error?: string | null; steps?: { id: string; ts: string; raw: string }[];
+  deliveries?: { id: number; seat_id: string; status: string; reason?: string | null; routed?: string | null; reply_comment_id?: number | null }[] };
 const EVENT_TONE: Record<string, string> = { error: 'text-blocked', done: 'text-shipped' };
 const FILTERS = [['', 'All'], ['owner', 'You'], ['seats', 'Team'], ['desk', 'Desk']] as const; // short: they share one row with the order toggle on a phone
 const DISCUSSION_TONE: Record<string, 'needs' | 'blocked' | 'shipped' | 'neutral' | 'action'> = { queued: 'neutral', running: 'action', complete: 'needs', approved: 'shipped', failed: 'blocked', cancelled: 'neutral', rejected: 'neutral', changes_requested: 'neutral' };
@@ -123,6 +125,7 @@ export function Conversation({ d, live, tkey, state, status }: { d: Detail; live
                     <LongText id={`msg-${it.id}`} text={text} self={tkey} />
                   </div>
                 </article>);
+              if (it.deliveries?.length) body = <div className="grid gap-1.5">{body}<Deliveries list={it.deliveries} tkey={tkey} /></div>;
             }
             return <Fragment key={it.id}>{sep}{body}</Fragment>;
           }) : <p className="text-muted-foreground">{st.agent ? 'Nothing from them yet.' : 'No recorded updates yet. Messages appear here as the team works.'}</p>}

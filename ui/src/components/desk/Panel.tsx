@@ -25,6 +25,8 @@ export function Panel({ title, description, head, children, footer, onClose, wid
       <SheetContent side="right" data-panel showCloseButton={false} aria-label={label} aria-describedby={description ? undefined : undefined}
         className={cn('w-full gap-0 border-l p-0 sm:max-w-[640px]', wide && 'sm:max-w-[780px]')}
         onCloseAutoFocus={restore}
+        // An inline list that owns Escape while open (the composer's @ picker) closes first; the panel stays.
+        onEscapeKeyDown={(e) => { if (document.querySelector('[data-captures-escape]')) e.preventDefault(); }}
         onOpenAutoFocus={(e) => { const el = (e.currentTarget as HTMLElement).querySelector<HTMLElement>('[data-autofocus]'); if (el) { e.preventDefault(); el.focus(); } }}>
         {/* compact (a phone reply has focus): one line, title only, so the thread keeps the room. */}
         <header className={cn('grid grid-cols-[minmax(0,1fr)] gap-1.5 border-b px-5 sm:px-6', compact ? 'pb-2 pt-[calc(env(safe-area-inset-top)+8px)]' : 'pb-3 pt-[calc(env(safe-area-inset-top)+16px)]')}>

@@ -133,7 +133,8 @@ export const DENY_RULES = [
 const WEB_RULES = ['WebSearch', 'WebFetch'];
 // Read-only review kinds: no sandboxed Bash(*), no workspace writes, no desk mutations (see runner.sandboxSettings and
 // scheduler.deskAction). Verdicts are structured final output, not desk commands.
-export const READ_ONLY_KINDS = new Set(['product_review', 'research_review', 'connector_assessment', 'feature_groom']);
+// A tagged run (mention) is read-only too: the thread that tagged it is untrusted, so it may not write files or .git.
+export const READ_ONLY_KINDS = new Set(['product_review', 'research_review', 'connector_assessment', 'feature_groom', 'mention']);
 
 // opts (research kinds): { web: boolean, mcpAllow: ['mcp__<connector>__<tool>', …] } from the run's server-owned job.
 export function permissionsFor(kind, cwd = '/nonexistent', opts = {}) {
