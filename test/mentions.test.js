@@ -384,6 +384,14 @@ test('composer rules: the @ query, picking, tags shown = tags sent, delivery wor
   assert.deepEqual(m.matchSeats(agents, '').map((a) => a.id), ['principal-be', 'sre', 'dba'], 'switched-off seats last');
   assert.deepEqual(m.insertMention('hi @ro', m.mentionQuery('hi @ro', 6), 'Rowan'), { text: 'hi @Rowan ', caret: 10 });
   assert.deepEqual(m.taggedSeats('@Rowan and @devon, not @nobody or me@casey.x', agents), ['principal-be', 'sre']);
+  // The people picker: removing a chip takes the tag out; "Tag N people" makes the text tag exactly the chosen seats.
+  assert.equal(m.removeMention('@Rowan @Devon does it work?', 'principal-be', agents), '@Devon does it work?');
+  assert.equal(m.removeMention('ask @Rowan and @Devon now', 'sre', agents), 'ask @Rowan and now');
+  assert.deepEqual(m.setMentions('', ['principal-be', 'sre'], agents), { text: '@Rowan @Devon ', caret: 14 });
+  assert.deepEqual(m.setMentions('does it work?', ['principal-be'], agents, 0), { text: '@Rowan does it work?', caret: 7 });
+  assert.deepEqual(m.setMentions('hi @ro', ['principal-be', 'sre'], agents, 6), { text: 'hi @Rowan @Devon ', caret: 17 }, 'replaces the open @query');
+  assert.deepEqual(m.setMentions('@Rowan @Devon why?', ['sre'], agents, 18).text, '@Devon why?');
+  assert.deepEqual(m.setMentions('hi @', [], agents, 4), { text: 'hi ', caret: 3 }, 'a dangling @ goes away');
   assert.deepEqual(m.seatState(agents[1], (k) => `ticket ${k}`), { key: 'busy', text: 'busy on ticket M-1' });
   assert.equal(m.seatState(agents[2]).text, 'switched off');
   assert.equal(m.deliveryView({ status: 'queued' }, { busy: true }).detail, 'up next, after their current work');
