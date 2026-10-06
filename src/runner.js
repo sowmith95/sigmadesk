@@ -38,6 +38,17 @@ export function todoProgress(todos) {
 const evidence = new Map(); // runId -> { pending: Map(id -> cmd), done: [{cmd, ok}] }
 export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
 
+/** A tagged run (@mention) stops after mentions.maxSteps tool calls: the desk-side bound when dollars cannot be capped. */
+function stepLimit(ctx) {
+  if (ctx.run.kind !== 'mention') return;
+  ctx.state.steps = (ctx.state.steps || 0) + 1;
+  const max = Number(config.mentions?.maxSteps) || 60;
+  if (ctx.state.steps === max + 1) {
+    store.logEvent({ run_id: ctx.run.id, agent_id: ctx.run.agent_id, ticket_key: ctx.run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for a tagged reply)` });
+    killRun(ctx.run.id, `step limit (${max})`);
+  }
+}
+
 // Apply an engine's normalized events to the desk (activity log, presence, progress, result).
 export function applyEvents(events, ctx) {
   const { run } = ctx;
@@ -52,6 +63,7 @@ export function applyEvents(events, ctx) {
         break;
       case 'tool':
         store.logEvent({ ...base, kind: 'tool', text: e.text });
+        stepLimit(ctx);
         if (ctx.presence !== false) store.updateAgent(run.agent_id, { last_action: e.text, last_action_at: store.now() });
         break;
       case 'todos': {
@@ -517,7 +529,9 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const px = context.packSettings();
   // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
   // Covers the first answer, follow-ups and every permitted page round (bounded by engines.perplexity.maxRunMinutes).
-  const timeoutMin = Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0);
+  // A tagged run on a plan-billed engine without a dollar cap is bounded by time instead (mentions.maxMinutes).
+  const timeoutMin = kind === 'mention' && !capsSpend(agent, 'mention') ? Number(config.mentions?.maxMinutes) || 10
+    : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0);
   const deadlineAt = Date.now() + timeoutMin * 60_000;
   if (!pplx) return spawnChild();
 

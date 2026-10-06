@@ -66,16 +66,36 @@ export function blockReason(seat, now = Date.now()) {
   const own = { ...a, engine: a.engine || 'claude' };
   const engine = ENGINES[own.engine];
   const seatToCheck = !engine?.supports || engine.supports('mention') ? own : selectionFor(seat, now, null, 'mention').seat;
-  if (seatToCheck && !runner.capsSpend(seatToCheck, 'mention')) {
+  if (seatToCheck && !boundFor(seatToCheck)) {
     const label = ENGINES[seatToCheck.engine || 'claude']?.label || seatToCheck.engine;
-    return `${name} runs on ${label}, which has no hard spend cap, and tagged work must stay under $${Number(settings().budgetUsd) || 2} a reply. Move ${name} to a Claude engine (Settings → Team), or tag someone else.`;
+    return `${name} runs on ${label}, which is billed per use with no hard spend cap, and tagged work must stay under $${Number(settings().budgetUsd) || 2} a reply. Move ${name} to a capped or plan-billed engine (Settings → Team), or tag someone else.`;
   }
   return null;
 }
-/** Can this seat start a tagged run right now: an engine is ready AND that engine enforces the hard spend cap. */
+/** How an engine is paid: 'plan' (the owner's subscription, no per-dollar spend) or 'api' (metered). */
+export function billingOf(engineId) {
+  const b = config.engines?.[engineId]?.billing;
+  return b === 'plan' || b === 'api' ? b : engineId === 'codex' ? 'plan' : 'api';
+}
+/**
+ * The hard bound a tagged run of this seat gets: a dollar cap the engine enforces, or, for a plan-billed engine without
+ * one, the desk's own time and step limits. null = no bound possible (an API-billed engine without a cap): refused.
+ */
+export function boundFor(seat) {
+  if (!seat) return null;
+  if (runner.capsSpend(seat, 'mention')) return { kind: 'usd', usd: Number(settings().budgetUsd) || 2 };
+  if (billingOf(seat.engine || 'claude') === 'plan') return { kind: 'time', minutes: Number(settings().maxMinutes) || 10, steps: Number(settings().maxSteps) || 60 };
+  return null;
+}
+/** "Rowan has 10 minutes for this" / "… up to $2 for this": said in the thread when the run starts. */
+export function boundText(seat, b) {
+  const name = firstName(seat.id);
+  return b.kind === 'usd' ? `${name} has up to $${b.usd} for this reply.` : `${name} has ${b.minutes} minutes (at most ${b.steps} steps) for this reply.`;
+}
+/** Can this seat start a tagged run right now: an engine is ready AND the run can be bounded (dollars, or time on a plan). */
 export function launchable(seat, now = Date.now()) {
   const sel = selectionFor(seat, now, null, 'mention');
-  return !!sel.seat && runner.capsSpend(sel.seat, 'mention');
+  return !!sel.seat && !!boundFor(sel.seat);
 }
 
 /** Tagged deliveries on this ticket in the last hour (every tagged seat counts: each one starts a run). */

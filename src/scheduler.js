@@ -453,12 +453,15 @@ export async function launchMention(m, fence) {
         runId = run.id;
         // The engine the run actually got must enforce the hard spend cap (a fallback could pick one that does not).
         const [engine, ...model] = String(run.model || '').split(':');
-        if (!runner.capsSpend({ ...agentById[seat], engine, model: model.join(':') }, 'mention')) {
-          store.updateMention(m.id, { status: 'blocked', run_id: run.id, reason: `${agentById[seat].name}'s available engine (${engine}) has no hard spend cap, so the desk stopped the run. Retry when a Claude engine is available.`, ended_at: store.now() });
-          runner.killRun(run.id, 'tagged work needs an engine with a hard spend cap');
+        const got = { ...agentById[seat], engine, model: model.join(':') };
+        const bound = mentions.boundFor(got);
+        if (!bound) {
+          store.updateMention(m.id, { status: 'blocked', run_id: run.id, reason: `${agentById[seat].name}'s available engine (${engine}) is billed per use with no hard spend cap, so the desk stopped the run. Retry when a capped or plan-billed engine is available.`, ended_at: store.now() });
+          runner.killRun(run.id, 'tagged work needs a bounded engine');
           return;
         }
         store.updateMention(m.id, { run_id: run.id });
+        store.addComment(m.ticket_key, 'system', `⏱ ${mentions.boundText(got, bound)}`);
       } });
     const { run, aborted, failure } = await p;
     if (aborted) store.updateAgent(seat, { status: 'idle', current_ticket: null, current_run: null, current_kind: null });

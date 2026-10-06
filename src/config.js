@@ -105,6 +105,10 @@ const DEFAULTS = {
     budgetUsd: 2, // hard spend cap per tagged run (Claude CLI --max-budget-usd); engines without a hard cap are refused
     maxPerTicketPerHour: 6, // tagged deliveries per ticket per hour (stops loops and runaway cost)
     maxAttempts: 3, // an interrupted tagged run is retried this many times, then fails visibly with a Retry
+    // Engines with no per-run dollar cap but billed to the owner's plan (engines.*.billing = 'plan'): the bound is
+    // time and steps instead. The desk stops the run at either limit. API-billed engines without a cap are refused.
+    maxMinutes: 10,
+    maxSteps: 60, // tool calls and commands in one tagged run
   },
   resolve: {
     budgetUsd: 1.5, // per conflict-resolution run (Claude CLI hard cap)
@@ -227,7 +231,8 @@ const DEFAULTS = {
   engines: {
     autoFallback: true,
     fallbackCooldownMinutes: 15,
-    codex: { bin: '', models: [], pricing: null, reserveUsd: 2 },
+    // billing: 'plan' = runs draw on the owner's ChatGPT plan (no per-dollar spend); 'api' = metered per token.
+    codex: { bin: '', models: [], pricing: null, reserveUsd: 2, billing: 'plan' },
     // Extra Claude Code model ids offered to seats besides fable/opus/sonnet/haiku (access is checked on use).
     claude: { models: [] },
     // Perplexity thinking seats: the desk builds a context pack the local relay must send verbatim.

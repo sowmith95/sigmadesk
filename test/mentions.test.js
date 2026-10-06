@@ -125,13 +125,18 @@ test('the comment and its deliveries commit together: a failed delivery write le
 
 test('blocked, closed and rate-limited tags say why in plain language', () => {
   fresh();
-  team.applyTeamOverrides({ dba: { enabled: false }, junior: { engine: 'codex', model: '' } });
+  team.applyTeamOverrides({ dba: { enabled: false }, junior: { engine: 'codex', model: '' }, 'principal-fe': { engine: 'codex', model: '' } });
+  config.engines.codex.billing = 'api'; // metered Codex: no dollar cap and no plan, so no bound is possible
   const t = ticket();
   const r = tag(t, ['dba', 'junior', 'principal-be']);
   const [off, codex, ok] = r.mentions;
   assert.equal(off.status, 'blocked'); assert.match(off.reason, /Casey is switched off \(Settings → Team\)/);
-  assert.equal(codex.status, 'blocked'); assert.match(codex.reason, /Riley runs on Codex.*, which has no hard spend cap/);
+  assert.equal(codex.status, 'blocked'); assert.match(codex.reason, /Riley runs on Codex.*, which is billed per use with no hard spend cap/);
   assert.equal(ok.status, 'queued');
+  config.engines.codex.billing = 'plan'; // the default: Codex on the owner's ChatGPT plan is bounded by time instead
+  assert.equal(tag(t, ['principal-fe']).mentions[0].status, 'queued');
+  assert.deepEqual(mentions.boundFor({ ...team.agentById['principal-fe'], engine: 'codex' }), { kind: 'time', minutes: 10, steps: 60 });
+  assert.deepEqual(mentions.boundFor({ ...team.agentById['principal-be'], engine: 'claude', model: 'fable' }), { kind: 'usd', usd: 2 });
   team.applyTeamOverrides({});
   const done = ticket({ status: 'done' });
   assert.throws(() => tag(done, ['principal-be']), (e) => e.status === 409 && e.code === 'ticket_closed' && /Reopen it first/.test(e.message));
@@ -359,4 +364,47 @@ test('composer rules: the @ query, picking, tags shown = tags sent, delivery wor
   const conv = await import('../public/conversation.js');
   const items = conv.conversationItems({ comments: [{ id: 5, author: 'owner', body: '@Rowan hi', ts: '2026-10-05T10:00:00Z' }], mentions: [{ id: 1, comment_id: 5, seat_id: 'principal-be', status: 'queued' }] });
   assert.equal(items[0].deliveries[0].seat_id, 'principal-be');
+});
+
+test('plan-billed Codex: a tagged run says its time bound in the thread, and the desk stops it at the time or step limit', async () => {
+  fresh();
+  const codex = path.join(tmp, 'codex-fixture.mjs');
+  fs.writeFileSync(codex, `#!/usr/bin/env node
+const require = (await import('node:module')).createRequire(import.meta.url);
+process.stdin.resume(); process.stdin.on('end', () => {
+  let wait = 0; try { wait = Number(require('fs').readFileSync(${JSON.stringify(path.join(tmp, 'codex-wait'))}, 'utf8')); } catch {}
+  setTimeout(() => {
+    console.log(JSON.stringify({ type: 'thread.started', thread_id: 'fixture' }));
+    console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Rowan here: the retry covers NYSE TICK.' } }));
+    console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 5, output_tokens: 5 } }));
+  }, wait);
+});`); fs.chmodSync(codex, 0o755);
+  const oldBin = config.engines.codex.bin, oldMin = config.mentions.maxMinutes;
+  config.engines.codex.bin = codex;
+  team.applyTeamOverrides({ 'principal-be': { engine: 'codex', model: '' } });
+  try {
+    const t = ticket();
+    const r = tag(t, ['principal-be'], 'Does it cover NYSE TICK?');
+    await sched.launchMention(store.getMention(r.mentions[0].id));
+    const m = store.getMention(r.mentions[0].id);
+    assert.equal(m.status, 'replied', m.reason);
+    assert.ok(store.listComments(t.key).some((c) => c.author === 'system' && /⏱ Rowan has 10 minutes \(at most 60 steps\) for this reply\./.test(c.body)));
+    // Overrun: the desk's own timer kills the run (no dollar cap exists to do it).
+    config.mentions.maxMinutes = 0.02; fs.writeFileSync(path.join(tmp, 'codex-wait'), '8000');
+    const r2 = tag(ticket(), ['principal-be'], 'Take your time');
+    const started = Date.now();
+    await sched.launchMention(store.getMention(r2.mentions[0].id));
+    const m2 = store.getMention(r2.mentions[0].id);
+    assert.ok(Date.now() - started < 7000, 'stopped well before the engine finished');
+    const killed = store.recentRuns(1)[0];
+    assert.deepEqual([killed.kind, killed.status, store.getRun(killed.id).result_text], ['mention', 'killed', 'timeout']);
+    assert.equal(m2.status, 'queued', 'an interrupted tag is retried (bounded by maxAttempts)');
+    // Steps: the run is stopped once it exceeds mentions.maxSteps tool calls.
+    const live = store.createRun({ agent_id: 'principal-be', ticket_key: t.key, kind: 'mention', token: 'step-tok', model: 'codex:' });
+    const ctx = { run: live, state: {}, presence: false };
+    runner.applyEvents(Array.from({ length: 60 }, (_, i) => ({ type: 'tool', text: `Reading f${i}` })), ctx);
+    assert.equal(store.getRun(live.id).status, 'running');
+    runner.applyEvents([{ type: 'tool', text: 'one more' }], ctx);
+    assert.deepEqual([store.getRun(live.id).status, store.getRun(live.id).result_text], ['killed', 'step limit (60)']);
+  } finally { config.engines.codex.bin = oldBin; config.mentions.maxMinutes = oldMin; fs.rmSync(path.join(tmp, 'codex-wait'), { force: true }); team.applyTeamOverrides({}); }
 });
