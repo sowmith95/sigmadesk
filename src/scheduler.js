@@ -1089,7 +1089,9 @@ export function recoverOrphans() {
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
   for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });
   for (const run of store.unfinishedRuns()) {
-    if (run.pid) runner.killGroup(run.pid); // guarded: never pgid <= 1 or the desk's own; SIGKILL only while that group lives
+    // A pid from a previous desk lifetime is signalled only if it is provably the same process (pid + start time);
+    // otherwise it may be reused by something else, so it is left alone and the run is just marked interrupted.
+    if (run.pid) runner.killRecordedGroup(run).catch(() => {});
     // No terminal report survived the restart: charge the cap so interrupted spend is never forgotten.
     store.updateRun(run.id, { status: 'killed', ended_at: store.now(), result_text: 'desk restarted', token: null,
       cost_usd: run.cost_usd || runner.reservationFor(run), cost_estimated: run.cost_usd ? 0 : 1 });

@@ -476,7 +476,8 @@ function migrate() {
       // research programs: the program a run belongs to and its server-owned job metadata (allowances, connectors)
       program: 'TEXT', job: 'TEXT',
       // tool calls and commands counted for a step-bounded run (tagged runs), persisted as they happen
-      steps: 'INTEGER DEFAULT 0' },
+      steps: 'INTEGER DEFAULT 0',
+      pid_start: 'TEXT' }, // the engine process's start time: a restart only signals a pid that is provably the same process
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));

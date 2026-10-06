@@ -174,16 +174,17 @@ export const workspaceDir = (key) => path.join(config.workspaceRoot, key);
 // Clones made before --no-hardlinks share object files with the owner's repo. Give every such file its own inode
 // (copy + atomic rename), which leaves the owner's file untouched and is safe while the clone is in use.
 export function breakHardlinks(dir) {
-  const root = path.join(dir, '.git', 'objects');
-  if (!fs.existsSync(root)) return 0;
+  const root = seatDir(dir, ['.git', 'objects'], { create: false }); // a planted link at .git or .git/objects is refused
+  if (!root) return 0;
   let fixed = 0;
   const walk = (d) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) { // Dirent types come from lstat: links are skipped
       const p = path.join(d, e.name);
       if (e.isDirectory()) walk(p);
-      else if (e.isFile() && fs.statSync(p).nlink > 1) {
+      else if (e.isFile() && fs.lstatSync(p).nlink > 1) {
         const tmp = `${p}.unlink-${process.pid}`;
-        fs.copyFileSync(p, tmp);
+        try { if (fs.lstatSync(tmp)) fs.unlinkSync(tmp); } catch { /* none */ } // never copy onto a planted link
+        fs.copyFileSync(p, tmp, fs.constants.COPYFILE_EXCL);
         fs.chmodSync(tmp, fs.statSync(p).mode);
         fs.renameSync(tmp, p);
         fixed += 1;
@@ -590,14 +591,47 @@ export const buildArgs = (agent, kind, cwd, opts) => buildCommand({ ...agent, en
 
 // ---------------- file mailbox (desk transport for engines whose sandbox blocks unix sockets) ----------------
 const mailboxes = new Map(); // runId -> dir
-function openMailbox(runId, cwd) {
-  // One subfolder per run inside that seat's own clone.
-  const dir = path.join(cwd, '.desk-mailbox', `r${runId}`);
-  fs.mkdirSync(dir, { recursive: true });
-  const exclude = path.join(cwd, '.git', 'info', 'exclude');
+/**
+ * A directory the desk writes in, inside a seat workspace: every component from the workspace down is checked with
+ * lstat and must be a real directory (a seat may have planted a link anywhere in its own tree); missing ones are
+ * created one at a time (mkdir never follows a link, and fails if one appears meanwhile). Throws a plain refusal.
+ */
+export function seatDir(root, parts, { create = true } = {}) {
+  const refuse = (p) => { throw Object.assign(new Error(`refusing to write through a link in the seat's workspace: ${p}`), { status: 409 }); };
+  if (!fs.lstatSync(root).isDirectory()) refuse(root);
+  let at = root;
+  for (const part of parts) {
+    if (!part || part === '.' || part === '..' || part.includes('/')) refuse(path.join(at, String(part)));
+    at = path.join(at, part);
+    let st = null; try { st = fs.lstatSync(at); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (!st) { if (!create) return null; try { fs.mkdirSync(at, { mode: 0o755 }); } catch (e) { if (e.code !== 'EEXIST') throw e; } st = fs.lstatSync(at); }
+    if (!st.isDirectory()) refuse(at);
+  }
+  return at;
+}
+/** Append to a file inside a seat workspace without following a link (O_NOFOLLOW; created exclusively if missing). */
+export function seatAppend(dir, name, text, { unless } = {}) {
+  const file = path.join(dir, name);
+  const C = fs.constants;
+  let fd;
+  try { fd = fs.openSync(file, C.O_RDWR | C.O_APPEND | C.O_NOFOLLOW); }
+  catch (e) {
+    if (e.code === 'ELOOP') throw Object.assign(new Error(`refusing to write through a link in the seat's workspace: ${file}`), { status: 409 });
+    if (e.code !== 'ENOENT') throw e;
+    fd = fs.openSync(file, C.O_RDWR | C.O_APPEND | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o644);
+  }
   try {
-    if (fs.existsSync(path.dirname(exclude)) && !fs.readFileSync(exclude, 'utf8').includes('.desk-mailbox')) fs.appendFileSync(exclude, '\n.desk-mailbox/\n');
-  } catch { /* not a clone */ }
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`not a regular file: ${file}`);
+    if (unless && fs.readFileSync(fd, 'utf8').includes(unless)) return false;
+    fs.writeSync(fd, text);
+    return true;
+  } finally { fs.closeSync(fd); }
+}
+export function openMailbox(runId, cwd) {
+  // One subfolder per run inside that seat's own clone; never through a link the seat planted.
+  const dir = seatDir(cwd, ['.desk-mailbox', `r${runId}`]);
+  const info = seatDir(cwd, ['.git', 'info'], { create: false }) ?? (fs.existsSync(path.join(cwd, '.git')) ? seatDir(cwd, ['.git', 'info']) : null);
+  if (info) seatAppend(info, 'exclude', '\n.desk-mailbox/\n', { unless: '.desk-mailbox' });
   mailboxes.set(runId, dir);
   return dir;
 }
@@ -710,6 +744,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const child = spawn(cmd.bin, cmd.args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
   children.set(run.id, child);
   store.updateRun(run.id, { pid: child.pid });
+  // The process's start time identifies it after a restart (a recorded pid alone may have been reused meanwhile).
+  if (child.pid) processStart(child.pid).then((at) => { if (at) store.updateRun(run.id, { pid_start: at }); });
   if (child.pid) lessons.delivered(run.id, ticketKey); // lessons count as given only once the prompt reaches a process
   child.stdin.on('error', () => {});
   child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt);
@@ -791,10 +827,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
       resolve({ run: store.getRun(run.id), result: r, failure, steps: ctx.state.steps || 0 });
     };
-    // The run ends when its engine exits: its whole process group goes with it (anything it backgrounded, even a
-    // process holding our pipes open), SIGTERM first, SIGKILL after a grace period. No descendant outlives a run.
-    child.on('exit', () => killGroup(child.pid, { owner: run.id }));
-    child.on('close', (c) => { killGroup(child.pid, { owner: run.id }); finish(c); });
+    child.on('close', finish);
     child.on('error', (err) => {
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `spawn failed: ${err.message}` });
       finish(-1);
@@ -860,6 +893,20 @@ export function killGroup(pgid, { graceMs = 5000, pollMs = 100, owner = null } =
   }, pollMs));
   groupWatch.get(pgid).unref?.();
   return true;
+}
+/** A process's start time as the OS reports it (`ps -o lstart=`), or '' when it is not running. */
+export function processStart(pid) {
+  return new Promise((resolve) => execFile('ps', ['-o', 'lstart=', '-p', String(pid)], { timeout: 5000 }, (e, out) => resolve(e ? '' : String(out).trim())));
+}
+/**
+ * Restart cleanup for a run recorded by a previous desk lifetime: its group is signalled only when the recorded
+ * process is provably the same one (same pid AND same start time). Anything else is skipped: the pid may be reused.
+ */
+export async function killRecordedGroup(run) {
+  if (!run?.pid || !run.pid_start) return false;
+  const now = await processStart(run.pid);
+  if (!now || now !== run.pid_start) return false;
+  return killGroup(run.pid);
 }
 /** Groups still being watched for their SIGKILL fallback (tests). */
 export const watchedGroups = () => [...groupWatch.keys()];

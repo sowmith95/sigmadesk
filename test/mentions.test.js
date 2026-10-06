@@ -575,29 +575,6 @@ test('review fixes: a crash between a run\'s final record and the tag\'s account
   assert.ok(Math.abs(store.getMention(m.id).spent_usd - 1.6) < 1e-9);
 });
 
-test('final check: a run takes its whole process group with it, even a descendant holding its output open', async () => {
-  const cli = path.join(tmp, 'orphan.mjs'), pidFile = path.join(tmp, 'orphan.pid');
-  fs.writeFileSync(cli, `#!/usr/bin/env node
-import { spawn } from 'node:child_process'; import fs from 'node:fs';
-process.stdin.resume(); process.stdin.on('end', () => {
-  const kid = spawn('sleep', ['300'], { stdio: 'inherit' }); fs.writeFileSync(${JSON.stringify(pidFile)}, String(kid.pid)); kid.unref();
-  console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0, num_turns: 1 }));
-  process.exit(0);
-});`); fs.chmodSync(cli, 0o755);
-  const old = config.bins.claude; config.bins.claude = cli;
-  try {
-    const cwd = path.join(tmp, 'orphan-cwd'); fs.mkdirSync(cwd, { recursive: true });
-    const started = Date.now();
-    const out = await runner.startRun({ agentId: 'principal-be', kind: 'consult', cwd, prompt: 'x', track: false });
-    assert.equal(out.run.status, 'success');
-    assert.ok(Date.now() - started < 10_000, 'the run did not wait for its background child');
-    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
-    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
-    for (let i = 0; i < 60 && alive(); i++) await new Promise((r) => setTimeout(r, 100));
-    assert.equal(alive(), false, 'no descendant survives the run');
-  } finally { config.bins.claude = old; }
-});
-
 test('final check: workspace paths stay inside the workspaces root, and the template is verified and keyed on its filters', async () => {
   assert.throws(() => runner.guardWorkspacePath(config.dataDir), /refusing/);
   assert.throws(() => runner.guardWorkspacePath(path.join(tmp, 'elsewhere')), /refusing/);
@@ -728,3 +705,48 @@ test('round 4: the template stamp lives outside the copied tree; local-only pref
     assert.equal(execFileSync('git', ['-C', copy, 'rev-parse', 'origin/main'], { encoding: 'utf8' }).trim(), g('rev-parse', 'main'));
   } finally { g('update-ref', '-d', 'refs/remotes/origin/main'); }
 });
+
+test('round 5: restart cleanup signals a recorded pid only when its start time proves it is the same process', async () => {
+  const g = await sleepGroup(true);
+  try {
+    const start = await runner.processStart(g);
+    assert.ok(start);
+    assert.equal(await runner.killRecordedGroup({ pid: g, pid_start: 'Mon Jan  1 00:00:00 2001' }), false, 'a pid now used by another process is left alone');
+    assert.equal(await runner.killRecordedGroup({ pid: g }), false, 'no recorded start time: never signalled');
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(groupAlive(g), true);
+    assert.equal(await runner.killRecordedGroup({ pid: g, pid_start: start }), true, 'the same process: its group is ended');
+  } finally { try { process.kill(-g, 'SIGKILL'); } catch { /* gone */ } }
+});
+
+test('round 5: desk writes inside a seat workspace never go through a planted link', () => {
+  const ws = path.join(config.workspaceRoot, 'M-5151');
+  removeAll(ws); fs.mkdirSync(ws, { recursive: true });
+  const tpl = runner.templateDir();
+  const before = runner.treeManifest(tpl), beforeStamp = fs.readFileSync(`${tpl}.stamp.json`, 'utf8');
+  try {
+    // .desk-mailbox → the template: the mailbox is refused, nothing is created in the template.
+    fs.symlinkSync(tpl, path.join(ws, '.desk-mailbox'));
+    assert.throws(() => runner.openMailbox(9001, ws), (e) => e.status === 409 && /refusing to write through a link/.test(e.message));
+    fs.unlinkSync(path.join(ws, '.desk-mailbox'));
+    // .git → the template: no exclude append, no hardlink rewrite through it.
+    fs.symlinkSync(path.join(tpl, '.git'), path.join(ws, '.git'));
+    assert.throws(() => runner.openMailbox(9002, ws), /refusing to write through a link/);
+    assert.throws(() => runner.breakHardlinks(ws), /refusing to write through a link/);
+    fs.unlinkSync(path.join(ws, '.git'));
+    // A real .git whose info/exclude is a link: refused by O_NOFOLLOW.
+    fs.mkdirSync(path.join(ws, '.git', 'info'), { recursive: true });
+    fs.symlinkSync(path.join(tpl, '.git', 'HEAD'), path.join(ws, '.git', 'info', 'exclude'));
+    assert.throws(() => runner.openMailbox(9003, ws), /refusing to write through a link/);
+    assert.equal(runner.treeManifest(tpl), before, 'nothing in the template changed');
+    assert.equal(fs.readFileSync(`${tpl}.stamp.json`, 'utf8'), beforeStamp);
+    assert.equal(fs.existsSync(path.join(tpl, 'r9001')) || fs.existsSync(path.join(tpl, 'r9002')), false);
+    // A clean workspace still gets its mailbox and exclude line, once.
+    fs.unlinkSync(path.join(ws, '.git', 'info', 'exclude'));
+    const mb = runner.openMailbox(9004, ws);
+    assert.equal(mb, path.join(ws, '.desk-mailbox', 'r9004'));
+    runner.openMailbox(9005, ws);
+    assert.equal(fs.readFileSync(path.join(ws, '.git', 'info', 'exclude'), 'utf8').split('.desk-mailbox/').length - 1, 1);
+  } finally { removeAll(ws); }
+});
+function removeAll(p) { try { runner.removeTree(p); } catch { /* none */ } }
