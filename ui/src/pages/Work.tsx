@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input';
 import { ChoiceChips } from '@/components/desk/Choices';
 import { Tag, Key, SeatAvatar, Section } from '@/components/desk/Bits';
 import { KIND_LABEL, NowLine, cardFor, firstName, reasonText, Disclose } from '@/components/desk/Work';
+import { WritingMark } from '@/components/desk/Presence';
 import { Lineage, EpicTree, EpicProgress, childrenOf, isFeatureRoot, openEpic, leafStats } from '@/components/desk/Epic';
 import { cn } from '@/lib/utils';
 import type { Board, BoardItem, Ticket } from '@/types';
@@ -33,7 +34,7 @@ function WorkRow({ it }: { it: BoardItem }) {
         <b className="[overflow-wrap:anywhere]">{it.name}</b>
         {line && <p className="text-sm text-muted-foreground">{line.length > 170 ? `${line.slice(0, 169).replace(/\s+\S*$/, '')}…` : line}</p>}
         {card && <NowLine card={card} compact />}
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">{t.assignee && <><SeatAvatar id={it.worker || t.assignee} />{firstName(it.worker || t.assignee)}</>}<span className="flex-1" />{it.bucket === 'shipped' && ago(t.updated_at)}</div>
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">{t.assignee && <><SeatAvatar id={it.worker || t.assignee} />{firstName(it.worker || t.assignee)}</>}<WritingMark tkey={t.key} /><span className="flex-1" />{it.bucket === 'shipped' && ago(t.updated_at)}</div>
       </button>
       {kids.length > 0 && <div className="grid gap-2 px-3 pb-3"><EpicProgress epic={t.key} /><Disclose id={`epic-${t.key}`} summary={`${kids.length} task${kids.length === 1 ? '' : 's'}`}><EpicTree root={t.key} /></Disclose></div>}
     </article>

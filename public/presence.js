@@ -33,6 +33,7 @@ const plainAge = (ms) => (ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))}s 
  * input: { key, agents, runs, events, waiting (meta.scheduler.waiting), drafts (S.drafts), now }
  * output: { writers: [{ seat, name, state, label, ageMs, runId, text }], next: [{ seat, name, text, held }], draft: { id } | null }
  * writers are ordered writing → quiet → stalled, then by most recent activity.
+ * @param {{ key?: string, agents?: any[], runs?: any[], events?: any[], waiting?: any[], drafts?: Record<string, string>, now?: number }} [o]
  */
 export function presenceFor({ key, agents = [], runs = [], events = [], waiting = [], drafts = {}, now = Date.now() } = {}) {
   if (!key) return { writers: [], next: [], draft: null };
@@ -91,6 +92,7 @@ export function presenceFor({ key, agents = [], runs = [], events = [], waiting 
 }
 
 /** "Rowan is writing…", "Rowan and Morgan are writing…", "Rowan, Morgan and Quinn are…", "Rowan, Morgan and 2 others are…". */
+/** @param {string[]} names */
 export function writingSentence(names) {
   const n = names.length;
   if (!n) return '';
