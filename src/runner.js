@@ -424,11 +424,20 @@ export function buildCommand(agent, kind, cwd, { resume = null, fork = false, ex
     seat: agent, kind, cwd, resume, fork, extraDirs, mcpServers,
     perms: permissionsFor(kind, cwd, jobPermissions(kind, job)), denyRules: DENY_RULES, charter, settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
   });
-  // Conflict resolutions get their own hard spend cap (merge train, #3).
-  const capAt = kind === 'resolve' ? cmd.args.indexOf('--max-budget-usd') : -1;
-  if (capAt >= 0) cmd.args[capAt + 1] = String(Math.min(Number(cmd.args[capAt + 1]) || Infinity, Number(config.resolve?.budgetUsd) || 1.5));
+  // Conflict resolutions (merge train, #3) and tagged runs (@mentions) get their own, lower hard spend cap.
+  const cap = kindCap(kind);
+  const capAt = cap ? cmd.args.indexOf('--max-budget-usd') : -1;
+  if (capAt >= 0) cmd.args[capAt + 1] = String(Math.min(Number(cmd.args[capAt + 1]) || Infinity, cap));
   return cmd;
 }
+
+/** A per-kind hard spend cap below the seat's own (null = the seat's cap applies). */
+export function kindCap(kind) {
+  if (kind === 'resolve') return Number(config.resolve?.budgetUsd) || 1.5;
+  if (kind === 'mention') return Number(config.mentions?.budgetUsd) || 2;
+  return null;
+}
+const capped = (kind, usd) => (kindCap(kind) ? Math.min(usd, kindCap(kind)) : usd);
 
 // Provenance: which charter/playbook/engine/model produced this run, so scorecards can be split by version.
 const engineVersions = {};
@@ -469,7 +478,7 @@ export const runCwd = (runId) => store.getRun(runId)?.cwd;
 // The reservation follows the engine the job will actually use (a capability fallback can cost more than the seat's own).
 export const runBudget = (agentId, kind = null) => {
   const seat = selectionFor(agentId, Date.now(), null, kind).seat || agentById[agentId] || {};
-  return engineOf(seat).budgetUsd(seat);
+  return capped(kind, engineOf(seat).budgetUsd(seat));
 };
 export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: String(run?.model || '').split(':')[0] }).budgetUsd({ model: String(run?.model || '').split(':').slice(1).join(':') });
 
@@ -491,8 +500,10 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job });
   // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
   if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
-  store.updateRun(run.id, { reserve_usd: engineOf(agent).budgetUsd(agent) });
-  access.bindRun(agentId, ticketKey, run.id); // dormant ticket-scoped production access becomes this run's
+  store.updateRun(run.id, { reserve_usd: capped(kind, engineOf(agent).budgetUsd(agent)) });
+  // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
+  // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
+  if (kind !== 'mention') access.bindRun(agentId, ticketKey, run.id);
   onStart?.(run);
   const ctx = { run, cwd, result: null, state: {}, presence: track };
   if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
@@ -623,7 +634,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (failure) holdProvider(engine.id, failure, r?.result || stderr || ctx.state.lastError);
       // No terminal result (killed, crashed, timed out): charge the full per-run cap so the risk limit stays honest.
       const knownCost = r?.cost_known !== false && r && (r.total_cost_usd || !r.is_error);
-      const cost = knownCost ? (r.total_cost_usd ?? 0) : engine.budgetUsd(agent);
+      const cost = knownCost ? (r.total_cost_usd ?? 0) : capped(kind, engine.budgetUsd(agent));
       store.updateRun(run.id, {
         status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
         result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
@@ -830,8 +841,8 @@ export async function remoteHead(branch) {
   const { stdout } = await git(['ls-remote', url, `refs/heads/${branch}`], { timeout: 60_000 });
   return stdout.split('\t')[0].trim() || null;
 }
-/** Does this seat's engine enforce a hard per-run spend cap for a resolve run? (Claude CLI: --max-budget-usd.) */
-export function capsSpend(seat) {
+/** Does this seat's engine enforce a hard per-run spend cap for this kind of run? (Claude CLI: --max-budget-usd.) */
+export function capsSpend(seat, kind = 'resolve') {
   if (!seat) return false;
-  try { return buildCommand(seat, 'resolve', path.join(config.workspaceRoot, '_cap-probe')).args.includes('--max-budget-usd'); } catch { return false; }
+  try { return buildCommand(seat, kind, path.join(config.workspaceRoot, '_cap-probe')).args.includes('--max-budget-usd'); } catch { return false; }
 }

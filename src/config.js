@@ -48,7 +48,7 @@ const DEFAULTS = {
     busyWindow: { enabled: false, timezone: 'America/New_York', days: [1, 2, 3, 4, 5], start: '09:30', end: '16:15', maxConcurrent: 1 },
     dailyBudgetUsd: 150,
     runBudgetUsd: { fable: 8, opus: 5, sonnet: 3, haiku: 0.75 },
-    runTimeoutMin: { implement: 45, qa: 20, review: 20, pr_review: 25, respond: 45, resolve: 30, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, verify: 15, access_review: 5, design: 20, council_review: 5, feature_groom: 25, epic_review: 20 },
+    runTimeoutMin: { implement: 45, qa: 20, review: 20, pr_review: 25, respond: 45, resolve: 30, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, verify: 15, access_review: 5, design: 20, council_review: 5, feature_groom: 25, epic_review: 20, mention: 15 },
     maxQaLoops: 2,
     planHoldAt: 0.8, // hold new runs when the Claude plan's 5-hour window is this full (leave room for you)
     maxConsultsPerGroom: 1,
@@ -97,6 +97,14 @@ const DEFAULTS = {
     enabled: true,
     updateWhenBehind: true,
     unknownGraceMinutes: 5, // a merge call that errored: only rolled back once GitHub shows it OPEN this long after // the queue front is brought up to date with the base (lazy rebase) before merging
+  },
+  // Owner @mentions in a ticket conversation: each tagged seat gets one capped, read-only run that answers in the
+  // thread and routes real work into the normal jobs (implement, design, verify, a new task). Gates never move.
+  mentions: {
+    enabled: true,
+    budgetUsd: 2, // hard spend cap per tagged run (Claude CLI --max-budget-usd); engines without a hard cap are refused
+    maxPerTicketPerHour: 6, // tagged deliveries per ticket per hour (stops loops and runaway cost)
+    maxAttempts: 3, // an interrupted tagged run is retried this many times, then fails visibly with a Retry
   },
   resolve: {
     budgetUsd: 1.5, // per conflict-resolution run (Claude CLI hard cap)
@@ -169,7 +177,7 @@ const DEFAULTS = {
   ops: {
     enabled: false,
     // Run kinds in which a seat holding a grant may probe. WHO may probe is decided by grants (access.*), not here.
-    kinds: ['investigate', 'consult', 'verify', 'design'],
+    kinds: ['investigate', 'consult', 'verify', 'design', 'mention'],
     // Host psql binary (a path, or [path, ...fixed args]). Empty = `psql` on PATH. Wrappers that reach into containers
     // (docker/podman/kubectl exec, ssh, a shell) are refused: credentials stay in the owner's pgpass/service file.
     psql: '',
@@ -206,6 +214,9 @@ const DEFAULTS = {
       maxMinutes: 240, // longest timed grant an agent approver may give (ticket-scoped grants end with the ticket)
       maxActive: 3, // active agent-approved grants at once
       ticketMaxHours: 24, // hard cap on a ticket- or run-scoped grant
+      // The owner tagged a seat in a ticket conversation: a read-only probe request from that tagged run is granted for
+      // that run only (at most 60 min), within this policy. Approver seats and renewals still go to the owner.
+      ownerMentionAutoGrant: true,
     },
   },
   // Per-agent overrides keyed by agent id, e.g. {"junior": {"model": "haiku"}, "pm": {"enabled": false}}

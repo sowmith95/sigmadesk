@@ -39,6 +39,7 @@ export function validatePolicy(p) {
     maxMinutes: int(p.maxMinutes, 5, 1440, 'maxMinutes'),
     maxActive: int(p.maxActive, 0, 20, 'maxActive'),
     ticketMaxHours: int(p.ticketMaxHours ?? 24, 1, 72, 'ticketMaxHours'),
+    ownerMentionAutoGrant: (() => { const v = p.ownerMentionAutoGrant ?? true; if (typeof v !== 'boolean') throw err('ownerMentionAutoGrant must be true or false'); return v; })(),
   };
 }
 export function setPolicy(p) {
@@ -153,6 +154,43 @@ export function violations({ seat, probes, minutes, ticketScoped }, approver = n
 export function approverFor(seat, pol = policy()) {
   return pol.approvers.find((id) => id !== seat && agentById[id] && agentById[id].enabled !== false) || null;
 }
+// ---------------- owner @mentions ----------------
+/** Longest grant the owner-mention rule gives (and never longer than the policy's timed maximum). */
+export const OWNER_MENTION_MAX_MINUTES = 60;
+/**
+ * The owner tagged this seat in a ticket conversation, and the tagged run asks for read-only probes: the request is
+ * granted for THAT run only (run-bound, at most 60 min), within the owner's policy. The origin is the delivery the server
+ * recorded for the owner's message (never text, never inherited by work the run creates). Returns null when the request
+ * does not come from an owner-tagged run, { why } when the rule does not apply, or { minutes } when it does.
+ */
+export function ownerMentionDecision({ seat, probes, minutes, ticketScoped, runId }, pol = policy()) {
+  const run = runId ? store.getRun(runId) : null;
+  if (!run || run.kind !== 'mention' || !run.token || run.agent_id !== seat) return null;
+  const job = json(run.job || 'null', null);
+  const m = job?.mention ? store.getMention(job.mention) : null;
+  if (!m || m.origin !== 'owner' || m.seat_id !== seat || m.run_id !== run.id) return null;
+  if (pol.ownerMentionAutoGrant === false) return { why: ['automatic access for tagged seats is off in the access policy'] };
+  if (ticketScoped) return { why: ['a tagged run gets access for itself only, not for the whole ticket'] };
+  const mins = Math.min(minutes || OWNER_MENTION_MAX_MINUTES, OWNER_MENTION_MAX_MINUTES);
+  const v = violations({ seat, probes, minutes: mins, ticketScoped: false }, null, pol);
+  return v.length ? { why: v } : { minutes: mins, mention: m };
+}
+function ownerMentionGrant({ seat, probes, why, minutes, run, mention }) {
+  const r = store.insertAccessRequest({ seat, probes, why: String(why).slice(0, 500), minutes, ticket_scoped: false, ticket_key: run.ticket_key || null,
+    run_id: run.id, filed_by: seat, status: 'approved', approver: null, owner_reason: null });
+  const g = store.insertGrant({ seat, probes, expires_at: new Date(Date.now() + minutes * 60_000).toISOString(), ticket_key: null, run_id: run.id,
+    standing: false, granted_by: 'owner_mention', request_id: r.id, reason: `tagged by the owner (message #${mention.comment_id})` });
+  store.updateAccessRequest(r.id, { status: 'approved', decided_by: 'owner_mention', decided_at: nowIso(), note: 'granted because the owner tagged this seat', grant_id: g.id });
+  const what = describeProbes(probes);
+  const text = `You tagged ${nameOf(seat)}, so the desk gave ${nameOf(seat)} read-only production access for this reply only (${what}, at most ${minutes} min): ${r.why}`;
+  store.logEvent({ kind: 'action', agent_id: 'system', ticket_key: run.ticket_key, run_id: run.id, text });
+  if (run.ticket_key && store.getTicket(run.ticket_key)) store.addComment(run.ticket_key, 'system', `🔑 ${esc(text)}
+
+It ends when ${nameOf(seat)}'s run ends. Writes, restarts and deploys stay impossible.`);
+  notify('access', run.ticket_key ? store.getTicket(run.ticket_key) : null, text);
+  return { request: store.getAccessRequest(r.id), grant: g, message: `Granted for this run (#${g.id}) because the owner tagged you: ${what}, at most ${minutes} min. Probes work now; access ends when this run ends.` };
+}
+
 /** A seat (or the desk, for a verify task) asks for access. Returns the request and a message for the seat. */
 export function request({ seat, probes, why, minutes = null, ticketScoped = false, ticketKey = null, runId = null, filedBy = seat }) {
   if (!agentById[seat]) throw err(`unknown seat ${seat}`);
@@ -162,12 +200,16 @@ export function request({ seat, probes, why, minutes = null, ticketScoped = fals
   const dup = store.openAccessRequests().find((r) => r.seat === seat && (r.ticket_key || null) === (ticketKey || null) && (!runId || r.run_id === runId || !r.run_id));
   if (dup) return { request: dup, message: `Request #${dup.id} is already ${dup.status === 'owner' ? "with the owner" : `with ${nameOf(dup.approver)}`}.` };
   const pol = policy();
+  const tagged = ownerMentionDecision({ seat, probes, minutes, ticketScoped, runId }, pol);
+  if (tagged?.minutes) return ownerMentionGrant({ seat, probes, why, minutes: tagged.minutes, run: store.getRun(runId), mention: tagged.mention });
   const approver = approverFor(seat, pol);
   const v = violations({ seat, probes, minutes, ticketScoped }, null, pol);
-  const toOwner = v.length > 0 || !approver;
+  // A tagged seat whose request the owner-mention rule could not grant: the owner decides, and is told why.
+  const toOwner = v.length > 0 || !approver || !!tagged;
+  const reason = tagged ? `you tagged ${nameOf(seat)}, but access is not automatic here: ${tagged.why.join('; ')}` : v.length ? v.join('; ') : 'no EM/SRE approver is available';
   const r = store.insertAccessRequest({ seat, probes, why: String(why).slice(0, 500), minutes: ticketScoped ? null : minutes, ticket_scoped: ticketScoped, ticket_key: ticketKey,
     run_id: ticketScoped && !ticketKey ? runId : runId, filed_by: filedBy, status: toOwner ? 'owner' : 'pending', approver: toOwner ? null : approver,
-    owner_reason: toOwner ? (v.length ? v.join('; ') : 'no EM/SRE approver is available') : null });
+    owner_reason: toOwner ? reason : null });
   const what = `${describeProbes(probes)} ${forText(minutes, ticketScoped, ticketKey)}`;
   const text = `${nameOf(seat)} asked for production read access (${what}): ${r.why}`;
   store.logEvent({ kind: 'action', agent_id: filedBy === 'desk' ? 'system' : seat, ticket_key: ticketKey, text: `${text} → ${toOwner ? 'the owner decides' : `${nameOf(approver)} reviews`}` });

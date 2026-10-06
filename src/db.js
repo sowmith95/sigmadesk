@@ -146,6 +146,33 @@ CREATE TABLE IF NOT EXISTS owner_discussions (
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   ended_at TEXT
 );
+-- @mentions in a ticket conversation: who is on the ticket, and one delivery per (owner message, tagged seat).
+CREATE TABLE IF NOT EXISTS ticket_participants (
+  ticket_key TEXT NOT NULL,
+  seat_id TEXT NOT NULL,
+  added_by TEXT NOT NULL DEFAULT 'owner',
+  added_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (ticket_key, seat_id)
+);
+CREATE TABLE IF NOT EXISTS mention_deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT NOT NULL,
+  comment_id INTEGER NOT NULL,
+  seat_id TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'owner',
+  status TEXT NOT NULL DEFAULT 'queued',
+  reason TEXT,
+  run_id INTEGER,
+  reply_comment_id INTEGER,
+  routed TEXT,
+  attempts INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  started_at TEXT,
+  ended_at TEXT,
+  UNIQUE (comment_id, seat_id)
+);
+CREATE INDEX IF NOT EXISTS mention_deliveries_ticket ON mention_deliveries(ticket_key, id);
+CREATE INDEX IF NOT EXISTS mention_deliveries_status ON mention_deliveries(status);
 CREATE TABLE IF NOT EXISTS councils (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ticket_key TEXT NOT NULL,
@@ -509,6 +536,8 @@ export function assignmentFacts(since) {
   };
 }
 const q = (sql) => db.prepare(sql);
+/** The open database (tests use it to simulate a failing write). */
+export const handle = () => db;
 export function transaction(fn) {
   if (transactionMessages) return fn(); // nested: part of the enclosing transaction (commits or rolls back with it)
   db.exec('BEGIN IMMEDIATE');
@@ -1093,6 +1122,40 @@ export function listReservations() {
 /** A closed ticket (done/wontdo) can hold nothing. */
 export function clearReservation(key) { kvSet(`reserve:${key}`, 'null'); }
 export const branchUpdateOf = reservationOf; // back-compat name used by older call sites/tests
+
+// ---------- @mentions: participants and per-seat deliveries ----------
+export const participantsOf = (key) => q('SELECT * FROM ticket_participants WHERE ticket_key=? ORDER BY added_at, seat_id').all(key);
+/** Adds the seats that are not on the ticket yet; returns how many were new. */
+export function addParticipants(key, seats, by = 'owner') {
+  let n = 0;
+  for (const seat of seats) n += Number(q('INSERT OR IGNORE INTO ticket_participants(ticket_key,seat_id,added_by) VALUES(?,?,?)').run(key, seat, by).changes);
+  if (n) announce({ type: 'participants', data: { ticket_key: key, participants: participantsOf(key) } });
+  return n;
+}
+export function removeParticipant(key, seat) {
+  const n = Number(q('DELETE FROM ticket_participants WHERE ticket_key=? AND seat_id=?').run(key, seat).changes);
+  if (n) announce({ type: 'participants', data: { ticket_key: key, participants: participantsOf(key) } });
+  return n;
+}
+export const getMention = (id) => q('SELECT * FROM mention_deliveries WHERE id=?').get(id) || null;
+export const mentionsFor = (key) => q('SELECT * FROM mention_deliveries WHERE ticket_key=? ORDER BY id').all(key);
+export const mentionsOfComment = (commentId) => q('SELECT * FROM mention_deliveries WHERE comment_id=? ORDER BY id').all(commentId);
+export const openMentions = () => q("SELECT * FROM mention_deliveries WHERE status IN ('queued','working') ORDER BY id").all();
+export const mentionsSince = (key, iso) => q('SELECT COUNT(*) n FROM mention_deliveries WHERE ticket_key=? AND created_at>=?').get(key, iso).n;
+/** One delivery per (comment, seat): a repeat is ignored and the existing row returned. */
+export function createMention(m) {
+  q('INSERT OR IGNORE INTO mention_deliveries(ticket_key,comment_id,seat_id,origin,status,reason) VALUES(?,?,?,?,?,?)')
+    .run(m.ticket_key, m.comment_id, m.seat_id, m.origin || 'owner', m.status || 'queued', m.reason ?? null);
+  const row = q('SELECT * FROM mention_deliveries WHERE comment_id=? AND seat_id=?').get(m.comment_id, m.seat_id);
+  announce({ type: 'mention', data: row });
+  return row;
+}
+const MENTION_FIELDS = ['status', 'reason', 'run_id', 'reply_comment_id', 'routed', 'attempts', 'started_at', 'ended_at'];
+export function updateMention(id, patch) {
+  const cols = Object.keys(patch).filter((k) => MENTION_FIELDS.includes(k));
+  if (cols.length) q(`UPDATE mention_deliveries SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
+  const m = getMention(id); announce({ type: 'mention', data: m }); return m;
+}
 
 // ---------- small durable key/value store (watch cursors etc.) ----------
 export function createDiscussion(ticketKey, question) {
