@@ -1,4 +1,4 @@
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -150,14 +150,17 @@ export function guardWorkspacePath(p) {
   fs.mkdirSync(config.workspaceRoot, { recursive: true });
   const root = real(config.workspaceRoot);
   const parent = real(path.dirname(p));
-  let target = path.join(parent, path.basename(p));
-  try { if (fs.lstatSync(target).isSymbolicLink()) target = real(target); } catch { /* not there yet */ }
+  const target = path.join(parent, path.basename(p));
+  // The desk only ever creates real directories here: a link in a workspace's place was planted (a seat may delete
+  // and recreate its own workspace entry), so it is refused, never resolved.
+  try { if (!fs.lstatSync(target).isDirectory()) throw new Error(`refusing workspace path that is not a real directory: ${p}`); } catch (e) { if (e.code !== 'ENOENT') throw e; }
   const inside = (a, b) => a === b || a.startsWith(`${b}${path.sep}`);
   if (parent !== root || !inside(target, root) || target === root) throw new Error(`refusing workspace path outside ${root}: ${p}`);
   for (const bad of [config.dataDir, templateDir()].map(real)) if (inside(target, bad) || inside(bad, target)) throw new Error(`refusing workspace path that touches desk data: ${p}`);
   return target;
 }
 export const templateDir = () => path.join(config.dataDir, 'scratch-template');
+const templateStamp = () => `${templateDir()}.stamp.json`; // outside the copied tree: a copy never carries or touches it
 
 /** Remove a tree without ever following a link in it (a seat may have planted one anywhere inside). */
 export function removeTree(p) {
@@ -194,7 +197,7 @@ export function breakHardlinks(dir) {
 // A clone (not a worktree): its own .git inside the sandbox-writable dir, and none of the main checkout's hooks.
 export function ensureWorkspace(ticket) {
   return withGitLock(async () => {
-    const dir = workspaceDir(ticket.key);
+    const dir = guardWorkspacePath(workspaceDir(ticket.key)); // a seat may have replaced its workspace entry with a link
     const branch = ticket.branch || `${config.project.branchPrefix}${ticket.key.toLowerCase()}-${slugify(ticket.title)}`;
     const base = config.project.baseBranch;
     if (!fs.existsSync(path.join(dir, '.git'))) {
@@ -243,8 +246,7 @@ export function ensureReadonlyWorkspace(seatId = 'scratch') {
     // APFS: a copy-on-write clone (new inodes; a seat's write never reaches the template). Elsewhere a reflink or copy.
     await pexec('cp', os.platform() === 'darwin' ? ['-cR', tpl, dir] : ['-R', '--reflink=auto', tpl, dir], { timeout: 600_000 })
       .catch(() => pexec('cp', ['-R', tpl, dir], { timeout: 600_000 }));
-    fs.rmSync(path.join(dir, '.git', 'desk-template'), { force: true });
-    return guardWorkspacePath(dir);
+    return guardWorkspacePath(dir); // the template's stamp lives outside it, so nothing is written after the copy
   });
 }
 
@@ -270,7 +272,11 @@ export async function scratchTemplate({ force = false } = {}) {
       ? await git([...(await ownerRemoteFlags()), '-C', pub, 'fetch', '-q', '--no-tags', url.trim(), `+refs/heads/${base}:${ref}`], { timeout: 120_000 }).then(() => true, () => false)
       : false;
     if (!fromRemote) {
-      const sha = await git(['-C', config.project.repoPath, 'rev-parse', `refs/remotes/origin/${base}`]).catch(() => git(['-C', config.project.repoPath, 'rev-parse', base])).then((r) => r.stdout.trim(), () => '');
+      // Local-only: the owner's own base branch is the truth; a retained origin/<base> ref may be stale. With a remote
+      // that could not be reached, the last known origin/<base> is used first, as the publisher does.
+      const order = url.trim() ? [`refs/remotes/origin/${base}`, `refs/heads/${base}`] : [`refs/heads/${base}`, `refs/remotes/origin/${base}`];
+      let sha = '';
+      for (const refName of order) { sha = await git(['-C', config.project.repoPath, 'rev-parse', '-q', '--verify', `${refName}^{commit}`]).then((r) => r.stdout.trim(), () => ''); if (sha) break; }
       if (sha) await git(['-c', 'protocol.file.allow=always', '-C', pub, 'fetch', '-q', '--no-tags', config.project.repoPath, `+${sha}:${ref}`]).catch(() => {});
     }
     templateFetchedAt = Date.now();
@@ -293,9 +299,11 @@ export async function scratchTemplate({ force = false } = {}) {
   }
   await git(['-c', 'protocol.file.allow=always', '-C', tmp, 'fetch', '-q', '--no-tags', pub, `+${ref}:refs/remotes/origin/${base}`]);
   await git(['-C', tmp, 'checkout', '-q', '--detach', `refs/remotes/origin/${base}`]);
-  fs.writeFileSync(path.join(tmp, '.git', 'desk-template'), JSON.stringify({ sha, filterHash, manifest: treeManifest(tmp) }));
+  const manifest = treeManifest(tmp);
+  fs.rmSync(templateStamp(), { force: true });
   removeTree(tpl);
   fs.renameSync(tmp, tpl);
+  fs.writeFileSync(templateStamp(), JSON.stringify({ sha, filterHash, manifest }));
   return tpl;
 }
 /** Every entry of a tree (never following links): path, type, mode, size, mtime, plus .git's config/HEAD/hooks. */
@@ -304,7 +312,7 @@ export function treeManifest(dir) {
   const walk = (d, rel) => {
     for (const name of fs.readdirSync(d).sort()) {
       const p = path.join(d, name), r = rel ? `${rel}/${name}` : name;
-      if (r === '.git/desk-template' || r === '.git/index' || (r.startsWith('.git/') && /^\.git\/(objects|logs|refs|FETCH_HEAD|ORIG_HEAD)/.test(r))) continue;
+      if (r === '.git/index' || (r.startsWith('.git/') && /^\.git\/(objects|logs|refs|FETCH_HEAD|ORIG_HEAD)/.test(r))) continue;
       const st = fs.lstatSync(p);
       h.update(`${r}\0${st.isSymbolicLink() ? 'l' : st.isDirectory() ? 'd' : 'f'}\0${st.mode}\0${st.size}\0${Math.floor(st.mtimeMs)}\n`);
       if (st.isSymbolicLink()) h.update(fs.readlinkSync(p));
@@ -320,7 +328,7 @@ export function templateIntact(tpl, sha, filterHash) {
   try {
     const g = path.join(tpl, '.git');
     if (fs.lstatSync(tpl).isSymbolicLink() || fs.lstatSync(g).isSymbolicLink()) return false;
-    const stamp = JSON.parse(fs.readFileSync(path.join(g, 'desk-template'), 'utf8'));
+    const stamp = JSON.parse(fs.readFileSync(templateStamp(), 'utf8'));
     return stamp.sha === sha && stamp.filterHash === filterHash && stamp.manifest === treeManifest(tpl);
   } catch { return false; }
 }
@@ -785,8 +793,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     };
     // The run ends when its engine exits: its whole process group goes with it (anything it backgrounded, even a
     // process holding our pipes open), SIGTERM first, SIGKILL after a grace period. No descendant outlives a run.
-    child.on('exit', () => killGroup(child.pid));
-    child.on('close', (c) => { killGroup(child.pid); finish(c); });
+    child.on('exit', () => killGroup(child.pid, { owner: run.id }));
+    child.on('close', (c) => { killGroup(child.pid, { owner: run.id }); finish(c); });
     child.on('error', (err) => {
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `spawn failed: ${err.message}` });
       finish(-1);
@@ -821,12 +829,42 @@ async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, in
 
 const preparing = new Map(); // runId -> AbortController while a Perplexity pack is being built
 
-/** End a run's process group: SIGTERM now, SIGKILL after the grace period (a no-op once the group is gone). */
-export function killGroup(pid, graceMs = 5000) {
-  if (!pid) return;
-  try { process.kill(-pid, 'SIGTERM'); } catch { return; } // group already gone
-  setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } }, graceMs).unref();
+// ---------------- process groups ----------------
+// Every seat run is its own process group (detached spawn: pgid = the engine's pid). Ending a run ends its group. A
+// pgid can only be reused once EVERY member of the group is gone, so the group is watched until it is empty and is
+// never signalled again after that moment: the SIGKILL fallback is skipped (and its timer cleared) as soon as the
+// group is seen empty, re-checked live right before the signal, and never sent to a pgid that now belongs to another
+// live run, to pgid <= 1, or to the desk's own process group.
+const groupWatch = new Map(); // pgid -> interval
+let deskPgid = null;
+function ownPgid() {
+  if (deskPgid === null) { try { deskPgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).trim()) || 0; } catch { deskPgid = 0; } }
+  return deskPgid;
 }
+const groupAlive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+const signallable = (pgid) => Number.isInteger(pgid) && pgid > 1 && pgid !== process.pid && pgid !== ownPgid();
+/** Is this pgid the group of a live run other than `owner` (a reused pgid that now belongs to a replacement seat)? */
+const otherRunsGroup = (pgid, owner) => [...children.entries()].some(([id, c]) => c.pid === pgid && id !== owner);
+/** End a run's process group: SIGTERM now, SIGKILL after the grace period only if that same group still has members. */
+export function killGroup(pgid, { graceMs = 5000, pollMs = 100, owner = null } = {}) {
+  if (!signallable(pgid) || otherRunsGroup(pgid, owner) || !groupAlive(pgid)) return false;
+  try { process.kill(-pgid, 'SIGTERM'); } catch { return false; }
+  if (groupWatch.has(pgid)) return true;
+  const deadline = Date.now() + graceMs;
+  const stop = () => { clearInterval(groupWatch.get(pgid)); groupWatch.delete(pgid); };
+  groupWatch.set(pgid, setInterval(() => {
+    if (!groupAlive(pgid) || otherRunsGroup(pgid, owner)) return stop(); // gone (the pgid may be reused from now on)
+    if (Date.now() < deadline) return;
+    stop();
+    if (signallable(pgid) && !otherRunsGroup(pgid, owner) && groupAlive(pgid)) { try { process.kill(-pgid, 'SIGKILL'); } catch { /* gone */ } }
+  }, pollMs));
+  groupWatch.get(pgid).unref?.();
+  return true;
+}
+/** Groups still being watched for their SIGKILL fallback (tests). */
+export const watchedGroups = () => [...groupWatch.keys()];
+/** Test hook: register a stand-in "other live run" owning a pgid (the reuse replay). */
+export function _claimGroup(runId, pid) { if (pid) children.set(runId, { pid }); else children.delete(runId); }
 export function killRun(runId, reason = 'killed') {
   const run = store.getRun(runId);
   if (!run || run.status !== 'running') return false;
@@ -834,11 +872,9 @@ export function killRun(runId, reason = 'killed') {
   store.updateRun(runId, { status: 'killed', result_text: reason, token: null });
   ops.cancelRun(runId);
   preparing.get(runId)?.abort();
-  const pid = children.get(runId)?.pid ?? run.pid;
-  if (pid) {
-    try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
-    setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } }, 5000).unref();
-  }
+  // Only a group the desk spawned in this lifetime is signalled here (a pid read back from the database may be reused).
+  const pid = children.get(runId)?.pid;
+  if (pid) killGroup(pid, { owner: runId });
   return true;
 }
 
@@ -853,7 +889,7 @@ export async function shutdownAll(reason) {
   killAll(reason);
   const deadline = Date.now() + 6000;
   while (children.size && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
-  for (const c of children.values()) { try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ } }
+  for (const c of children.values()) if (signallable(c.pid) && groupAlive(c.pid)) { try { process.kill(-c.pid, 'SIGKILL'); } catch { /* gone */ } }
 }
 
 export const runningCount = () => children.size;

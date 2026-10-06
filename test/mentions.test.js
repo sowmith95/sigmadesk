@@ -644,3 +644,87 @@ test('final check: a restart rebuilds the tag\'s used steps from its runs, so 59
   assert.equal(after.steps_used, 59);
   assert.equal(mentions.remaining(after, { kind: 'time', minutes: 10, steps: 60 }).limits.steps, 1);
 });
+
+const sleepGroup = async (ignoreTerm) => {
+  const { spawn } = await import('node:child_process');
+  const c = spawn('/bin/sh', ['-c', `${ignoreTerm ? "trap '' TERM; " : ''}sleep 30 & wait`], { detached: true, stdio: 'ignore' });
+  c.unref(); await new Promise((r) => setTimeout(r, 150));
+  return c.pid;
+};
+const groupAlive = (g) => { try { process.kill(-g, 0); return true; } catch { return false; } };
+
+test('round 4: the SIGKILL fallback never reaches a reused pgid, an emptied group, pgid 1 or the desk\'s own group', async () => {
+  assert.equal(runner.killGroup(1), false); assert.equal(runner.killGroup(process.pid), false); assert.equal(runner.killGroup(0), false);
+  // A group that ends on SIGTERM: its watch is cleared at once (no timer left to fire into a reused pgid).
+  const quick = await sleepGroup(false);
+  assert.equal(runner.killGroup(quick, { graceMs: 2000, pollMs: 20 }), true);
+  for (let i = 0; i < 50 && runner.watchedGroups().includes(quick); i++) await new Promise((r) => setTimeout(r, 20));
+  assert.equal(runner.watchedGroups().includes(quick), false); assert.equal(groupAlive(quick), false);
+  // Reuse replay: during the grace period the pgid comes to belong to a replacement seat's live run. No SIGKILL.
+  const g = await sleepGroup(true);
+  runner.killGroup(g, { graceMs: 300, pollMs: 20, owner: 'old-run' });
+  runner._claimGroup('replacement-run', g);
+  try {
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(groupAlive(g), true, 'the replacement seat\'s group was not signalled');
+    assert.equal(runner.watchedGroups().includes(g), false, 'the watch ended when the pgid changed hands');
+  } finally { runner._claimGroup('replacement-run', null); try { process.kill(-g, 'SIGKILL'); } catch { /* gone */ } }
+  // Without a new owner, a group that ignores SIGTERM is SIGKILLed after the grace period.
+  const stubborn = await sleepGroup(true);
+  runner.killGroup(stubborn, { graceMs: 200, pollMs: 20 });
+  for (let i = 0; i < 50 && groupAlive(stubborn); i++) await new Promise((r) => setTimeout(r, 20));
+  assert.equal(groupAlive(stubborn), false);
+});
+
+const sandboxed = process.platform === 'darwin' && fs.existsSync('/usr/bin/sandbox-exec') && fs.existsSync('/usr/bin/perl');
+test('round 4: a detached (setsid) seat process stays inside its workspace; a replaced workspace entry is refused with no writes', { skip: !sandboxed && 'needs macOS sandbox-exec' }, async () => {
+  // The engines' sandboxes grant writes as a subpath of the seat's directory (Claude: allowWrite [cwd]; Codex:
+  // workspace_roots "." = write). The same rule shape, applied by Seatbelt, to a process that setsid()s and outlives
+  // its parent: it keeps the sandbox, cannot write the workspaces root or the data dir, and cannot rename its
+  // directory. It CAN delete its own directory entry and plant a link there, which the desk then refuses.
+  const dir = await runner.ensureReadonlyWorkspace('qa');
+  const root = fs.realpathSync(config.workspaceRoot), data = fs.realpathSync(config.dataDir);
+  const stampBefore = fs.statSync(`${runner.templateDir()}.stamp.json`).mtimeMs, manifestBefore = runner.treeManifest(runner.templateDir());
+  const profile = path.join(tmp, 'seat.sb');
+  fs.writeFileSync(profile, `(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (subpath "${fs.realpathSync(dir)}") (subpath "/dev"))\n`);
+  const report = path.join(tmp, 'detached-report');
+  fs.rmSync(report, { force: true });
+  const script = `use POSIX; my $pid = fork(); if ($pid) { exit 0 } POSIX::setsid(); sleep 1;
+    my @r; push @r, (open(my $a, '>', '${root}/planted') ? 'ROOT' : 'root-denied'); push @r, (open(my $b, '>', '${data}/planted') ? 'DATA' : 'data-denied');
+    push @r, (rename('${dir}', '${root}/moved') ? 'RENAMED' : 'rename-denied');
+    system('/bin/rm', '-rf', '${dir}'); push @r, (symlink('${data}', '${dir}') ? 'relinked' : 'relink-denied');
+    open(my $o, '>', '/dev/stdout'); print $o join(',', @r);`;
+  const { spawn } = await import('node:child_process');
+  const out = fs.openSync(report, 'w');
+  await new Promise((resolve) => spawn('/usr/bin/sandbox-exec', ['-f', profile, '/usr/bin/perl', '-e', script], { stdio: ['ignore', out, 'ignore'] }).on('exit', resolve));
+  for (let i = 0; i < 60 && !fs.readFileSync(report, 'utf8'); i++) await new Promise((r) => setTimeout(r, 100));
+  fs.closeSync(out);
+  assert.equal(fs.readFileSync(report, 'utf8'), 'root-denied,data-denied,rename-denied,relinked', 'the detached process outlived its parent and stayed sandboxed');
+  assert.equal(fs.existsSync(path.join(root, 'planted')) || fs.existsSync(path.join(data, 'planted')) || fs.existsSync(path.join(root, 'moved')), false);
+  try {
+    assert.equal(fs.lstatSync(dir).isSymbolicLink(), true);
+    // Every desk path that deletes or hands out a workspace refuses the planted link, before writing anything.
+    await assert.rejects(runner.ensureReadonlyWorkspace('qa'), /refusing/);
+    assert.throws(() => runner.guardWorkspacePath(dir), /not a real directory/);
+    assert.equal(fs.statSync(`${runner.templateDir()}.stamp.json`).mtimeMs, stampBefore);
+    assert.equal(runner.treeManifest(runner.templateDir()), manifestBefore, 'the template is untouched');
+  } finally { fs.unlinkSync(dir); }
+  // ensureWorkspace (a builder's clone) refuses a planted link in the same way.
+  const key = 'M-4242';
+  fs.symlinkSync(data, path.join(config.workspaceRoot, key));
+  try { await assert.rejects(runner.ensureWorkspace({ key, title: 'x' }), /not a real directory/); }
+  finally { fs.unlinkSync(path.join(config.workspaceRoot, key)); }
+});
+
+test('round 4: the template stamp lives outside the copied tree; local-only prefers the owner\'s base over a stale origin ref', async () => {
+  const dir = await runner.ensureReadonlyWorkspace('principal-fe');
+  assert.equal(fs.existsSync(path.join(dir, '.git', 'desk-template')), false, 'no stamp in a seat copy');
+  assert.ok(fs.existsSync(`${runner.templateDir()}.stamp.json`));
+  const g = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8' }).trim();
+  const old = g('rev-parse', 'main~1');
+  g('update-ref', 'refs/remotes/origin/main', old); // a retained, stale origin/main in a checkout with no remote
+  try {
+    const copy = await runner.ensureReadonlyWorkspace('principal-fe');
+    assert.equal(execFileSync('git', ['-C', copy, 'rev-parse', 'origin/main'], { encoding: 'utf8' }).trim(), g('rev-parse', 'main'));
+  } finally { g('update-ref', '-d', 'refs/remotes/origin/main'); }
+});

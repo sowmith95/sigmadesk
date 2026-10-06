@@ -1089,10 +1089,7 @@ export function recoverOrphans() {
   for (const d of store.pendingDiscussions()) if (d.status === 'running') store.updateDiscussion(d.id, { status: 'queued', run_id: null });
   for (const inc of store.listIncidents({ status: 'investigating' })) store.updateIncident(inc.id, { status: 'watching', note: 'investigation interrupted by restart' });
   for (const run of store.unfinishedRuns()) {
-    if (run.pid) {
-      try { process.kill(-run.pid, 'SIGTERM'); } catch { /* gone */ }
-      setTimeout(() => { try { process.kill(-run.pid, 'SIGKILL'); } catch { /* gone */ } }, 5000).unref();
-    }
+    if (run.pid) runner.killGroup(run.pid); // guarded: never pgid <= 1 or the desk's own; SIGKILL only while that group lives
     // No terminal report survived the restart: charge the cap so interrupted spend is never forgotten.
     store.updateRun(run.id, { status: 'killed', ended_at: store.now(), result_text: 'desk restarted', token: null,
       cost_usd: run.cost_usd || runner.reservationFor(run), cost_estimated: run.cost_usd ? 0 : 1 });
