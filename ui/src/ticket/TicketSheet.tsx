@@ -17,14 +17,16 @@ import { Lineage, EpicTree, EpicProgress, childrenOf, isFeatureRoot } from '@/co
 import { NextStep, GateSuggestions, EpicReview, OwnerTaskActions } from '@/components/desk/Flow';
 import { Tracker } from '@/components/desk/Tracker';
 import { PresenceStrip } from '@/components/desk/Presence';
+import { useMentionPicker, SeatPicker, TagLine, Participants } from './Mentions';
+import { taggedSeats } from '../../../public/mentions.js';
 import type { Board, BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 
 /** Decision actions. Decisions carry the ticket version on screen (expected_updated_at), so a stale screen cannot act;
  *  a draft is cleared only after the server accepts it; a 409 refreshes and keeps the draft. */
-function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping }:
-  { t: Ticket; dec: BoardItem | null; d: Detail | null; compose: boolean; setCompose: (v: boolean) => void; onDecided: () => void; replyRef: React.RefObject<HTMLTextAreaElement | null>; onTyping: (v: boolean) => void }) {
+function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping, tagging }:
+  { t: Ticket; dec: BoardItem | null; d: Detail | null; compose: boolean; setCompose: (v: boolean) => void; onDecided: () => void; replyRef: React.RefObject<HTMLTextAreaElement | null>; onTyping: (v: boolean) => void; tagging: React.MutableRefObject<boolean> }) {
   const [mode, setMode] = useState<'changes' | null>(null);
   const [busy, setBusy] = useState(false);
   const dk = draftKey(t.key, dec?.id);
@@ -34,8 +36,14 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping 
   const proposal = dec?.kind === 'design' ? (d?.discussions || []).find((x: Detail) => x.id === dec.proposal_id) : null;
   const council = dec?.kind === 'council' ? councilFor(dec.council_id) : null;
   const who = firstName(t.assignee);
-  const edit = (v: string) => { setText(v); setDraft(dk, v); };
-  const done = () => { setDraft(dk, ''); setText(''); setMode(null); setCompose(false); onDecided(); };
+  // One request id per message being sent: a retried POST (timeout, double tap) returns what the first one made.
+  const requestId = useRef<string | null>(null);
+  const edit = (v: string) => { setText(v); setDraft(dk, v); requestId.current = null; };
+  const tags = useMentionPicker({ text, setText: edit, area: replyRef });
+  // "Tag someone" from the closed footer: open the composer with the picker already showing.
+  useEffect(() => { if (compose && tagging.current) { tagging.current = false; requestAnimationFrame(() => tags.start()); } }, [compose]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The reply may unmount while focused (no blur event): the phone header gets its full height back here.
+  const done = () => { setDraft(dk, ''); setText(''); setMode(null); setCompose(false); onTyping(false); onDecided(); };
   const refresh = async () => { await loadSnapshot().catch(() => {}); await loadDetail(); };
   const guard = async <T,>(fn: () => Promise<T>): Promise<T> => { try { return await fn(); } catch (e) { if ((e as { status?: number }).status === 409) await refresh(); throw e; } };
   const decide = (value: 'approve' | 'correction' | 'reject') => async () => {
@@ -54,18 +62,40 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping 
   const send = (m: 'answer' | 'comment' | 'discussion') => async () => {
     const body = text.trim();
     if (!body) { replyRef.current?.focus(); throw new Error(m === 'answer' ? 'Type your answer first.' : 'Type a message first.'); }
-    return guard(async () => { const r = await api('POST', `/api/tickets/${t.key}/reply`, { body, mode: m, expected_updated_at: m === 'answer' ? t.updated_at : undefined }); done(); await loadDetail(); return r; });
+    return guard(async () => { const r = await api('POST', `/api/tickets/${t.key}/reply`, { body, mode: m, mentions: [], expected_updated_at: m === 'answer' ? t.updated_at : undefined }); done(); await loadDetail(); return r; });
   };
+  // A message that tags seats: the tags shown are exactly the ones sent; a closed ticket is reopened first, if you say so.
+  const tagged = compose ? taggedSeats(text, S.agents) : [];
+  const sendTagged = async () => {
+    const body = text.trim();
+    const reopen = async () => {
+      if (!window.confirm(`${nameOf(t)} is closed. Reopen it and send your message?`)) return false;
+      await api('PATCH', `/api/tickets/${t.key}`, { status: 'todo' }); await loadSnapshot().catch(() => {}); return true;
+    };
+    if (['done', 'wontdo'].includes(t.status) && !(await reopen())) return false;
+    requestId.current ||= (crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`).replace(/[^A-Za-z0-9_-]/g, '');
+    const post = () => api('POST', `/api/tickets/${t.key}/reply`, { body, mode: 'auto', mentions: tagged, request_id: requestId.current });
+    let r;
+    try { r = await post(); } catch (e) {
+      if ((e as { code?: string }).code !== 'ticket_closed' || !(await reopen())) throw e;
+      r = await post();
+    }
+    done(); await loadDetail(); return r;
+  };
+  const names = (ids: string[]) => { const n = ids.map((id) => String(S.agents.find((a) => a.id === id)?.name || id).split(/\s+/)[0]); return n.length < 3 ? n.join(' and ') : `${n.slice(0, -1).join(', ')} and ${n.at(-1)}`; };
   const menuRun = (fn: () => Promise<unknown>, ok: string) => async () => { if (busy) return; setBusy(true); try { const r = await fn(); if (r !== false) toast(ok); } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); } };
   // The reply grows with what you type (up to 40% of the screen), so the whole answer stays readable while writing.
   // Phones keep it shorter (22% of the screen) so the message being answered stays readable above it.
   const grow = (el: HTMLTextAreaElement | null) => { if (!el) return; el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight + 2, window.innerHeight * (window.innerWidth < 768 ? 0.22 : 0.4))}px`; };
   useLayoutEffect(() => { grow(replyRef.current); }, [text, mode, compose]); // eslint-disable-line react-hooks/exhaustive-deps
-  const box = (placeholder: string, label: string) => <Textarea id="reply" ref={replyRef} rows={2} aria-label={label} placeholder={placeholder} maxLength={8000} value={text}
-    className="max-h-[40dvh] min-h-[3.25rem] resize-none overflow-y-auto leading-relaxed max-md:max-h-[22dvh]" onChange={(e) => edit(e.target.value)}
+  const box = (placeholder: string, label: string, mention = false) => <Textarea id="reply" ref={replyRef} rows={2} aria-label={label} placeholder={placeholder} maxLength={8000} value={text}
+    className="max-h-[40dvh] min-h-[3.25rem] resize-none overflow-y-auto leading-relaxed max-md:max-h-[22dvh]"
+    onChange={(e) => { edit(e.target.value); if (mention) tags.sync(e.target.value, e.target.selectionStart); }}
+    {...(mention ? { ...tags.aria, onKeyDown: tags.keyDown, onClick: (e: React.MouseEvent<HTMLTextAreaElement>) => tags.sync(e.currentTarget.value, e.currentTarget.selectionStart),
+      onKeyUp: (e: React.KeyboardEvent<HTMLTextAreaElement>) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) tags.sync(e.currentTarget.value, e.currentTarget.selectionStart); } } : {})}
     // Typing on a phone: the header shrinks to one line and the thread scrolls so the newest message starts at the top.
     onFocus={() => { if (window.innerWidth >= 768) return; onTyping(true); setTimeout(() => document.querySelector('[data-panel] [role="log"]')?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 250); }}
-    onBlur={() => onTyping(false)} />;
+    onBlur={() => { onTyping(false); if (mention) setTimeout(() => tags.close(), 150); }} />;
   const More = ({ items }: { items: { label: string; run: () => Promise<unknown>; ok: string; danger?: boolean; disabled?: boolean }[] }) => (
     <DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" aria-label="More actions"><MoreHorizontal className="size-4" />More</Button></DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="min-w-60">{items.map((i) => <DropdownMenuItem key={i.label} disabled={i.disabled || busy} variant={i.danger ? 'destructive' : 'default'} onSelect={menuRun(i.run, i.ok)} className="min-h-10">{i.label}</DropdownMenuItem>)}</DropdownMenuContent></DropdownMenu>
@@ -76,13 +106,19 @@ function Footer({ t, dec, d, compose, setCompose, onDecided, replyRef, onTyping 
   // The answer footer is the common one on a phone: its primary shares one row with More.
   const tight = 'flex flex-wrap items-center gap-2 max-md:[&>[data-primary]]:order-first max-md:[&>[data-primary]]:flex-1 max-md:[&>span.flex-1]:hidden';
   const composeUi = <>
-    {box('Message the manager about this ticket…', 'Message')}
+    <SeatPicker {...tags.picker} />
+    <TagLine text={text} onTag={tags.start} />
+    {box('Message the team… type @ to tag someone', 'Message', true)}
     <div className={row}>
       <Button variant="ghost" onClick={() => setCompose(false)}>{dec ? 'Back to the decision' : 'Cancel'}</Button>
-      <AsyncButton variant="secondary" run={send('comment')} ok="Comment saved to the thread">Comment only</AsyncButton>
+      {!tagged.length && <AsyncButton variant="secondary" run={send('comment')} ok="Comment saved to the thread">Comment only</AsyncButton>}
       <span className="flex-1" />
-      <AsyncButton data-primary size="lg" run={send('discussion')} ok="Sent to the manager; the ticket keeps its place">Ask the manager</AsyncButton>
-    </div><p className="text-sm text-muted-foreground">Asking the manager starts a design discussion. It does not answer or approve anything.</p></>;
+      {/* Keep the reply focused through the press: on a phone its blur re-lays out the panel under the finger. */}
+      {tagged.length ? <AsyncButton data-primary size="lg" onMouseDown={(e) => e.preventDefault()} run={sendTagged} ok={`Sent to ${names(tagged)}; they answer here`}>Send to {names(tagged)}</AsyncButton>
+        : <AsyncButton data-primary size="lg" run={send('discussion')} ok="Sent to the manager; the ticket keeps its place">Ask the manager</AsyncButton>}
+    </div><p className="text-sm text-muted-foreground">{tagged.length
+      ? `${names(tagged)} ${tagged.length === 1 ? 'answers' : 'each answer'} here. Real work still goes through QA, two reviews and the merge; a question waiting for you stays open.`
+      : 'Asking the manager starts a design discussion. It does not answer or approve anything.'}</p></>;
   const talk = { label: 'Comment or ask the manager…', run: async () => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); return false; }, ok: '' };
   if (compose) return composeUi;
   if (dec?.kind === 'product') return <div className={row}><More items={[talk]} /><p className="text-sm text-muted-foreground">Resolve the objections in the Reviews tab.</p></div>;
@@ -140,6 +176,7 @@ export function TicketSheet() {
   const [reviewMsg, setReviewMsg] = useState('');
   const conv = useRef<ConvState>({ agent: '', follow: true, top: 0 });
   const replyRef = useRef<HTMLTextAreaElement>(null);
+  const tagging = useRef(false); // "Tag someone" asked the composer to open with the picker showing
   const B = currentBoard() as Board;
   const decisions = t ? (B.decisions || B.needs_you).filter((x) => x.key === t.key) : [];
   const dec = decisionId ? decisions.find((x) => x.id === decisionId) || null : decisions[0] || null;
@@ -166,9 +203,10 @@ export function TicketSheet() {
       {kids.length > 0 && <Tag>Epic</Tag>}
       {nameOf(t) !== t.title && <span className="truncate text-sm text-muted-foreground">{t.title}</span>}
     </div>
+    <Participants tkey={t.key} list={d?.participants || []} />
     </div>
   );
-  const footer = <Footer t={t} dec={dec} d={d} compose={compose} setCompose={setCompose} onDecided={() => setDecisionId(null)} replyRef={replyRef} onTyping={setTyping} />;
+  const footer = <Footer t={t} dec={dec} d={d} compose={compose} setCompose={setCompose} onDecided={() => setDecisionId(null)} replyRef={replyRef} onTyping={setTyping} tagging={tagging} />;
   const shownTab = dec || tab !== 'decision' ? tab : 'conversation';
   const focusReply = () => requestAnimationFrame(() => replyRef.current?.focus());
   // Presence (who is writing) sits right above the reply area, in the Conversation only. Drafts for decisions that no
@@ -179,7 +217,8 @@ export function TicketSheet() {
     onDraft={(id) => { if (id === 'msg') setCompose(true); else { setCompose(false); setDecisionId(id); setTab('decision'); } focusReply(); }} /> : null;
   return (
     <Panel wide label={nameOf(t)} title={nameOf(t)} head={head} compact={typing} onClose={closeSheet}
-      footer={<>{presence}{(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); focusReply(); }}>Comment or ask the manager</Button></div>}</>}>
+      footer={<>{presence}{(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); focusReply(); }}>Comment or ask the manager</Button>
+        <Button variant="ghost" onClick={() => { tagging.current = true; setCompose(true); setTab('conversation'); }}>@ Tag someone</Button></div>}</>}>
       {tracked && <Tracker t={t} B={B} mergeState={d?.merge_state} choices={decisions} selected={dec?.id} labelOf={(x) => label(x) || "Decision"}
         onChoose={(id) => { setDecisionId(id); setTab('decision'); }} onDecision={(id, key) => { if (key === t.key) { setDecisionId(id); setTab('decision'); } else openTicket(key, { decision: id }); }} />}
       {!tracked && decisions.length > 1 && <div role="group" aria-label="Decisions on this ticket" className="flex flex-wrap gap-2">

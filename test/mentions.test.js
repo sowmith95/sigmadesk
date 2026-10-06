@@ -334,3 +334,29 @@ test('a tag on a ticket that closes before the seat starts is cancelled, not run
     assert.deepEqual([store.getMention(r.mentions[0].id).status, store.getMention(r.mentions[0].id).reason], ['cancelled', 'the ticket closed before they started']);
   } finally { store.setSetting('paused', 'true'); }
 });
+
+test('composer rules: the @ query, picking, tags shown = tags sent, delivery wording, live deltas', async () => {
+  const m = await import('../public/mentions.js');
+  const sync = await import('../ui/src/lib/sync.js');
+  const agents = [{ id: 'principal-be', name: 'Rowan', role: 'Principal Backend Engineer', enabled: true }, { id: 'sre', name: 'Devon', role: 'Site Reliability Engineer', enabled: true, status: 'working', current_ticket: 'M-1' },
+    { id: 'dba', name: 'Casey', role: 'Database Engineer', enabled: false }];
+  assert.deepEqual(m.mentionQuery('hi @ro', 6), { start: 3, query: 'ro' });
+  assert.equal(m.mentionQuery('mail a@ro', 9), null, 'an e-mail address is not a tag');
+  assert.equal(m.mentionQuery('@ro x', 5), null);
+  assert.deepEqual(m.matchSeats(agents, 'data').map((a) => a.id), ['dba']);
+  assert.deepEqual(m.matchSeats(agents, '').map((a) => a.id), ['principal-be', 'sre', 'dba'], 'switched-off seats last');
+  assert.deepEqual(m.insertMention('hi @ro', m.mentionQuery('hi @ro', 6), 'Rowan'), { text: 'hi @Rowan ', caret: 10 });
+  assert.deepEqual(m.taggedSeats('@Rowan and @devon, not @nobody or me@casey.x', agents), ['principal-be', 'sre']);
+  assert.deepEqual(m.seatState(agents[1], (k) => `ticket ${k}`), { key: 'busy', text: 'busy on ticket M-1' });
+  assert.equal(m.seatState(agents[2]).text, 'switched off');
+  assert.equal(m.deliveryView({ status: 'queued' }, { busy: true }).detail, 'up next, after their current work');
+  assert.deepEqual([m.deliveryView({ status: 'failed', reason: 'no answer' }).retry, m.deliveryView({ status: 'replied', routed: 'task:M-9' }).detail], [true, 'filed M-9']);
+  const S = { tickets: [], agents: [], events: [], runs: [], detail: { key: 'M-1', data: { mentions: [] }, pending: sync.emptyPending() } };
+  sync.applyDelta(S, { type: 'mention', data: { id: 1, ticket_key: 'M-1', status: 'queued' } });
+  sync.applyDelta(S, { type: 'mention', data: { id: 1, ticket_key: 'M-1', status: 'working' } });
+  sync.applyDelta(S, { type: 'participants', data: { ticket_key: 'M-1', participants: [{ seat_id: 'sre' }] } });
+  assert.deepEqual([S.detail.data.mentions.map((x) => x.status), S.detail.data.participants], [['working'], [{ seat_id: 'sre' }]]);
+  const conv = await import('../public/conversation.js');
+  const items = conv.conversationItems({ comments: [{ id: 5, author: 'owner', body: '@Rowan hi', ts: '2026-10-05T10:00:00Z' }], mentions: [{ id: 1, comment_id: 5, seat_id: 'principal-be', status: 'queued' }] });
+  assert.equal(items[0].deliveries[0].seat_id, 'principal-be');
+});
