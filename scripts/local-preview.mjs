@@ -119,3 +119,29 @@ if (process.env.SIGMADESK_REVIEW_DEMO === '1') {
     verdict:m.agent_id==='product-design'?'concern':'support',recommendation:m.agent_id==='product-design'?'Keep the message draft visible when new updates arrive.':'Build a small preview and measure task completion.',
     users:['Owner reviewing work on a phone'],benefits:['Less searching for the current status'],drawbacks:['More controls on a small screen'],alternatives:['Keep the existing expanded log'],evidence:['Demo acceptance criteria and fixture state'],conditions:m.agent_id==='product-design'?['Verify draft preservation at 390px']:[],architecture:'Reuse the task sheet and event stream.',rollout:'Preview, limited rollout, then general use; revert on draft loss.',success_metric:'Reviewers can find the latest update and retain their reply draft.'}});
 }
+
+// Presence demo (SIGMADESK_PRESENCE_DEMO=1): fixture runs so the ticket's "who is writing" strip has real rows to read.
+// The two runs on the composer ticket post a fresh step every 15 s while the preview lives (so they stay "writing");
+// a third seat's run started 8 minutes ago and never posted (stalled). Nothing executes; no model is called.
+if (process.env.SIGMADESK_PRESENCE_DEMO === '1') {
+  const byTitle = (s) => store.listTickets().find((t) => t.title.startsWith(s));
+  const composer = byTitle('Improve the mobile navigation'), sre = byTitle('Add a clear SRE source-health summary');
+  store.updateTicket(composer.key, { status: 'qa', progress_msg: 'waiting for QA' });
+  const live = (agent_id, ticket_key, kind) => {
+    const run = store.createRun({ agent_id, ticket_key, kind, token: `demo-${agent_id}`, model: 'demo:fixture' });
+    store.updateAgent(agent_id, { status: 'working', current_ticket: ticket_key, current_run: run.id, current_kind: kind });
+    return run;
+  };
+  const quinn = live('senior-fe', composer.key, 'respond'), sage = live('principal-fe', composer.key, 'review');
+  const stuck = live('junior', sre.key, 'implement');
+  store.updateRun(stuck.id, { started_at: new Date(Date.now() - 8 * 60_000).toISOString() });
+  store.logEvent({ run_id: quinn.id, agent_id: 'senior-fe', ticket_key: composer.key, kind: 'plan', text: '✓ Read the review notes\n▸ Keep the draft through live updates\n· Re-run the phone checks' });
+  const steps = [
+    ['senior-fe', quinn, 'tool', 'Reading ui/src/ticket/TicketSheet.tsx'], ['principal-fe', sage, 'tool', 'Reading ui/src/components/desk/Panel.tsx'],
+    ['senior-fe', quinn, 'tool', 'Editing ui/src/ticket/parts.tsx'], ['principal-fe', sage, 'action', 'Drafting the review'],
+    ['senior-fe', quinn, 'tool', '$ npm test'], ['principal-fe', sage, 'tool', 'Searching for “onTyping” in ui/src'],
+  ];
+  let i = 0;
+  const step = () => { for (const k of [0, 1]) { const [agent_id, run, kind, text] = steps[(i + k) % steps.length]; store.logEvent({ run_id: run.id, agent_id, ticket_key: composer.key, kind, text }); } i += 2; };
+  step(); setInterval(step, 15_000).unref();
+}

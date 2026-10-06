@@ -6,7 +6,7 @@
 //   Cost     — this run against its reserved cap
 // Never a percentage bar: agent-estimated percentages are stripped, not painted.
 
-const STALE_MS = 3 * 60_000;
+export const STALE_MS = 3 * 60_000; // "No update for N min" — the ticket presence strip uses the same threshold
 const PLAN_MARK = { '✓': 'done', '▸': 'now', '·': 'todo' };
 
 /** "45% · reading code" → "Reading code". */

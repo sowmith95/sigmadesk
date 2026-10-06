@@ -16,6 +16,7 @@ import { Conversation, Brief, PrSummary, ProductReview, ResearchReview, Details,
 import { Lineage, EpicTree, EpicProgress, childrenOf, isFeatureRoot } from '@/components/desk/Epic';
 import { NextStep, GateSuggestions, EpicReview, OwnerTaskActions } from '@/components/desk/Flow';
 import { Tracker } from '@/components/desk/Tracker';
+import { PresenceStrip } from '@/components/desk/Presence';
 import type { Board, BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -168,9 +169,17 @@ export function TicketSheet() {
     </div>
   );
   const footer = <Footer t={t} dec={dec} d={d} compose={compose} setCompose={setCompose} onDecided={() => setDecisionId(null)} replyRef={replyRef} onTyping={setTyping} />;
+  const shownTab = dec || tab !== 'decision' ? tab : 'conversation';
+  const focusReply = () => requestAnimationFrame(() => replyRef.current?.focus());
+  // Presence (who is writing) sits right above the reply area, in the Conversation only. Drafts for decisions that no
+  // longer exist are not "unsent drafts" here.
+  const drafts = Object.fromEntries(Object.entries(S.drafts).filter(([k]) => k === draftKey(t.key) || decisions.some((x) => k === draftKey(t.key, x.id))));
+  const presence = shownTab === 'conversation' ? <PresenceStrip tkey={t.key} drafts={drafts} onSeat={() => { (document.activeElement as HTMLElement | null)?.blur?.(); setTab('run'); }}
+    hideDraft={(id) => (compose ? id === 'msg' : dec?.id === id)}
+    onDraft={(id) => { if (id === 'msg') setCompose(true); else { setCompose(false); setDecisionId(id); setTab('decision'); } focusReply(); }} /> : null;
   return (
     <Panel wide label={nameOf(t)} title={nameOf(t)} head={head} compact={typing} onClose={closeSheet}
-      footer={(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); requestAnimationFrame(() => replyRef.current?.focus()); }}>Comment or ask the manager</Button></div>}>
+      footer={<>{presence}{(dec || compose) ? footer : <div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={() => { setCompose(true); focusReply(); }}>Comment or ask the manager</Button></div>}</>}>
       {tracked && <Tracker t={t} B={B} mergeState={d?.merge_state} choices={decisions} selected={dec?.id} labelOf={(x) => label(x) || "Decision"}
         onChoose={(id) => { setDecisionId(id); setTab('decision'); }} onDecision={(id, key) => { if (key === t.key) { setDecisionId(id); setTab('decision'); } else openTicket(key, { decision: id }); }} />}
       {!tracked && decisions.length > 1 && <div role="group" aria-label="Decisions on this ticket" className="flex flex-wrap gap-2">
@@ -178,7 +187,7 @@ export function TicketSheet() {
       {isFeatureRoot(t) && <p className="text-[13px] text-muted-foreground">A feature: its plan, tasks and grooming are on <button type="button" className="text-primary hover:underline" onClick={() => openFeature(t.key)}>its feature page</button>.</p>}
       {gone && <p role="status" className="rounded-md bg-blocked/15 px-3 py-2">That decision was resolved or changed while you were reading. Nothing was submitted.</p>}
       {!dec && it && ['blocked', 'queued', 'epic'].includes(it.bucket) && <p className="rounded-md bg-secondary px-3 py-2"><Named text={humanReason(clean(it.reason), S.tickets)} /></p>}
-      <Tabs data-sheet-tabs value={dec || tab !== 'decision' ? tab : 'conversation'} onValueChange={setTab} className="min-w-0 scroll-mt-2 gap-4">
+      <Tabs data-sheet-tabs value={shownTab} onValueChange={setTab} className="min-w-0 scroll-mt-2 gap-4">
         <TabsList className="w-full max-w-full justify-start overflow-x-auto">
           {dec && <TabsTrigger value="decision">Decision</TabsTrigger>}
           {kids.length > 0 && <TabsTrigger value="tasks">Tasks ({kids.length})</TabsTrigger>}
