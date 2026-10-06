@@ -273,8 +273,7 @@ test('the conversation reads newest first (toggle kept), the thread scrolls with
   assert.match((await texts())[0], /first note/, 'oldest first on request');
   assert.equal(await page.evaluate(() => localStorage.getItem('sd2.convOrder')), 'oldest');
   await page.click('[data-conv-order]');
-  await page.getByRole('button', { name: 'Comment or ask the manager' }).click();
-  const reply = page.locator('#reply');
+  const reply = page.locator('#message'); // the message bar: always there, no button first
   const before = await reply.evaluate((el) => el.offsetHeight);
   await reply.fill('line one\nline two\nline three\nline four\nline five');
   assert.ok((await reply.evaluate((el) => el.offsetHeight)) > before, 'the box grows with the text');

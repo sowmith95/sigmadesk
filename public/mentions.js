@@ -71,6 +71,43 @@ export function tokensIn(text, agents = []) {
 /** The seats a message tags, in order, once each: exactly the tags the composer shows. */
 export const taggedSeats = (text, agents = []) => [...new Set(tokensIn(text, agents).filter((p) => p.seat).map((p) => p.seat))];
 
+/** Take every tag of this seat out of the text (and the space after it), leaving the rest as written. */
+export function removeMention(text, seat, agents = []) {
+  const parts = tokensIn(text, agents);
+  let out = '';
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].seat !== seat) { out += parts[i].text; continue; }
+    const next = parts[i + 1];
+    if (next && !next.seat) parts[i + 1] = { text: out === '' || /\s$/.test(out) ? next.text.replace(/^[ \t]+/, '') : next.text };
+  }
+  return out;
+}
+
+/**
+ * Make the text tag exactly `seats` (the people picker's "Tag N people"): tags of seats no longer chosen come out; new
+ * ones go where the open "@query" is (replacing it), else at the caret, else in front. Returns { text, caret }.
+ * @param {string} text @param {string[]} seats @param {any[]} [agents] @param {number|null} [caret]
+ */
+export function setMentions(text, seats, agents = [], caret = null) {
+  let s = String(text || '');
+  for (const id of taggedSeats(s, agents)) if (!seats.includes(id)) s = removeMention(s, id, agents);
+  const have = taggedSeats(s, agents);
+  const add = seats.filter((id) => !have.includes(id)).map((id) => agents.find((a) => a.id === id)).filter(Boolean);
+  const at = caret == null ? null : Math.min(caret, s.length);
+  const q = at == null ? null : mentionQuery(s, at);
+  if (!add.length) {
+    // Nothing new: a dangling "@" or "@query" the picker was opened from goes away.
+    if (q) { const end = q.start + 1 + q.query.length; s = s.slice(0, q.start) + s.slice(end).replace(/^ /, ''); return { text: s, caret: q.start }; }
+    return { text: s, caret: at ?? s.length };
+  }
+  const handles = add.map((a) => `@${handleOf(a, agents)}`).join(' ');
+  if (q) { const end = q.start + 1 + q.query.length; const rest = s.slice(end); const ins = `${handles}${/^\s/.test(rest) ? '' : ' '}`; return { text: s.slice(0, q.start) + ins + rest, caret: q.start + ins.length }; }
+  const pos = at ?? 0;
+  const before = s.slice(0, pos), after = s.slice(pos);
+  const ins = `${before && !/\s$/.test(before) ? ' ' : ''}${handles}${/^\s/.test(after) ? '' : ' '}`;
+  return { text: before + ins + after, caret: before.length + ins.length };
+}
+
 const STATE = {
   queued: { label: 'Queued', tone: 'neutral' }, working: { label: 'Working', tone: 'action' }, replied: { label: 'Replied', tone: 'shipped' },
   blocked: { label: 'Blocked', tone: 'blocked' }, failed: { label: 'Failed', tone: 'blocked' }, cancelled: { label: 'Cancelled', tone: 'neutral' },

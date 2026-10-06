@@ -8,7 +8,7 @@ import { Section } from '@/components/desk/Bits';
 
 type Grant = { id: number; seat: string; seat_name: string; probes: string[]; expires_at: string | null; ticket_key: string | null; run_id: number | null; standing: number; granted_by: string; reason: string | null; created_at: string; revoked_at?: string | null; revoked_by?: string | null };
 type Req = { id: number; seat: string; seat_name: string; probes: string[]; why: string; minutes: number | null; ticket_scoped: number; ticket_key: string | null; status: string; approver_name?: string | null; owner_reason?: string | null; decided_by?: string | null; note?: string | null; created_at: string };
-type Policy = { approvers: string[]; seats: string[]; probes: string[]; maxMinutes: number; maxActive: number; ticketMaxHours: number };
+type Policy = { approvers: string[]; seats: string[]; probes: string[]; maxMinutes: number; maxActive: number; ticketMaxHours: number; ownerMentionAutoGrant?: boolean };
 type Data = { grants: Grant[]; requests: Req[]; policy: Policy; probes: string[]; seats: { id: string; name: string; role: string }[]; history: { grants: Grant[]; requests: Req[] } };
 
 const probesText = (p: string[]) => (p.includes('*') ? 'all read-only probes' : p.join(', '));
@@ -32,7 +32,7 @@ export function AccessPanel() {
   const [pol, setPol] = useState<Record<string, string> | null>(null);
   const [edited, setEdited] = useState(false);
   const editedRef = useRef(false);
-  const load = () => api('GET', '/api/access').then((x: Data) => { setD(x); if (!editedRef.current) setPol({ approvers: x.policy.approvers.join(', '), seats: x.policy.seats.join(', '), probes: x.policy.probes.join(', '), maxMinutes: String(x.policy.maxMinutes), maxActive: String(x.policy.maxActive), ticketMaxHours: String(x.policy.ticketMaxHours) }); }).catch((e: Error) => setError(e.message));
+  const load = () => api('GET', '/api/access').then((x: Data) => { setD(x); if (!editedRef.current) setPol({ approvers: x.policy.approvers.join(', '), seats: x.policy.seats.join(', '), probes: x.policy.probes.join(', '), maxMinutes: String(x.policy.maxMinutes), maxActive: String(x.policy.maxActive), ticketMaxHours: String(x.policy.ticketMaxHours), ownerMentionAutoGrant: x.policy.ownerMentionAutoGrant === false ? 'off' : 'on' }); }).catch((e: Error) => setError(e.message));
   // Grants end on their own (expiry, ticket or run end, an approver's revoke): poll the desk's state, not just the clock.
   useEffect(() => { load(); const t = setInterval(() => { setNow(Date.now()); if (document.visibilityState === 'visible') load(); }, 10_000); return () => clearInterval(t); }, []);
   const after = async () => { await load(); await loadSnapshot(); };
@@ -71,8 +71,10 @@ export function AccessPanel() {
           <p className="text-muted-foreground">Requests within this policy are decided by the EM or the SRE (never for themselves). Access for the EM or SRE themselves, renewals, and anything beyond this policy come to your Inbox.</p>
           {([['approvers', 'Approvers (manager, sre)'], ['seats', 'Seats they may grant'], ['probes', 'Probes (* = all)'], ['maxMinutes', 'Longest grant (minutes)'], ['maxActive', 'Active agent grants at most'], ['ticketMaxHours', 'Ticket-scoped cap (hours)']] as const).map(([k, label]) => (
             <label key={k} className="flex items-center justify-between gap-3"><span>{label}</span><Input className="w-72" value={pol[k]} onChange={(e) => { editedRef.current = true; setEdited(true); setPol({ ...pol, [k]: e.target.value }); }} /></label>))}
+          <label className="flex items-center justify-between gap-3"><span>Tagged people may get read access for their reply automatically</span>
+            <input type="checkbox" className="size-5" aria-label="Automatic read access for tagged people" checked={pol.ownerMentionAutoGrant !== 'off'} onChange={(e) => { editedRef.current = true; setEdited(true); setPol({ ...pol, ownerMentionAutoGrant: e.target.checked ? 'on' : 'off' }); }} /></label>
           <AsyncButton className="justify-self-start" variant="secondary" run={async () => {
-            await api('POST', '/api/access/policy', { policy: { approvers: list(pol.approvers), seats: list(pol.seats), probes: list(pol.probes), maxMinutes: Number(pol.maxMinutes), maxActive: Number(pol.maxActive), ticketMaxHours: Number(pol.ticketMaxHours) } }); editedRef.current = false; setEdited(false); await after();
+            await api('POST', '/api/access/policy', { policy: { approvers: list(pol.approvers), seats: list(pol.seats), probes: list(pol.probes), maxMinutes: Number(pol.maxMinutes), maxActive: Number(pol.maxActive), ticketMaxHours: Number(pol.ticketMaxHours), ownerMentionAutoGrant: pol.ownerMentionAutoGrant !== 'off' } }); editedRef.current = false; setEdited(false); await after();
           }} ok="Policy saved">{edited ? 'Save policy (unsaved changes)' : 'Save policy'}</AsyncButton>
         </div></Section>}
         <Section title="History"><div className="grid gap-1 text-sm text-muted-foreground">

@@ -40,8 +40,9 @@ export function Panel({ title, description, head, children, footer, onClose, wid
           </div>
         </header>
         {/* minmax(0,1fr): grid tracks would otherwise grow to the widest unbreakable child (tab rows, long titles). */}
-        {/* compact: extra room below so the newest message can scroll to the top even in a short thread. */}
-        <div ref={bodyRef} className={cn('grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)] content-start gap-5 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6', compact && 'pb-[60dvh]')}>{children}</div>
+        {/* compact: extra room below so the newest message can scroll to the top even in a short thread. A spacer, not
+            padding: padding cannot shrink, so it pushed the footer (and its Send button) below a short phone screen. */}
+        <div ref={bodyRef} className={cn('grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)] content-start gap-5 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6', compact && "after:block after:h-[60dvh] after:content-['']")}>{children}</div>
         {footer ? <footer className="grid gap-2.5 border-t bg-card px-5 pb-[calc(env(safe-area-inset-bottom)+12px)] pt-3 sm:px-6">{footer}</footer> : null}
       </SheetContent>
     </Sheet>

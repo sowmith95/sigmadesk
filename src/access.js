@@ -177,11 +177,20 @@ export function ownerMentionDecision({ seat, probes, minutes, ticketScoped, runI
   if (!run || run.agent_id !== seat) return null;
   const m = liveTag(run);
   if (!m) return null;
+  if (m.prod_access === 0) return { why: [`you chose to decide ${nameOf(seat)}'s access yourself when you tagged them`] };
   if (pol.ownerMentionAutoGrant === false) return { why: ['automatic access for tagged seats is off in the access policy'] };
   if (ticketScoped) return { why: ['a tagged run gets access for itself only, not for the whole ticket'] };
   const mins = Math.min(minutes || OWNER_MENTION_MAX_MINUTES, OWNER_MENTION_MAX_MINUTES);
   const v = violations({ seat, probes, minutes: mins, ticketScoped: false }, null, pol);
   return v.length ? { why: v } : { minutes: mins, mention: m };
+}
+/**
+ * Before the owner tags anyone: would the owner-mention rule give this seat access for its reply right now? [] = yes;
+ * else the reasons it would not (the picker shows them). The tagged run's own request is checked again when it asks.
+ */
+export function ownerMentionPreview(seat, pol = policy()) {
+  if (pol.ownerMentionAutoGrant === false) return ['automatic access for tagged seats is off in the access policy'];
+  return violations({ seat, probes: pol.probes.includes('*') ? ['*'] : pol.probes, minutes: Math.min(OWNER_MENTION_MAX_MINUTES, pol.maxMinutes), ticketScoped: false }, null, pol);
 }
 function ownerMentionGrant({ seat, probes, why, minutes, run, mention }) {
   if (!liveTag(store.getRun(run.id))) throw err('this tag is no longer active', 409);
@@ -351,7 +360,9 @@ export function summary() {
   return { grants, requests, owner_requests: requests.filter((r) => r.status === 'owner') };
 }
 export function details() {
-  return { ...summary(), policy: policy(), probes: probeIds(), seats: Object.keys(agentById).map((id) => ({ id, name: nameOf(id), role: agentById[id].role })),
+  const pol = policy();
+  return { ...summary(), policy: pol, probes: probeIds(), seats: Object.keys(agentById).map((id) => ({ id, name: nameOf(id), role: agentById[id].role })),
+    mention_access: Object.fromEntries(Object.keys(agentById).map((id) => [id, ownerMentionPreview(id, pol)])),
     history: { grants: store.grantHistory(50).map(view), requests: store.accessRequestHistory(50).map((r) => ({ ...r, probes: json(r.probes, []), seat_name: nameOf(r.seat) })) } };
 }
 /** `desk access list` / `desk ops list` text. */
