@@ -1,14 +1,14 @@
-// @mentions on a ticket: the composer's seat picker, the tags line, per-recipient delivery states under the owner's
-// message, and the participants row with "Add people". The rules live in public/mentions.js (unit-tested).
+// @mentions on a ticket: the message bar's inline seat picker, per-recipient delivery states under the owner's message,
+// and the participants row with "Add people". The rules live in public/mentions.js (unit-tested).
 import { useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type RefObject } from 'react';
 import { Check, UserPlus } from 'lucide-react';
 import { nameOf } from '../../../public/names.js';
-import { mentionQuery, matchSeats, insertMention, seatState, handleOf, taggedSeats, deliveryView } from '../../../public/mentions.js';
+import { mentionQuery, matchSeats, insertMention, seatState, handleOf, deliveryView } from '../../../public/mentions.js';
 import { S, api, ticketByKey, loadDetail, toast } from '@/store.js';
 import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { AsyncButton } from '@/components/desk/AsyncButton';
-import { Tag, SeatAvatar, MentionChip } from '@/components/desk/Bits';
+import { Tag, SeatAvatar } from '@/components/desk/Bits';
 import { cn } from '@/lib/utils';
 import type { Agent } from '@/types';
 
@@ -28,7 +28,7 @@ export function useMentionPicker({ text, setText, area }: { text: string; setTex
   const [active, setActive] = useState(0);
   const id = useId();
   const agents = S.agents as Agent[];
-  const items = q ? matchSeats(agents, q.query).slice(0, 8) as Agent[] : [];
+  const items = q ? matchSeats(agents, q.query) as Agent[] : [];
   const open = !!q && items.length > 0;
   // The caret after a pick goes where the tag ends, set in the same commit as the new text (a frame later would move it
   // under characters typed meanwhile).
@@ -70,14 +70,16 @@ export function useMentionPicker({ text, setText, area }: { text: string; setTex
   };
 }
 
-export function SeatPicker({ open, items, active, listId, optionId, onPick, onHover }:
-  { open: boolean; items: Agent[]; active: number; listId: string; optionId: (i: number) => string; onPick: (a: Agent) => void; onHover: (i: number) => void }) {
+export function SeatPicker({ open, items, active, listId, optionId, onPick, onHover, onMore }:
+  { open: boolean; items: Agent[]; active: number; listId: string; optionId: (i: number) => string; onPick: (a: Agent) => void; onHover: (i: number) => void; onMore?: () => void }) {
   if (!open) return null;
   return (
     // data-captures-escape: the panel leaves Escape to this list while it is open.
     <div data-mention-picker data-captures-escape className="grid gap-1 rounded-lg border bg-popover p-1 shadow-lg">
-      <p className="px-2 pt-1 text-xs text-muted-foreground">Tag someone · they answer here</p>
-      <ul id={listId} role="listbox" aria-label="People to tag" className="grid max-h-[38dvh] gap-0.5 overflow-y-auto overscroll-contain">
+      <p className="flex items-center gap-2 px-2 pt-1 text-xs text-muted-foreground"><span className="flex-1">Tag someone · they answer here</span>
+        {/* Several people, or the whole team: the full picker (a sheet on a phone). */}
+        {onMore && <button type="button" className="min-h-8 rounded-md px-2 text-[13px] font-medium text-primary hover:bg-secondary" onMouseDown={(e) => e.preventDefault()} onClick={onMore}>Pick several…</button>}</p>
+      <ul id={listId} role="listbox" aria-label="People to tag" className="grid max-h-[min(38dvh,16rem)] gap-0.5 overflow-y-auto overscroll-contain">
         {items.map((a, i) => {
           const st = seatState(a, ticketName);
           return (
@@ -91,19 +93,6 @@ export function SeatPicker({ open, items, active, listId, optionId, onPick, onHo
             </li>);
         })}
       </ul>
-    </div>
-  );
-}
-
-/** "To: Rowan, Devon" — exactly the seats the message will tag (what you see is what is sent). */
-export function TagLine({ text, onTag }: { text: string; onTag: () => void }) {
-  const seats = taggedSeats(text, S.agents);
-  return (
-    <div className="flex flex-wrap items-center gap-1.5 text-sm" data-tag-line>
-      {seats.length ? <><span className="text-muted-foreground">To</span>{seats.map((s: string) => <MentionChip key={s} seat={s} />)}</>
-        : <span className="text-muted-foreground">Type @ to tag someone; they answer in this thread.</span>}
-      <span className="flex-1" />
-      <Button type="button" size="sm" variant="ghost" onMouseDown={(e) => e.preventDefault()} onClick={onTag} aria-label="Tag someone">@ Tag</Button>
     </div>
   );
 }
@@ -135,24 +124,33 @@ export function Deliveries({ list, tkey }: { list: Delivery[]; tkey: string }) {
   );
 }
 
-/** Who is on the ticket (stacked portraits) and "Add people": participants see the thread; only tags start work. */
-export function Participants({ tkey, list }: { tkey: string; list: { seat_id: string }[] }) {
+/**
+ * Who is on the ticket and "Add people": participants see the thread; only tags start work. Each portrait is a button
+ * that opens that person (status, work, production access, tag in chat).
+ */
+export function Participants({ tkey, list, onPerson }: { tkey: string; list: { seat_id: string }[]; onPerson?: (seat: string) => void }) {
   const agents = S.agents as Agent[];
   const on = new Set(list.map((p) => p.seat_id));
   const shown = list.slice(0, 5);
-  const more = list.length - shown.length;
+  const rest = list.slice(5);
   const toggle = (a: Agent) => async (e: Event) => {
     e.preventDefault(); // keep the menu open: add several people at once
     try { await api('POST', `/api/tickets/${tkey}/participants`, on.has(a.id) ? { remove: [a.id] } : { add: [a.id] }); await loadDetail(); }
     catch (err) { toast((err as Error).message, true); }
   };
+  const seatName = (id: string) => firstName(agents.find((a) => a.id === id), id);
   return (
-    <div className="flex items-center gap-2" data-participants={tkey}>
-      {list.length > 0 && <span className="flex -space-x-2" aria-label={`On this ticket: ${list.map((p) => firstName(agents.find((a) => a.id === p.seat_id), p.seat_id)).join(', ')}`} role="img">
-        {shown.map((p) => <span key={p.seat_id} className="inline-flex rounded-full ring-2 ring-card"><SeatAvatar id={p.seat_id} size="sm" /></span>)}
-        {more > 0 && <span className="z-10 inline-grid size-6 place-items-center rounded-full bg-secondary text-[11px] font-semibold ring-2 ring-card">+{more}</span>}</span>}
+    <div className="flex flex-wrap items-center gap-1" data-participants={tkey}>
+      {list.length > 0 && <span className="flex items-center" role="group" aria-label={`On this ticket: ${list.map((p) => seatName(p.seat_id)).join(', ')}`}>
+        {shown.map((p) => <button key={p.seat_id} type="button" data-person={p.seat_id} aria-label={`${seatName(p.seat_id)}: status and production access`} onClick={() => onPerson?.(p.seat_id)}
+          className="grid size-10 place-items-center rounded-full hover:bg-secondary focus-visible:outline-2 focus-visible:outline-ring"><SeatAvatar id={p.seat_id} size="md" /></button>)}
+        {rest.length > 0 && <DropdownMenu><DropdownMenuTrigger asChild>
+          <button type="button" aria-label={`${rest.length} more on this ticket`} className="grid size-10 place-items-center rounded-full text-[13px] font-semibold hover:bg-secondary"><span className="grid size-8 place-items-center rounded-full bg-secondary">+{rest.length}</span></button>
+        </DropdownMenuTrigger><DropdownMenuContent align="start" className="max-h-[60dvh] min-w-56 overflow-y-auto">
+          {rest.map((p) => <DropdownMenuItem key={p.seat_id} className="min-h-11 gap-2.5" onSelect={() => onPerson?.(p.seat_id)}><SeatAvatar id={p.seat_id} size="md" />{seatName(p.seat_id)}</DropdownMenuItem>)}
+        </DropdownMenuContent></DropdownMenu>}</span>}
       <DropdownMenu>
-        <DropdownMenuTrigger asChild><Button size="sm" variant="ghost" className="h-8 px-2 max-md:h-10"><UserPlus className="size-4" />Add people</Button></DropdownMenuTrigger>
+        <DropdownMenuTrigger asChild><Button size="sm" variant="ghost" className="h-10 px-2"><UserPlus className="size-4" />Add people</Button></DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="max-h-[60dvh] min-w-64 overflow-y-auto">
           <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">They see this thread. Tag them in a message to ask for something.</DropdownMenuLabel>
           {agents.map((a) => {

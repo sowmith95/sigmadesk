@@ -27,9 +27,8 @@ test('the conversation shows who is writing, who is next and the owner draft; a 
   assert.match(await writing.innerText(), /^(Sage and Quinn|Quinn and Sage) are writing…/);
   assert.equal(await page.locator('[data-presence-state="next"]').innerText(), 'Taylor is next · desk paused');
   assert.equal(await page.locator('[data-presence] [aria-live="polite"]').count(), 1, 'one polite live region');
-  // The owner's draft: tapping it opens the composer with the draft, and the chip steps aside while the box is shown.
-  await page.locator('[data-presence-state="draft"]').click();
-  assert.equal(await page.locator('#reply').inputValue(), 'half a thought');
+  // The owner's draft is in the always-visible message bar, so the strip shows no separate draft chip for it.
+  assert.equal(await page.locator('#message').inputValue(), 'half a thought');
   assert.equal(await page.locator('[data-presence-state="draft"]').count(), 0);
   // Presence is a Conversation thing; a seat's chip jumps to its live run.
   await writing.click();
