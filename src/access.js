@@ -105,7 +105,7 @@ function endGrant(g, by, reason) {
 }
 /** End every grant whose time, ticket or run is over; then stop probes that lost their authorization. */
 export function sweep() {
-  let ended = 0;
+  let ended = enforceMaxActive();
   for (const g of store.openGrants()) {
     const why = endReason(g) || (g.granted_by === 'post_deploy' ? postDeployEnd(g) : null);
     if (why && why !== 'revoked' && endGrant(g, why)) ended++;
@@ -121,8 +121,19 @@ export function sweep() {
   ops.recheckAll();
   return ended;
 }
+/**
+ * The owner lowered maxActive: agent-made grants beyond it end now, oldest first (the newest keep working). Owner grants
+ * are never touched. Called at every probe (grantFor) and every sweep.
+ */
+export function enforceMaxActive(pol = policy()) {
+  const agent = store.openGrants().filter((g) => !endReason(g) && g.granted_by !== 'owner').sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || a.id - b.id);
+  let n = 0;
+  for (const g of agent.slice(0, Math.max(0, agent.length - pol.maxActive))) if (endGrant(g, 'policy changed', `more than the policy's ${pol.maxActive} active agent grants`)) n++;
+  return n;
+}
 /** The grant that lets this run use this probe right now, or null. Never cached. */
 export function grantFor(run, probe, at = nowIso()) {
+  enforceMaxActive();
   for (const g of store.openGrants(run.agent_id)) {
     const why = endReason(g, at);
     if (why) { if (why !== 'revoked') { endGrant(g, why); } continue; }
@@ -192,9 +203,11 @@ export function postDeployGrant({ run, checkpoint, probes, minutes = 15, scope =
   return g;
 }
 /** A scoped grant (post-deploy) names the resources it covers: a probe naming another container or database is refused. */
+export const scopeOf = (g) => (g?.scope ? json(g.scope, null) : null);
 export function scopeProblem(g, probe, params = {}) {
-  const scope = g?.scope ? json(g.scope, null) : null;
+  const scope = scopeOf(g);
   if (!scope) return null;
+  if (probe === 'container_status' && !(scope.containers || []).length) return 'this post-deploy grant covers no containers';
   if (params.container && !(scope.containers || []).includes(params.container)) return `this post-deploy grant covers only ${(scope.containers || []).join(', ') || 'no containers'}, not ${params.container}`;
   if (params.db && !(scope.dbs || []).includes(params.db)) return `this post-deploy grant covers only the ${(scope.dbs || []).join(', ') || 'no'} database(s), not ${params.db}`;
   return null;

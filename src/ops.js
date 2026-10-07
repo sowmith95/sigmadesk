@@ -345,8 +345,9 @@ function finishProcess(r, op) {
 
 const dockerBin = () => config.ops.docker || 'docker';
 const dockerRun = (op, args, timeoutMs = 15000, rawCap = config.ops.maxBytes * 4) => runProcess(op, dockerBin(), args, { timeoutMs, rawCap });
-async function containerStatus(op) {
-  const allow = new Set(config.ops.containers || []);
+async function containerStatus(op, only = null) {
+  // only: a scoped grant (post-deploy) sees its own containers and nothing about any other.
+  const allow = new Set((config.ops.containers || []).filter((c) => !only || only.includes(c)));
   if (!allow.size) throw refuse('no containers are allowlisted (owner: ops.containers)', 409);
   const started = Date.now();
   const ps = await dockerRun(op, ['ps', '-a', '--format', '{{.Names}}\t{{.State}}\t{{.Status}}\t{{.RunningFor}}'], 10000);
@@ -559,8 +560,10 @@ export async function handle(run, body = {}) {
   const scoped = access.scopeProblem(access.grantFor(run, probe), probe, params);
   if (scoped) { audit({ params, outcome: 'refused', detail: scoped }); throw refuse(scoped, 403); }
   const p = PROBES[probe];
+  // A scoped grant never shares the cache with unscoped callers (its answer is filtered to its resources).
+  const scopedTo = access.scopeOf(access.grantFor(run, probe))?.containers || null;
   const fromCache = (pr) => { const out = wrap(probe, pr, { ...cached(cacheKey(probe, pr)), ms: 0 }, { cached: true, lim }); audit({ params: pr, duration_ms: 0, bytes: Buffer.byteLength(out), outcome: 'cached' }); return out; };
-  if (cached(cacheKey(probe, params))) return fromCache(params);
+  if (!scopedTo && cached(cacheKey(probe, params))) return fromCache(params);
   // Budget: check and reserve in one synchronous step, before the call can wait in a queue.
   const over = budgetProblem(run.id, lim, false);
   if (over) { audit({ params, outcome: 'refused', detail: over }); throw refuse(over, 429); }
@@ -576,14 +579,14 @@ export async function handle(run, body = {}) {
     try { params = validate(probe, raw, lim); } catch (err) { audit({ params, outcome: 'refused', detail: err.message }); throw err; }
     const scoped2 = access.scopeProblem(access.grantFor(run, probe), probe, params);
     if (scoped2) { audit({ params, outcome: 'refused', detail: scoped2 }); throw refuse(scoped2, 403); }
-    if (cached(cacheKey(probe, params))) return fromCache(params);
+    if (!scopedTo && cached(cacheKey(probe, params))) return fromCache(params);
     const late2 = budgetProblem(run.id, lim, true);
     if (late2) { audit({ params, outcome: 'refused', detail: late2 }); throw refuse(late2, 429); }
     bindGrant(op, access.grantFor(run, probe));
     let r;
     try {
       r = p.lane === 'db' ? await runSql(op, probe, params, lim)
-        : probe === 'container_status' ? await containerStatus(op)
+        : probe === 'container_status' ? await containerStatus(op, scopedTo)
           : probe === 'container_logs' ? await containerLogs(op, params)
             : await appHealth(op);
     } catch (err) {
@@ -591,7 +594,7 @@ export async function handle(run, body = {}) {
       r = { outcome: 'error', text: 'probe failed', ms: 0 };
     }
     if (op.cancelled && r.outcome === 'ok') r = { outcome: 'cancelled', text: `cancelled: ${op.cancelled}`, ms: r.ms };
-    if (r.outcome === 'ok') cache.set(cacheKey(probe, params), { at: Date.now(), outcome: r.outcome, text: r.text, health: r.health });
+    if (r.outcome === 'ok' && !scopedTo) cache.set(cacheKey(probe, params), { at: Date.now(), outcome: r.outcome, text: r.text, health: r.health });
     const out = wrap(probe, params, r, { cached: false, lim });
     audit({ params, duration_ms: r.ms, bytes: Buffer.byteLength(out), outcome: r.outcome, health: r.health === 'unreachable' ? 'unhealthy' : r.health || null,
       detail: r.outcome === 'ok' ? (r.health === 'unhealthy' ? `HTTP ${r.status}: application unhealthy` : null) : clean(r.text).slice(0, 300) });

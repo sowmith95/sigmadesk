@@ -275,12 +275,17 @@ export function createWatchFor({ deployKey, mergeSha, ticketKey, pr, rows, sourc
     workflows: JSON.stringify(rows.map((r) => ({ workflow: r.workflow, run_id: r.run_id, run_attempt: r.run_attempt, completed_at: r.completed_at }))),
     source, deployed_at: deployedAt, baseline: JSON.stringify(baseline), criteria: t?.prod_verify || null, criteria_source: t?.prod_verify ? 'ticket' : 'derived', trading_path: tradingPath(t) ? 1 : 0 });
   if (!created) return watch;
-  // Per-target watermark: a newer deployment of the same target is already known → this one is history at once.
-  const newer = watch.target ? store.watchesOfTarget().find((x) => x.id !== watch.id && overlaps(x.target, watch.target) && x.deployed_at > deployedAt) : null;
-  if (newer) {
-    store.updateWatch(watch.id, { status: 'superseded', superseded_by: newer.id, verdict_note: `found after the newer deployment ${short(newer.merge_sha)} of ${watch.target}` });
-    store.logEvent({ kind: 'action', agent_id: 'system', ticket_key: ticketKey, text: `recorded deploy of ${short(mergeSha)}; production had already moved on to ${short(newer.merge_sha)}, so it is not watched` });
-    return store.getWatch(watch.id);
+  // Per-(target, component) watermark: components a newer deployment already replaced are not this watch's to check.
+  if (watch.target) {
+    const newer = store.watchesOfTarget().filter((x) => x.id !== watch.id && overlaps(x.target, watch.target) && x.deployed_at > deployedAt);
+    const taken = targetsOf(watch.target).filter((c) => newer.some((x) => targetsOf(x.target).includes(c)));
+    if (taken.length === targetsOf(watch.target).length) {
+      store.updateWatch(watch.id, { status: 'superseded', superseded_by: newer[0].id, verdict_note: `found after the newer deployment ${short(newer[0].merge_sha)} of ${watch.target}` });
+      store.logEvent({ kind: 'action', agent_id: 'system', ticket_key: ticketKey, text: `recorded deploy of ${short(mergeSha)}; production had already moved on to ${short(newer[0].merge_sha)}, so it is not watched` });
+      return store.getWatch(watch.id);
+    }
+    if (taken.length) store.updateWatch(watch.id, { target: targetsOf(watch.target).filter((c) => !taken.includes(c)).join(','), retired_targets: JSON.stringify(taken),
+      verdict_note: `${taken.join(', ')} already run a newer deployment` });
   }
   const c = DW().checkpoints || {};
   const at = Date.parse(deployedAt);
@@ -290,13 +295,25 @@ export function createWatchFor({ deployKey, mergeSha, ticketKey, pr, rows, sourc
   const open = store.createCheckpoint({ watch_id: watch.id, name: 'session_open', due_at: iso(sc.due || at) });
   // Never a throw inside the release: a calendar problem is recorded and goes to the owner (the lock is released).
   if (sc.error) store.updateCheckpoint(open.id, { status: 'unschedulable', summary: `could not be scheduled: ${sc.error}` });
-  // Production advanced: older watches of the SAME (known) target stop. Unknown targets are never superseded.
-  for (const w of store.activeWatches()) if (w.id !== watch.id && overlaps(w.target, watch.target) && w.deployed_at <= deployedAt) supersede(w, watch);
+  // Production advanced: older watches stop checking the components this deployment replaced (all of them → the watch
+  // is superseded; some → only those). Unknown targets are never superseded.
+  for (const w of store.activeWatches()) if (w.id !== watch.id && overlaps(w.target, watch.target) && w.deployed_at <= deployedAt) retire(w, watch);
   const runs = rows.map((r) => `${r.workflow.split('/').pop()}${r.run_id ? ` run ${r.run_id}${r.run_attempt > 1 ? ` (attempt ${r.run_attempt})` : ''}` : ''}`).join(', ');
   const next = sc.due ? fmt(sc.due) : `the next market open (NOT scheduled: ${sc.error})`;
   store.logEvent({ kind: sc.error ? 'error' : 'action', agent_id: 'system', ticket_key: ticketKey, text: `deployed ${short(mergeSha)} (${runs}) — watching production: T+5 smoke, T+30, ${next}` });
   if (t) say(t, `deployed:${deployKey}`, `🚀 **Deployed** \`${short(mergeSha)}\` via ${runs}${targets.length ? ` to ${targets.join(', ')}` : ' (deployment target unknown: no other deployment supersedes this watch)'} at ${fmt(new Date(deployedAt))}. SigmaDesk now watches production: a smoke check in 5 minutes, another at 30 minutes, and one at ${next}.${t.prod_verify ? '' : ' This ticket has no "How to verify in production" criteria, so the checks are general health checks only (limited).'}`, mergeSha);
   return watch;
+}
+const targetsOf = (t) => String(t || '').split(',').filter(Boolean);
+/** A newer deployment replaced some of this watch's components: stop checking those, keep watching the rest. */
+function retire(w, by) {
+  const taken = targetsOf(w.target).filter((c) => targetsOf(by.target).includes(c));
+  const remaining = targetsOf(w.target).filter((c) => !taken.includes(c));
+  if (!remaining.length) return supersede(w, by);
+  store.updateWatch(w.id, { target: remaining.join(','), retired_targets: JSON.stringify([...(json(w.retired_targets, []) || []), ...taken]),
+    verdict_note: `${taken.join(', ')} moved on to ${short(by.merge_sha)}; ${remaining.join(', ')} still watched` });
+  const t = w.ticket_key ? store.getTicket(w.ticket_key) : null;
+  if (t) store.addComment(t.key, 'system', `⏭ ${taken.join(', ')} now run${taken.length === 1 ? 's' : ''} \`${short(by.merge_sha)}\`; the remaining checks of \`${short(w.merge_sha)}\` cover ${remaining.join(', ')} only.`);
 }
 function supersede(w, by) {
   store.updateWatch(w.id, { status: 'superseded', superseded_by: by.id, verdict_note: `production advanced to ${short(by.merge_sha)} before every check ran` });
@@ -456,11 +473,19 @@ export function identityOf(identity, mergeSha) {
   return tagged ? 'match' : 'unresolved';
 }
 
+const CARRY_MIN = 15;
+/** The watch's own targets, and the containers of components a newer deployment took over (not this watch's any more). */
+function retiredContainers(w) {
+  const retired = json(w.retired_targets, []) || [];
+  const mine = new Set(targetContainers(w.target));
+  return new Set(targetContainers(retired.join(',')).filter((c) => !mine.has(c)));
+}
 /**
- * Observe production for one checkpoint: fresh desk probes in a bounded, rotating order — app health and container
- * status first (required), then ingest freshness, then the logs of the target's containers starting where the previous
- * attempt stopped. Log results from an earlier attempt of this checkpoint (≤ 15 min old) are carried over, so a small
- * market-hours allowance still covers every container across retries; what is still unread makes it incomplete.
+ * Observe production for one checkpoint: fresh desk probes within a bounded allowance. App health and container status
+ * come first (required); then every ingest-freshness database and every watched container's logs are SECONDARY tasks:
+ * the ones without a fresh-enough result (≤ 15 min) from an earlier attempt of this checkpoint go first, logs before
+ * freshness, so neither can starve the other across retries. A task never read within the allowance is listed exactly as
+ * a coverage gap and keeps the checkpoint incomplete (retried, then inconclusive).
  */
 export async function observe(w, cp, now = clock.now()) {
   const baseline = json(w.baseline, {}) || {};
@@ -470,51 +495,55 @@ export async function observe(w, cp, now = clock.now()) {
   const lim = ops.limits();
   const allowance = Math.max(2, Number(DW().probesPerCheckpoint) || lim.perRun);
   let used = 0, incomplete = false;
+  const gaps = [];
   const probe = async (id, params = {}) => {
     if (used >= allowance) { incomplete = true; return null; }
     used++;
     return ops.deskProbe(id, params, { ticketKey: w.ticket_key, purpose: `post-deploy ${cp.name} check` });
   };
   const prev = json(cp.evidence, null);
-  const logOrder = (() => {
-    const all = targetContainers(w.target).length ? targetContainers(w.target).filter((c) => logContainers().includes(c)).concat(logContainers().filter((c) => !targetContainers(w.target).includes(c))) : logContainers();
-    const start = (prev?.next_log || 0) % Math.max(1, all.length);
-    return [...all.slice(start), ...all.slice(0, start)];
-  })();
+  const retired = retiredContainers(w);
+  if (retired.size) coverage.push(`${[...retired].join(', ')} now run${retired.size === 1 ? 's' : ''} a newer deployment: not attributed to this one`);
+  const mine = targetContainers(w.target);
+  const watchedLogs = [...mine.filter((c) => logContainers().includes(c)), ...logContainers().filter((c) => !mine.includes(c))].filter((c) => !retired.has(c));
   const no = ops.deskDenial();
-  let nextLog = 0;
   if (no) coverage.push(`production was not observed: ${no}`);
   else {
     if (config.ops.appHealth?.baseUrl) { const r = await probe('app_health'); if (r) items.push(healthItem(r, identity)); }
     else coverage.push('no app health endpoint is configured (ops.appHealth)');
-    if (containers().length) { const r = await probe('container_status'); if (r) items.push(...containerItems(r, baseline, cp, identity)); }
+    if (containers().length) { const r = await probe('container_status'); if (r) items.push(...containerItems(r, baseline, cp, identity).filter((i) => !retired.has(i.criterion.replace(/^container (.*) runs$/, '$1')))); }
     else coverage.push('no containers are allowlisted (ops.containers): container state was not checked');
-    for (const db of freshnessDbs()) { const r = await probe('ingest_freshness', { db }); if (r) items.push(...freshnessItems(r, baseline, now, db)); else items.push(item(`ingest freshness (${db})`, 'ingest_freshness', iso(now), '', 'not read yet (probe allowance)', 'unknown', null, { incomplete: true })); }
     const span = Math.ceil((now.getTime() - Date.parse(w.deployed_at)) / 60_000) + 1;
     const maxMin = lim.maxLogHours * 60;
     const from = iso(Math.max(Date.parse(w.deployed_at), now.getTime() - maxMin * 60_000));
     const aMin = Math.max(1, Math.round((now.getTime() - Date.parse(from)) / 60_000));
     const known = knownSignatures();
     const before = baseline.trusted && baseline.logs ? { minutes: baseline.logs.minutes || BASE_MIN, signatures: baseline.logs.signatures || {} } : null;
-    const carried = new Map((prev?.items || []).filter((i) => i.probe === 'container_logs' && i.container && now.getTime() - Date.parse(i.observed_at) <= 15 * 60_000).map((i) => [i.container, i]));
-    for (const [i, c] of logOrder.entries()) {
-      // Allowance used up: a fresh-enough read of this container from an earlier attempt still counts.
-      if (used >= allowance && carried.has(c)) { items.push({ ...carried.get(c), carried: true }); continue; }
-      const r = await probe('container_logs', { container: c, since: `${Math.max(1, Math.min(span, maxMin))}m`, tail: String(lim.maxTail) });
-      if (!r) {
-        items.push(item(`no new or rising errors in ${c} since the deploy`, 'container_logs', iso(now), '', 'not read yet (probe allowance; rotated to the next attempt)', 'unknown', null, { container: c, incomplete: true }));
+    const carried = new Map();
+    for (const i of prev?.items || []) if (i.key && !i.incomplete && i.result !== 'unknown' && now.getTime() - Date.parse(i.observed_at) <= CARRY_MIN * 60_000) carried.set(i.key, [...(carried.get(i.key) || []), i]);
+    const tasks = [...watchedLogs.map((c) => ({ key: `log:${c}`, kind: 'log', c, label: `logs of ${c}` })), ...freshnessDbs().map((db) => ({ key: `db:${db}`, kind: 'fresh', db, label: `ingest freshness of ${db}` }))];
+    const ordered = [...tasks.filter((t) => !carried.has(t.key)), ...tasks.filter((t) => carried.has(t.key))];
+    for (const t of ordered) {
+      if (used >= allowance) {
+        if (carried.has(t.key)) { items.push(...carried.get(t.key).map((i) => ({ ...i, carried: true }))); continue; }
+        incomplete = true; gaps.push(t.label);
+        items.push(item(t.kind === 'log' ? `no new or rising errors in ${t.c} since the deploy` : `ingest freshness (${t.db})`, t.kind === 'log' ? 'container_logs' : 'ingest_freshness', iso(now), '',
+          'not read: the probe allowance ran out before it', 'unknown', null, { key: t.key, container: t.c, incomplete: true }));
         continue;
       }
-      nextLog = i + 1;
-      if (r.outcome !== 'ok') { items.push(item(`no new or rising errors in ${c} since the deploy`, 'container_logs', r.observed_at, '', 'not read', 'unknown', r.text.slice(0, 120), { container: c, incomplete: r.outcome === 'refused' })); continue; }
-      const s = logSignatures(r.text, c, from, iso(now.getTime() + 1));
-      const notes = [span > maxMin ? `only the last ${lim.maxLogHours}h of logs are readable now` : null, s.untimed ? `${s.untimed} line(s) without a timestamp were ignored` : null,
+      if (t.kind === 'fresh') { const r = await probe('ingest_freshness', { db: t.db }); if (r.outcome === 'refused') gaps.push(t.label); items.push(...freshnessItems(r, baseline, now, t.db).map((i) => ({ ...i, key: t.key, db: t.db }))); continue; }
+      const c = t.c;
+      const r = await probe('container_logs', { container: c, since: `${Math.max(1, Math.min(span, maxMin))}m`, tail: String(lim.maxTail) });
+      if (r.outcome !== 'ok') { items.push(item(`no new or rising errors in ${c} since the deploy`, 'container_logs', r.observed_at, '', 'not read', 'unknown', r.text.slice(0, 120), { key: t.key, container: c, incomplete: r.outcome === 'refused' })); if (r.outcome === 'refused') gaps.push(t.label); continue; }
+      const sg = logSignatures(r.text, c, from, iso(now.getTime() + 1));
+      const notes = [span > maxMin ? `only the last ${lim.maxLogHours}h of logs are readable now` : null, sg.untimed ? `${sg.untimed} line(s) without a timestamp were ignored` : null,
         /raw read capped/.test(r.text) ? 'the log read was capped' : null].filter(Boolean).join('; ') || null;
       if (span > maxMin) coverage.push(`${c}: logs only for the last ${lim.maxLogHours}h of ${Math.round(span / 60)}h since the deploy`);
       const usable = before && (baseline.logs.containers || logContainers()).includes(c) ? before : null;
-      items.push({ ...signatureRates(c, 'container_logs', r.observed_at, { minutes: aMin, signatures: s.signatures }, usable, known, w.deployed_at, notes), container: c });
+      items.push({ ...signatureRates(c, 'container_logs', r.observed_at, { minutes: aMin, signatures: sg.signatures }, usable, known, w.deployed_at, notes), container: c, key: t.key });
     }
-    if (incomplete) coverage.push(`the checkpoint's probe allowance (${allowance}${lim.busy ? ', market hours' : ''}) did not cover every required check this attempt`);
+    if (gaps.length) coverage.push(`not read within the probe allowance (${allowance} per attempt${lim.busy ? ', market hours' : ''}, attempt ${cp.attempts || 1}): ${gaps.join(', ')}`);
+    else if (incomplete) coverage.push(`the checkpoint's probe allowance (${allowance}${lim.busy ? ', market hours' : ''}) did not cover every required check this attempt`);
   }
   if (config.watch.enabled) {
     const fresh = store.listIncidents({ limit: 500 }).filter((i) => i.project === config.project.name && Date.parse(i.first_seen) >= Date.parse(w.deployed_at));
@@ -529,7 +558,7 @@ export async function observe(w, cp, now = clock.now()) {
   if (late > (Number(DW().overdueMinutes) || 20)) coverage.push(`this check ran ${late} min late`);
   const missingRequired = items.some((i) => i.incomplete && REQUIRED.has(i.probe));
   return { checkpoint: cp.name, observed_at: iso(now), deployment: { merge_sha: w.merge_sha, deployed_at: w.deployed_at, target: w.target || 'unknown', source: w.source }, identity, items, coverage: [...new Set(coverage)],
-    probes_used: used, allowance, fresh: true, late_minutes: late, incomplete: incomplete || missingRequired, next_log: (prev?.next_log || 0) + nextLog };
+    probes_used: used, allowance, fresh: true, late_minutes: late, incomplete: incomplete || missingRequired, gaps };
 }
 
 /** Which checkpoints the ticket's own criteria are checked at (by the SRE): T+30, and the session open on the trading path. */
@@ -552,7 +581,8 @@ export function decide(w, cp, ev) {
     return cp.attempts < 2 ? { verdict: 'regression', retry: true, provisional: true, reason } : { verdict: 'regression', reason };
   }
   if (!observedAnything || ev.incomplete) {
-    const reason = !observedAnything ? ev.coverage[0] || 'nothing could be observed' : `partial coverage: ${unknown.filter((u) => u.incomplete).map((u) => u.criterion).join(', ') || 'required checks were not read'}`;
+    const reason = !observedAnything ? ev.coverage[0] || 'nothing could be observed'
+      : `partial coverage after ${cp.attempts} attempt(s): ${ev.gaps?.length ? `never read within the probe allowance — ${ev.gaps.join(', ')}` : unknown.filter((u) => u.incomplete).map((u) => u.criterion).join(', ') || 'required checks were not read'}`;
     return !ops.deskDenial() && cp.attempts <= retries ? { verdict: 'inconclusive', retry: true, reason } : { verdict: 'inconclusive', reason };
   }
   if (ev.identity?.status === 'mismatch') return { verdict: 'inconclusive', reason: ev.coverage.find((c) => /reports commit/.test(c)) };
@@ -571,9 +601,12 @@ const watchCaps = () => ({ kind: 'watch', usd: Number(config.watch?.budgetUsd) |
 export const budgetWords = { whose: "this checkpoint's", again: 'The checkpoint is recorded as inconclusive.' };
 
 /** The first hard failure: hold deploying merges and page the owner NOW, before the confirming look. */
-function provisionalHold(w, cp, reason) {
+const provisionalKey = (id) => `deploy:provisional:${id}`;
+function provisionalHold(w, cp, reason, failed = []) {
   store.transaction(() => {
     const fresh = store.getWatch(w.id);
+    // What failed is remembered: only fresh healthy evidence of THOSE criteria lifts the hold.
+    if (fresh?.hold_kind === 'provisional' || !fresh?.hold) store.kvSet(provisionalKey(w.id), JSON.stringify([...new Set([...(json(store.kvGet(provisionalKey(w.id)), []) || []), ...failed])]));
     if (!fresh || fresh.status !== 'watching' || fresh.hold) return;
     store.updateWatch(w.id, { hold: 1, hold_kind: 'provisional', verdict_note: `${checkpointLabel(cp.name)}: ${reason}`.slice(0, 600) });
     const t = w.ticket_key ? store.getTicket(w.ticket_key) : null;
@@ -584,13 +617,21 @@ function provisionalHold(w, cp, reason) {
   const t = w.ticket_key ? store.getTicket(w.ticket_key) : null;
   notify('page', t, `Possible regression after deploying ${ticketName(t)} (${short(w.merge_sha)}); deploying merges are held`);
 }
-/** The confirming look did not see the failure again: lift the provisional hold (the record stays). */
-function liftProvisional(w, why) {
+/**
+ * Lift a provisional hold only on positive recovery evidence: every criterion that failed has a fresh (not carried)
+ * passing observation now. A confirming look that could not read it (budget, refusal) keeps the hold.
+ */
+function liftProvisional(w, ev, why) {
   const fresh = store.getWatch(w.id);
-  if (!fresh?.hold || fresh.hold_kind !== 'provisional') return;
+  if (!fresh?.hold || fresh.hold_kind !== 'provisional') return false;
+  const failed = json(store.kvGet(provisionalKey(w.id)), []) || [];
+  const recovered = failed.length > 0 && failed.every((c) => (ev.items || []).some((i) => i.criterion === c && i.result === 'pass' && !i.carried));
+  if (!recovered) return false;
   store.updateWatch(w.id, { hold: 0, cleared_by: 'desk (not confirmed)', cleared_at: iso(clock.now()) });
   const t = w.ticket_key ? store.getTicket(w.ticket_key) : null;
-  if (t) say(t, `provisional-lifted:${w.id}`, `▶️ The failure was not seen again on the confirming look (${why}); the provisional hold is lifted and the watch continues.`, w.merge_sha);
+  if (t) say(t, `provisional-lifted:${w.id}`, `▶️ The failed checks passed again on a fresh look (${failed.join('; ')}; ${why}); the provisional hold is lifted and the watch continues.`, w.merge_sha);
+  store.kvSet(provisionalKey(w.id), '[]');
+  return true;
 }
 
 /** Run one due checkpoint end to end (desk probes → decision → retry / SRE / verdict). */
@@ -607,8 +648,8 @@ export async function runCheckpoint(cp, now = clock.now()) {
   const ev = await observe(w, cp, now);
   if (store.getWatch(w.id)?.status !== 'watching') { store.updateCheckpoint(cp.id, { status: 'superseded', completed_at: iso(clock.now()), evidence: JSON.stringify(ev) }); return { status: 'superseded' }; }
   const d = decide(w, cp, ev);
-  if (d.provisional) provisionalHold(w, cp, d.reason);
-  else if (d.verdict !== 'regression') liftProvisional(w, d.reason);
+  if (d.provisional) provisionalHold(w, cp, d.reason, ev.items.filter((i) => i.result === 'fail').map((i) => i.criterion));
+  else if (d.verdict !== 'regression') liftProvisional(w, ev, d.reason);
   const waits = DW().retryMinutes || [2, 5, 10];
   if (d.retry && attempts <= waits.length) {
     store.updateCheckpoint(cp.id, { status: 'pending', next_attempt_at: iso(now.getTime() + waits[attempts - 1] * 60_000), evidence: JSON.stringify(ev), summary: `retrying: ${d.reason}` });
@@ -849,9 +890,27 @@ export async function command(run, body) {
     if ((ev.items || []).some((i) => i.result === 'fail')) throw err('the desk\'s evidence has an unresolved failure: that vetoes "verified"');
     if (!fresh) throw err(`nothing was checked with a fresh probe in this run (cached answers do not count): run the probe that settles ${/criteria/.test(cp.sre_reason || '') ? "the ticket's criteria" : 'the anomaly'}, or say inconclusive`);
     if (ev.identity?.status !== 'match') throw err('production is not shown to run this deployment (deployment identity unresolved or different): say inconclusive');
+    // Every criterion needs its OWN evidence: an anomaly is only settled by a fresh healthy probe of that same kind
+    // (and container/database) in this run; an unrelated probe never stands in for it.
+    const audit = store.opsAuditOfRun(run.id).filter((a) => a.outcome === 'ok' && a.health !== 'unhealthy');
+    const covers = (i) => audit.some((a) => { const p = json(a.params, {}) || {}; return a.probe === i.probe && (!i.container || p.container === i.container) && (!i.db || p.db === i.db); });
+    const unsettled = (ev.items || []).filter((i) => i.result === 'anomaly' && !covers(i));
+    if (unsettled.length) throw err(`not settled by a fresh probe of its own in this run: ${unsettled.map((i) => i.criterion).join('; ')} — check each, or say inconclusive`);
+  }
+  let finalEv = ev;
+  if (action === 'verified') {
+    // The desk confirms every required criterion afresh before accepting "verified": anything still unread, unknown or
+    // failing (e.g. freshness) leaves the checkpoint unresolved.
+    const w = store.getWatch(cp.watch_id);
+    const re = await observe(w, { ...cp, evidence: null }, clock.now());
+    const bad = re.items.filter((i) => i.result === 'fail');
+    const open = re.items.filter((i) => i.result === 'unknown' || i.incomplete);
+    if (bad.length) throw err(`the desk's fresh look shows a failure: ${bad.map((i) => `${i.criterion} (${i.observed})`).join('; ')} — say regression`);
+    if (open.length || re.identity?.status !== 'match') throw err(`not every required criterion has fresh healthy evidence (${[...open.map((i) => i.criterion), ...(re.identity?.status !== 'match' ? ['deployment identity'] : [])].join('; ')}) — say inconclusive`);
+    finalEv = { ...re, sre_settled: (ev.items || []).filter((i) => i.result === 'anomaly').map((i) => i.criterion) };
   }
   const limited = action === 'verified' && store.getWatch(cp.watch_id)?.criteria_source !== 'ticket';
-  await finish(cp, action, { summary: text, evidence: ev, limited, author: run.agent_id, sre: { seat: run.agent_id, verdict: action, text, run_id: run.id, fresh_probes: fresh, at: iso(clock.now()) } });
+  await finish(cp, action, { summary: text, evidence: finalEv, limited, author: run.agent_id, sre: { seat: run.agent_id, verdict: action, text, run_id: run.id, fresh_probes: fresh, at: iso(clock.now()) } });
   return 'Recorded. Stop now.';
 }
 

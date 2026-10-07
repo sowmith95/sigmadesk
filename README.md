@@ -436,7 +436,8 @@ deploy and then checks production itself.
 - **Targets.** `deploy.targets` names what each deploying workflow redeploys, e.g.
   `{"deploy-mac-mini.yml": "alpaca-trader"}`, and `deployWatch.targetContainers` which allowlisted containers belong to
   a target (default: the container named like the target). Only a newer deployment of a **positively matched** target
-  supersedes a watch; an unmapped deployment never cancels another watch and is itself watched to the end. An older
+  supersedes a watch, per component: an ingestor-only deployment retires just the ingestor part of a trader+ingestor
+  watch, and the trader keeps being checked; an unmapped deployment never cancels another watch and is itself watched to the end. An older
   deployment discovered after a newer one of the same target is recorded as superseded at once (per-target watermark).
 - **Checkpoints.** T+5 min (smoke), T+30 min, and the **next exchange session open + 5 min**. The calendar is a small
   built-in NYSE table for 2026–2027 (holidays, 13:00 early closes, regular session 09:30–16:00 America/New_York, DST
@@ -453,15 +454,19 @@ deploy and then checks production itself.
   baseline, error signatures as **normalized per-minute rates** over two bounded windows (30 min before the merge, and
   since the deploy; a known signature counts when its rate rises `deployWatch.signatureRateRatio`×, default 3), and
   ingest freshness (stale while the market is closed is not judged; only a trusted baseline that was already stale
-  excuses it). Required checks come first and the logs rotate across retries, so a small market-hours allowance
-  (`deployWatch.probesPerCheckpoint`, default the per-run limit) still covers every container; the desk's own probes
+  excuses it). Required checks come first; then each watched container's logs and each freshness database
+  — the ones not yet read (fresh within 15 min) first, logs before freshness — so a small market-hours allowance
+  (`deployWatch.probesPerCheckpoint`, default the per-run limit) covers everything across retries, and an allowance
+  that never can ends inconclusive naming exactly what was never read; the desk's own probes
   leave `deployWatch.sreReserveProbes` of the hourly budget for the SRE. Each checkpoint stores structured evidence:
   criterion, probe, observation time, threshold, observed value, result, coverage limits, and the deployment identity
   (workflow runs, container images, and the commit the app reports on `/health` when it does). **Verified needs the deployment identity to match** (the app reports
   this commit on `/health`, or a container image is tagged with it) and healthy evidence for every required check; any
   unhealthy answer vetoes it, and partial coverage is inconclusive. The first hard failure immediately places a
-  **provisional hold** on deploying merges and pages you; one more look a couple of minutes later confirms it (a clean
-  look lifts the provisional hold); a check that observed nothing is retried
+  **provisional hold** on deploying merges and pages you; one more look a couple of minutes later confirms it (only a fresh
+  passing look at the very checks that failed lifts the provisional hold; a confirmation the budget refused keeps it);
+  an SRE "verified" is accepted only after the desk's own fresh look gives every required criterion healthy evidence
+  and each anomaly was re-checked with its own probe; a check that observed nothing is retried
   (`deployWatch.retryMinutes`), then inconclusive. A check missed by more than `deployWatch.missedHours` is recorded as
   missed. During market hours the probe allowance per checkpoint is the busy-window per-run limit.
 - **The SRE model only when needed.** Anomalies (one restart, a new error signature below
@@ -471,7 +476,8 @@ deploy and then checks production itself.
   from the SRE needs a fresh probe in that run. Watch and verify runs never publish or merge anything; a watch run cannot even comment.
 - **Access.** `access.policy.postDeployAutoGrant` is **off** by default (also for desks saved before it existed). When
   you switch it on (Access sheet), a checkpoint's SRE run gets a grant bound to that run and checkpoint, within the policy (allowed seats, probes,
-  longest duration, active grants), limited to the deployment's containers and databases, expiring with the run; the
+  longest duration, active grants), limited to the deployment's containers and databases (container status shows only those), expiring with the run;
+  lowering `maxActive` ends the oldest agent grants beyond it; the
   policy is re-checked at every probe (narrowing it ends the grant) and the grant ends when the deployment stops being
   watched. An access request from a check run lives and ends with that run, not with the (done) ticket. Off, the SRE works from the desk's evidence or asks you for access.
 - **Risk.** Owner policy: unknown risk counts as high. A ticket is low risk only when both its stored risk and the diff

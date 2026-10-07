@@ -753,7 +753,7 @@ test('review #10: a small market-hours allowance rotates through every container
   const ev = JSON.parse(smoke().evidence);
   assert.deepEqual(ev.items.filter((i) => i.probe === 'container_logs').map((i) => i.container).sort(), ['alpaca-trader', 'ingestor', 'precompute']);
   assert.equal(smoke().verdict, 'verified', 'complete after rotating');
-  assert.equal(smoke().attempts, 3);
+  assert.equal(smoke().attempts, 2, 'two secondary slots per attempt: three logs and one database in two attempts');
   ops.setNow(() => new Date('2026-10-03T15:00:00Z'));
   config.ops.containers = ['alpaca-trader'];
   delete config.deployWatch.targetContainers;
@@ -793,4 +793,139 @@ test('review #11: calendar config is validated; an uncovered year fails closed t
   dw.hooks.beforeWatch = null;
   assert.deepEqual([l.state, /could not be recorded/.test(l.note)], ['escalated', true]);
   assert.ok(train.ownerClearDeploy({ merge_sha: m2 }));
+});
+
+// ---------------- round-2 review fixes ----------------
+test('round 2 #1: every criterion needs its own fresh evidence — an unrelated probe never settles it; unread freshness stays unresolved', async () => {
+  reset();
+  const t = doneTicket({ prod_verify: 'fills panel shows today' });
+  const { m, w } = await deployed(t);
+  app.body = sha40(m);
+  docker({ inspect: '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' }); // one restart: an anomaly
+  fs.writeFileSync(psqlCtl, JSON.stringify({ out: 'source\tlatest\tlag_s\n' })); // freshness reports nothing: unresolved
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const cp = dw.claimJob(dw.nextJobs()[0].checkpoint);
+  const r = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t.key, token: `r1${++seq}`, model: 'x', job: { checkpoint: cp.id } });
+  store.updateCheckpoint(cp.id, { run_id: r.id });
+  const g = access.ownerGrant({ seat: 'sre', probes: ['*'], minutes: 30, reason: 'test' });
+  ops.clearCache();
+  await ops.handle(r, { probe: 'db_health', db: 'timescale' }); // unrelated to the restart
+  await assert.rejects(sched.deskAction(r, 'watch', { action: 'verified', body: 'fine' }), /not settled by a fresh probe of its own.*container alpaca-trader runs/);
+  await ops.handle(r, { probe: 'container_status' }); // the anomaly's own probe
+  await assert.rejects(sched.deskAction(r, 'watch', { action: 'verified', body: 'fine' }), /not every required criterion has fresh healthy evidence.*ingest freshness/);
+  fs.writeFileSync(psqlCtl, '{}'); // now the desk's fresh look can read freshness
+  assert.match(await sched.deskAction(r, 'watch', { action: 'verified', body: 'restart was the deploy itself; all healthy' }), /Recorded/);
+  assert.equal(store.getCheckpoint(cp.id).verdict, 'verified');
+  assert.ok(JSON.parse(store.getCheckpoint(cp.id).evidence).items.some((i) => i.criterion === 'ingest bars is fresh' && i.result === 'pass'), 'the stored evidence is the fresh look');
+  store.endGrant(g.id, 'owner', 'reset');
+  assert.equal(w.id > 0, true);
+});
+
+test('round 2 #2: a provisional hold lifts only on a fresh healthy look at what failed; a refused confirmation keeps it', async () => {
+  reset();
+  const t = doneTicket();
+  const { m, w } = await deployed(t);
+  app.body = sha40(m); app.status = 503;
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  assert.equal(store.getWatch(w.id).hold_kind, 'provisional');
+  // The confirming look is refused by the hourly budget: no recovery evidence, the hold stays.
+  app.status = 200;
+  const per = config.ops.normal.perHour;
+  config.ops.normal.perHour = 1;
+  dw.clock.now = () => at(11);
+  await dw.sweep({ now: at(11) });
+  config.ops.normal.perHour = per;
+  assert.deepEqual([store.getWatch(w.id).hold, store.getWatch(w.id).hold_kind], [1, 'provisional'], 'no positive evidence: still held');
+  // A fresh, healthy answer of the failed check lifts it.
+  const next = store.checkpointsOf(w.id).find((c) => c.name === 'smoke').next_attempt_at;
+  dw.clock.now = () => new Date(next);
+  await dw.sweep({ now: new Date(next) });
+  assert.equal(store.getWatch(w.id).hold, 0);
+  assert.ok(store.listComments(t.key).some((c) => /passed again on a fresh look/.test(c.body)));
+});
+
+test('round 2 #3: a scoped grant sees only its containers in container_status; lowering maxActive ends the oldest agent grants', async () => {
+  reset();
+  const base = access.validatePolicy(access.policy());
+  access.setPolicy({ ...base, postDeployAutoGrant: true });
+  const t = doneTicket();
+  const { m, w } = await deployed(t);
+  app.body = sha40(m);
+  docker({ inspect: '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' });
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const cp = dw.claimJob(dw.nextJobs()[0].checkpoint);
+  const r = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t.key, token: `r3${++seq}`, model: 'x', job: { checkpoint: cp.id } });
+  const g = dw.jobStarted(store.getCheckpoint(cp.id), r);
+  config.ops.containers = ['alpaca-trader', 'broker-gateway'];
+  docker({ ps: 'alpaca-trader\trunning\tUp\t1m\nbroker-gateway\trunning\tUp\t1m', inspect: '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' });
+  const out = await ops.handle(r, { probe: 'container_status' });
+  assert.match(out, /alpaca-trader/);
+  assert.doesNotMatch(out, /broker-gateway/, 'nothing about containers outside the grant');
+  config.ops.containers = ['alpaca-trader'];
+  // An older agent grant exists too; the owner lowers maxActive to 1: the oldest ends at the next probe.
+  const older = store.insertGrant({ seat: 'dba', probes: ['db_health'], expires_at: new Date(Date.now() + 3600_000).toISOString(), granted_by: 'manager', reason: 'older' });
+  store.handle().exec(`UPDATE ops_grants SET created_at = '2000-01-01T00:00:00.000Z' WHERE id = ${older.id}`);
+  access.setPolicy({ ...base, postDeployAutoGrant: true, maxActive: 1 });
+  assert.equal(ops.denial(r, 'app_health'), null, 'the newest grant keeps working');
+  assert.equal(store.getGrant(older.id).revoked_by, 'policy changed');
+  access.setPolicy({ ...base, postDeployAutoGrant: true, maxActive: 0 });
+  assert.ok(ops.denial(r, 'app_health'));
+  assert.equal(store.getGrant(g.id).revoked_by, 'policy changed');
+  access.setPolicy({ ...base, postDeployAutoGrant: false });
+  assert.equal(w.id > 0, true);
+});
+
+test('round 2 #4: an ingestor-only deployment retires only the ingestor part of a trader+ingestor watch', async () => {
+  reset();
+  config.ops.containers = ['alpaca-trader', 'ingestor'];
+  const mk = (targets, completed, key) => { const m = sha(); const rows = targets.map((tg, i) => store.recordDeploy({ deploy_key: key, merge_sha: m, workflow: `.github/workflows/${tg}.yml`, run_id: 80000 + seq * 10 + i, target: tg, status: 'success', completed_at: completed, source: 'external' }).row);
+    return store.transaction(() => dw.createWatchFor({ deployKey: key, mergeSha: m, ticketKey: null, pr: null, rows, source: 'external' })); };
+  const both = mk(['alpaca-trader', 'ingestor'], at(3).toISOString(), `b${++seq}`);
+  mk(['ingestor'], at(6).toISOString(), `i${++seq}`);
+  const w = store.getWatch(both.id);
+  assert.deepEqual([w.status, w.target, JSON.parse(w.retired_targets)], ['watching', 'alpaca-trader', ['ingestor']], 'trader monitoring continues');
+  docker({ ps: 'alpaca-trader\trunning\tUp\t1m\ningestor\trunning\tUp\t1m', inspect: '/alpaca-trader\thealthy\t0\t2026-10-03T15:01:00Z\tfalse\timg\n/ingestor\thealthy\t5\t2026-10-03T15:06:00Z\tfalse\timg' });
+  const ev = await dw.observe(w, { name: 'settle', due_at: at(33).toISOString(), attempts: 1, evidence: null }, at(33));
+  assert.ok(!ev.items.some((i) => /ingestor/.test(i.criterion)), 'the ingestor now runs another deployment: not judged here');
+  assert.ok(ev.items.some((i) => i.criterion === 'container alpaca-trader runs'));
+  // An older trader+ingestor deployment discovered after the ingestor one: only its trader part is watched.
+  const late = mk(['alpaca-trader', 'ingestor'], at(4).toISOString(), `l${++seq}`);
+  assert.equal(store.getWatch(late.id).target, 'alpaca-trader');
+  config.ops.containers = ['alpaca-trader'];
+});
+
+test('round 2 #5: two freshness databases cannot starve logs; an impossible allowance ends inconclusive with the exact gap', async () => {
+  reset();
+  config.ops.databases.ts2 = { host: '127.0.0.1', port: 5433, dbname: 'ts2', user: 'ro' };
+  config.ops.freshness = [{ label: 'bars', db: 'timescale' }, { label: 'bars2', db: 'ts2' }];
+  config.ops.busy.perHour = 100000;
+  ops.setNow(() => new Date('2026-10-07T15:00:00Z')); // market hours: 4 probes per attempt
+  const t = doneTicket();
+  const { m, w } = await deployed(t);
+  app.body = sha40(m);
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const ev1 = JSON.parse(store.checkpointsOf(w.id).find((c) => c.name === 'smoke').evidence);
+  assert.ok(ev1.items.some((i) => i.probe === 'container_logs' && !i.incomplete), 'logs are read on the first attempt');
+  assert.match(ev1.coverage.join(' '), /not read within the probe allowance .*ingest freshness of ts2/);
+  dw.clock.now = () => at(11);
+  await dw.sweep({ now: at(11) });
+  assert.equal(store.checkpointsOf(w.id).find((c) => c.name === 'smoke').verdict, 'verified', 'covered across two attempts');
+  // An allowance that can never reach the secondary checks: inconclusive, naming exactly what was never read.
+  reset();
+  config.deployWatch.probesPerCheckpoint = 2;
+  const t2 = doneTicket();
+  const { m: m2, w: w2 } = await deployed(t2);
+  app.body = sha40(m2);
+  for (const min of [9, 11, 16, 26]) { dw.clock.now = () => at(min); await dw.sweep({ now: at(min) }); }
+  const s2 = store.checkpointsOf(w2.id).find((c) => c.name === 'smoke');
+  assert.equal(s2.verdict, 'inconclusive');
+  assert.match(s2.summary, /never read within the probe allowance — logs of alpaca-trader, ingest freshness of timescale, ingest freshness of ts2/);
+  delete config.deployWatch.probesPerCheckpoint;
+  delete config.ops.databases.ts2;
+  config.ops.freshness = [{ label: 'bars', db: 'timescale' }];
+  ops.setNow(() => new Date('2026-10-03T15:00:00Z'));
 });
