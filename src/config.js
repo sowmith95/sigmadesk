@@ -91,12 +91,10 @@ const DEFAULTS = {
     workflows: 'auto',
     // Which service each deploying workflow redeploys, e.g. {"deploy-mac-mini.yml": "alpaca-trader"}. The decision brief
     // names a deploy target ONLY from this mapping; a workflow without an entry says "deployment target unknown".
+    // Also part of every deployment's identity for the post-deploy watch (an unmapped workflow = "unknown target").
     targets: {},
     waitMinutes: 45, // after a deploying merge, wait this long for its deploy run before asking the owner
     graceMinutes: 3, // no deploy run seen this long after the merge = the merge did not trigger one
-    // Which service/environment each deploying workflow redeploys, e.g. {"deploy-mac-mini.yml": "alpaca-trader"}.
-    // Part of every deployment's identity; a workflow without an entry deploys an "unknown target".
-    targets: {},
   },
   // Post-deploy watch (#7): after a deploy finishes, the desk itself checks production at T+5 min (smoke), T+30 min
   // and the next exchange session open + 5 min, against a baseline captured at merge. The SRE model is woken only for
