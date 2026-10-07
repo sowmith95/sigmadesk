@@ -20,6 +20,8 @@ import { PresenceStrip } from '@/components/desk/Presence';
 import { Participants } from './Mentions';
 import { MessageBar, type BarHandle } from './MessageBar';
 import { PersonSheet } from '@/components/desk/PeopleSheet';
+import { DecisionLead } from '@/components/desk/DecisionBrief';
+import { AutonomyLine } from '@/components/desk/Autonomy';
 import type { Board, BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -172,6 +174,7 @@ export function TicketSheet() {
       {nameOf(t) !== t.title && <span className="truncate text-sm text-muted-foreground">{t.title}</span>}
     </div>
     <Participants tkey={t.key} list={d?.participants || []} onPerson={setPerson} />
+    <AutonomyLine a={d?.autonomy} onOpen={() => setTab('details')} />
     </div>
   );
   const shownTab = dec || tab !== 'decision' ? tab : 'conversation';
@@ -212,6 +215,7 @@ export function TicketSheet() {
           <TabsTrigger value="details">Details</TabsTrigger>
         </TabsList>
         {dec && <TabsContent value="decision" className="grid gap-4">
+          <DecisionLead it={dec} t={t} />
           {dec.kind === 'product' ? <ProductReview t={t} d={d} msg={reviewMsg} setMsg={setReviewMsg} /> : dec.kind === 'owner_task' ? <OwnerTaskActions t={t} /> : dec.kind === 'epic_review' ? <EpicReview root={t.key} /> : <Brief dec={dec} t={t} d={d} />}
           <PrSummary t={t} dec={dec} />
           <Reviews raw={prReviewsOf(t, d)} compact={false} t={t} />

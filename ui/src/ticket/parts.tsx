@@ -10,9 +10,10 @@ import { Textarea } from '@/components/ui/textarea';
 import { AsyncButton } from '@/components/desk/AsyncButton';
 import { Tag, Named, SeatAvatar } from '@/components/desk/Bits';
 import { Markdown, Inline } from '@/components/desk/Markdown';
-import { cardFor, EvidenceList, CiTag, Disclose, STAGE_LABEL, firstName } from '@/components/desk/Work';
+import { cardFor, EvidenceList, CiTag, Disclose, STAGE_LABEL } from '@/components/desk/Work';
 import { cn } from '@/lib/utils';
 import { Deliveries } from './Mentions';
+import { TicketAutonomy } from '@/components/desk/Autonomy';
 import type { BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -166,19 +167,9 @@ export function Brief({ dec, t, d }: { dec: BoardItem; t: Ticket; d: Detail | nu
       : dec.kind === 'research' ? "The independent second reviewer did not pass this research proposal; the author's revision allowance is used up or the reviewer rejected it."
         : dec.kind === 'council' ? 'The architecture council finished its review.'
           : outcome(strip(submit ? submit.body.split('\n').slice(1).join(' ').trim() || submit.body : card?.result?.summary || t.progress_msg || 'No change summary posted.'));
-  const pr = prFor(t);
-  const risk = ({
-    merge: [pr ? `CI ${pr.checks}${pr.mergeable === 'CONFLICTING' ? ', conflicts with the base branch' : ''}.` : 'CI status not loaded yet.', 'Merging deploys production.'],
-    publish: ['Approving pushes the branch and opens a draft PR. Nothing merges until you merge it.'],
-    guard: ['The change touches protected paths or is unusually large. Approving pushes it and opens a draft PR.'],
-    question: [`${firstName(t.assignee)} is paused until you answer.`],
-    design: ['Approving records the design. Implementation, QA and merge keep their own gates.'],
-    council: ['A council verdict records a design decision; implementation, QA and merge keep their own gates.'],
-    research: ['Approving waives the second review (recorded as your verdict) and lets the manager groom it. Send back gives the author one more revision with your notes. Reject closes the proposal.'],
-  } as Record<string, string[]>)[dec.kind || ''] || [];
   return (
-    <Block tone="needs">
-      <Row k="Your decision"><p className="font-semibold">{dec.verb}</p>
+    <Block>
+      <Row k={q ? 'The question' : 'Why it is yours'}>
         {q && <div className="rounded-md bg-needs/15 px-3 py-2"><Markdown text={questionText(q.body)} self={t.key} /></div>}
         {dec.kind === 'design' && (proposal ? <div className="rounded-md bg-background p-3"><p className="mb-1 text-sm text-muted-foreground">Recommendation #{proposal.id}</p><Markdown text={proposal.response} self={t.key} /></div>
           : <p className="text-muted-foreground">Loading recommendation #{dec.proposal_id}…</p>)}
@@ -186,9 +177,15 @@ export function Brief({ dec, t, d }: { dec: BoardItem; t: Ticket; d: Detail | nu
         {!q && !['design', 'council'].includes(dec.kind || '') && <p><Named text={clean(dec.reason)} /></p>}</Row>
       <Row k="Outcome"><p><Named text={changed} /></p></Row>
       {!['design', 'council'].includes(dec.kind || '') && <Row k="Evidence"><EvidenceList ev={card?.evidence} /></Row>}
-      <Row k="Remaining risk">{risk.map((r, i) => <p key={i}>{r}</p>)}</Row>
     </Block>
   );
+}
+
+/** What merging this PR starts, from the server's decision snapshot (detected workflows, never a blanket claim). */
+function MergeConsequence({ t }: { t: Ticket }) {
+  const b = Object.values((S.meta.decision_briefs || {}) as Record<string, Detail>).find((x) => x.key === t.key && x.kind === 'merge');
+  if (b?.consequence) return <p className="text-sm text-muted-foreground" data-merge-consequence={b.consequence.deploy?.state}>If merged: {b.consequence.summary}.</p>;
+  return <p className="text-sm text-muted-foreground" data-merge-consequence="unchecked">Which workflows merging starts is checked once it is ready to merge.</p>;
 }
 
 export function PrSummary({ t, dec }: { t: Ticket; dec: BoardItem | null }) {
@@ -207,7 +204,7 @@ export function PrSummary({ t, dec }: { t: Ticket; dec: BoardItem | null }) {
     <Block title={`Pull request #${n}`}>
       {pr ? <p className="flex flex-wrap items-center gap-2"><CiTag t={t} /><span className="font-mono text-sm">+{pr.additions} −{pr.deletions}</span><span className="text-sm text-muted-foreground">in {pr.files} files</span></p>
         : <p className="text-muted-foreground">{S.prsLoading ? 'Loading CI status from GitHub…' : S.prs?.error ? `GitHub status unavailable: ${S.prs.error}` : 'CI status not loaded.'}</p>}
-      <p className="text-sm text-muted-foreground">Merging into {S.prs?.base || 'main'} deploys production.</p>
+      <MergeConsequence t={t} />
       {r && <p className="text-sm text-muted-foreground" role="status">Branch refresh: {r.status === 'conflicts' ? 'engineer resolving conflicts' : r.status === 'rebased' ? 'rebased, fresh validation in progress' : r.status === 'published' ? 'published after fresh QA' : 'preparing'}; base {r.base?.slice(0, 10) || 'pending'}</p>}
       <div className="flex flex-wrap gap-2">
         {dec?.kind !== 'merge' && <Button variant="secondary" onClick={() => openSheet({ type: 'pr', number: n })}>PR actions</Button>}
@@ -293,6 +290,7 @@ export function Details({ t, d }: { t: Ticket; d: Detail | null }) {
   const Fact = ({ k, children }: { k: string; children: ReactNode }) => <div className="grid grid-cols-[120px_1fr] gap-3"><span className="text-sm text-muted-foreground">{k}</span><span className="min-w-0 [overflow-wrap:anywhere]">{children}</span></div>;
   return (
     <div className="grid gap-5">
+      <TicketAutonomy t={t} a={d?.autonomy} />
       <Block title="Description"><div className="max-h-[50vh] overflow-auto">{t.description ? <Markdown text={t.description} self={t.key} /> : <p className="text-muted-foreground">No description provided.</p>}</div></Block>
       <Block title="Ticket">
         <Sel label="Stage" field="status" options={Object.entries(STAGE_LABEL).filter(([k]) => k !== 'done' || t.status === 'done')} value={t.status} ok="Stage changed" />

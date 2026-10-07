@@ -89,6 +89,9 @@ const DEFAULTS = {
   // PR's files deploys; or list the deploying workflow files, e.g. ["deploy-mac-mini.yml"]. Unreadable = deploys.
   deploy: {
     workflows: 'auto',
+    // Which service each deploying workflow redeploys, e.g. {"deploy-mac-mini.yml": "alpaca-trader"}. The decision brief
+    // names a deploy target ONLY from this mapping; a workflow without an entry says "deployment target unknown".
+    targets: {},
     waitMinutes: 45, // after a deploying merge, wait this long for its deploy run before asking the owner
     graceMinutes: 3, // no deploy run seen this long after the merge = the merge did not trigger one
   },
@@ -391,6 +394,9 @@ export function validateConfig(c = config) {
     if (w) problems.push(w);
   }
   for (const [k, v] of Object.entries(c.project.env || {})) { const why = agentEnvProblem(k, v); if (why) problems.push(`${why} (it is withheld from seats)`); }
+  const dt = c.deploy?.targets;
+  if (dt != null && (typeof dt !== 'object' || Array.isArray(dt) || !Object.values(dt).every((v) => (typeof v === 'string' && v.trim()) || (Array.isArray(v) && v.length && v.every((x) => typeof x === 'string' && x.trim())))))
+    problems.push('deploy.targets must map workflow file names to a service name or a list of service names');
   const home = os.homedir();
   for (const p of c.project.readOnlyPaths || []) if (path.resolve(p) === home || home.startsWith(`${path.resolve(p)}/`)) problems.push(`project.readOnlyPaths: ${p} would expose your home folder to every seat`);
   if (c.github.sync && !c.project.githubRepo) problems.push('github.sync is on but project.githubRepo is unknown');
