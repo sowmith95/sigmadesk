@@ -435,8 +435,10 @@ deploy and then checks production itself.
   not the merge train or reviews are on.
 - **Targets.** `deploy.targets` names what each deploying workflow redeploys, e.g.
   `{"deploy-mac-mini.yml": "alpaca-trader"}`, and `deployWatch.targetContainers` which allowlisted containers belong to
-  a target (default: the container named like the target). Only a newer deployment of a **positively matched** target
-  supersedes a watch, per component: an ingestor-only deployment retires just the ingestor part of a trader+ingestor
+  a target (default: the container named like the target). Deployments are compared by the concrete **resources** their targets stand for (containers via
+  `deployWatch.targetContainers`, databases via `deployWatch.targetDatabases`), never by label: blue and green that
+  both run the `trader` container share it. A newer deployment retires exactly the shared resources from older watches,
+  per component: an ingestor-only deployment retires just the ingestor part of a trader+ingestor
   watch, and the trader keeps being checked; an unmapped deployment never cancels another watch and is itself watched to the end. An older
   deployment discovered after a newer one of the same target is recorded as superseded at once (per-target watermark).
 - **Checkpoints.** T+5 min (smoke), T+30 min, and the **next exchange session open + 5 min**. The calendar is a small
@@ -481,7 +483,8 @@ deploy and then checks production itself.
 - **Access.** `access.policy.postDeployAutoGrant` is **off** by default (also for desks saved before it existed). When
   you switch it on (Access sheet), a checkpoint's SRE run gets a grant bound to that run and checkpoint, within the policy (allowed seats, probes,
   longest duration, active grants), limited to the deployment's containers and databases — derived live from the watch at every probe, so a component a
-  newer deployment took over is refused at once (container status shows only the rest) — expiring with the run;
+  newer deployment took over is refused at once (container status shows only the rest) — re-checked when a queued probe
+  starts and again when its answer returns, so a resource that left while it waited or ran is dropped and said so — expiring with the run;
   lowering `maxActive` ends the oldest agent grants beyond it; the
   policy is re-checked at every probe (narrowing it ends the grant) and the grant ends when the deployment stops being
   watched. An access request from a check run lives and ends with that run, not with the (done) ticket. Off, the SRE works from the desk's evidence or asks you for access.

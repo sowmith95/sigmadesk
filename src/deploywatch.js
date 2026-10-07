@@ -145,8 +145,9 @@ export function liveScope(g) {
   const cp = g?.watch_checkpoint ? store.getCheckpoint(g.watch_checkpoint) : null;
   const w = cp ? store.getWatch(cp.watch_id) : null;
   if (!w || w.status !== 'watching') return { target: null, containers: [], dbs: [] };
-  const retired = retiredContainers(w);
-  return { target: w.target, containers: targetContainers(w.target).filter((c) => !retired.has(c)), dbs: freshnessDbs() };
+  const active = activeResources(w);
+  const retired = new Set(json(w.retired_resources, []) || []);
+  return { target: w.target, containers: active.filter((r) => r.startsWith('container:')).map((r) => r.slice(10)), dbs: freshnessDbs().filter((d) => !retired.has(`database:${d}`)) };
 }
 access.setScopeResolver(liveScope);
 export function targetContainers(target) {
@@ -259,8 +260,25 @@ export function recordLockOutcome(l, outcome, states = null, { by = null } = {})
   return createWatchFor({ deployKey, mergeSha, ticketKey: l.key || null, pr: l.pr || null, rows, source: sourceOf(l.by), mergedAt: l.at || null });
 }
 
-/** Two deployments touch the same thing only when both targets are known and they share one. */
-const overlaps = (a, b) => !!a && !!b && String(b).split(',').some((t) => String(a).split(',').includes(t));
+/**
+ * Deployments are compared by the concrete RESOURCES their targets stand for, never by label: `container:<name>` (the
+ * target's containers, deployWatch.targetContainers or the container named like it), `database:<id>`
+ * (deployWatch.targetDatabases), else `target:<label>` for a mapped target without known resources. Two labels that
+ * share a container (blue/green → trader) therefore share it here. An unknown target has no resources: it supersedes
+ * nothing and is superseded by nothing.
+ */
+export function resourcesOfTarget(label) {
+  const cs = targetContainers(label);
+  const dbs = (DW().targetDatabases || {})[label] || [];
+  const out = [...cs.map((c) => `container:${c}`), ...dbs.map((d) => `database:${d}`)];
+  return out.length ? out : [`target:${label}`];
+}
+export const resourcesOf = (targets) => [...new Set(targetsOf(targets).flatMap(resourcesOfTarget))];
+/** A watch's resources that are still its own: every resource of its targets minus those a newer deployment took over. */
+export function activeResources(w) {
+  const retired = new Set(json(w?.retired_resources, []) || []);
+  return resourcesOf(w?.target).filter((r) => !retired.has(r));
+}
 /** When the next session-open checkpoint is due, or why it cannot be scheduled (fails closed). */
 export function sessionCheckpoint(afterMs) {
   const c = DW().checkpoints || {};
@@ -284,17 +302,18 @@ export function createWatchFor({ deployKey, mergeSha, ticketKey, pr, rows, sourc
     workflows: JSON.stringify(rows.map((r) => ({ workflow: r.workflow, run_id: r.run_id, run_attempt: r.run_attempt, completed_at: r.completed_at }))),
     source, deployed_at: deployedAt, baseline: JSON.stringify(baseline), criteria: t?.prod_verify || null, criteria_source: t?.prod_verify ? 'ticket' : 'derived', trading_path: tradingPath(t) ? 1 : 0 });
   if (!created) return watch;
-  // Per-(target, component) watermark: components a newer deployment already replaced are not this watch's to check.
-  if (watch.target) {
-    const newer = store.watchesOfTarget().filter((x) => x.id !== watch.id && overlaps(x.target, watch.target) && x.deployed_at > deployedAt);
-    const taken = targetsOf(watch.target).filter((c) => newer.some((x) => targetsOf(x.target).includes(c)));
-    if (taken.length === targetsOf(watch.target).length) {
-      store.updateWatch(watch.id, { status: 'superseded', superseded_by: newer[0].id, verdict_note: `found after the newer deployment ${short(newer[0].merge_sha)} of ${watch.target}` });
+  // Per-resource watermark: resources a newer deployment (of any target sharing them) already replaced are not this
+  // watch's to check; if none are left it is history at once.
+  const mineRes = resourcesOf(watch.target);
+  if (mineRes.length) {
+    const newer = store.watchesOfTarget().filter((x) => x.id !== watch.id && x.deployed_at > deployedAt && resourcesOf(x.target).some((r) => mineRes.includes(r)));
+    const taken = mineRes.filter((r) => newer.some((x) => resourcesOf(x.target).includes(r)));
+    if (taken.length === mineRes.length) {
+      store.updateWatch(watch.id, { status: 'superseded', superseded_by: newer[0].id, retired_resources: JSON.stringify(taken), verdict_note: `found after the newer deployment ${short(newer[0].merge_sha)} of ${taken.join(', ')}` });
       store.logEvent({ kind: 'action', agent_id: 'system', ticket_key: ticketKey, text: `recorded deploy of ${short(mergeSha)}; production had already moved on to ${short(newer[0].merge_sha)}, so it is not watched` });
       return store.getWatch(watch.id);
     }
-    if (taken.length) store.updateWatch(watch.id, { target: targetsOf(watch.target).filter((c) => !taken.includes(c)).join(','), retired_targets: JSON.stringify(taken),
-      verdict_note: `${taken.join(', ')} already run a newer deployment` });
+    if (taken.length) markRetired(watch, taken, `${taken.join(', ')} already run a newer deployment`);
   }
   const c = DW().checkpoints || {};
   const at = Date.parse(deployedAt);
@@ -306,21 +325,28 @@ export function createWatchFor({ deployKey, mergeSha, ticketKey, pr, rows, sourc
   if (sc.error) store.updateCheckpoint(open.id, { status: 'unschedulable', summary: `could not be scheduled: ${sc.error}` });
   // Production advanced: older watches stop checking the components this deployment replaced (all of them → the watch
   // is superseded; some → only those). Unknown targets are never superseded.
-  for (const w of store.activeWatches()) if (w.id !== watch.id && overlaps(w.target, watch.target) && w.deployed_at <= deployedAt) retire(w, watch);
+  for (const w of store.activeWatches()) if (w.id !== watch.id && w.deployed_at <= deployedAt) retire(w, store.getWatch(watch.id));
   const runs = rows.map((r) => `${r.workflow.split('/').pop()}${r.run_id ? ` run ${r.run_id}${r.run_attempt > 1 ? ` (attempt ${r.run_attempt})` : ''}` : ''}`).join(', ');
   const next = sc.due ? fmt(sc.due) : `the next market open (NOT scheduled: ${sc.error})`;
   store.logEvent({ kind: sc.error ? 'error' : 'action', agent_id: 'system', ticket_key: ticketKey, text: `deployed ${short(mergeSha)} (${runs}) — watching production: T+5 smoke, T+30, ${next}` });
   if (t) say(t, `deployed:${deployKey}`, `🚀 **Deployed** \`${short(mergeSha)}\` via ${runs}${targets.length ? ` to ${targets.join(', ')}` : ' (deployment target unknown: no other deployment supersedes this watch)'} at ${fmt(new Date(deployedAt))}. SigmaDesk now watches production: a smoke check in 5 minutes, another at 30 minutes, and one at ${next}.${t.prod_verify ? '' : ' This ticket has no "How to verify in production" criteria, so the checks are general health checks only (limited).'}`, mergeSha);
   return watch;
 }
-const targetsOf = (t) => String(t || '').split(',').filter(Boolean);
-/** A newer deployment replaced some of this watch's components: stop checking those, keep watching the rest. */
+function targetsOf(t) { return String(t || '').split(',').filter(Boolean); }
+/** Record resources a newer deployment took over; target labels whose every resource is gone are listed as retired. */
+function markRetired(w, taken, note) {
+  const res = [...new Set([...(json(w.retired_resources, []) || []), ...taken])];
+  const labels = targetsOf(w.target).filter((l) => resourcesOfTarget(l).every((r) => res.includes(r)));
+  return store.updateWatch(w.id, { retired_resources: JSON.stringify(res), retired_targets: JSON.stringify(labels), verdict_note: note });
+}
+/** A newer deployment replaced some of this watch's resources: stop checking those, keep watching the rest. */
 function retire(w, by) {
-  const taken = targetsOf(w.target).filter((c) => targetsOf(by.target).includes(c));
-  const remaining = targetsOf(w.target).filter((c) => !taken.includes(c));
-  if (!remaining.length) return supersede(w, by);
-  store.updateWatch(w.id, { target: remaining.join(','), retired_targets: JSON.stringify([...(json(w.retired_targets, []) || []), ...taken]),
-    verdict_note: `${taken.join(', ')} moved on to ${short(by.merge_sha)}; ${remaining.join(', ')} still watched` });
+  const taken = activeResources(w).filter((r) => resourcesOf(by.target).includes(r));
+  if (!taken.length) return;
+  const after = markRetired(w, taken, `${taken.join(', ')} moved on to ${short(by.merge_sha)}`);
+  const remaining = activeResources(after);
+  if (!remaining.length) return supersede(after, by);
+  store.updateWatch(w.id, { verdict_note: `${taken.join(', ')} moved on to ${short(by.merge_sha)}; ${remaining.join(', ')} still watched` });
   const t = w.ticket_key ? store.getTicket(w.ticket_key) : null;
   if (t) store.addComment(t.key, 'system', `⏭ ${taken.join(', ')} now run${taken.length === 1 ? 's' : ''} \`${short(by.merge_sha)}\`; the remaining checks of \`${short(w.merge_sha)}\` cover ${remaining.join(', ')} only.`);
 }
@@ -543,9 +569,7 @@ export function identityOf(identity, mergeSha) {
 const CARRY_MIN = 15;
 /** The watch's own targets, and the containers of components a newer deployment took over (not this watch's any more). */
 function retiredContainers(w) {
-  const retired = json(w.retired_targets, []) || [];
-  const mine = new Set(targetContainers(w.target));
-  return new Set(targetContainers(retired.join(',')).filter((c) => !mine.has(c)));
+  return new Set((json(w.retired_resources, []) || []).filter((r) => r.startsWith('container:')).map((r) => r.slice(10)));
 }
 /**
  * Observe production for one checkpoint: fresh desk probes within a bounded allowance. App health and container status
@@ -571,7 +595,7 @@ export async function observe(w, cp, now = clock.now()) {
   const prev = json(cp.evidence, null);
   const retired = retiredContainers(w);
   if (retired.size) coverage.push(`${[...retired].join(', ')} now run${retired.size === 1 ? 's' : ''} a newer deployment: not attributed to this one`);
-  const mine = targetContainers(w.target);
+  const mine = activeResources(w).filter((r) => r.startsWith('container:')).map((r) => r.slice(10));
   const watchedLogs = [...mine.filter((c) => logContainers().includes(c)), ...logContainers().filter((c) => !mine.includes(c))].filter((c) => !retired.has(c));
   const no = ops.deskDenial();
   if (no) coverage.push(`production was not observed: ${no}`);
@@ -899,7 +923,7 @@ export function jobStarted(cp, run, { minutes = 15 } = {}) {
   store.updateCheckpoint(cp.id, { run_id: run.id });
   const w = store.getWatch(cp.watch_id);
   const probes = ['app_health', 'container_status', 'container_logs', 'ingest_freshness'];
-  const scope = { target: w?.target || null, containers: targetContainers(w?.target), dbs: freshnessDbs() };
+  const scope = { target: w?.target || null, containers: activeResources(w).filter((r) => r.startsWith('container:')).map((r) => r.slice(10)), dbs: freshnessDbs() };
   return access.postDeployGrant({ run: store.getRun(run.id) || run, checkpoint: store.getCheckpoint(cp.id), probes, minutes, scope });
 }
 export function chargeJob(cpId, run, steps = 0) {

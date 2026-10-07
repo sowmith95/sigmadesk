@@ -562,8 +562,10 @@ export async function handle(run, body = {}) {
   const scoped = access.scopeProblem(access.grantFor(run, probe), probe, params);
   if (scoped) { audit({ params, outcome: 'refused', detail: scoped }); throw refuse(scoped, 403); }
   const p = PROBES[probe];
-  // A scoped grant never shares the cache with unscoped callers (its answer is filtered to its resources).
-  const scopedTo = access.scopeOf(access.grantFor(run, probe))?.containers || null;
+  // A scoped grant never shares the cache with unscoped callers (its answer is filtered to its resources). Its scope is
+  // re-derived at dequeue and again when the answer returns: a resource that left the watch meanwhile is dropped.
+  const scopeNow = () => access.scopeOf(access.grantFor(run, probe));
+  let scopedTo = scopeNow()?.containers || null;
   const fromCache = (pr) => { const out = wrap(probe, pr, { ...cached(cacheKey(probe, pr)), ms: 0 }, { cached: true, lim }); audit({ params: pr, duration_ms: 0, bytes: Buffer.byteLength(out), outcome: 'cached' }); return out; };
   if (!scopedTo && cached(cacheKey(probe, params))) return fromCache(params);
   // Budget: check and reserve in one synchronous step, before the call can wait in a queue.
@@ -581,6 +583,7 @@ export async function handle(run, body = {}) {
     try { params = validate(probe, raw, lim); } catch (err) { audit({ params, outcome: 'refused', detail: err.message }); throw err; }
     const scoped2 = access.scopeProblem(access.grantFor(run, probe), probe, params);
     if (scoped2) { audit({ params, outcome: 'refused', detail: scoped2 }); throw refuse(scoped2, 403); }
+    if (scopedTo) scopedTo = scopeNow()?.containers || [];
     if (!scopedTo && cached(cacheKey(probe, params))) return fromCache(params);
     const late2 = budgetProblem(run.id, lim, true);
     if (late2) { audit({ params, outcome: 'refused', detail: late2 }); throw refuse(late2, 429); }
@@ -596,9 +599,21 @@ export async function handle(run, body = {}) {
       r = { outcome: 'error', text: 'probe failed', ms: 0 };
     }
     if (op.cancelled && r.outcome === 'ok') r = { outcome: 'cancelled', text: `cancelled: ${op.cancelled}`, ms: r.ms };
+    let finalOnly = scopedTo;
+    if (scopedTo && r.outcome === 'ok') {
+      const fin = scopeNow();
+      if (!fin) r = { outcome: 'cancelled', text: 'cancelled: production read access ended while the probe ran', ms: r.ms };
+      else {
+        finalOnly = fin.containers || [];
+        const gone = (scopedTo || []).filter((c) => !finalOnly.includes(c));
+        if (probe === 'container_status' && gone.length) r = { ...r, text: dropContainers(r.text, gone) };
+        const left = (params.container && !finalOnly.includes(params.container)) ? params.container : (params.db && !(fin.dbs || []).includes(params.db)) ? params.db : null;
+        if (left) { audit({ params, outcome: 'refused', detail: `${left} left this watch while the probe ran` }); throw refuse(`${left} left this watch while the probe ran (a newer deployment took it over); its result was dropped`, 403); }
+      }
+    }
     if (r.outcome === 'ok' && !scopedTo) cache.set(cacheKey(probe, params), { at: Date.now(), outcome: r.outcome, text: r.text, health: r.health });
     const out = wrap(probe, params, r, { cached: false, lim });
-    audit({ params, duration_ms: r.ms, bytes: Buffer.byteLength(out), outcome: r.outcome, health: r.health === 'unreachable' ? 'unhealthy' : r.health || null, resources: observedResources(probe, params, r, scopedTo),
+    audit({ params, duration_ms: r.ms, bytes: Buffer.byteLength(out), outcome: r.outcome, health: r.health === 'unreachable' ? 'unhealthy' : r.health || null, resources: observedResources(probe, params, r, finalOnly),
       detail: r.outcome === 'ok' ? (r.health === 'unhealthy' ? `HTTP ${r.status}: application unhealthy` : null) : clean(r.text).slice(0, 300) });
     const who = agentById[run.agent_id]?.name || run.agent_id;
     const secs = `${(r.ms / 1000).toFixed(1)}s`;
@@ -613,6 +628,14 @@ export async function handle(run, body = {}) {
   }
 }
 
+/** Remove containers that left a scoped grant while its status probe ran (rows and "not found" names), saying so. */
+export function dropContainers(text, gone) {
+  const g = new Set(gone);
+  const lines = String(text).split('\n').filter((l) => !g.has(l.split('\t')[0].replace(/^\//, '')))
+    .map((l) => (l.startsWith('not found: ') ? `not found: ${l.slice(11).split(',').map((x) => x.trim()).filter((x) => !g.has(x)).join(', ')}` : l))
+    .filter((l) => l !== 'not found: ');
+  return `${lines.join('\n')}\n# ${gone.join(', ')} left this watch while the probe ran: dropped\n`;
+}
 /** The resources a successful probe call actually observed: the evidence identity post-deploy checks match on. */
 export function observedResources(probe, params, r, only = null) {
   if (r.outcome !== 'ok') return [];

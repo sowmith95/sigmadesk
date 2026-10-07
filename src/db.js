@@ -553,7 +553,7 @@ function migrate() {
     // hold_status: what the deploy lock recorded when it held (kept when a later observation updates status)
     deploy_history: { hold_status: 'TEXT' },
     // hold_kind: provisional (first hard failure, before confirmation) | regression (confirmed)
-    deploy_watches: { hold_kind: 'TEXT', retired_targets: 'TEXT' },
+    deploy_watches: { hold_kind: 'TEXT', retired_targets: 'TEXT', retired_resources: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     // prod_access 0: the owner chose "ask me in my Inbox" for this delivery, so its run never gets automatic access
@@ -1317,7 +1317,7 @@ export const watchesSince = (iso) => q('SELECT * FROM deploy_watches WHERE deplo
 export const watchesOfTarget = () => q("SELECT * FROM deploy_watches WHERE target IS NOT NULL ORDER BY deployed_at DESC, id DESC LIMIT 500").all();
 export const recentWatches = (limit = 30) => q('SELECT * FROM deploy_watches ORDER BY id DESC LIMIT ?').all(limit);
 export function updateWatch(id, patch) {
-  const cols = Object.keys(patch).filter((k) => ['status', 'verdict_note', 'superseded_by', 'hold', 'hold_kind', 'target', 'retired_targets', 'cleared_by', 'cleared_at', 'incident_key', 'revert_key', 'baseline'].includes(k));
+  const cols = Object.keys(patch).filter((k) => ['status', 'verdict_note', 'superseded_by', 'hold', 'hold_kind', 'target', 'retired_targets', 'retired_resources', 'cleared_by', 'cleared_at', 'incident_key', 'revert_key', 'baseline'].includes(k));
   if (cols.length) q(`UPDATE deploy_watches SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), now(), id);
   const row = getWatch(id); announce({ type: 'watch', data: row }); return row;
 }

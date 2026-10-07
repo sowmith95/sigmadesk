@@ -36,6 +36,7 @@ fs.writeFileSync(fakeDocker, `#!/usr/bin/env node
 const fs = require('fs');
 const a = process.argv.slice(2);
 const c = (() => { try { return JSON.parse(fs.readFileSync(${JSON.stringify(dockerCtl)}, 'utf8')); } catch { return {}; } })();
+if (c.sleepMs && ['ps', 'logs'].includes(a[0])) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, c.sleepMs);
 if (a[0] === 'ps') console.log(c.ps ?? 'alpaca-trader\\trunning\\tUp 1 minute\\t1 minute ago');
 else if (a[0] === 'inspect') console.log(c.inspect ?? '/alpaca-trader\\thealthy\\t0\\t2026-10-03T15:01:00Z\\tfalse\\tghcr.io/o/alpaca:main@sha256:abc');
 else if (a[0] === 'stats') console.log('alpaca-trader\\t3%\\t512MiB / 2GiB\\t25%');
@@ -105,6 +106,7 @@ const reset = () => {
   for (const s of ['pending', 'needs_sre', 'sre_running', 'running']) for (const c of store.checkpointsByStatus(s)) store.updateCheckpoint(c.id, { status: 'superseded' });
   docker(); app.status = 200; app.body = '{"status":"ok"}'; fs.writeFileSync(psqlCtl, '{}'); setGh('branch-runs.json', []);
   store.kvSet('deploywatch:reconciled', '');
+  for (const g of store.openGrants()) store.endGrant(g.id, 'owner', 'test reset');
 };
 /** A deploy of a fresh merge commit that finished OK, released by the lock → its watch. */
 async function deployed(t, { attempt = 1 } = {}) {
@@ -887,14 +889,14 @@ test('round 2 #4: an ingestor-only deployment retires only the ingestor part of 
   const both = mk(['alpaca-trader', 'ingestor'], at(3).toISOString(), `b${++seq}`);
   mk(['ingestor'], at(6).toISOString(), `i${++seq}`);
   const w = store.getWatch(both.id);
-  assert.deepEqual([w.status, w.target, JSON.parse(w.retired_targets)], ['watching', 'alpaca-trader', ['ingestor']], 'trader monitoring continues');
+  assert.deepEqual([w.status, dw.activeResources(w), JSON.parse(w.retired_targets)], ['watching', ['container:alpaca-trader'], ['ingestor']], 'trader monitoring continues');
   docker({ ps: 'alpaca-trader\trunning\tUp\t1m\ningestor\trunning\tUp\t1m', inspect: '/alpaca-trader\thealthy\t0\t2026-10-03T15:01:00Z\tfalse\timg\n/ingestor\thealthy\t5\t2026-10-03T15:06:00Z\tfalse\timg' });
   const ev = await dw.observe(w, { name: 'settle', due_at: at(33).toISOString(), attempts: 1, evidence: null }, at(33));
   assert.ok(!ev.items.some((i) => /ingestor/.test(i.criterion)), 'the ingestor now runs another deployment: not judged here');
   assert.ok(ev.items.some((i) => i.criterion === 'container alpaca-trader runs'));
   // An older trader+ingestor deployment discovered after the ingestor one: only its trader part is watched.
   const late = mk(['alpaca-trader', 'ingestor'], at(4).toISOString(), `l${++seq}`);
-  assert.equal(store.getWatch(late.id).target, 'alpaca-trader');
+  assert.deepEqual(dw.activeResources(store.getWatch(late.id)), ['container:alpaca-trader']);
   config.ops.containers = ['alpaca-trader'];
 });
 
@@ -1031,4 +1033,107 @@ test('round 3 property: verified ⇒ every required key has fresh healthy eviden
     const failed = [...new Set(ev.items.filter((i) => i.result === 'fail').map(dw.evKey))];
     if (dw.recovered(failed, re)) for (const f of failed) { const seen = re.items.filter((y) => `${y.kind}|${y.resource}|${y.criterion}` === f); assert.ok(seen.length && seen.every((y) => y.result === 'pass' && !y.carried), `released without ${f}`); }
   }
+});
+
+// ---------------- round-4: scope at completion, and resources instead of target labels ----------------
+const mkRows = (targets, completed, key) => { const m = sha(); const rows = targets.map((tg, i) => store.recordDeploy({ deploy_key: key, merge_sha: m, workflow: `.github/workflows/${tg}.yml`, run_id: 95000 + seq * 10 + i, target: tg, status: 'success', completed_at: completed, source: 'external' }).row);
+  return store.transaction(() => dw.createWatchFor({ deployKey: key, mergeSha: m, ticketKey: null, pr: null, rows, source: 'external' })); };
+
+test('round 4: a probe queued or running when its resource leaves the watch drops that resource (status) or its result (logs)', async () => {
+  reset();
+  config.ops.containers = ['alpaca-trader', 'ingestor'];
+  const ps = 'alpaca-trader\trunning\tUp\t1m\ningestor\trunning\tUp\t1m';
+  const ins = '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg\n/ingestor\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg';
+  docker({ ps, inspect: ins });
+  const w = mkRows(['alpaca-trader', 'ingestor'], at(3).toISOString(), `q${++seq}`);
+  app.body = sha40(w.merge_sha);
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const { r, done } = await mkGrantRun(null, w);
+  // Both docker lanes busy with slow desk probes; the seat's status probe waits in the queue.
+  docker({ ps, inspect: ins, sleepMs: 700 });
+  const blockers = [ops.deskProbe('container_status'), ops.deskProbe('container_status')];
+  await new Promise((res) => setTimeout(res, 100));
+  const queued = ops.handle(r, { probe: 'container_status' });
+  await new Promise((res) => setTimeout(res, 100));
+  mkRows(['ingestor'], at(12).toISOString(), `nq${++seq}`); // the ingestor leaves this watch while the probe waits
+  const out = await queued;
+  await Promise.all(blockers);
+  assert.doesNotMatch(out, /^ingestor\t/m);
+  assert.deepEqual(JSON.parse(store.opsAuditOfRun(r.id).at(-1).resources), ['alpaca-trader']);
+  // Running (not queued) when the change happens: the answer comes back, the departed rows are dropped and said so.
+  const w2 = mkRows(['alpaca-trader', 'ingestor'], at(20).toISOString(), `q${++seq}`);
+  app.body = sha40(w2.merge_sha);
+  dw.clock.now = () => at(26);
+  docker({ ps, inspect: ins });
+  await dw.sweep({ now: at(26) });
+  const g2 = await mkGrantRun(null, w2);
+  docker({ ps, inspect: ins, sleepMs: 500 });
+  const running = ops.handle(g2.r, { probe: 'container_status' });
+  const logs = ops.handle(g2.r, { probe: 'container_logs', container: 'ingestor' }).then(() => null, (e) => e);
+  await new Promise((res) => setTimeout(res, 150));
+  mkRows(['ingestor'], at(28).toISOString(), `nr${++seq}`);
+  const out2 = await running;
+  assert.match(out2, /ingestor left this watch while the probe ran: dropped/);
+  assert.doesNotMatch(out2, /^ingestor\t/m);
+  assert.match(String((await logs)?.message), /ingestor left this watch while the probe ran/);
+  docker({ ps, inspect: ins });
+  done(); g2.done();
+  config.ops.containers = ['alpaca-trader'];
+});
+
+test('round 4: blue and green share the trader container — a newer green retires trader from the blue+ingestor watch', async () => {
+  reset();
+  config.ops.containers = ['trader', 'ingestor'];
+  config.deployWatch.targetContainers = { blue: ['trader'], green: ['trader'], ingestor: ['ingestor'] };
+  const ps = 'trader\trunning\tUp\t1m\ningestor\trunning\tUp\t1m';
+  docker({ ps, inspect: '/trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg\n/ingestor\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' });
+  const w = mkRows(['blue', 'ingestor'], at(3).toISOString(), `bg${++seq}`);
+  app.body = sha40(w.merge_sha);
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const { r, done } = await mkGrantRun(null, w);
+  assert.match(await ops.handle(r, { probe: 'container_logs', container: 'trader' }), /ops-result/);
+  mkRows(['green'], at(12).toISOString(), `gr${++seq}`);
+  assert.deepEqual(dw.activeResources(store.getWatch(w.id)), ['container:ingestor']);
+  await assert.rejects(ops.handle(r, { probe: 'container_logs', container: 'trader' }), /covers only ingestor/);
+  assert.match(await ops.handle(r, { probe: 'container_logs', container: 'ingestor' }), /ops-result/);
+  // An older blue-only deployment found later: everything it ran was already replaced → superseded at once.
+  const old = mkRows(['blue'], at(5).toISOString(), `ob${++seq}`);
+  assert.equal(store.getWatch(old.id).status, 'superseded');
+  done();
+  delete config.deployWatch.targetContainers;
+  config.ops.containers = ['alpaca-trader'];
+});
+
+test('round 4 property: aliased targets retire exactly the shared resources; queued/running drops leave nothing out of scope', () => {
+  let x = 11;
+  const rnd = (n) => { x = (x * 1103515245 + 12345) % 2147483648; return x % n; };
+  const C = ['c1', 'c2', 'c3', 'c4'];
+  const saved = config.ops.containers;
+  config.ops.containers = C;
+  for (let n = 0; n < 60; n++) {
+    reset();
+    const labels = ['l1', 'l2', 'l3', 'l4'];
+    const map = Object.fromEntries(labels.map((l) => [l, C.filter(() => rnd(3) === 0).concat(rnd(2) ? [] : [C[rnd(4)]]).filter((v, i, a) => a.indexOf(v) === i)]));
+    config.deployWatch.targetContainers = map;
+    const deps = Array.from({ length: 2 + rnd(4) }, (_, i) => ({ labels: labels.filter(() => rnd(2)).slice(0, 2), at: at(5 + rnd(60)).toISOString(), i })).filter((d) => d.labels.length);
+    const made = deps.map((d) => ({ d, w: mkRows(d.labels, d.at, `p${++seq}`) })); // created in random time order
+    const res = (ls) => [...new Set(ls.flatMap((l) => (map[l].length ? map[l].map((c) => `container:${c}`) : [`target:${l}`])))];
+    for (const { d, w } of made) {
+      const later = made.filter((o) => o.d.at > d.at).flatMap((o) => res(o.d.labels));
+      const want = res(d.labels).filter((r) => !later.includes(r)).sort();
+      const now = store.getWatch(w.id);
+      if (!want.length) assert.equal(now.status, 'superseded', `case ${n}: nothing left`);
+      else { assert.equal(now.status, 'watching', `case ${n}`); assert.deepEqual(dw.activeResources(now).sort(), want, `case ${n}`); }
+    }
+    // Drops: whatever left scope while a status probe ran is gone from the answer and from the audited resources.
+    const before = C.filter(() => rnd(2)); const after = before.filter(() => rnd(2));
+    const text = `# containers\nname\tstate\n${before.map((c) => `${c}\trunning`).join('\n')}\n# health\n${before.map((c) => `/${c}\thealthy`).join('\n')}`;
+    const out = ops.dropContainers(text, before.filter((c) => !after.includes(c)));
+    for (const c of before.filter((y) => !after.includes(y))) assert.doesNotMatch(out, new RegExp(`^/?${c}\\t`, 'm'));
+    for (const c of ops.observedResources('container_status', {}, { outcome: 'ok', text: out }, after)) assert.ok(after.includes(c));
+  }
+  delete config.deployWatch.targetContainers;
+  config.ops.containers = saved;
 });
