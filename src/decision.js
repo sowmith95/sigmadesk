@@ -129,17 +129,19 @@ export async function refreshDeploy(t, { force = false } = {}) {
 }
 /**
  * Record the PR as GitHub reported it (from the PR list the owner's UI already loads): head, state, base, mergeability
- * and every individual check, plus the base SHA the desk had observed. Any change replaces the record at once; an
- * older read never replaces a newer one.
+ * and every individual check. Provenance comes from the read itself: the base commit GitHub reported in that response
+ * (baseRefOid) and when it was read (read_at), so a cached listing replayed later never acquires the current base. A
+ * row without them records an unknown base (the brief then says refreshing). Any change replaces the record at once;
+ * an older read never replaces a newer one.
  */
-export function recordCi(rows = [], at = store.now()) {
-  const baseSha = store.kvGet('train:base') || null;
+export function recordCi(rows = [], fallbackAt = store.now()) {
   for (const r of rows) {
     if (!r?.key || !r.head_sha) continue;
+    const at = r.read_at || fallbackAt;
     const prev = json(CI_KEY(r.key));
     if (prev && Date.parse(prev.at) > Date.parse(at)) continue;
-    const next = { sha: r.head_sha, state: r.state || null, base: r.base || null, base_sha: baseSha, checks: r.checks, mergeable: r.mergeable || null, rollup: r.rollup || null, at };
-    if (prev && JSON.stringify({ ...prev, at: null }) === JSON.stringify({ ...next, at: null }) && Date.now() - Date.parse(prev.at) < 60_000) continue;
+    const next = { sha: r.head_sha, state: r.state || null, base: r.base || null, base_sha: r.base_sha || null, checks: r.checks, mergeable: r.mergeable || null, rollup: r.rollup || null, at };
+    if (prev && JSON.stringify(prev) === JSON.stringify(next)) continue;
     store.kvSet(CI_KEY(r.key), JSON.stringify(next));
   }
 }

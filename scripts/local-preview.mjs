@@ -250,6 +250,7 @@ if (process.env.SIGMADESK_DECISION_DEMO === '1') {
   store.setSetting('ops_enabled', 'true'); // GitHub sync stays off: the preview never calls GitHub
   const ago = (min) => new Date(Date.now() - min * 60_000).toISOString();
   const decisionMod = await import('../src/decision.js');
+  store.kvSet('train:base', '9c41e07d2b5a6f18'); // the base the desk last observed (what CI below was read against)
   const H1 = 'a17c0de9b14f2e7d', H2 = '5e2d9f01c77ab3e4', OLD = '4be91c2aa83f1d02';
   const merge = (t, { head, risk, diffRisk, files, deploy, ci, approvedMin, qaMin, since: waited }) => {
     store.updateTicket(t.key, { status: 'ready_for_human', pr_url: `https://github.com/test/fixture/pull/${t.id + 10}`, branch: `sigmadesk/${t.key.toLowerCase()}`, head_sha: head, qa_sha: head,

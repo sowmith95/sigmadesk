@@ -104,8 +104,9 @@ export function ciEvidence({ head, ci = null, now = Date.now(), baseSha }) {
   const m = minutesSince(ci.at, now);
   const read = `read ${agoText(m)}`;
   // Read before the base branch moved (or without the base it was read against): refreshing, never green.
-  if (baseSha !== undefined && (ci.base_sha === undefined || (ci.base_sha || null) !== (baseSha || null)))
-    return { state: 'refreshing', sha: ci.sha, at: ci.at, age_minutes: m, checks: ci.checks, text: `Refreshing: CI was ${read}, before the latest move of the base branch.` };
+  // A read with no base, or with no observed base to compare it to, proves nothing about the current base either.
+  if (baseSha !== undefined && (!ci.base_sha || !baseSha || ci.base_sha !== baseSha))
+    return { state: 'refreshing', sha: ci.sha, at: ci.at, age_minutes: m, checks: ci.checks, text: !ci.base_sha || !baseSha ? `Refreshing: CI was ${read}, but which base it was read against is unknown.` : `Refreshing: CI was ${read} against base ${short(ci.base_sha)}; the base is now ${short(baseSha)}.` };
   if (head && ci.sha && ci.sha !== head) return { state: 'stale', sha: ci.sha, at: ci.at, age_minutes: m, checks: ci.checks, text: `CI was read for ${short(ci.sha)}, not the current commit ${short(head)} (${read}).` };
   const what = { passing: 'CI passing', failing: 'CI failing', pending: 'CI still running', none: 'No CI checks reported' }[ci.checks] || `CI ${ci.checks || 'unknown'}`;
   return { state: m != null && m > 60 ? 'old' : 'current', sha: ci.sha || head, at: ci.at, age_minutes: m, checks: ci.checks, mergeable: ci.mergeable || null, text: `${what} (${read}).` };

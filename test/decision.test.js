@@ -98,7 +98,7 @@ test('brief: "you decide", consequence, releases, wait from the decision start, 
   const d = { id: 'SD-4:merge', key: 'SD-4', kind: 'merge', name: 'Review contracts', verb: 'Merge Review contracts', ticket };
   const b = M.brief({ decision: d, ticket, now: NOW, since: at(190), releases: [{ key: 'SD-7', name: 'Model switch', status: 'todo' }], qaAt: at(60),
     reviews: { ok: true, context: { seat: 'manager', verdict: 'approve', updated_at: at(40) }, independent: { seat: 'principal-be', verdict: 'approve', updated_at: at(35) } },
-    ci: { sha: H, checks: 'passing', mergeable: 'MERGEABLE', base_sha: null, at: at(4) }, live: LIVE(), deploy: { state: 'deploys', workflows: [WF[0]] }, targets: { 'deploy-mac-mini.yml': 'alpaca-trader' },
+    ci: { sha: H, checks: 'passing', mergeable: 'MERGEABLE', base_sha: 'B1', at: at(4) }, baseSha: 'B1', live: LIVE(), deploy: { state: 'deploys', workflows: [WF[0]] }, targets: { 'deploy-mac-mini.yml': 'alpaca-trader' },
     busy: false, policy: { eligible: false, reason: 'the ticket is marked high-risk' }, pr: 12, policyVersion: 'abc' });
   assert.equal(b.you_decide, 'Merge Review contracts into main');
   assert.equal(b.consequence.summary, 'Merges PR #12 into main → starts Deploy Mac Mini → redeploys alpaca-trader');
@@ -161,7 +161,8 @@ test('the brief runs the live merge predicates (prs.authorizeMerge) on the last 
   const t = store.createTicket({ title: 'Merge me too', status: 'ready_for_human', assignee: 'senior-be' });
   store.updateTicket(t.key, { pr_url: 'https://github.com/x/y/pull/5', head_sha: H, qa_sha: H, risk: 'low', diff_risk: 'low' });
   for (const [seat, role] of [['manager', 'context'], ['principal-be', 'independent']]) { const r = store.createPrReview({ ticket_key: t.key, seat, role, sha: H }); store.updatePrReview(r.id, { verdict: 'approve' }); }
-  decision.recordCi([{ key: t.key, head_sha: H, state: 'OPEN', base: 'main', checks: 'passing', mergeable: 'UNKNOWN', rollup: [{ name: 'test', conclusion: 'SUCCESS' }] }]);
+  store.kvSet('train:base', 'base-5');
+  decision.recordCi([{ key: t.key, head_sha: H, state: 'OPEN', base: 'main', base_sha: 'base-5', read_at: store.now(), checks: 'passing', mergeable: 'UNKNOWN', rollup: [{ name: 'test', conclusion: 'SUCCESS' }] }]);
   const b = server.snapshot().meta.decision_briefs[`${t.key}:merge`];
   const st = Object.fromEntries(b.gate.items.map((i) => [i.id, i.state]));
   assert.equal(st.reviews, 'waiting'); assert.equal(st.mergeable, 'unknown'); assert.equal(st.ci, 'ok');
@@ -191,7 +192,7 @@ test('readiness follows the required-check policy and every new GitHub read at o
   for (const [seat, role] of [['manager', 'context'], ['principal-be', 'independent']]) { const r = store.createPrReview({ ticket_key: t.key, seat, role, sha: H }); store.updatePrReview(r.id, { verdict: 'approve', published_comment_id: `c${r.id}` }); }
   store.kvSet('train:base', 'base-9');
   store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head: H, base: 'base-9', cfg: decision.classificationVersion(), ci_key: decision.checksPolicyVersion(), state: 'none', workflows: [], workflows_at: 'base', ci_applicable: [], at: store.now() }));
-  const row = (rollup) => ({ key: t.key, head_sha: H, state: 'OPEN', base: 'main', checks: 'passing', mergeable: 'MERGEABLE', rollup });
+  const row = (rollup) => ({ key: t.key, head_sha: H, state: 'OPEN', base: 'main', base_sha: 'base-9', read_at: new Date().toISOString(), checks: 'passing', mergeable: 'MERGEABLE', rollup });
   decision.recordCi([row([{ name: 'test', conclusion: 'SUCCESS' }])]);
   const gate = () => server.snapshot().meta.decision_briefs[`${t.key}:merge`].gate;
   assert.equal(gate().state, 'ready');
@@ -210,6 +211,43 @@ test('readiness follows the required-check policy and every new GitHub read at o
   store.kvSet('train:base', 'base-10');
   const ci = gate().items.find((i) => i.id === 'ci');
   assert.equal(ci.state, 'unknown'); assert.match(ci.text, /^Refreshing/); assert.notEqual(gate().state, 'ready');
+});
+
+test('CI provenance comes from the GitHub read itself: replaying a cached listing after the base moved never re-dates it (repro, review 3)', async () => {
+  const { config } = await import('../src/config.js');
+  const prs = await import('../src/prs.js');
+  const out = path.join(tmp, 'gh-out.json'), calls = path.join(tmp, 'gh-calls');
+  const fake = path.join(tmp, 'fake-gh');
+  fs.writeFileSync(fake, `#!/bin/sh\necho x >> "${calls}"\ncat "${out}"\n`); fs.chmodSync(fake, 0o755);
+  config.bins.gh = fake; config.project.githubRepo = 'x/y';
+  const t = store.createTicket({ title: 'Provenance', status: 'ready_for_human', assignee: 'senior-be' });
+  store.updateTicket(t.key, { pr_url: 'https://github.com/x/y/pull/77', head_sha: H, qa_sha: H, risk: 'low', diff_risk: 'low' });
+  for (const [seat, role] of [['manager', 'context'], ['principal-be', 'independent']]) { const r = store.createPrReview({ ticket_key: t.key, seat, role, sha: H }); store.updatePrReview(r.id, { verdict: 'approve', published_comment_id: `c${r.id}` }); }
+  const pr = (baseOid) => [{ number: 77, title: `[${t.key}] Provenance`, state: 'OPEN', isDraft: false, url: 'https://github.com/x/y/pull/77', author: { login: 'd' }, labels: [], latestReviews: [], reviewRequests: [],
+    mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }], headRefOid: H, baseRefName: 'main', baseRefOid: baseOid, additions: 1, deletions: 0, changedFiles: 1 }];
+  store.kvSet('ci:required', JSON.stringify({ names: [], source: 'auto' }));
+  const deploy = (b) => store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head: H, base: b, cfg: decision.classificationVersion(), ci_key: decision.checksPolicyVersion(), state: 'none', workflows: [], workflows_at: 'base', ci_applicable: [], at: store.now() }));
+  const gate = () => server.snapshot().meta.decision_briefs[`${t.key}:merge`].gate;
+  // Read green CI against B1.
+  fs.writeFileSync(out, JSON.stringify(pr('B1'))); store.kvSet('train:base', 'B1'); deploy('B1');
+  decision.recordCi(await prs.listPrs({ refresh: true }), new Date(prs.listedAt()).toISOString());
+  assert.equal(gate().state, 'ready');
+  // The base moves to B2; the cached listing is replayed (no new GitHub read) with its original timestamp.
+  store.kvSet('train:base', 'B2'); deploy('B2');
+  decision.recordCi(await prs.listPrs(), new Date(prs.listedAt()).toISOString());
+  assert.equal(fs.readFileSync(calls, 'utf8').trim().split('\n').length, 1, 'one GitHub read only');
+  assert.equal(JSON.parse(store.kvGet(`decision:ci:${t.key}`)).base_sha, 'B1', 'the record keeps the base the read reported');
+  const ci = gate().items.find((i) => i.id === 'ci');
+  assert.equal(ci.state, 'unknown'); assert.match(ci.text, /^Refreshing: .*against base B1; the base is now B2/); assert.notEqual(gate().state, 'ready');
+  // A row without provenance (an older listing) records an unknown base: refreshing, never green.
+  decision.recordCi([{ key: t.key, head_sha: H, state: 'OPEN', base: 'main', checks: 'passing', mergeable: 'MERGEABLE', rollup: [{ name: 'test', conclusion: 'SUCCESS' }] }], store.now());
+  assert.notEqual(gate().state, 'ready');
+  // A real read at B2 makes it current again.
+  fs.writeFileSync(out, JSON.stringify(pr('B2')));
+  await new Promise((r) => setTimeout(r, 5));
+  decision.recordCi(await prs.listPrs({ refresh: true }), new Date(prs.listedAt()).toISOString());
+  assert.equal(JSON.parse(store.kvGet(`decision:ci:${t.key}`)).base_sha, 'B2');
+  assert.equal(gate().state, 'ready');
 });
 
 test('Verify in production on a merged ticket: one linked task, idempotent, the ticket stays merged; refused with the reason when nobody can read production', async () => {

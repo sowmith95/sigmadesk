@@ -23,7 +23,7 @@ function fail(msg, status = 409) { throw Object.assign(new Error(msg), { status 
 
 const FIELDS = ['number', 'title', 'state', 'isDraft', 'url', 'author', 'createdAt', 'updatedAt', 'mergedAt', 'closedAt',
   'headRefName', 'labels', 'reviewDecision', 'reviewRequests', 'latestReviews', 'mergeable', 'statusCheckRollup',
-  'additions', 'deletions', 'changedFiles', 'headRefOid', 'baseRefName'].join(',');
+  'additions', 'deletions', 'changedFiles', 'headRefOid', 'baseRefName', 'baseRefOid'].join(',');
 
 export function checksState(rollup = []) {
   if (!rollup.length) return 'none';
@@ -39,6 +39,7 @@ let cache = { at: 0, rows: [] };
 export async function listPrs({ refresh = false } = {}) {
   if (!refresh && Date.now() - cache.at < 30_000) return cache.rows;
   const raw = JSON.parse(await gh(['pr', 'list', '-R', repo(), '--state', 'all', '--limit', '200', '--search', 'SigmaDesk in:body', '--json', FIELDS]));
+  const readAt = new Date().toISOString(); // when THIS response was read: cached rows keep it, with the base it reported
   const tickets = Object.fromEntries(store.listTickets().map((t) => [t.key, t]));
   const rows = raw.map((p) => {
     const key = p.title.match(/^\[([A-Z][A-Z0-9]*-\d+)\]/)?.[1] || null;
@@ -55,7 +56,7 @@ export async function listPrs({ refresh = false } = {}) {
       checks: checksState(p.statusCheckRollup || []), rollup: (p.statusCheckRollup || []).map((c) => ({ name: checkName(c), conclusion: c.conclusion || c.state || c.status || '' })), additions: p.additions, deletions: p.deletions, files: p.changedFiles,
       tags: labels.filter((l) => l.startsWith(TAG_PREFIX)).map((l) => l.slice(TAG_PREFIX.length)),
       labels: labels.filter((l) => !SYSTEM_LABEL(l) && !l.startsWith(TAG_PREFIX)),
-      head_sha: p.headRefOid || null, base: p.baseRefName || null, desk_review: t ? deskReview(t, p.headRefOid) : null,
+      head_sha: p.headRefOid || null, base: p.baseRefName || null, base_sha: p.baseRefOid || null, read_at: readAt, desk_review: t ? deskReview(t, p.headRefOid) : null,
     };
   });
   cache = { at: Date.now(), rows };
