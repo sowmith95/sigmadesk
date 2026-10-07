@@ -40,10 +40,13 @@ export function validatePolicy(p) {
     maxActive: int(p.maxActive, 0, 20, 'maxActive'),
     ticketMaxHours: int(p.ticketMaxHours ?? 24, 1, 72, 'ticketMaxHours'),
     ownerMentionAutoGrant: (() => { const v = p.ownerMentionAutoGrant ?? true; if (typeof v !== 'boolean') throw err('ownerMentionAutoGrant must be true or false'); return v; })(),
+    // Explicit opt-in (default off, also for desks saved before it existed): a policy without it keeps it off.
+    postDeployAutoGrant: (() => { const v = p.postDeployAutoGrant ?? false; if (typeof v !== 'boolean') throw err('postDeployAutoGrant must be true or false'); return v; })(),
   };
 }
 export function setPolicy(p) {
-  const clean = validatePolicy(p);
+  // A partial edit from an older client (no postDeployAutoGrant field) keeps the saved choice instead of resetting it.
+  const clean = validatePolicy({ postDeployAutoGrant: policy().postDeployAutoGrant === true, ...p });
   store.writeSetting('access_policy', JSON.stringify(clean));
   store.logEvent({ kind: 'system', agent_id: 'owner', text: `access policy: approvers ${clean.approvers.join('/') || 'none'}, seats ${clean.seats.join(', ')}, up to ${clean.maxMinutes} min, ${clean.maxActive} active` });
   return clean;
@@ -73,7 +76,7 @@ const forText = (minutes, ticketScoped, ticketKey) => (ticketScoped ? (ticketKey
 // A ticket-scoped grant is dormant until a run of that seat starts on that ticket (bindRun), then lives only while that
 // run is live AND the ticket is being worked (in_progress / review); it is never usable in todo or needs_human.
 export const TICKET_LIVE = ['in_progress', 'review'];
-const ENDINGS = ['expired', 'ticket closed', 'ticket left work', 'run ended'];
+const ENDINGS = ['expired', 'ticket closed', 'ticket left work', 'run ended', 'policy changed', 'deployment no longer watched'];
 function endReason(g, at = nowIso()) {
   if (g.revoked_at) return 'revoked';
   if (g.expires_at && g.expires_at <= at) return 'expired';
@@ -103,7 +106,10 @@ function endGrant(g, by, reason) {
 /** End every grant whose time, ticket or run is over; then stop probes that lost their authorization. */
 export function sweep() {
   let ended = 0;
-  for (const g of store.openGrants()) { const why = endReason(g); if (why && why !== 'revoked' && endGrant(g, why)) ended++; }
+  for (const g of store.openGrants()) {
+    const why = endReason(g) || (g.granted_by === 'post_deploy' ? postDeployEnd(g) : null);
+    if (why && why !== 'revoked' && endGrant(g, why)) ended++;
+  }
   for (const r of store.openAccessRequests()) {
     if (r.run_id && !r.ticket_key && !store.getRun(r.run_id)?.token) store.updateAccessRequest(r.id, { status: 'withdrawn', note: 'the asking run ended', decided_at: nowIso() });
     else if (r.ticket_key && ['done', 'wontdo'].includes(store.getTicket(r.ticket_key)?.status)) store.updateAccessRequest(r.id, { status: 'withdrawn', note: 'the ticket closed', decided_at: nowIso() });
@@ -120,6 +126,9 @@ export function grantFor(run, probe, at = nowIso()) {
     if (g.run_id && g.run_id !== run.id) continue; // run-bound: that run only
     // A grant the owner's tag gave lives only while that tag is live (re-checked at every probe call).
     if (g.granted_by === 'owner_mention' && !liveTag(store.getRun(run.id))) { endGrant(g, 'run ended'); continue; }
+    // A post-deploy checkpoint grant lives only while the owner's policy still allows it and its checkpoint is still
+    // being interpreted by THIS run on a deployment that is still watched (tightening or supersession ends it).
+    if (g.granted_by === 'post_deploy') { const why = postDeployEnd(g, run); if (why) { endGrant(g, why); continue; } }
     if (g.ticket_key && (!g.run_id || g.ticket_key !== run.ticket_key)) continue; // ticket grants: only once bound, on that ticket
     return g;
   }
@@ -130,6 +139,34 @@ export function seatHasAccess(seat, ticketKey = null) {
   return store.openGrants(seat).some((g) => !endReason(g) && !g.run_id && (!g.ticket_key || g.ticket_key === ticketKey));
 }
 const esc = (s) => String(s ?? '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+
+// ---------------- post-deploy checkpoint grants (#7) ----------------
+/** Why a post_deploy grant must end now, or null. Checked at every probe call (grantFor) and every sweep. */
+function postDeployEnd(g, run = null) {
+  if (policy().postDeployAutoGrant !== true) return 'policy changed';
+  const cp = g.watch_checkpoint ? store.getCheckpoint(g.watch_checkpoint) : null;
+  const w = cp ? store.getWatch(cp.watch_id) : null;
+  if (!cp || !w || w.status !== 'watching' || cp.status !== 'sre_running') return 'deployment no longer watched';
+  if (run && (cp.run_id !== run.id || g.run_id !== run.id)) return 'run ended';
+  return null;
+}
+/**
+ * The owner opted in (access.policy.postDeployAutoGrant): the SRE's checkpoint run gets a grant bound to that run and
+ * checkpoint, to exactly `probes` (within the policy's probe list), expiring at `minutes`. null when the policy is off or
+ * nothing is left after the policy's probe list.
+ */
+export function postDeployGrant({ run, checkpoint, probes, minutes = 15, target = null }) {
+  const pol = policy();
+  if (pol.postDeployAutoGrant !== true) return null;
+  const allowed = probes.filter((p) => ops.PROBES[p] && (pol.probes.includes('*') || pol.probes.includes(p)));
+  if (!allowed.length || !run?.id) return null;
+  const mins = Math.max(5, Math.min(Number(minutes) || 15, 60));
+  const g = store.insertGrant({ seat: run.agent_id, probes: allowed, expires_at: new Date(Date.now() + mins * 60_000).toISOString(), ticket_key: null, run_id: run.id,
+    standing: false, granted_by: 'post_deploy', reason: `post-deploy checkpoint #${checkpoint.id}${target ? ` (${target})` : ''}`, watch_checkpoint: checkpoint.id });
+  store.logEvent({ kind: 'action', agent_id: 'system', run_id: run.id, ticket_key: run.ticket_key || null,
+    text: `post-deploy check: ${nameOf(run.agent_id)} may read ${describeProbes(allowed)} for this checkpoint run only (at most ${mins} min; the owner's access policy allows post-deploy grants)` });
+  return g;
+}
 /** Held access now, or ended within the last hour: asking again is a renewal, and renewals are the owner's. */
 function recentAccess(seat) {
   const hour = new Date(Date.now() - 3600_000).toISOString();

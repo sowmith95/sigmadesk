@@ -82,10 +82,12 @@ export function billingOf(engineId) {
  * The hard bound a tagged run of this seat gets: a dollar cap the engine enforces, or, for a plan-billed engine without
  * one, the desk's own time and step limits. null = no bound possible (an API-billed engine without a cap): refused.
  */
-export function boundFor(seat) {
+export function boundFor(seat, caps = null) {
   if (!seat) return null;
-  if (runner.capsSpend(seat, 'mention')) return { kind: 'usd', usd: Number(settings().budgetUsd) || 2 };
-  if (billingOf(seat.engine || 'claude') === 'plan') return { kind: 'time', minutes: Number(settings().maxMinutes) || 10, steps: Number(settings().maxSteps) || 60 };
+  // caps: another job's allowance with the same admission rule (post-deploy checkpoints: watch.budgetUsd, …).
+  const c = caps || { kind: 'mention', usd: Number(settings().budgetUsd) || 2, minutes: Number(settings().maxMinutes) || 10, steps: Number(settings().maxSteps) || 60 };
+  if (runner.capsSpend(seat, c.kind || 'mention')) return { kind: 'usd', usd: c.usd };
+  if (billingOf(seat.engine || 'claude') === 'plan') return { kind: 'time', minutes: c.minutes, steps: c.steps };
   return null;
 }
 /**
@@ -93,15 +95,16 @@ export function boundFor(seat) {
  * steps are persisted on the delivery after each run. { refuse } when nothing is left; else { limits } for the run.
  */
 const round = (x, d = 2) => Math.floor(x * 10 ** d + 1e-6) / 10 ** d; // floor, without float dust (2 - 1.6)
-export function remaining(m, b) {
+export function remaining(m, b, words = null) {
   const name = firstName(m.seat_id);
+  const w = words || { whose: "this tag's", again: `Tag ${name} again in a new message to continue.` };
   if (b.kind === 'usd') {
     const usd = round(b.usd - (m.spent_usd || 0));
-    return usd < 0.05 ? { refuse: `${name} used this tag's whole $${b.usd} allowance across attempts. Tag ${name} again in a new message to continue.`, exhausted: true }
+    return usd < 0.05 ? { refuse: `${name} used ${w.whose} whole $${b.usd} allowance across attempts. ${w.again}`, exhausted: true }
       : { limits: { usd }, bound: { ...b, usd } };
   }
   const minutes = round(b.minutes - (m.spent_ms || 0) / 60_000, 3), steps = b.steps - (m.steps_used || 0);
-  return minutes < 0.01 || steps < 1 ? { refuse: `${name} used this tag's whole allowance (${b.minutes} minutes, ${b.steps} steps) across attempts. Tag ${name} again in a new message to continue.`, exhausted: true }
+  return minutes < 0.01 || steps < 1 ? { refuse: `${name} used ${w.whose} whole allowance (${b.minutes} minutes, ${b.steps} steps) across attempts. ${w.again}`, exhausted: true }
     : { limits: { minutes, steps }, bound: { ...b, minutes, steps } };
 }
 /** "Rowan has 10 minutes for this" / "… up to $2 for this": said in the thread when the run starts. */
