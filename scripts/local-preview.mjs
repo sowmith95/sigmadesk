@@ -27,7 +27,9 @@ const cfg = path.join(tmp, 'config.json');
 fs.writeFileSync(cfg, JSON.stringify({ server: { port: Number(process.env.SIGMADESK_PORT || 8791), hosts: ['127.0.0.1'], preventIdleSleep: false, preview: true, ...(process.env.SIGMADESK_PREVIEW_TOKEN ? { ownerToken: process.env.SIGMADESK_PREVIEW_TOKEN } : {}) /* tests of the sign-in link */ },
   project: { name: 'SigmaDesk · local preview', repoPath: repo, githubRepo: 'test/fixture', playbook: path.join(root, 'playbooks/default.md') },
   bins: { claude: cli }, engines: { codex: { bin: cli } }, github: { sync: false, openDraftPrs: false }, pm: { enabled: false },
-  watch: { enabled: true, intervalSeconds: 5, sources: [{ type: 'file', path: log, label: 'Preview service' }] }, notify: { webhookUrl: '' } }));
+  watch: { enabled: true, intervalSeconds: 5, sources: [{ type: 'file', path: log, label: 'Preview service' }] }, notify: { webhookUrl: '' },
+  // Decision demo: one workflow mapped to a service (the brief names a target only from this), read-only probes configured.
+  ...(process.env.SIGMADESK_DECISION_DEMO === '1' ? { deploy: { targets: { 'deploy-mac-mini.yml': 'alpaca-trader' } }, ops: { enabled: true } } : {}) }));
 process.env.SIGMADESK_CONFIG = cfg; process.env.SIGMADESK_DB = path.join(tmp, 'state.db'); process.env.SIGMADESK_SOCKET = path.join(tmp, 'run', 'agent.sock'); process.env.SIGMADESK_WORKSPACES = path.join(tmp, 'workspaces');
 process.env.CODEX_HOME = path.join(tmp, 'owner-codex'); fs.mkdirSync(process.env.CODEX_HOME);
 for (const name of ['PERPLEXITY_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'XAI_API_KEY', 'SIGMADESK_TOKEN']) delete process.env[name];
@@ -233,4 +235,54 @@ if (process.env.SIGMADESK_TEAM_DEMO === '1') {
   ];
   let h = 0;
   setInterval(() => { const [a, k, kind, text] = handoffs[h++ % handoffs.length](); store.logEvent({ agent_id: a, ticket_key: k, kind, text }); }, 20_000).unref();
+}
+
+// Decision demo (SIGMADESK_DECISION_DEMO=1): merge decisions with real-shaped evidence for the decision snapshot (#6).
+// The facts the desk reads from git and GitHub in the background (which workflows a merge starts, the CI rollup) are
+// seeded exactly as the desk caches them, each pinned to a commit; one merge carries CI read for an OLDER commit (stale)
+// and an unmapped workflow (target unknown). A merged ticket is ready for "Verify in production" (read access on, the SRE
+// on, a timed grant running). Nothing runs: the desk stays paused and no model or GitHub call is made.
+if (process.env.SIGMADESK_DECISION_DEMO === '1') {
+  store.setSetting('paused', 'true');
+  const overrides = JSON.parse(store.getSettings().team);
+  for (const id of ['manager', 'sre', 'senior-be', 'senior-fe', 'principal-be', 'qa']) overrides[id] = { ...overrides[id], enabled: true };
+  store.setSetting('team', JSON.stringify(overrides)); team.applyTeamOverrides(overrides);
+  store.setSetting('ops_enabled', 'true'); // GitHub sync stays off: the preview never calls GitHub
+  const ago = (min) => new Date(Date.now() - min * 60_000).toISOString();
+  const H1 = 'a17c0de9b14f2e7d', H2 = '5e2d9f01c77ab3e4', OLD = '4be91c2aa83f1d02';
+  const merge = (t, { head, risk, diffRisk, files, deploy, ci, approvedMin, qaMin, since: waited }) => {
+    store.updateTicket(t.key, { status: 'ready_for_human', pr_url: `https://github.com/test/fixture/pull/${t.id + 10}`, branch: `sigmadesk/${t.key.toLowerCase()}`, head_sha: head, qa_sha: head,
+      risk, diff_risk: diffRisk, review_stage: 'approved', approved_at: ago(approvedMin) });
+    const qa = store.createRun({ agent_id: 'qa', ticket_key: t.key, kind: 'qa', token: null, model: 'demo:fixture' });
+    store.updateRun(qa.id, { status: 'done', started_at: ago(qaMin + 6), ended_at: ago(qaMin) });
+    for (const [seat, role, min] of [['manager', 'context', approvedMin + 8], ['principal-be', 'independent', approvedMin]]) {
+      const r = store.createPrReview({ ticket_key: t.key, seat, role, sha: head });
+      store.updatePrReview(r.id, { verdict: 'approve', published_comment_id: `c${r.id}`, body: 'Approved: the contract is preserved and covered by tests.' });
+      store.handle().prepare('UPDATE pr_reviews SET updated_at=? WHERE id=?').run(ago(min), r.id);
+    }
+    store.kvSet(`diff-files:${t.key}`, JSON.stringify(files));
+    store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head, base: store.kvGet('train:base') || null, files, at: ago(2), ...deploy }));
+    store.kvSet(`decision:ci:${t.key}`, JSON.stringify({ at: ago(ci.min), sha: ci.sha, checks: ci.checks, mergeable: 'MERGEABLE' }));
+    const since = JSON.parse(store.kvGet('inbox:since') || '{}'); since[`${t.key}:merge`] = ago(waited); store.kvSet('inbox:since', JSON.stringify(since));
+    store.kvSet('inbox:since:seeded', store.now());
+    return t;
+  };
+  const contracts = store.listTickets().find((t) => t.title.startsWith('Preserve review contracts'));
+  merge(contracts, { head: H1, risk: 'high', diffRisk: 'high', approvedMin: 41, qaMin: 64, since: 190,
+    files: ['alpaca_trader/app/oms/exit_monitor.py', 'alpaca_trader/tests/test_exit_monitor.py'],
+    deploy: { state: 'deploys', workflows: [{ file: '.github/workflows/deploy-mac-mini.yml', name: 'Deploy to Mac mini', reason: 'runs on push to main' }], reason: 'it redeploys via Deploy to Mac mini' },
+    ci: { min: 4, sha: H1, checks: 'passing' } });
+  store.addComment(contracts.key, 'senior-be', '🚀 Submitted: review contracts survive a model switch; the exit monitor keeps its thresholds.');
+  const next = store.createTicket({ title: 'Switch reviewers to the new model', status: 'todo', assignee: 'senior-be', priority: 'P2', area: 'backend', complexity: 'S', reporter: 'owner', source: 'human' });
+  store.updateTicket(next.key, { after_key: contracts.key });
+  const docs = store.createTicket({ title: 'Publish the runbook site from the docs folder', status: 'todo', assignee: 'senior-fe', priority: 'P2', area: 'frontend', complexity: 'S', reporter: 'owner', source: 'human' });
+  merge(docs, { head: H2, risk: null, diffRisk: 'low', approvedMin: 18, qaMin: 30, since: 35,
+    files: ['docs/runbook.md', '.github/workflows/docs-site.yml'],
+    deploy: { state: 'deploys', workflows: [{ file: '.github/workflows/docs-site.yml', name: 'Docs site', reason: 'runs on push to main' }], reason: 'it redeploys via Docs site' },
+    ci: { min: 52, sha: OLD, checks: 'passing' } });
+  // A merged ticket ("Verify in production" files a linked task) with a running timed grant for the SRE.
+  const shipped = store.listTickets().find((t) => t.status === 'done');
+  store.updateTicket(shipped.key, { pr_url: 'https://github.com/test/fixture/pull/9', done_at: ago(26 * 60) });
+  const access = await import('../src/access.js');
+  access.ownerGrant({ seat: 'sre', probes: ['*'], minutes: 45, ticket_key: null, standing: false, reason: 'Preview: checking the fill counts' });
 }

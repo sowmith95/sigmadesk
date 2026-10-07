@@ -14,6 +14,7 @@ import { AsyncButton } from '@/components/desk/AsyncButton';
 import { SeatAvatar } from '@/components/desk/Bits';
 import { BottomSheet, PeoplePicker, useAccess, useIsPhone } from '@/components/desk/PeopleSheet';
 import { useMentionPicker, SeatPicker } from './Mentions';
+import { QuickAsks } from './QuickAsks';
 import { cn } from '@/lib/utils';
 import type { Agent, Ticket } from '@/types';
 
@@ -40,7 +41,7 @@ export function MessageBar({ t, onTyping, handle }: { t: Ticket; onTyping: (v: b
   const caret = useRef<number | null>(null); // where the picker's tags go (the open "@query", or the caret)
   const [choice, setChoiceState] = useState<Record<string, boolean>>(choices[t.key] || {});
   const setChoice = (c: Record<string, boolean>) => { choices[t.key] = c; setChoiceState(c); };
-  const { data } = useAccess(picking || tagged.length > 0, 30_000);
+  const { data } = useAccess(true, 30_000); // the picker, the tag chips and the quick asks all show each person's access
   const why = data?.mention_access;
   const autoAccess = (seat: string) => why?.[seat]?.length === 0 && choice[seat] !== false;
   const caretTo = useRef<number | null>(null);
@@ -93,6 +94,7 @@ export function MessageBar({ t, onTyping, handle }: { t: Ticket; onTyping: (v: b
 
   const bar = (
     <div className="grid min-w-0 gap-1.5" data-message-bar>
+      {!text.trim() && <QuickAsks t={t} choice={choice} setChoice={setChoice} why={why} />}
       <SeatPicker {...tags.picker} onMore={openPicker} />
       {tagged.length > 0 && <div className="flex min-w-0 flex-wrap items-center gap-1.5" data-tag-line>
         <span className="text-sm text-muted-foreground">To</span>

@@ -70,6 +70,8 @@ async function pr(number) {
   return p;
 }
 const bust = () => { cache.at = 0; };
+/** When the PR list was last read from GitHub (ms; 0 = never). */
+export const listedAt = () => cache.at;
 export async function assertRefreshable(number, ticket) {
   const p = await pr(number);
   if (p.state !== 'OPEN' || p.headRefName !== ticket.branch) fail('Refresh requires this ticket’s open PR branch');
