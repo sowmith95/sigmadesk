@@ -146,7 +146,7 @@ export function liveScope(g) {
   const w = cp ? store.getWatch(cp.watch_id) : null;
   if (!w || w.status !== 'watching') return { target: null, containers: [], dbs: [] };
   const active = activeResources(w);
-  const retired = new Set(json(w.retired_resources, []) || []);
+  const retired = new Set(retiredResourcesOf(w));
   return { target: w.target, containers: active.filter((r) => r.startsWith('container:')).map((r) => r.slice(10)), dbs: freshnessDbs().filter((d) => !retired.has(`database:${d}`)) };
 }
 access.setScopeResolver(liveScope);
@@ -275,8 +275,13 @@ export function resourcesOfTarget(label) {
 }
 export const resourcesOf = (targets) => [...new Set(targetsOf(targets).flatMap(resourcesOfTarget))];
 /** A watch's resources that are still its own: every resource of its targets minus those a newer deployment took over. */
+/** Resources a watch gave up. A row from before retired_resources existed (NULL) is read from its retired_targets. */
+export function retiredResourcesOf(w) {
+  if (w?.retired_resources != null) return json(w.retired_resources, []) || [];
+  return resourcesOf((json(w?.retired_targets, []) || []).join(','));
+}
 export function activeResources(w) {
-  const retired = new Set(json(w?.retired_resources, []) || []);
+  const retired = new Set(retiredResourcesOf(w));
   return resourcesOf(w?.target).filter((r) => !retired.has(r));
 }
 /** When the next session-open checkpoint is due, or why it cannot be scheduled (fails closed). */
@@ -335,7 +340,7 @@ export function createWatchFor({ deployKey, mergeSha, ticketKey, pr, rows, sourc
 function targetsOf(t) { return String(t || '').split(',').filter(Boolean); }
 /** Record resources a newer deployment took over; target labels whose every resource is gone are listed as retired. */
 function markRetired(w, taken, note) {
-  const res = [...new Set([...(json(w.retired_resources, []) || []), ...taken])];
+  const res = [...new Set([...retiredResourcesOf(w), ...taken])];
   const labels = targetsOf(w.target).filter((l) => resourcesOfTarget(l).every((r) => res.includes(r)));
   return store.updateWatch(w.id, { retired_resources: JSON.stringify(res), retired_targets: JSON.stringify(labels), verdict_note: note });
 }
@@ -569,7 +574,7 @@ export function identityOf(identity, mergeSha) {
 const CARRY_MIN = 15;
 /** The watch's own targets, and the containers of components a newer deployment took over (not this watch's any more). */
 function retiredContainers(w) {
-  return new Set((json(w.retired_resources, []) || []).filter((r) => r.startsWith('container:')).map((r) => r.slice(10)));
+  return new Set(retiredResourcesOf(w).filter((r) => r.startsWith('container:')).map((r) => r.slice(10)));
 }
 /**
  * Observe production for one checkpoint: fresh desk probes within a bounded allowance. App health and container status

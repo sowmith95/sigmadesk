@@ -1137,3 +1137,20 @@ test('round 4 property: aliased targets retire exactly the shared resources; que
   delete config.deployWatch.targetContainers;
   config.ops.containers = saved;
 });
+
+test('round 5: a parent-shape watch (retired_targets set, retired_resources NULL) still never judges the retired ingestor', async () => {
+  reset();
+  config.ops.containers = ['alpaca-trader', 'ingestor'];
+  const w0 = mkRows(['alpaca-trader'], at(3).toISOString(), `ps${++seq}`);
+  store.handle().exec(`UPDATE deploy_watches SET retired_targets='["ingestor"]', retired_resources=NULL WHERE id=${w0.id}`);
+  const w = store.getWatch(w0.id);
+  assert.deepEqual(dw.retiredResourcesOf(w), ['container:ingestor']);
+  app.body = sha40(w.merge_sha);
+  docker({ ps: 'alpaca-trader\trunning\tUp\t1m\ningestor\texited\tExited (1)\t1m', inspect: '/alpaca-trader\thealthy\t0\t2026-10-03T15:01:00Z\tfalse\timg\n/ingestor\tunhealthy\t9\t2026-10-03T15:01:00Z\ttrue\timg' });
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const ev = JSON.parse(store.checkpointsOf(w.id).find((c) => c.name === 'smoke').evidence);
+  assert.ok(!ev.items.some((i) => i.resource === 'ingestor'), 'no evidence about the retired ingestor');
+  assert.equal(store.getWatch(w.id).hold, 0);
+  config.ops.containers = ['alpaca-trader'];
+});

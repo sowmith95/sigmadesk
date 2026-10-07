@@ -572,11 +572,23 @@ function migrate() {
     for (const [col, type] of Object.entries(cols)) if (!have.has(col)) {
       db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
       if (table === 'tickets' && col === 'done_at') db.exec("UPDATE tickets SET done_at = updated_at WHERE status = 'done'"); // best record for earlier work
+      if (table === 'deploy_watches' && col === 'retired_resources') backfillRetiredResources();
     }
   }
   backfillQaVerdicts();
 }
 
+// Watches retired per target label before resources existed: map each label to its resources the way the post-deploy
+// watch does (deployWatch.targetContainers, the container named like it, deployWatch.targetDatabases, else target:<label>).
+function backfillRetiredResources() {
+  const dw = config.deployWatch || {}, cs = config.ops?.containers || [];
+  const of = (l) => { const c = (dw.targetContainers?.[l] || (cs.includes(l) ? [l] : [])).filter((x) => cs.includes(x)).map((x) => `container:${x}`);
+    const d = (dw.targetDatabases?.[l] || []).map((x) => `database:${x}`); return c.length || d.length ? [...c, ...d] : [`target:${l}`]; };
+  for (const w of db.prepare("SELECT id, retired_targets FROM deploy_watches WHERE retired_resources IS NULL AND retired_targets IS NOT NULL AND retired_targets <> '[]'").all()) {
+    let labels = []; try { labels = JSON.parse(w.retired_targets) || []; } catch { labels = []; }
+    db.prepare('UPDATE deploy_watches SET retired_resources=? WHERE id=?').run(JSON.stringify([...new Set(labels.flatMap(of))]), w.id);
+  }
+}
 export const now = () => new Date().toISOString();
 // ---------------- QA verdicts and lessons ----------------
 export const QA_REASONS = ['bug', 'tests', 'spec', 'base', 'flaky'];
