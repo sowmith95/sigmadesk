@@ -55,7 +55,7 @@ function RowMenu({ it }: { it: Row }) {
         {it.snoozed_until ? <DropdownMenuItem className="min-h-10" onSelect={run(() => snooze(it.id, null))}>Bring back now</DropdownMenuItem>
           : it.protected ? <DropdownMenuLabel className="font-normal text-muted-foreground">Can't snooze: it protects production</DropdownMenuLabel>
             : snoozePresets().map((p) => <DropdownMenuItem key={p.id} className="min-h-10" onSelect={run(() => snooze(it.id, p.until))}>Snooze {p.label.toLowerCase()}{it.waiting?.length ? ` (with ${it.waiting.length} waiting)` : ''}</DropdownMenuItem>)}
-        {t && it.kind !== 'deploy' && <><DropdownMenuSeparator /><DropdownMenuLabel className="font-normal text-muted-foreground">Priority (now {t.priority || 'P2'}{t.priority_pinned ? ', set by you' : ''})</DropdownMenuLabel>
+        {t && it.kind !== 'deploy' && it.kind !== 'regression' && <><DropdownMenuSeparator /><DropdownMenuLabel className="font-normal text-muted-foreground">Priority (now {t.priority || 'P2'}{t.priority_pinned ? ', set by you' : ''})</DropdownMenuLabel>
           <DropdownMenuRadioGroup value={t.priority || 'P2'} onValueChange={(p) => { if (p !== t.priority) run(() => api('PATCH', `/api/tickets/${t.key}`, { priority: p }).then(() => { loadSnapshot(); toast(`${t.key} is ${p}`); }))(); }}>
             {[['P0', 'P0 · drop everything'], ['P1', 'P1 · high'], ['P2', 'P2 · normal'], ['P3', 'P3 · low']].map(([p, label]) => <DropdownMenuRadioItem key={p} value={p} className="min-h-10">{label}</DropdownMenuRadioItem>)}
           </DropdownMenuRadioGroup>

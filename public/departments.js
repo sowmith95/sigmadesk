@@ -77,7 +77,7 @@ export const seatIndex = (deps) => Object.fromEntries(deps.flatMap((d) => d.seat
 export function departmentOf(item, deps, seats = seatIndex(deps)) {
   const has = (id) => deps.some((d) => d.id === id);
   const t = item?.ticket || null;
-  if (item?.kind === 'page' && has('reliability')) return 'reliability';
+  if ((item?.kind === 'page' || item?.kind === 'regression' || item?.kind === 'watch_schedule') && has('reliability')) return 'reliability';
   if (item?.kind === 'deploy' && has('qa')) return 'qa';
   if (item?.kind === 'access' && seats[item.access?.seat]) return seats[item.access.seat];
   if (item?.worker && seats[item.worker]) return seats[item.worker];
@@ -249,7 +249,6 @@ export function departmentKpis(state, deps, { now = Date.now(), board = null } =
   const inDep = (id) => (t) => departmentOf({ ticket: t }, deps, seats) === id;
   const bugs = (id) => tickets.filter((t) => OPEN(t) && t.type === 'bug' && inDep(id)(t));
   const oldest = (list, field = 'created_at') => list.reduce((o, t) => (!o || ts(t[field]) < ts(o[field]) ? t : o), null);
-  const evWindow = events.length ? `the latest ${events.length} desk events (since ${new Date(Math.min(...events.map((e) => ts(e.ts)))).toISOString()})` : 'no events loaded';
   const out = {};
   for (const d of deps) {
     const k = [];
@@ -302,35 +301,43 @@ export function departmentKpis(state, deps, { now = Date.now(), board = null } =
     out[d.id] = { concern: d.concern, kpis: k };
   }
   // Release facts: merged, deployed and production-verified are different things (a merged change is not "shipped").
-  const week = now - 7 * 86400_000;
+  // Deployed and production-verified count DISTINCT deployments from the desk's deploy history over one window (the
+  // server's post-deploy watch summary), so "verified" is always "x of the deployments in that window".
+  const p = meta.production?.kpis || null;
+  const days = p?.window_days || 7;
+  const week = p?.since ? ts(p.since) : now - days * 86400_000;
+  const win = `last ${days} days`;
   const merged = tickets.filter((t) => t.status === 'done' && t.pr_url && ts(t.done_at || t.updated_at) >= week);
-  const verified = events.filter((e) => e.kind === 'action' && /^verified in production/.test(String(e.text || '')));
   const release = [
-    kpi('Merged', String(merged.length), { source: 'tickets done with a PR (done_at)', at: nowIso, window: 'last 7 days' }),
-    UNKNOWN('Deployed', 'the desk keeps only the current deploy lock, not a history of finished deploys', 'merge train deploy lock'),
-    kpi('Production-verified', String(verified.length), { source: '"verified in production" reports by the SRE', at: nowIso, window: evWindow }),
+    kpi('Merged', String(merged.length), { source: 'tickets done with a PR (done_at)', at: nowIso, window: win }),
+    p ? kpi('Deployed', String(p.deployed), { source: `distinct successful deployments in the deploy history${p.failed ? ` (${p.failed} failed)` : ''}`, at: p.observed_at || nowIso, window: win, tone: p.failed ? 'needs' : 'neutral' })
+      : UNKNOWN('Deployed', 'the server sent no deploy history', 'deploy history'),
+    p ? kpi('Production-verified', `${p.verified} of ${p.deployed}`, { source: `deployments whose post-deploy checks all passed against their own criteria with a matching deployment identity${p.verified_limited ? `; ${p.verified_limited} more passed general health only (limited, not counted)` : ''}${p.watching ? `; ${p.watching} still being watched` : ''}${p.regression ? `; ${p.regression} regression suspected` : ''}${p.inconclusive ? `; ${p.inconclusive} inconclusive` : ''}`,
+      at: p.observed_at || nowIso, window: win, tone: p.regression ? 'blocked' : 'neutral' })
+      : UNKNOWN('Production-verified', 'the server sent no post-deploy verdicts', 'post-deploy watch'),
   ];
   return { departments: out, release };
 }
 
 // ---------------- exceptions (the wall leads with these) ----------------
 const KIND_LABEL = { guard: 'publish approval', merge: 'merge', publish: 'publish approval', question: 'question', design: 'design decision', council: 'council verdict',
-  plan: 'plan review', deploy: 'deploy hold', access: 'access request', page: 'error page', conflict: 'conflict', setup: 'setup step', refresh: 'branch refresh',
+  plan: 'plan review', deploy: 'deploy hold', regression: 'regression hold', watch_schedule: 'post-deploy check schedule', access: 'access request', page: 'error page', conflict: 'conflict', setup: 'setup step', refresh: 'branch refresh',
   stuck: 'stuck task', owner_task: 'your task', epic_review: 'epic question', product: 'review feedback', research: 'research decision' };
 export const decisionLabel = (kind) => KIND_LABEL[kind] || 'decision';
 
 /**
- * Exceptions, most urgent first: deploy holds, incidents being paged/investigated, stalled runs, then approvals by age
+ * Exceptions, most urgent first: suspected regressions (they hold deploying merges), deploy holds, incidents being paged/investigated, stalled runs, then approvals by age
  * (oldest first). Each: { id, type, title, detail, since, item?, seat?, ticket? }.
  */
 /** @param {{ board: any, states?: Record<string, any>, agents?: any[], incidents?: any[], now?: number }} o */
 export function exceptions({ board, states = {}, agents = [], incidents = [], now = Date.now() }) {
   const out = [];
   const name = (id) => String(agents.find((a) => a.id === id)?.name || id).split(/\s+/)[0];
+  for (const it of board?.needs_you || []) if (it.kind === 'regression') out.push({ id: it.id, type: 'regression', title: it.verb, detail: it.reason, since: it.regression?.deployed_at || it.since || null, item: it });
   for (const it of board?.needs_you || []) if (it.kind === 'deploy') out.push({ id: it.id, type: 'deploy', title: it.verb, detail: it.reason, since: it.deploy?.at || it.since || null, item: it });
   for (const i of incidents) if (['paged', 'investigating'].includes(i.status)) out.push({ id: `incident-${i.id}`, type: 'incident', title: `${i.label || 'Service'} errors · ${i.status}`, detail: String(i.normalized || '').slice(0, 140), since: i.first_seen || null, ticket: i.ticket_key || null });
   for (const [seat, s] of Object.entries(states)) if (s.state === 'stalled') out.push({ id: `stalled-${seat}`, type: 'stalled', title: `${name(seat)} · no update for ${Math.max(1, mins(s.ageMs || 0))} min`, detail: s.label || '', since: s.ageMs != null ? new Date(now - s.ageMs).toISOString() : null, seat, ticket: s.ticket });
-  const approvals = (board?.needs_you || []).filter((it) => it.kind !== 'deploy').sort((a, b) => ts(a.since) - ts(b.since));
+  const approvals = (board?.needs_you || []).filter((it) => it.kind !== 'deploy' && it.kind !== 'regression').sort((a, b) => ts(a.since) - ts(b.since));
   for (const it of approvals) out.push({ id: it.id, type: 'approval', title: it.verb, detail: decisionLabel(it.kind), since: it.since || null, item: it });
   return out;
 }

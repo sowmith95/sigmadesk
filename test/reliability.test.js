@@ -24,7 +24,7 @@ before(async () => {
   runner = await import('../src/runner.js');
   team = await import('../src/team.js');
   watch = await import('../src/watch.js');
-  config.root = tmp;
+  config.root = tmp; config.dataDir = path.join(tmp, 'data'); // own publisher: test files run in parallel
   store.openDb(':memory:');
   dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: true }]);
 });

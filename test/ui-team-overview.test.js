@@ -30,7 +30,8 @@ test('department cards: counts agree with the Inbox, KPIs show source or unknown
   }
   assert.equal(await page.locator('[data-department="data"] [data-kpi][data-unknown]').count(), 2, 'unobserved telemetry says unknown');
   assert.match(await page.locator('[data-department="data"] [data-kpi]').first().innerText(), /does not observe/);
-  assert.equal(await page.locator('[data-release-fact="Deployed"]').innerText().then((t) => t.split('\n')[0]), 'unknown');
+  // Deployed counts distinct deployments from the deploy history (none in the demo), not an unknown any more (#7).
+  assert.equal(await page.locator('[data-release-fact="Deployed"]').innerText().then((t) => t.split('\n')[0]), '0');
   const chip = (s) => page.locator(`[data-team-overview] [data-seat-chip="${s}"]`).getAttribute('data-state');
   assert.equal(await chip('senior-fe'), 'working'); assert.equal(await chip('junior'), 'stalled'); assert.equal(await chip('dba'), 'quiet'); assert.equal(await chip('support'), 'off');
   // The planning pill opens its decision in the ticket sheet.

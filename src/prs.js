@@ -429,8 +429,15 @@ export async function mergeInfo(number) {
 /** Workflow runs GitHub started for a commit, identified by workflow FILE path (display names can collide). */
 export async function runsForCommit(sha) {
   const out = JSON.parse(await gh(['api', `repos/${repo()}/actions/runs?head_sha=${encodeURIComponent(String(sha))}&per_page=100`,
-    '--jq', '[.workflow_runs[] | {path, name, status, conclusion, id, suite: .check_suite_id}]']) || '[]');
-  return out.map((r) => ({ ...r, path: String(r.path || '').replace(/@.*$/, '') }));
+    '--jq', '[.workflow_runs[] | {path, name, status, conclusion, id, suite: .check_suite_id, run_attempt, run_started_at, updated_at, event, head_sha}]']) || '[]');
+  return out.map(normRun);
+}
+const normRun = (r) => ({ ...r, path: String(r.path || '').replace(/@.*$/, ''), run_attempt: Number(r.run_attempt) || 1 });
+/** Recent completed workflow runs on a branch (post-deploy reconciliation: reruns and manual deploys the desk missed). */
+export async function recentBranchRuns(branch, perPage = 30) {
+  const out = JSON.parse(await gh(['api', `repos/${repo()}/actions/runs?branch=${encodeURIComponent(String(branch))}&status=completed&per_page=${Math.min(100, Number(perPage) || 30)}`,
+    '--jq', '[.workflow_runs[] | {path, name, status, conclusion, id, run_attempt, run_started_at, updated_at, event, head_sha}]']) || '[]');
+  return out.map(normRun);
 }
 /** Paths a PR changes (for owner merges of PRs the desk did not open). */
 export async function prFiles(number) {

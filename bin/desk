@@ -27,7 +27,7 @@ const USAGE = `usage:
   desk council-models              approved review models, readiness and lenses
   desk council [--profile LENS] [--reviewer MODEL] [--challenger MODEL] "<question>"  (manager/principals; once per run)
   desk route KEY pm|manager|human "<why>" [--type T] [--priority P]
-  desk submit "<summary>"
+  desk submit [--verify-prod "<how to verify in production after the deploy>"] "<summary>"
   desk continue-rebase                     (implementer: after editing desk-listed conflict files)
   desk qa pass|fail "<notes>"
   desk accept pass|changes "<notes>"
@@ -43,6 +43,7 @@ const USAGE = `usage:
   desk ops request <probe…|all> --why "<what you must check>" [--for 1h | --ticket]
   desk access list | desk access approve <id> [--for 1h | --ticket] "<why>" | desk access deny|owner <id> "<why>" | desk access revoke <id> "<why>"   (EM/SRE)
   desk verify done "<what production shows>" | desk verify owner "<why no read-only probe can answer>"   (SRE verify runs)
+  desk watch verified|regression|inconclusive "<what production shows>"   (SRE post-deploy check runs)
   desk reply "<answer>"   (a run where the owner tagged you: your one answer in the thread)
   desk handoff implement|design|verify "<what>" | desk handoff task --title T "<what>" | desk handoff merge|deploy "<what was asked>"   (tagged runs: route real work into the normal jobs)`;
 
@@ -84,7 +85,7 @@ switch (cmd) {
   case 'qa': case 'accept': case 'review': body.verdict = pos.shift(); body.body = pos.join(' '); break;
   case 'ops': body.probe = pos.shift() || 'list'; if (body.probe === 'request') body.probes = pos.splice(0); break;
   case 'access': body.action = pos.shift() || 'list'; if (/^\d+$/.test(pos[0] || '')) body.id = pos.shift(); body.body = pos.join(' '); break;
-  case 'respond': case 'resolve': case 'verify': case 'handoff': body.action = pos.shift(); body.body = pos.join(' '); break;
+  case 'respond': case 'resolve': case 'verify': case 'watch': case 'handoff': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'incident': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'context-file': body.path = pos.join(' '); break;
   case 'lesson': body.body = pos.join(' '); break;

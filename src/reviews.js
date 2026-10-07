@@ -49,6 +49,8 @@ const diffHits = (key) => { try { return JSON.parse(store.kvGet(`diff-risk:${key
 /** Is this ticket allowed to merge itself after two approvals? (Transient blockers — CI, window — are checked later.) */
 export function autoMergePolicy(t) {
   const am = config.review.autoMerge || {};
+  // A revert prepared after a suspected regression (post-deploy watch): persisted owner-only, whatever its risk says.
+  if (t.owner_merge_only) return { eligible: false, reason: 'it reverts a deployment after a suspected regression, and only the owner merges reverts' };
   if (!am.enabled) return { eligible: false, reason: 'auto-merge is switched off' };
   if (am.excludeRiskHigh !== false) {
     if (!t.risk) return { eligible: false, reason: 'nobody recorded a risk level for this ticket, so it counts as high-risk' };

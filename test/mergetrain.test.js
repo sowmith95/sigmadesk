@@ -119,7 +119,8 @@ async function approveBoth(key) {
 /** A ticket whose PR branch is on origin, through QA and two approvals. */
 async function approvedPr(file, text = `change ${++seq}\n`, { risk = 'low' } = {}) {
   const t0 = store.createTicket({ title: `Change ${file} ${++seq}`, status: 'in_progress', assignee: 'junior', area: 'backend', complexity: 'S' });
-  store.updateTicket(t0.key, { designer: 'principal-be', risk, builder: 'junior' });
+  // Trading-path work needs its "How to verify in production" criteria to merge (#7).
+  store.updateTicket(t0.key, { designer: 'principal-be', risk, builder: 'junior', ...(risk === 'high' ? { prod_verify: 'app /health answers 200 after the deploy' } : {}) });
   const ws = await runner.ensureWorkspace(store.getTicket(t0.key));
   write(ws.dir, file, text); g(ws.dir, 'add', '.'); g(ws.dir, 'commit', '-qm', `change ${file}`);
   g(ws.dir, 'push', '-q', origin, `HEAD:refs/heads/${ws.branch}`);

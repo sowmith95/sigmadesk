@@ -192,6 +192,23 @@ export function board(state, extra = {}) {
       action: 'Check the deploy', verb: `The deploy of ${lt ? nameOf(lt) : lock.key || 'the last merge'} ${lock.state === 'failed' ? 'failed' : 'was never confirmed'}`,
       reason: `${lock.note ? `${lock.note}. ` : ''}Every merge that deploys waits until you check it, then clear the hold (or merge with a reason).`, deploy: lock });
   }
+  // A suspected regression after a deploy (post-deploy watch, #7): an urgent page that also holds every deploying merge
+  // until the owner clears it. Never snoozable.
+  for (const w of state.meta?.production?.hold || []) {
+    const lt = tickets.find((x) => x.key === w.ticket_key);
+    const name = lt ? nameOf(lt) : `commit ${String(w.merge_sha || '').slice(0, 7)}`;
+    out.needs_you.push({ key: lt?.key || `deploy-${w.id}`, id: `regression:${w.id}`, kind: 'regression', bucket: 'needs_you', ticket: lt, name, priority: w.trading_path ? 'P0' : 'P1',
+      action: 'Check production', verb: w.hold_kind === 'provisional' ? `Possible regression after deploying ${name} (confirming)` : `Regression suspected after deploying ${name}`,
+      reason: `${w.note ? `${w.note}. ` : ''}Every merge that deploys waits until you clear this hold.${w.revert_key ? ` A revert is being prepared in ${w.revert_key}; only you merge it.` : ''}${w.incident_key ? ` Incident: ${w.incident_key}.` : ''}`,
+      regression: w, since: w.deployed_at });
+  }
+  // A post-deploy check the exchange calendar could not schedule (year not covered, bad override): the owner's.
+  for (const c of state.meta?.production?.unschedulable || []) {
+    const lt = tickets.find((x) => x.key === c.watch?.ticket_key);
+    const name = lt ? nameOf(lt) : `commit ${String(c.watch?.merge_sha || '').slice(0, 7)}`;
+    out.needs_you.push({ key: lt?.key || `deploy-${c.watch?.id}`, id: `watch-schedule:${c.id}`, kind: 'watch_schedule', bucket: 'needs_you', ticket: lt, name,
+      action: 'Schedule the check', verb: `The ${c.label} of ${name} could not be scheduled`, reason: `${c.summary || ''}. Fix deployWatch.calendar and retry, choose a time, or skip it (the deployment then cannot be fully verified).`, checkpoint: c });
+  }
   // A production read access request beyond the EM/SRE's policy (or with no agent approver) is the owner's decision.
   for (const r of state.meta?.access?.owner_requests || []) {
     const who = (state.agents || []).find((a) => a.id === r.seat)?.name || r.seat_name || r.seat;
@@ -240,7 +257,7 @@ export function board(state, extra = {}) {
   // `decisions` keeps every decision (the ticket sheet, Work page and palette find a ticket's decision there);
   // `needs_you` is the grouped Inbox list the counts describe.
   out.decisions = [...out.needs_you];
-  const rank = { guard: 0, deploy: 0, access: 1, owner_task: 1, conflict: 1, setup: 1, refresh: 1, stuck: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
+  const rank = { guard: 0, deploy: 0, regression: 0, access: 1, owner_task: 1, conflict: 1, setup: 1, refresh: 1, stuck: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
   out.decisions.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
   // The Inbox: grouped rows in lanes and order (public/inbox.js); snoozed rows are set aside, not resolved, and are
   // not counted as needing you until they wake. Every decision stays in `decisions` for sheets, trackers and search.

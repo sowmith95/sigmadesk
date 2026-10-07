@@ -418,6 +418,91 @@ answers it with probes under a ticket-scoped grant; it comes to you only if no p
    desk passes psql an environment without any inherited `PG*` variables. Passwords in the config are refused.
 4. Restart the desk, turn on **Settings → Production read access**, and grant (or let the EM approve) access as needed.
 
+## Post-deploy watch: does the change work in production?
+
+A merge is not a deploy, and a deploy is not a verified change. After every deploying merge the desk records the
+deploy and then checks production itself.
+
+- **Deploy history.** One row per deploy workflow run of a merge commit: workflow, run id, **run attempt**, target,
+  status, completion time and source (`desk`, `owner` or `external`). It is written in the same transaction that
+  releases (or holds) the merge train's deploy lock, so a crash never leaves a released lock without its record and its
+  watch. A failed or never-confirmed deploy stays `failed`/`unknown` in the history even after you clear the hold.
+  Every ~10 minutes the desk also compares GitHub's recent runs of the deploying workflows with the history: a re-run
+  (a new attempt), a manual `workflow_dispatch` or a push it missed becomes an `external` deployment, and a run the
+  history holds as `unknown` (an escalated or owner-cleared hold) gets its late result — a late success is watched,
+  while the hold's own record (`hold_status`, `cleared_by`) stays as it was. If recording a finished deploy fails, the
+  lock is escalated for you to clear, never left "running". Deploy monitoring runs on its own minute timer, whether or
+  not the merge train or reviews are on.
+- **Targets.** `deploy.targets` names what each deploying workflow redeploys, e.g.
+  `{"deploy-mac-mini.yml": "alpaca-trader"}`, and `deployWatch.targetContainers` which allowlisted containers belong to
+  a target (default: the container named like the target). Deployments are compared by the concrete **resources** their targets stand for (containers via
+  `deployWatch.targetContainers`, databases via `deployWatch.targetDatabases`), never by label: blue and green that
+  both run the `trader` container share it. A newer deployment retires exactly the shared resources from older watches,
+  per component: an ingestor-only deployment retires just the ingestor part of a trader+ingestor
+  watch, and the trader keeps being checked; an unmapped deployment never cancels another watch and is itself watched to the end. An older
+  deployment discovered after a newer one of the same target is recorded as superseded at once (per-target watermark).
+- **Checkpoints.** T+5 min (smoke), T+30 min, and the **next exchange session open + 5 min**. The calendar is a small
+  built-in NYSE table for 2026–2027 (holidays, 13:00 early closes, regular session 09:30–16:00 America/New_York, DST
+  through the time zone database). Extend or replace it with `deployWatch.calendar`:
+  `{"holidays": ["2028-01-17"], "earlyCloses": {"2028-11-24": "13:00"}, "replace": false}`. A year outside the table
+  **fails closed**: the session-open check is marked unschedulable and goes to your Inbox (retry after fixing the
+  calendar, choose a time, or skip it — then the deployment cannot be fully verified). List covered years with
+  `deployWatch.calendar.years`; a bad override is reported at startup.
+- **Baselines.** Just before a deploying merge the desk reads production (container restarts, start times and images,
+  error signatures in the last 30 minutes of logs, ingest freshness). The baseline is only trusted when it finished
+  before the deploy run started and is at most `deployWatch.baselineMaxAgeMinutes` old; otherwise the evidence says so.
+- **Deterministic checks first.** At each checkpoint the desk runs fresh read-only probes itself (never cached): app
+  `/health` (**HTTP 5xx = unhealthy**, whatever the probe's own outcome), container state/health/restarts against the
+  baseline, error signatures as **normalized per-minute rates** over two bounded windows (30 min before the merge, and
+  since the deploy; a known signature counts when its rate rises `deployWatch.signatureRateRatio`×, default 3), and
+  ingest freshness (stale while the market is closed is not judged; only a trusted baseline that was already stale
+  excuses it). Required checks come first; then each watched container's logs and each freshness database
+  — the ones not yet read (fresh within 15 min) first, logs before freshness — so a small market-hours allowance
+  (`deployWatch.probesPerCheckpoint`, default the per-run limit) covers everything across retries, and an allowance
+  that never can ends inconclusive naming exactly what was never read; the desk's own probes
+  leave `deployWatch.sreReserveProbes` of the hourly budget for the SRE. Each checkpoint stores structured evidence:
+  criterion, probe, observation time, threshold, observed value, result, coverage limits, and the deployment identity
+  (workflow runs, container images, and the commit the app reports on `/health` when it does). **Verified needs the deployment identity to match** (the app reports
+  this commit on `/health`, or a container image is tagged with it) and healthy evidence for every required check; any
+  unhealthy answer vetoes it, and partial coverage is inconclusive. The first hard failure immediately places a
+  **provisional hold** on deploying merges and pages you; one more look a couple of minutes later confirms it (only a fresh
+  passing look at the very checks that failed lifts the provisional hold; a confirmation the budget refused keeps it);
+  an SRE "verified" is accepted only after the desk's own fresh look gives every required criterion healthy evidence
+  and each anomaly was re-checked with its own probe; a check that observed nothing is retried
+  (`deployWatch.retryMinutes`), then inconclusive. A check missed by more than `deployWatch.missedHours` is recorded as
+  missed. During market hours the probe allowance per checkpoint is the busy-window per-run limit.
+- **Evidence identity.** Every piece of evidence is keyed by `{criterion, kind, resource}` (probe kind and the exact
+  container, database or endpoint it observed; audited probe calls record what they observed). Settling an anomaly,
+  accepting "verified", the provisional hold's failure set and its release, and coverage gaps all match on that key: a
+  trader-scoped status never settles the broker, and database A's failure is released only by a healthy read of A.
+- **The SRE model only when needed.** Anomalies (one restart, a new error signature below
+  `deployWatch.newSignatureMinCount`, a 3xx/4xx health answer) and the ticket's own criteria (at T+30, and at the
+  session open for trading-path work) go to the SRE in a capped `watch` run: `watch.budgetUsd` (default $1) per
+  checkpoint across attempts on a capped engine, or `watch.maxMinutes`/`watch.maxSteps` on a plan-billed one. "Verified"
+  from the SRE needs a fresh probe in that run. Watch and verify runs never publish or merge anything; a watch run cannot even comment.
+- **Access.** `access.policy.postDeployAutoGrant` is **off** by default (also for desks saved before it existed). When
+  you switch it on (Access sheet), a checkpoint's SRE run gets a grant bound to that run and checkpoint, within the policy (allowed seats, probes,
+  longest duration, active grants), limited to the deployment's containers and databases — derived live from the watch at every probe, so a component a
+  newer deployment took over is refused at once (container status shows only the rest) — re-checked when a queued probe
+  starts and again when its answer returns, so a resource that left while it waited or ran is dropped and said so — expiring with the run;
+  lowering `maxActive` ends the oldest agent grants beyond it; the
+  policy is re-checked at every probe (narrowing it ends the grant) and the grant ends when the deployment stops being
+  watched. An access request from a check run lives and ends with that run, not with the (done) ticket. Off, the SRE works from the desk's evidence or asks you for access.
+- **Risk.** Owner policy: unknown risk counts as high. A ticket is low risk only when both its stored risk and the diff
+  classifier say low; a deployment with no ticket (external) is treated as trading-path.
+- **"How to verify in production".** Builders write it with `desk submit --verify-prod "<what read-only checks should
+  show, and when>"`; reviewers check it; you can set it on a ticket (`POST /api/tickets/KEY/prod-verify`).
+  **Trading-path (high-risk) tickets without it cannot merge** (desk or owner), with that reason on the ticket. Others
+  merge; their checks are general health only and every verdict says "limited".
+- **Verdicts.** `verified`, `regression suspected` or `inconclusive`, posted on the ticket and the PR. A suspected
+  regression pages you (Inbox, never snoozable), **holds every further deploying merge of the train until you clear it**
+  (Inbox → Clear the hold; you can still merge yourself, e.g. the revert), files an incident ticket (P0 on the trading
+  path) and a revert ticket for the builder who made the change. The revert goes through the normal flow (QA, two
+  reviews) and is persisted as **owner-only merge**; its description has the right `git revert` for the merge commit's
+  parents (`-m 1` for a two-parent merge) and flags database migrations and order/broker code a revert cannot undo.
+- **Team KPIs.** Deployed and production-verified count distinct deployments over the same 7-day window
+  ("2 of 3 verified"); limited verifications (general health only) are reported but not counted as verified; regressions and deploy holds lead the Team Wall's exceptions.
+
 ## Quick start
 
 Requirements: Node ≥ 22.13, git, at least one engine — the [Claude Code CLI](https://code.claude.com) and/or the

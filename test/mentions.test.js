@@ -38,7 +38,7 @@ let prompt = ''; process.stdin.on('data', (d) => { prompt += d; }); process.stdi
 let config, store, sched, dispatch, team, access, mentions, runner, server, ops;
 let appSrv;
 before(async () => {
-  ({ config } = await import('../src/config.js')); config.root = tmp; config.bins.claude = fixture;
+  ({ config } = await import('../src/config.js')); config.root = tmp; config.dataDir = path.join(tmp, 'data'); config.bins.claude = fixture; // own publisher: test files run in parallel
   store = await import('../src/db.js'); store.openDb(':memory:');
   sched = await import('../src/scheduler.js'); dispatch = await import('../src/dispatch.js'); team = await import('../src/team.js');
   access = await import('../src/access.js'); mentions = await import('../src/mentions.js'); runner = await import('../src/runner.js');
