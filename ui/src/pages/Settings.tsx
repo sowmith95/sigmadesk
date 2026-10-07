@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { SwitchRow } from '@/components/desk/Fields';
 import { SeatAvatar, Section } from '@/components/desk/Bits';
 import { ChoiceChips } from '@/components/desk/Choices';
+import { AutonomyMatrix } from '@/components/desk/Autonomy';
 
 function NumberSetting({ k, label, hint, step = 1 }: { k: string; label: string; hint: string; step?: number }) {
   const [v, setV] = useState<string>(S.settings[k] ?? '');
@@ -59,6 +60,7 @@ export default function SettingsPage() {
         <NumberSetting k="max_concurrent" label="Seats at once" hint="A market-hours window in the config can lower this." />
         <Bool k="auto_fallback" label="Provider fallback" hint="When one provider is low or down, seats use another. Limits and gates still apply." />
       </Group></Section>
+      <Section title="Autonomy" id="autonomy"><AutonomyMatrix /></Section>
       <Section title="Grooming"><Group>
         <div className="grid gap-3 py-3">
           <div className="grid gap-0.5"><b className="font-medium">Morgan grooms on</b><span className="text-[13px] text-muted-foreground">Grooming reads the repository and turns requests into tasks. Codex reads the code directly; the seat's own engine is whatever Models per seat sets for Morgan.</span></div>

@@ -4,13 +4,14 @@
 // counters everywhere agree with what is shown.
 import { useState } from 'react';
 import { ChevronDown, ChevronRight, MoreHorizontal } from 'lucide-react';
-import { S, api, currentBoard, openTicket, questionFor, loadPrs, openFeature, loadSnapshot, toast, prFor } from '@/store.js';
+import { S, api, currentBoard, openTicket, questionFor, openFeature, loadSnapshot, loadPrs, toast } from '@/store.js';
 import { clean } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Tag, Empty, Section } from '@/components/desk/Bits';
-import { KIND_LABEL, CiTag, Reviews, prReviewsOf, NowLine, cardFor, Clamp, DecisionButton, firstName, reasonText, WorkerLine } from '@/components/desk/Work';
+import { KIND_LABEL, NowLine, cardFor, Clamp, DecisionButton, firstName, reasonText, WorkerLine } from '@/components/desk/Work';
 import { Lineage } from '@/components/desk/Epic';
+import { BriefLine, DecisionLead, briefOf } from '@/components/desk/DecisionBrief';
 import { ProgramUpdate } from '@/components/desk/Program';
 import { LANES, reasons, snoozePresets } from '../../../public/inbox.js';
 import { cn } from '@/lib/utils';
@@ -73,8 +74,10 @@ function InboxRow({ it, hero = false }: { it: Row; hero?: boolean }) {
   const reason = it.kind === 'question' && t ? questionFor(t) || it.reason : it.reason;
   const openIt = () => t && (it.kind === 'plan' ? openFeature(t.key) : openTicket(t.key, { decision: it.id }));
   // Facts as plain small text (no chips): a row stays two short lines on a phone.
-  const pr = it.lane === 'ship' && t ? prFor(t) : null;
-  const ci = pr ? { text: `CI ${pr.checks === 'none' ? 'not run' : pr.checks}${pr.mergeable === 'CONFLICTING' ? ' · conflicts' : ''}`, tone: pr.checks === 'failing' || pr.mergeable === 'CONFLICTING' ? 'text-blocked' : pr.checks === 'passing' ? 'text-shipped' : 'text-muted-foreground' } : null;
+  // CI as the server last read it, for this commit (stale and unknown said plainly): the same fact as the brief.
+  const ev = it.lane === 'ship' ? briefOf(it.id)?.evidence?.ci : null;
+  const ci = ev ? { text: ev.state === 'stale' ? 'CI stale' : ev.state === 'unknown' ? 'CI unknown' : `CI ${ev.checks === 'none' ? 'not run' : ev.checks}${ev.mergeable === 'CONFLICTING' ? ' · conflicts' : ''}${ev.state === 'old' ? ' (old)' : ''}`,
+    tone: ev.state === 'stale' || ev.checks === 'failing' || ev.mergeable === 'CONFLICTING' ? 'text-blocked' : ev.state === 'current' && ev.checks === 'passing' ? 'text-shipped' : 'text-muted-foreground' } : null;
   const fact = it.lane === 'ship' && t ? <>{ci && <span className={ci.tone}>· {ci.text}</span>}{t.risk === 'high' && <span className="text-muted-foreground">· high risk</span>}</>
     : it.kind === 'question' && t?.assignee ? <span className="text-[13px] text-muted-foreground">from {firstName(t.assignee)}</span> : null;
   return (
@@ -96,9 +99,10 @@ function InboxRow({ it, hero = false }: { it: Row; hero?: boolean }) {
         {fact}
         {!!it.waiting?.length && <span data-waiting={it.waiting.map((w) => w.key).join(',')} className="text-muted-foreground">· +{it.waiting.length} waiting question{it.waiting.length === 1 ? '' : 's'}</span>}
       </div>
-      {open && <div className="grid gap-2 pl-9">
+      {!open && <BriefLine it={it} />}
+      {open && <div className="grid gap-3 pl-9">
         <div className="max-w-[68ch] text-sm"><Clamp id={`reason-${it.id}`} text={clean(reason)} /></div>
-        {it.lane === 'ship' && t && <div className="flex flex-wrap gap-1.5"><CiTag t={t} /><Reviews raw={prReviewsOf(t)} compact /></div>}
+        {t && <DecisionLead it={it} t={t} inline full={['merge', 'publish', 'guard', 'deploy', 'access'].includes(it.kind || '')} />}
         {!!it.waiting?.length && <p className="text-sm text-muted-foreground">
           {it.kind === 'epic_review' ? 'Also answers: ' : `${it.waiting.length} more question${it.waiting.length === 1 ? '' : 's'} wait${it.waiting.length === 1 ? 's' : ''} on this: `}
           {it.waiting.map((w, i) => <span key={w.id}>{i > 0 && ', '}<button type="button" className="hover:text-foreground hover:underline" onClick={() => openTicket(w.key, { decision: w.id })}>{w.name}</button></span>)}</p>}
@@ -129,7 +133,7 @@ export function InboxPage() {
   const [lanes, setLanes] = useState(openLanes);
   const [showSnoozed, setShowSnoozed] = useState(false);
   const rows = B.needs_you as Row[];
-  if (rows.some((x) => x.kind === 'merge')) loadPrs();
+  if (rows.some((x) => x.kind === 'merge')) loadPrs(); // reading the PR list is also how the server learns each PR's CI
   const first = rows.find((r) => r.id === B.do_first) || null;
   const rest = rows.filter((r) => r !== first);
   const toggle = (id: string) => { const n = { ...lanes, [id]: !lanes[id] }; setLanes(n); try { localStorage.setItem(OPEN_KEY, JSON.stringify(n)); } catch { /* private mode */ } };
