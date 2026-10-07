@@ -72,3 +72,17 @@ test('ticket line: build, merge by risk class, production read with its expiry',
   r = forTicket({ ticket: { key: 'A-5', status: 'todo', risk: null }, matrix: matrix(base({ autoMerge: { enabled: true, excludeRiskHigh: false } })) });
   assert.match(r.text, /merge automatic \(risk unknown, waived\)/);
 });
+
+test('production-read readiness (repro, review P2): no SRE grant, a halted desk, no budget or nothing to probe blocks it; the authorized mode stays assisted', () => {
+  const ops = { configured: true, on: true, verify: true, targets: 2 };
+  let a = by(matrix(base({ ops, settings: { ...base().settings, paused: 'true' } })));
+  assert.equal(a.prod_read.mode, 'assisted'); assert.equal(a.prod_read.readiness.state, 'blocked');
+  assert.match(a.prod_read.readiness.reasons[0], /halted.*no verify run starts/);
+  assert.match(a.prod_read.readiness.reasons[1], /Devon holds no production access/);
+  a = by(matrix(base({ ops: { ...ops, targets: 0 }, ownerGrants: [{ seat: 'sre', expires_at: '2026-10-07T18:00:00Z' }] })));
+  assert.deepEqual(a.prod_read.readiness.reasons, ['No database or container is configured for the probes, so they have nothing to read.']);
+  a = by(matrix(base({ ops, budgetLeft: 0, ownerGrants: [{ seat: 'sre' }] })));
+  assert.match(a.prod_read.readiness.reasons[0], /spend limit.*no verify run starts/);
+  a = by(matrix(base({ ops, ownerGrants: [{ seat: 'sre', expires_at: '2026-10-07T18:00:00Z' }] })));
+  assert.equal(a.prod_read.readiness.state, 'ready'); assert.equal(a.prod_read.mode, 'assisted');
+});

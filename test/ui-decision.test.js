@@ -21,7 +21,7 @@ for (const [w, h] of [[390, 844], [1440, 900]]) {
     const line = page.locator(`article[data-ticket="${contracts.key}"] [data-brief-line="merge"]`);
     await line.waitFor();
     assert.match(await line.innerText(), /starts Deploy to Mac mini → redeploys alpaca-trader/);
-    assert.match(await page.locator(`article[data-ticket="${docs.key}"] [data-brief-line="merge"]`).innerText(), /CI was read for 4be91c2, not the current commit/);
+    assert.match(await page.locator(`article[data-ticket="${docs.key}"] [data-brief-line="merge"]`).innerText(), /Not confirmed: CI unknown/);
     assert.doesNotMatch(await page.locator('main').innerText(), /deploys production/i);
     if (w <= 400) assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'no sideways scroll on a phone');
 
@@ -33,6 +33,7 @@ for (const [w, h] of [[390, 844], [1440, 900]]) {
     assert.match(await lead.locator('[data-releases]').innerText(), /Unblocks Switch reviewers/);
     assert.deepEqual(await lead.locator('[data-gate-item]').evaluateAll((n) => n.map((x) => x.getAttribute('data-gate-item'))), ['qa', 'reviews', 'ci', 'deploy_window', 'policy']);
     assert.equal(await lead.locator('[data-gate-item="policy"]').getAttribute('data-state'), 'yours');
+    assert.equal(await lead.locator('[data-gate]').first().getAttribute('data-gate'), 'ready', 'every live predicate holds in the fixture');
     assert.equal(await lead.locator('[data-evidence="ci"]').getAttribute('data-state'), 'current');
     assert.match(await lead.locator('[data-human]').innerText(), /Watching the deploy/);
     assert.doesNotMatch(await page.locator('[data-panel]').innerText(), /deploys production/i);
@@ -44,9 +45,11 @@ for (const [w, h] of [[390, 844], [1440, 900]]) {
     const lead2 = page.locator('[data-panel] [data-decision-lead="merge"]');
     await lead2.waitFor();
     assert.equal(await lead2.locator('[data-evidence="ci"]').getAttribute('data-state'), 'stale');
-    assert.equal(await lead2.locator('[data-gate-item="ci"]').getAttribute('data-state'), 'blocked');
-    assert.match(await lead2.innerText(), /Deployment target unknown/);
-    assert.match(await lead2.innerText(), /edits 1 workflow file \(docs-site\.yml\)/);
+    assert.equal(await lead2.locator('[data-gate-item="ci"]').getAttribute('data-state'), 'unknown', 'CI read for another commit: not confirmed');
+    assert.equal(await lead2.locator('[data-consequence]').getAttribute('data-consequence'), 'unknown', 'it edits its workflow: no definite claim');
+    assert.match(await lead2.innerText(), /edits 1 workflow file \(docs-site\.yml\).*not read/);
+    assert.match(await lead2.locator('[data-gate-headline]').innerText(), /^Not confirmed: CI unknown/);
+    assert.doesNotMatch(await page.locator('[data-panel]').innerText(), /YOU DECIDE|IF YOU APPROVE|GATE\b/, 'sentence-case labels');
     assert.deepEqual(errors, []);
     await page.close();
   });
@@ -100,6 +103,7 @@ for (const [w, h] of [[390, 844], [1440, 900]]) {
     assert.equal(await row('merge_low').getAttribute('data-ready'), 'blocked', 'the halted preview desk blocks it without changing its mode');
     assert.equal(await row('merge_high').locator('[data-mode]').getAttribute('data-mode'), 'assisted');
     assert.equal(await row('prod_read').locator('[data-mode]').getAttribute('data-mode'), 'assisted');
+    assert.equal(await row('prod_read').getAttribute('data-ready'), 'blocked', 'halted preview desk: no verify run starts, though the SRE holds a grant');
     assert.equal(await m.locator('[data-control]').evaluateAll((n) => n.map((x) => x.getAttribute('data-control')).join(',')), 'ops_enabled,ownerMentionAutoGrant,open_draft_prs');
     assert.match(await row('merge_low').locator('[data-readonly]').innerText(), /Read-only here.*review\.autoMerge\.enabled/);
     assert.equal(await m.locator('[data-not-representable]').count(), 2);

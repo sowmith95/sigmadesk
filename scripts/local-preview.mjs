@@ -240,7 +240,7 @@ if (process.env.SIGMADESK_TEAM_DEMO === '1') {
 // Decision demo (SIGMADESK_DECISION_DEMO=1): merge decisions with real-shaped evidence for the decision snapshot (#6).
 // The facts the desk reads from git and GitHub in the background (which workflows a merge starts, the CI rollup) are
 // seeded exactly as the desk caches them, each pinned to a commit; one merge carries CI read for an OLDER commit (stale)
-// and an unmapped workflow (target unknown). A merged ticket is ready for "Verify in production" (read access on, the SRE
+// and edits its own workflow file without the approved commit's version having been read (consequence unknown). A merged ticket is ready for "Verify in production" (read access on, the SRE
 // on, a timed grant running). Nothing runs: the desk stays paused and no model or GitHub call is made.
 if (process.env.SIGMADESK_DECISION_DEMO === '1') {
   store.setSetting('paused', 'true');
@@ -249,6 +249,7 @@ if (process.env.SIGMADESK_DECISION_DEMO === '1') {
   store.setSetting('team', JSON.stringify(overrides)); team.applyTeamOverrides(overrides);
   store.setSetting('ops_enabled', 'true'); // GitHub sync stays off: the preview never calls GitHub
   const ago = (min) => new Date(Date.now() - min * 60_000).toISOString();
+  const decisionMod = await import('../src/decision.js');
   const H1 = 'a17c0de9b14f2e7d', H2 = '5e2d9f01c77ab3e4', OLD = '4be91c2aa83f1d02';
   const merge = (t, { head, risk, diffRisk, files, deploy, ci, approvedMin, qaMin, since: waited }) => {
     store.updateTicket(t.key, { status: 'ready_for_human', pr_url: `https://github.com/test/fixture/pull/${t.id + 10}`, branch: `sigmadesk/${t.key.toLowerCase()}`, head_sha: head, qa_sha: head,
@@ -261,8 +262,8 @@ if (process.env.SIGMADESK_DECISION_DEMO === '1') {
       store.handle().prepare('UPDATE pr_reviews SET updated_at=? WHERE id=?').run(ago(min), r.id);
     }
     store.kvSet(`diff-files:${t.key}`, JSON.stringify(files));
-    store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head, base: store.kvGet('train:base') || null, files, at: ago(2), ...deploy }));
-    store.kvSet(`decision:ci:${t.key}`, JSON.stringify({ at: ago(ci.min), sha: ci.sha, checks: ci.checks, mergeable: 'MERGEABLE' }));
+    store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head, base: store.kvGet('train:base') || null, cfg: decisionMod.classificationVersion(), files, at: ago(2), ...deploy }));
+    store.kvSet(`decision:ci:${t.key}`, JSON.stringify({ at: ago(ci.min), sha: ci.sha, state: 'OPEN', base: 'main', checks: ci.checks, mergeable: 'MERGEABLE', rollup: [{ name: 'test', conclusion: 'SUCCESS' }] }));
     const since = JSON.parse(store.kvGet('inbox:since') || '{}'); since[`${t.key}:merge`] = ago(waited); store.kvSet('inbox:since', JSON.stringify(since));
     store.kvSet('inbox:since:seeded', store.now());
     return t;
@@ -270,7 +271,7 @@ if (process.env.SIGMADESK_DECISION_DEMO === '1') {
   const contracts = store.listTickets().find((t) => t.title.startsWith('Preserve review contracts'));
   merge(contracts, { head: H1, risk: 'high', diffRisk: 'high', approvedMin: 41, qaMin: 64, since: 190,
     files: ['alpaca_trader/app/oms/exit_monitor.py', 'alpaca_trader/tests/test_exit_monitor.py'],
-    deploy: { state: 'deploys', workflows: [{ file: '.github/workflows/deploy-mac-mini.yml', name: 'Deploy to Mac mini', reason: 'runs on push to main' }], reason: 'it redeploys via Deploy to Mac mini' },
+    deploy: { state: 'deploys', workflows_at: 'base', workflows: [{ file: '.github/workflows/deploy-mac-mini.yml', name: 'Deploy to Mac mini', reason: 'runs on push to main' }], reason: 'it redeploys via Deploy to Mac mini' },
     ci: { min: 4, sha: H1, checks: 'passing' } });
   store.addComment(contracts.key, 'senior-be', '🚀 Submitted: review contracts survive a model switch; the exit monitor keeps its thresholds.');
   const next = store.createTicket({ title: 'Switch reviewers to the new model', status: 'todo', assignee: 'senior-be', priority: 'P2', area: 'backend', complexity: 'S', reporter: 'owner', source: 'human' });

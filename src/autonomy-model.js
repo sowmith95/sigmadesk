@@ -81,7 +81,11 @@ export function matrix(f) {
         : !f.seats?.sre ? `${sre}'s seat is off: every production check is yours.`
           : !ops.verify ? 'Verify runs are not allowed to probe (ops.kinds): every production check is yours.'
             : `${sre} verifies with read-only probes once access is granted. ${sre} approves access for others, so ${sre}'s own access is always yours to grant.`,
-    readiness: R('ready', []), grant: sreGrant || null,
+    // Readiness, separately: can a check actually run now? Grants, halt, budget, and something for the probes to read.
+    readiness: R('ready', opsMode === 'human-led' ? [] : [...common.map((r) => r.replace('.', ': no verify run starts.')),
+      ...(!sreGrant ? [`${sre} holds no production access: a check waits until you grant it (Inbox request, or Settings → Production access).`] : []),
+      ...(ops.targets === 0 ? ['No database or container is configured for the probes, so they have nothing to read.'] : [])]),
+    grant: sreGrant || null,
     control: ops.configured ? { kind: 'setting', key: 'ops_enabled', editable: true, value: ops.on, text: 'Production read access (Settings). Off stops every probe at once.' } : cfg('ops.enabled') });
 
   const tagAuto = f.policy?.ownerMentionAutoGrant !== false;

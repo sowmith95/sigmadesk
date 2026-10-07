@@ -29,9 +29,23 @@ test('consequence: detected workflows; a target only from deploy.targets; unknow
   assert.equal(M.deployConsequence(null).state, 'unknown');
   assert.match(M.deployConsequence(null).steps[0].text, /Not checked yet/);
   assert.match(M.deployConsequence({ state: 'unknown', workflows: [], reason: 'the changed files are unknown' }).steps[0].text, /unknown \(the changed files are unknown\)/);
-  const edits = M.deployConsequence({ state: 'deploys', workflows: [WF[0]] }, { files: ['app/x.py', '.github/workflows/deploy-mac-mini.yml'] });
-  assert.deepEqual(edits.workflow_changes, ['.github/workflows/deploy-mac-mini.yml']);
-  assert.match(edits.steps.at(-1).text, /edits 1 workflow file \(deploy-mac-mini\.yml\)/);
+  assert.equal(M.deployConsequence({ state: 'refreshing' }).state, 'unknown');
+  assert.match(M.deployConsequence({ state: 'refreshing' }).steps[0].text, /^Unknown, refreshing/);
+});
+
+test('workflow edits (repro, review P1): no definite claim unless the versions at the approved head were read', () => {
+  const files = ['app/x.py', '.github/workflows/deploy-mac-mini.yml'];
+  for (const dep of [{ state: 'none', workflows: [] }, { state: 'deploys', workflows: [WF[0]] }]) {
+    const c = M.deployConsequence({ ...dep, workflows_at: 'base' }, { files, targets: { 'deploy-mac-mini.yml': 'alpaca-trader' } });
+    assert.equal(c.state, 'unknown', dep.state); assert.equal(c.target, 'unknown');
+    assert.doesNotMatch(c.steps.map((x) => x.text).join(' '), /nothing redeploys|Redeploys alpaca-trader/);
+    assert.match(c.steps[0].text, /edits 1 workflow file \(deploy-mac-mini\.yml\).*not read/);
+  }
+  const head = M.deployConsequence({ state: 'none', workflows: [], workflows_at: 'head' }, { files });
+  assert.equal(head.state, 'none'); assert.match(head.steps[0].text, /versions at the approved commit/);
+  const t = { key: 'SD-1', head_sha: H, qa_sha: H, pr_url: 'https://x/pull/1' };
+  const b = M.brief({ decision: { id: 'SD-1:merge', key: 'SD-1', kind: 'merge', verb: 'Merge x', ticket: t }, ticket: t, files, deploy: { state: 'none', workflows: [], workflows_at: 'base' } });
+  assert.match(b.consequence.summary, /what it starts is unknown/); assert.doesNotMatch(b.consequence.summary, /nothing redeploys/);
 });
 
 test('evidence freshness: QA, reviews and CI each current, stale or unknown for the commit on screen', () => {
@@ -51,21 +65,31 @@ test('evidence freshness: QA, reviews and CI each current, stale or unknown for 
   assert.equal(M.ciEvidence({ head: H, ci: { sha: H, checks: 'passing', at: at(180) }, now: NOW }).state, 'old');
 });
 
-test('merge gate: ordered QA → reviews → CI → deploy window → policy; the busy window blocks only what deploys', () => {
+const LIVE = (codes = [], blockers = codes.map((c) => `${c} text`)) => ({ codes, blockers, rolled: true, required: ['test'] });
+test('merge gate (repro, review P2): the live merge predicates decide; unpublished waits, unknown mergeability is unknown, missing or old checks wait; green only when all hold', () => {
   const qa = M.qaEvidence({ head: H, qaSha: H, qaAt: at(30), now: NOW });
   const reviews = { state: 'current', text: '2 approvals' };
-  const ci = M.ciEvidence({ head: H, ci: { sha: H, checks: 'passing', at: at(5) }, now: NOW });
+  const ci = M.ciEvidence({ head: H, ci: { sha: H, checks: 'passing', mergeable: 'MERGEABLE', at: at(5) }, now: NOW });
   const dep = M.deployConsequence({ state: 'deploys', workflows: WF });
-  const g = M.mergeGate({ qa, reviews, ci, deploy: dep, busy: true, windowEnd: '4:15 PM ET', policy: { eligible: false, reason: 'the ticket is marked high-risk' } });
-  assert.deepEqual(g.items.map((i) => i.id), ['qa', 'reviews', 'ci', 'deploy_window', 'policy']);
-  assert.equal(g.state, 'blocked'); assert.match(g.headline, /^Deploy window: Inside the busy window until 4:15 PM ET/);
-  assert.equal(g.items.at(-1).state, 'yours');
-  const quiet = M.mergeGate({ qa, reviews, ci, deploy: M.deployConsequence({ state: 'none', workflows: [] }), busy: true, policy: { eligible: false, reason: 'x' } });
-  assert.equal(quiet.state, 'ready', 'nothing deploys: the busy window does not apply');
-  const stale = M.mergeGate({ qa: M.qaEvidence({ head: H, qaSha: OLD }), reviews, ci: M.ciEvidence({ head: H, ci: null }), deploy: dep, busy: false, policy: { eligible: true } });
-  assert.equal(stale.items[0].state, 'blocked'); assert.equal(stale.items[2].state, 'unknown');
-  const lock = M.mergeGate({ qa, reviews, ci, deploy: dep, busy: false, lock: { key: 'SD-9', state: 'failed' }, policy: { eligible: true } });
-  assert.ok(lock.items.some((i) => i.id === 'deploy_lock' && i.state === 'blocked'));
+  const ok = M.mergeGate({ qa, reviews, ci, deploy: dep, policy: { eligible: false, reason: 'high risk' }, live: LIVE() });
+  assert.deepEqual(ok.items.map((i) => i.id), ['qa', 'reviews', 'ci', 'deploy_window', 'policy']);
+  assert.equal(ok.state, 'ready'); assert.equal(ok.headline, 'Ready for you.');
+  const g = M.mergeGate({ qa, reviews: { ...reviews, unpublished: 1 }, ci: { ...ci, mergeable: 'UNKNOWN' }, deploy: dep, policy: { eligible: true }, live: LIVE(['mergeable_unknown', 'unpublished']) });
+  assert.equal(g.items.find((i) => i.id === 'reviews').state, 'waiting');
+  assert.equal(g.items.find((i) => i.id === 'mergeable').state, 'unknown');
+  assert.equal(g.state, 'waiting'); assert.match(g.headline, /^Reviews: .*not on the PR yet/);
+  const unk = M.mergeGate({ qa, reviews, ci: { ...ci, mergeable: 'UNKNOWN' }, deploy: dep, policy: { eligible: true }, live: LIVE(['mergeable_unknown']) });
+  assert.equal(unk.state, 'unknown'); assert.match(unk.headline, /^Not confirmed: mergeability unknown/);
+  const missing = M.mergeGate({ qa, reviews, ci, deploy: dep, policy: { eligible: true }, live: LIVE(['required_missing'], ['required check test has not passed on this commit (never reported)']) });
+  assert.equal(missing.items.find((i) => i.id === 'ci').state, 'waiting'); assert.match(missing.headline, /Required check test has not passed/);
+  const old = M.mergeGate({ qa, reviews, ci: M.ciEvidence({ head: H, ci: { sha: H, checks: 'passing', mergeable: 'MERGEABLE', at: at(180) }, now: NOW }), deploy: dep, policy: { eligible: true }, live: LIVE() });
+  assert.equal(old.items.find((i) => i.id === 'ci').state, 'waiting');
+  assert.equal(M.mergeGate({ qa, reviews, ci, deploy: dep, policy: { eligible: true }, live: null }).state, 'unknown', 'no live read: never green');
+  const busy = M.mergeGate({ qa, reviews, ci, deploy: dep, busy: true, windowEnd: '4:15 PM ET', policy: { eligible: true }, live: LIVE() });
+  assert.equal(busy.state, 'blocked'); assert.match(busy.headline, /^Deploy window: Inside the busy window until 4:15 PM ET/);
+  assert.equal(M.mergeGate({ qa, reviews, ci, deploy: M.deployConsequence({ state: 'none', workflows: [] }), busy: true, policy: { eligible: true }, live: LIVE() }).state, 'ready', 'nothing deploys: the busy window does not apply');
+  assert.equal(M.mergeGate({ qa: M.qaEvidence({ head: H, qaSha: OLD }), reviews, ci, deploy: dep, policy: { eligible: true }, live: LIVE(['qa']) }).items[0].state, 'blocked');
+  assert.ok(M.mergeGate({ qa, reviews, ci, deploy: dep, lock: { key: 'SD-9', state: 'failed' }, policy: { eligible: true }, live: LIVE() }).items.some((i) => i.id === 'deploy_lock' && i.state === 'blocked'));
   assert.equal(M.publishGate({ qa, githubSync: true, draftPrs: false }).state, 'blocked', 'draft PRs off: approving pushes nothing');
 });
 
@@ -74,7 +98,7 @@ test('brief: "you decide", consequence, releases, wait from the decision start, 
   const d = { id: 'SD-4:merge', key: 'SD-4', kind: 'merge', name: 'Review contracts', verb: 'Merge Review contracts', ticket };
   const b = M.brief({ decision: d, ticket, now: NOW, since: at(190), releases: [{ key: 'SD-7', name: 'Model switch', status: 'todo' }], qaAt: at(60),
     reviews: { ok: true, context: { seat: 'manager', verdict: 'approve', updated_at: at(40) }, independent: { seat: 'principal-be', verdict: 'approve', updated_at: at(35) } },
-    ci: { sha: H, checks: 'passing', at: at(4) }, deploy: { state: 'deploys', workflows: [WF[0]] }, targets: { 'deploy-mac-mini.yml': 'alpaca-trader' },
+    ci: { sha: H, checks: 'passing', mergeable: 'MERGEABLE', at: at(4) }, live: LIVE(), deploy: { state: 'deploys', workflows: [WF[0]] }, targets: { 'deploy-mac-mini.yml': 'alpaca-trader' },
     busy: false, policy: { eligible: false, reason: 'the ticket is marked high-risk' }, pr: 12, policyVersion: 'abc' });
   assert.equal(b.you_decide, 'Merge Review contracts into main');
   assert.equal(b.consequence.summary, 'Merges PR #12 into main → starts Deploy Mac Mini → redeploys alpaca-trader');
@@ -110,21 +134,38 @@ before(async () => {
 });
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-test('the snapshot embeds one brief per decision, keyed by decision id, with the cached deploy facts for the current commit only', () => {
+test('the snapshot embeds one brief per decision; deploy facts count only for the same head, observed base and classification config (repro, review P1)', () => {
   const t = store.createTicket({ title: 'Merge me', status: 'ready_for_human', assignee: 'senior-be' });
   store.updateTicket(t.key, { pr_url: 'https://github.com/x/y/pull/3', head_sha: H, qa_sha: H, risk: 'high' });
-  store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head: OLD, base: null, state: 'deploys', workflows: [{ file: '.github/workflows/deploy.yml', name: 'Deploy' }], at: store.now() }));
-  let snap = server.snapshot();
   const id = `${t.key}:merge`;
-  assert.ok(snap.meta.decision_briefs[id], 'a brief for the merge decision');
-  assert.equal(snap.meta.decision_briefs[id].consequence.deploy.state, 'unknown', 'deploy facts for another commit are not used');
-  store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head: H, base: null, state: 'deploys', workflows: [{ file: '.github/workflows/deploy.yml', name: 'Deploy' }], at: store.now() }));
-  snap = server.snapshot();
-  const b = snap.meta.decision_briefs[id];
+  const rec = (over) => store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head: H, base: 'base-1', cfg: decision.classificationVersion(), state: 'none', workflows: [], workflows_at: 'base', at: store.now(), ...over }));
+  store.kvSet('train:base', 'base-1');
+  rec({ head: OLD });
+  assert.equal(server.snapshot().meta.decision_briefs[id].consequence.deploy.state, 'unknown', 'another head: not used');
+  rec({});
+  assert.equal(server.snapshot().meta.decision_briefs[id].consequence.deploy.state, 'none');
+  store.kvSet('train:base', 'base-2'); // the base moved: the old-base "nothing redeploys" must not be shown
+  let b = server.snapshot().meta.decision_briefs[id];
+  assert.equal(b.consequence.deploy.state, 'unknown'); assert.match(b.consequence.steps[1].text, /^Unknown, refreshing/);
+  assert.doesNotMatch(b.consequence.summary, /nothing redeploys/);
+  rec({ base: 'base-2', cfg: 'other-config' });
+  assert.equal(server.snapshot().meta.decision_briefs[id].consequence.deploy.state, 'unknown', 'another classification config: not used');
+  rec({ base: 'base-2', state: 'deploys', workflows: [{ file: '.github/workflows/deploy.yml', name: 'Deploy' }] });
+  b = server.snapshot().meta.decision_briefs[id];
   assert.equal(b.consequence.deploy.target, 'known'); assert.deepEqual(b.consequence.deploy.targets, ['api']);
-  assert.equal(b.evidence.ci.state, 'unknown', 'CI never read: unknown, not green');
-  assert.ok(b.wait.since, 'the wait starts when the decision first appeared');
-  assert.equal(b.wait.since, snap.meta.waiting_since[id]);
+  assert.equal(b.evidence.ci.state, 'unknown', 'CI never read: unknown, not green'); assert.notEqual(b.gate.state, 'ready');
+  assert.equal(b.wait.since, server.snapshot().meta.waiting_since[id]);
+});
+
+test('the brief runs the live merge predicates (prs.authorizeMerge) on the last GitHub read: unpublished approvals wait, unknown mergeability is unknown (repro, review P2)', () => {
+  const t = store.createTicket({ title: 'Merge me too', status: 'ready_for_human', assignee: 'senior-be' });
+  store.updateTicket(t.key, { pr_url: 'https://github.com/x/y/pull/5', head_sha: H, qa_sha: H, risk: 'low', diff_risk: 'low' });
+  for (const [seat, role] of [['manager', 'context'], ['principal-be', 'independent']]) { const r = store.createPrReview({ ticket_key: t.key, seat, role, sha: H }); store.updatePrReview(r.id, { verdict: 'approve' }); }
+  decision.recordCi([{ key: t.key, head_sha: H, state: 'OPEN', base: 'main', checks: 'passing', mergeable: 'UNKNOWN', rollup: [{ name: 'test', conclusion: 'SUCCESS' }] }]);
+  const b = server.snapshot().meta.decision_briefs[`${t.key}:merge`];
+  const st = Object.fromEntries(b.gate.items.map((i) => [i.id, i.state]));
+  assert.equal(st.reviews, 'waiting'); assert.equal(st.mergeable, 'unknown'); assert.equal(st.ci, 'ok');
+  assert.equal(b.gate.state, 'waiting'); assert.match(b.gate.headline, /not on the PR yet/);
 });
 
 test('Verify in production on a merged ticket: one linked task, idempotent, the ticket stays merged; refused with the reason when nobody can read production', async () => {

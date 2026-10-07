@@ -14,6 +14,8 @@ import * as prs from './prs.js';
 import * as access from './access.js';
 import * as ops from './ops.js';
 import * as github from './github.js';
+import * as runner from './runner.js';
+import * as workflowsLib from './workflows.js';
 import { agentById } from './team.js';
 import * as flow from '../public/flow.js';
 import { nameOf as ticketName } from '../public/names.js';
@@ -34,32 +36,83 @@ export function policyVersion(settings = store.getSettings()) {
   return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex').slice(0, 10);
 }
 
-// ---------------- background facts: deploy classification and CI, each pinned to a commit ----------------
+// ---------------- background facts: deploy classification and CI, each pinned to what it describes ----------------
+/** Everything the deploy classification depends on besides the commit and the base: a change makes old facts unknown. */
+export function classificationVersion() {
+  return crypto.createHash('sha256').update(JSON.stringify([config.project.baseBranch, config.deploy?.workflows ?? 'auto', config.review?.requiredChecks ?? 'auto'])).digest('hex').slice(0, 10);
+}
+const isWorkflowFile = (f) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(String(f));
+/** A cached record describes exactly this head, this observed base and this classification config (never an older one). */
+export function deployFactsValid(rec, t, baseSha = store.kvGet('train:base') || null) {
+  return !!rec && rec.head === t.head_sha && (rec.base || null) === (baseSha || null) && rec.cfg === classificationVersion();
+}
+/**
+ * The workflows that would apply after merging `head`: the base branch's, with every workflow file the change adds,
+ * edits or deletes replaced by its version at the approved head. null = some version could not be read.
+ */
+async function workflowsAtHead(head, changed, baseList) {
+  return runner.withPublisher(async (pgit) => {
+    if ((await pgit(['cat-file', '-e', `${head}^{commit}`])).code) return null;
+    const byFile = new Map((baseList || []).map((w) => [w.file, w]));
+    for (const f of changed) {
+      const ls = await pgit(['ls-tree', '--name-only', head, '--', f]);
+      if (ls.code) return null;
+      if (!ls.stdout.trim()) { byFile.delete(f); continue; } // deleted by the change
+      const show = await pgit(['show', `${head}:${f}`]);
+      if (show.code) return null;
+      byFile.set(f, { file: f, text: show.stdout });
+    }
+    return [...byFile.values()];
+  });
+}
 const inflight = new Set();
-/** Which workflows merging this ticket starts, for its current commit and base (cached; recomputed when either moves). */
+/**
+ * Which workflows merging this ticket starts, for its current head, the observed base and the classification config
+ * (cached; recomputed when any of them moves). A change that edits workflow files is evaluated with the versions at
+ * the approved head; if those cannot be read, the result is unknown (no definite claim).
+ */
 export async function refreshDeploy(t, { force = false } = {}) {
   if (!t?.head_sha || inflight.has(t.key)) return json(DEPLOY_KEY(t.key));
   const baseSha = store.kvGet('train:base') || null;
   const prev = json(DEPLOY_KEY(t.key));
-  if (!force && prev && prev.head === t.head_sha && (prev.base || null) === baseSha && (prev.state !== 'unknown' || Date.now() - Date.parse(prev.at) < RECHECK_MS)) return prev;
+  if (!force && deployFactsValid(prev, t, baseSha) && (prev.state !== 'unknown' || Date.now() - Date.parse(prev.at) < RECHECK_MS)) return prev;
   inflight.add(t.key);
   try {
-    const info = await mergetrain.deployInfo(t).catch((err) => ({ deploys: true, workflows: [], reason: `the check failed: ${String(err.message).slice(0, 80)}` }));
     const files = json(`diff-files:${t.key}`);
-    const state = !info.deploys ? 'none' : info.workflows?.length ? 'deploys' : 'unknown';
-    const rec = { head: t.head_sha, base: baseSha, state, workflows: info.workflows || [], reason: info.reason || null, files: Array.isArray(files) ? files.slice(0, 500) : null, at: store.now() };
+    const rec = { head: t.head_sha, base: baseSha, cfg: classificationVersion(), files: Array.isArray(files) ? files.slice(0, 500) : null, at: store.now(), workflows: [], reason: null, workflows_at: null };
+    let wfs = null;
+    try { wfs = await mergetrain.workflowsAtBase(); } catch { wfs = null; }
+    const changed = (rec.files || []).filter(isWorkflowFile);
+    if (!rec.files?.length) Object.assign(rec, { state: 'unknown', reason: 'the changed files are unknown' });
+    else if (!wfs) Object.assign(rec, { state: 'unknown', reason: 'the base branch workflows could not be read' });
+    else {
+      let applicable = wfs;
+      if (changed.length) {
+        applicable = await workflowsAtHead(t.head_sha, changed, wfs).catch(() => null);
+        if (!applicable) Object.assign(rec, { state: 'unknown', reason: `it edits ${changed.map((f) => f.split('/').pop()).join(', ')} and those versions at the approved commit could not be read` });
+      }
+      if (applicable) {
+        const r = workflowsLib.deploysFor({ files: rec.files, branch: config.project.baseBranch, workflows: applicable, registered: config.deploy?.workflows ?? 'auto' });
+        Object.assign(rec, { state: !r.deploys ? 'none' : r.workflows.length ? 'deploys' : 'unknown', workflows: r.workflows, workflows_at: changed.length ? 'head' : 'base' });
+        // Which required checks apply to these files (the same coverage the live merge check uses).
+        try { const cov = prs.ciCoverage({ required: prs.requiredChecks().names, files: rec.files, workflows: wfs, checkFiles: json('ci:check-files', {}) }); rec.ci_applicable = cov.applicable; rec.ci_gap = !!cov.gap; } catch { /* coverage unknown: every required check counts */ }
+      }
+    }
+    // Never overwrite a newer record written while this one was computed.
+    const cur = json(DEPLOY_KEY(t.key));
+    if (cur && cur.head === rec.head && Date.parse(cur.at) > Date.parse(rec.at)) return cur;
     store.kvSet(DEPLOY_KEY(t.key), JSON.stringify(rec));
     store.bus.emit('msg', { type: 'inbox', data: null }); // open Inboxes re-read the snapshot
     return rec;
   } finally { inflight.delete(t.key); }
 }
-/** Record CI as GitHub reported it (from the PR list the owner's UI already loads). */
+/** Record the PR as GitHub reported it (from the PR list the owner's UI already loads): head, state, base, mergeability, checks. */
 export function recordCi(rows = [], at = store.now()) {
   for (const r of rows) {
     if (!r?.key || !r.head_sha) continue;
     const prev = json(CI_KEY(r.key));
     if (prev && prev.sha === r.head_sha && prev.checks === r.checks && prev.mergeable === r.mergeable && Date.now() - Date.parse(prev.at) < 60_000) continue;
-    store.kvSet(CI_KEY(r.key), JSON.stringify({ sha: r.head_sha, checks: r.checks, mergeable: r.mergeable || null, at }));
+    store.kvSet(CI_KEY(r.key), JSON.stringify({ sha: r.head_sha, state: r.state || null, base: r.base || null, checks: r.checks, mergeable: r.mergeable || null, rollup: r.rollup || null, at }));
   }
 }
 
@@ -91,10 +144,21 @@ export function briefFor(d, snap, { ix = flow.index(snap.tickets), now = Date.no
     const ap = t.head_sha ? store.approvalsAt(t.key, t.head_sha) : { ok: false };
     facts.reviews = { inFlow: store.inReviewFlow(t.key), context: ap.context || null, independent: ap.independent || null, ok: !!ap.ok, unpublished: ap.unpublished || 0 };
     const dep = json(DEPLOY_KEY(t.key));
-    facts.deploy = dep && dep.head === t.head_sha ? dep : null;
-    if (!facts.deploy && t.head_sha) refreshDeploy(t).catch(() => {}); // the next snapshot has it
+    const valid = t.head_sha && deployFactsValid(dep, t);
+    // Facts for another head, base or classification config are never shown: unknown until the refresh lands.
+    facts.deploy = valid ? dep : dep ? { state: 'refreshing' } : null;
+    if (!valid && t.head_sha) refreshDeploy(t).catch(() => {}); // the next snapshot has it
     const ci = json(CI_KEY(t.key));
     facts.ci = ci;
+    // The live merge predicates (prs.authorizeMerge), evaluated read-only on what the desk last read from GitHub.
+    if (ci && t.head_sha) {
+      const pr = { state: ci.state || 'OPEN', headRefOid: ci.sha, baseRefName: ci.base || config.project.baseBranch, mergeable: ci.mergeable || 'UNKNOWN',
+        statusCheckRollup: Array.isArray(ci.rollup) ? ci.rollup : [] };
+      const required = valid && Array.isArray(dep.ci_applicable) ? dep.ci_applicable : prs.requiredChecks().names;
+      const gate = store.inReviewFlow(t.key) ? { approvals: ap, qaSha: t.qa_sha } : null;
+      const live = prs.authorizeMerge(pr, { expectedSha: t.head_sha, actor: 'owner', gate, required, ciGap: valid && dep.ci_gap ? { areas: [] } : null, noChecksConfigured: false });
+      facts.live = { codes: live.codes, blockers: live.blockers, rolled: Array.isArray(ci.rollup), required };
+    }
     facts.targets = config.deploy?.targets || {};
     facts.busy = inBusyWindow();
     facts.windowEnd = facts.busy ? mergetrain.fmtTime(mergetrain.windowEnd()) : null;

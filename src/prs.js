@@ -52,7 +52,7 @@ export async function listPrs({ refresh = false } = {}) {
       author: p.author?.login, branch: p.headRefName, mergeable: p.mergeable, review: p.reviewDecision || null, owner_approved: ownerApproved,
       reviewers: (p.reviewRequests || []).map((r) => r.login || r.name || r.slug).filter(Boolean),
       reviews: (p.latestReviews || []).map((r) => ({ who: r.author?.login, state: r.state })),
-      checks: checksState(p.statusCheckRollup || []), additions: p.additions, deletions: p.deletions, files: p.changedFiles,
+      checks: checksState(p.statusCheckRollup || []), rollup: (p.statusCheckRollup || []).map((c) => ({ name: checkName(c), conclusion: c.conclusion || c.state || c.status || '' })), additions: p.additions, deletions: p.deletions, files: p.changedFiles,
       tags: labels.filter((l) => l.startsWith(TAG_PREFIX)).map((l) => l.slice(TAG_PREFIX.length)),
       labels: labels.filter((l) => !SYSTEM_LABEL(l) && !l.startsWith(TAG_PREFIX)),
       head_sha: p.headRefOid || null, base: p.baseRefName || null, desk_review: t ? deskReview(t, p.headRefOid) : null,
@@ -240,18 +240,20 @@ const seatName = (seat) => (seat ? `${agentById[seat]?.name || seat}` : '?');
  */
 export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, override = '', actor = 'owner', halted = false, gate = null,
   overrideReason = '', noChecksConfigured = false, baseBranch = config.project.baseBranch, required = [], ciGap = null, ciAckReason = '' } = {}) {
-  const blockers = []; const chain = [];
-  if (p.state !== 'OPEN') blockers.push(`PR is ${String(p.state).toLowerCase()}`);
-  if (!/^[0-9a-f]{7,40}$/.test(String(expectedSha))) blockers.push('the request did not say which commit it approves (expected head SHA)');
-  else if (p.headRefOid !== expectedSha) blockers.push(`the PR head moved (${String(p.headRefOid).slice(0, 7)} ≠ approved ${String(expectedSha).slice(0, 7)}) — reload and re-check`);
-  if (p.baseRefName !== baseBranch) blockers.push(`the PR targets \`${p.baseRefName || 'unknown'}\`, not \`${baseBranch}\` — merge its base first`);
-  if (p.mergeable === 'CONFLICTING') blockers.push('it conflicts with the base branch — rebase first');
-  else if (p.mergeable !== 'MERGEABLE') blockers.push('GitHub has not finished checking mergeability — try again in a minute');
+  // codes: the same predicates as stable ids, in order (the decision brief reads them; the strings stay for people).
+  const blockers = []; const chain = []; const codes = [];
+  const block = (code, msg) => { blockers.push(msg); codes.push(code); };
+  if (p.state !== 'OPEN') block('pr_state', `PR is ${String(p.state).toLowerCase()}`);
+  if (!/^[0-9a-f]{7,40}$/.test(String(expectedSha))) block('no_sha', 'the request did not say which commit it approves (expected head SHA)');
+  else if (p.headRefOid !== expectedSha) block('head_moved', `the PR head moved (${String(p.headRefOid).slice(0, 7)} ≠ approved ${String(expectedSha).slice(0, 7)}) — reload and re-check`);
+  if (p.baseRefName !== baseBranch) block('base', `the PR targets \`${p.baseRefName || 'unknown'}\`, not \`${baseBranch}\` — merge its base first`);
+  if (p.mergeable === 'CONFLICTING') block('conflict', 'it conflicts with the base branch — rebase first');
+  else if (p.mergeable !== 'MERGEABLE') block('mergeable_unknown', 'GitHub has not finished checking mergeability — try again in a minute');
   const ci = ciVerdict(p.statusCheckRollup || []);
-  if (ci === 'failing') blockers.push('CI is failing');
-  else if (ci === 'pending') blockers.push('CI is still running');
-  else if (ci === 'inconclusive') blockers.push('a CI check was skipped or neutral instead of passing (only review.optionalChecks may skip)');
-  else if (ci === 'none' && !noChecksConfigured && !ciGap) blockers.push('no CI result has been reported for this commit yet');
+  if (ci === 'failing') block('ci_failing', 'CI is failing');
+  else if (ci === 'pending') block('ci_pending', 'CI is still running');
+  else if (ci === 'inconclusive') block('ci_inconclusive', 'a CI check was skipped or neutral instead of passing (only review.optionalChecks may skip)');
+  else if (ci === 'none' && !noChecksConfigured && !ciGap) block('ci_none', 'no CI result has been reported for this commit yet');
   // No required check runs for the files this PR changes: waiting would block forever. The owner may acknowledge the gap
   // with its own reason (posted on the PR). It is separate from the review override: it never skips QA or approvals,
   // and the desk's auto-merge can never acknowledge it.
@@ -259,27 +261,27 @@ export function authorizeMerge(p, { expectedSha = '', inBusyWindow = false, over
   if (ciGap) {
     const gapMsg = `no required CI check runs for the files this PR changes (${ciGap.areas.join(', ') || 'these paths'}), so nothing tested it automatically`;
     if (actor === 'owner' && String(ciAckReason || '').trim().length >= MIN_OVERRIDE_REASON) acknowledged.push(gapMsg);
-    else blockers.push(actor === 'owner' ? `${gapMsg} — acknowledge the CI gap with a reason (at least ${MIN_OVERRIDE_REASON} characters)` : gapMsg);
+    else block('ci_gap', actor === 'owner' ? `${gapMsg} — acknowledge the CI gap with a reason (at least ${MIN_OVERRIDE_REASON} characters)` : gapMsg);
   }
   const reported = new Map((p.statusCheckRollup || []).map((c) => [checkName(c), c.conclusion || c.state || c.status || '']));
   const missing = required.filter((n) => reported.get(n) !== 'SUCCESS');
-  if (missing.length) blockers.push(`required check${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'have' : 'has'} not passed on this commit${missing.some((n) => !reported.has(n)) ? ' (never reported)' : ''}`);
+  if (missing.length) block('required_missing', `required check${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'have' : 'has'} not passed on this commit${missing.some((n) => !reported.has(n)) ? ' (never reported)' : ''}`);
   if (inBusyWindow && (actor !== 'owner' || String(override).trim().toLowerCase() !== OVERRIDE_PHRASE)) {
-    blockers.push(actor === 'owner' ? `merging ${baseBranch} deploys production and the desk is inside its busy window (market hours) — type "${OVERRIDE_PHRASE}" to override` : 'inside the busy window (market hours)');
+    block('busy_window', actor === 'owner' ? `merging ${baseBranch} deploys production and the desk is inside its busy window (market hours) — type "${OVERRIDE_PHRASE}" to override` : 'inside the busy window (market hours)');
   }
-  if (actor !== 'owner' && halted) blockers.push('the desk is paused');
+  if (actor !== 'owner' && halted) block('halted', 'the desk is paused');
   if (gate) {
     const a = gate.approvals || {};
     if (!a.ok) {
       const have = [a.context && `${seatName(a.context.seat)}: ${a.context.verdict}`, a.independent && `${seatName(a.independent.seat)}: ${a.independent.verdict}`].filter(Boolean).join(', ');
-      chain.push(`it needs two reviewer approvals at this commit (have: ${have || 'none'})`);
-    } else if (a.unpublished) chain.push('the review comments are not on the PR yet');
-    if (!gate.qaSha || gate.qaSha !== expectedSha) chain.push(gate.qaSha ? `QA passed a different commit (${String(gate.qaSha).slice(0, 7)})` : 'QA has not passed this commit');
+      codes.push('approvals'); chain.push(`it needs two reviewer approvals at this commit (have: ${have || 'none'})`);
+    } else if (a.unpublished) { codes.push('unpublished'); chain.push('the review comments are not on the PR yet'); }
+    if (!gate.qaSha || gate.qaSha !== expectedSha) { codes.push('qa'); chain.push(gate.qaSha ? `QA passed a different commit (${String(gate.qaSha).slice(0, 7)})` : 'QA has not passed this commit'); }
   }
   const reason = String(overrideReason || '').trim();
-  if (chain.length && actor === 'owner' && reason.length >= MIN_OVERRIDE_REASON) return { blockers, overridden: chain, acknowledged };
+  if (chain.length && actor === 'owner' && reason.length >= MIN_OVERRIDE_REASON) return { blockers, overridden: chain, acknowledged, codes };
   if (chain.length && actor === 'owner') chain[chain.length - 1] += ` — or give an owner override reason (at least ${MIN_OVERRIDE_REASON} characters)`;
-  return { blockers: [...blockers, ...chain], overridden: [], acknowledged };
+  return { blockers: [...blockers, ...chain], overridden: [], acknowledged, codes };
 }
 
 // "No checks at all" is a pass only when the repository has no Actions workflows (review.ci = "auto").

@@ -51,32 +51,28 @@ export function targetsFor(workflows = [], map = {}) {
 export function deployConsequence(deploy, { targets: map = {}, files = null } = {}) {
   const changed = (Array.isArray(files) ? files : deploy?.files || []).filter(isWorkflowFile);
   const steps = [];
-  if (!deploy) {
-    steps.push({ text: 'Not checked yet which workflows this merge starts. Until it is, the desk treats it as deploying.', tone: 'unknown' });
-    return { state: 'unknown', workflows: [], targets: [], target: 'unknown', workflow_changes: changed, steps: withChanges(steps, changed) };
-  }
+  const unknown = (text) => { steps.push({ text, tone: 'unknown' }); return { state: 'unknown', workflows: [], targets: [], target: 'unknown', workflow_changes: changed, steps }; };
+  if (!deploy) return unknown('Not checked yet which workflows this merge starts. Until it is, the desk treats it as deploying.');
+  if (deploy.state === 'refreshing') return unknown('Unknown, refreshing: the last check was for another commit, base or configuration. Until it lands, the desk treats it as deploying.');
+  // A change that edits workflow files: only a check of the versions at the approved commit may say anything definite.
+  if (changed.length && deploy.workflows_at !== 'head' && deploy.state !== 'unknown')
+    return unknown(`It edits ${plural(changed.length, 'workflow file')} (${list(changed.map(base))}): what runs after the merge depends on those new versions, which were not read. The desk treats it as deploying.`);
+  const read = changed.length ? `the versions at the approved commit (it edits ${list(changed.map(base))})` : 'the workflows on the base branch';
   if (deploy.state === 'none') {
-    steps.push({ text: 'No deploying workflow runs for these files: nothing redeploys.', tone: 'ok' });
-    return { state: 'none', workflows: [], targets: [], target: 'none', workflow_changes: changed, steps: withChanges(steps, changed) };
+    steps.push({ text: `No deploying workflow runs for these files: nothing redeploys (checked against ${read}).`, tone: 'ok' });
+    return { state: 'none', workflows: [], targets: [], target: 'none', workflow_changes: changed, steps };
   }
   const wfs = deploy.workflows || [];
-  if (deploy.state === 'unknown' || !wfs.length) {
-    steps.push({ text: `Which workflows run is unknown (${deploy.reason || 'not readable'}). The desk treats it as deploying.`, tone: 'unknown' });
-    return { state: 'unknown', workflows: [], targets: [], target: 'unknown', workflow_changes: changed, steps: withChanges(steps, changed) };
-  }
+  if (deploy.state === 'unknown' || !wfs.length) return unknown(`Which workflows run is unknown (${deploy.reason || 'not readable'}). The desk treats it as deploying.`);
   const names = wfs.map((w) => w.name);
   const assumed = wfs.filter((w) => /assuming/.test(w.reason || ''));
-  steps.push({ text: `Starts ${list(names)} (expected from the workflows on the base branch${assumed.length ? `; ${list(assumed.map((w) => w.name))} could not be read, so it is assumed to deploy` : ''}).`, tone: 'deploy' });
+  steps.push({ text: `Starts ${list(names)} (expected from ${read}${assumed.length ? `; ${list(assumed.map((w) => w.name))} could not be read, so it is assumed to deploy` : ''}).`, tone: 'deploy' });
   const t = targetsFor(wfs, map);
   let target = 'unknown';
   if (t.known.length && !t.unknown.length) { target = 'known'; steps.push({ text: `Redeploys ${list(t.services)} (deploy.targets).`, tone: 'deploy' }); }
   else if (t.known.length) { target = 'partial'; steps.push({ text: `Redeploys ${list(t.services)}; what ${list(t.unknown.map((u) => u.workflow))} deploys is unknown (no deploy.targets entry).`, tone: 'unknown' }); }
   else steps.push({ text: 'Deployment target unknown: no deploy.targets entry says which service these workflows deploy.', tone: 'unknown' });
-  return { state: 'deploys', workflows: names, targets: t.services, target, workflow_changes: changed, steps: withChanges(steps, changed) };
-}
-function withChanges(steps, changed) {
-  if (changed.length) steps.push({ text: `This change edits ${plural(changed.length, 'workflow file')} (${list(changed.map(base))}). After the merge those new versions run; this check read today's versions.`, tone: 'unknown' });
-  return steps;
+  return { state: 'deploys', workflows: names, targets: t.services, target, workflow_changes: changed, steps };
 }
 
 // ---------------- evidence freshness ----------------
@@ -115,26 +111,46 @@ export function ciEvidence({ head, ci = null, now = Date.now() }) {
 // state: ok · yours (it waits for the owner: why it is in the Inbox) · waiting (moves by itself) · blocked · unknown
 const G = (id, label, state, text) => ({ id, label, state, text });
 function overall(items) {
-  const blocked = items.filter((g) => g.state === 'blocked');
-  const unknown = items.filter((g) => g.state === 'unknown');
-  const waiting = items.filter((g) => g.state === 'waiting');
-  const state = blocked.length ? 'blocked' : waiting.length ? 'waiting' : 'ready';
-  const head = blocked[0] || waiting[0];
+  const of = (st) => items.filter((g) => g.state === st);
+  const [blocked, waiting, unknown] = [of('blocked'), of('waiting'), of('unknown')];
+  // Ready only when every predicate is positively satisfied (or is simply yours); otherwise the first reason leads.
+  const state = blocked.length ? 'blocked' : waiting.length ? 'waiting' : unknown.length ? 'unknown' : 'ready';
   const said = (g) => (g.text.toLowerCase().startsWith(`${g.label.toLowerCase()} `) ? `${g.text.charAt(0).toUpperCase()}${g.text.slice(1)}` : `${g.label}: ${g.text}`);
-  return { state, items, headline: head ? said(head) : `Ready for you${unknown.length ? ` (${list(unknown.map((u) => u.label.toLowerCase()))} unknown)` : ''}.` };
+  const head = blocked[0] || waiting[0];
+  const headline = head ? said(head) : unknown.length ? `Not confirmed: ${list(unknown.map((u) => (/^[A-Z]{2,}$/.test(u.label) ? u.label : u.label.toLowerCase())))} unknown.` : 'Ready for you.';
+  return { state, items, headline };
 }
 
-/** Merge gates, in order: QA, reviews, CI, conflicts, deploy window, deploy lock, merge policy (who may merge). */
-export function mergeGate({ qa, reviews, ci, deploy, busy = false, windowEnd = null, lock = null, policy = null, hold = null }) {
+const cap = (x) => (x ? `${x.charAt(0).toUpperCase()}${x.slice(1)}` : x);
+/**
+ * Merge gates, in order: QA, reviews, CI, mergeability, deploy window, deploy lock, merge policy. `live` carries the
+ * codes and texts of the LIVE merge predicates (prs.authorizeMerge) evaluated on what the desk last read from GitHub,
+ * so the brief and the real merge agree: unpublished approvals wait, unconfirmed mergeability is unknown, missing or
+ * old required checks wait. Nothing is green unless its predicate is positively satisfied.
+ */
+export function mergeGate({ qa, reviews, ci, deploy, busy = false, windowEnd = null, lock = null, policy = null, hold = null, live = null }) {
+  const codes = live?.codes || [];
+  const has = (c) => codes.includes(c);
+  const said = (c, fallback) => { const i = codes.indexOf(c); return cap(String(i >= 0 && live.blockers?.[i] ? live.blockers[i] : fallback).replace(/ — or give an owner override reason.*$/, '')) + (/[.!?]$/.test(String(i >= 0 ? live.blockers[i] : fallback)) ? '' : '.'); };
   const items = [];
-  items.push(G('qa', 'QA', qa.state === 'current' ? 'ok' : qa.state === 'unknown' ? 'unknown' : 'blocked', qa.text));
-  items.push(G('reviews', 'Reviews', reviews.state === 'current' ? 'ok' : reviews.state === 'unknown' ? 'unknown' : reviews.flow === false ? 'yours' : 'blocked', reviews.text));
-  const ciState = ci.state === 'unknown' ? 'unknown' : ci.state === 'stale' ? 'blocked' : ci.checks === 'passing' ? 'ok' : ci.checks === 'pending' ? 'waiting' : ci.checks === 'none' ? 'unknown' : 'blocked';
-  items.push(G('ci', 'CI', ciState, ci.text));
-  if (ci.mergeable === 'CONFLICTING') items.push(G('conflicts', 'Conflicts', 'blocked', 'It conflicts with the base branch; the builder resolves it first.'));
+  items.push(has('qa') ? G('qa', 'QA', 'blocked', qa.text) : G('qa', 'QA', qa.state === 'current' ? 'ok' : qa.state === 'unknown' ? 'unknown' : 'blocked', qa.text));
+  if (reviews.flow === false) items.push(G('reviews', 'Reviews', 'yours', reviews.text));
+  else if (has('approvals') || (reviews.state !== 'current' && reviews.state !== 'unknown')) items.push(G('reviews', 'Reviews', 'blocked', reviews.text));
+  else if (has('unpublished') || reviews.unpublished) items.push(G('reviews', 'Reviews', 'waiting', `${reviews.text} The review comments are not on the PR yet; the merge waits for them.`));
+  else items.push(G('reviews', 'Reviews', reviews.state === 'current' ? 'ok' : 'unknown', reviews.text));
+  if (ci.state === 'unknown') items.push(G('ci', 'CI', 'unknown', ci.text));
+  else if (ci.state === 'stale') items.push(G('ci', 'CI', 'unknown', `${ci.text} Re-reading before it counts.`));
+  else if (!live || !live.rolled) items.push(G('ci', 'CI', 'unknown', `${ci.text} The individual checks were not recorded, so the required ones cannot be confirmed.`));
+  else if (['ci_failing', 'ci_inconclusive', 'ci_gap'].find(has)) items.push(G('ci', 'CI', 'blocked', said(['ci_failing', 'ci_inconclusive', 'ci_gap'].find(has))));
+  else if (['ci_pending', 'ci_none', 'required_missing'].find(has)) items.push(G('ci', 'CI', 'waiting', said(['ci_pending', 'ci_none', 'required_missing'].find(has))));
+  else if (ci.state === 'old') items.push(G('ci', 'CI', 'waiting', `${ci.text} Old evidence: it is read again before the merge counts it.`));
+  else items.push(G('ci', 'CI', 'ok', `${ci.text}${live.required?.length ? ` Required: ${list(live.required)}.` : ''}`));
+  if (has('pr_state') || has('base')) items.push(G('pr', 'Pull request', 'blocked', said(has('pr_state') ? 'pr_state' : 'base')));
+  if (has('conflict') || ci.mergeable === 'CONFLICTING') items.push(G('conflicts', 'Conflicts', 'blocked', 'It conflicts with the base branch; the builder resolves it first.'));
+  else if (!live || has('mergeable_unknown')) items.push(G('mergeable', 'Mergeability', 'unknown', 'GitHub has not confirmed that it merges cleanly.'));
   const deploying = deploy.state !== 'none';
   if (deploying && busy) items.push(G('deploy_window', 'Deploy window', 'blocked', `Inside the busy window${windowEnd ? ` until ${windowEnd}` : ''}: a deploying merge now needs the market-hours override, or wait.`));
-  else items.push(G('deploy_window', 'Deploy window', 'ok', deploying ? (busy === null ? 'Busy window unknown.' : 'Outside the busy window.') : 'Nothing deploys, so the busy window does not apply.'));
+  else items.push(G('deploy_window', 'Deploy window', 'ok', deploying ? 'Outside the busy window.' : 'Nothing deploys, so the busy window does not apply.'));
   if (deploying && lock) {
     const running = ['running', 'merging'].includes(lock.state);
     items.push(G('deploy_lock', 'Deploy lock', running ? 'waiting' : 'blocked', running ? `The deploy of ${lock.key || 'the last merge'} is still running; deploying merges go one at a time.`
@@ -195,7 +211,7 @@ export function brief(facts) {
     out.consequence = { summary: [`Merges${n ? ` PR #${n}` : ''} into ${baseBranch}`, dep.state === 'none' ? 'nothing redeploys'
       : dep.state === 'unknown' ? 'what it starts is unknown' : `starts ${list(dep.workflows)}`, dep.state === 'deploys' ? (dep.target === 'known' ? `redeploys ${list(dep.targets)}` : 'deployment target unknown') : null].filter(Boolean).join(' → '),
     steps: [{ text: `Merges${n ? ` PR #${n}` : ''} into ${baseBranch}${head ? ` at ${short(head)}` : ''}.`, tone: 'ok' }, ...dep.steps], deploy: dep };
-    out.gate = mergeGate({ qa, reviews, ci, deploy: dep, busy: facts.busy, windowEnd: facts.windowEnd, lock: facts.lock, policy: facts.policy, hold: t?.merge_hold || null });
+    out.gate = mergeGate({ qa, reviews, ci, deploy: dep, busy: facts.busy, windowEnd: facts.windowEnd, lock: facts.lock, policy: facts.policy, hold: t?.merge_hold || null, live: facts.live || null });
     out.evidence = { ...out.evidence, qa, reviews, ci };
     const human = [];
     if (dep.state !== 'none') human.push(`Watching the deploy: the desk waits up to ${facts.deployWaitMinutes || 45} min for its run, and a failed or unconfirmed deploy comes back to you and holds every deploying merge.`);

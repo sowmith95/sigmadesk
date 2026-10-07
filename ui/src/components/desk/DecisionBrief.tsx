@@ -21,7 +21,10 @@ const GATE_ICON: Record<string, [typeof Check, string, string]> = {
 };
 const FRESH: Record<string, [string, string]> = { current: ['current', 'text-shipped'], old: ['old', 'text-needs'], stale: ['stale', 'text-blocked'], unknown: ['unknown', 'text-muted-foreground'], none: ['none', 'text-blocked'] };
 const TONE: Record<string, string> = { ok: 'text-foreground', deploy: 'text-foreground', unknown: 'text-needs' };
-const GATE_HEAD: Record<string, string> = { ready: 'text-shipped', waiting: 'text-muted-foreground', blocked: 'text-blocked' };
+// Four distinct gate states: green only when every predicate is positively satisfied.
+const GATE_HEAD: Record<string, string> = { ready: 'text-shipped', waiting: 'text-needs', unknown: 'text-muted-foreground', blocked: 'text-blocked' };
+const GATE_DOT: Record<string, string> = { ready: 'bg-shipped', waiting: 'bg-needs', unknown: 'border border-muted-foreground bg-transparent', blocked: 'bg-blocked' };
+const GATE_WORD: Record<string, string> = { ready: 'Ready', waiting: 'Waiting', unknown: 'Not confirmed', blocked: 'Blocked' };
 
 /** The brief describes another commit than the one on screen: say it, and fetch a fresh snapshot. */
 function useStale(b: Brief | null, t?: Ticket | null) {
@@ -37,18 +40,18 @@ export function BriefLine({ it }: { it: BoardItem }) {
   const g = b.gate || {};
   const showConsequence = ['merge', 'publish', 'guard', 'deploy', 'access'].includes(b.kind);
   if (!showConsequence && g.state === 'ready') return null;
-  const dot = g.state === 'blocked' ? 'bg-blocked' : g.state === 'waiting' ? 'bg-muted-foreground' : 'bg-shipped';
   return (
     <p data-brief-line={b.kind} className="flex min-w-0 items-baseline gap-1.5 pl-9 text-[13px] text-muted-foreground">
-      <span aria-hidden className={cn('relative top-[-1px] inline-block size-1.5 shrink-0 rounded-full', dot)} />
-      <span className="sr-only">{g.state === 'blocked' ? 'Blocked' : g.state === 'waiting' ? 'Waiting' : 'Ready'}: </span>
+      <span aria-hidden data-gate-dot={g.state} className={cn('relative top-[-1px] inline-block size-2 shrink-0 rounded-full', GATE_DOT[g.state] || GATE_DOT.unknown)} />
+      <span className="sr-only">{GATE_WORD[g.state] || g.state}: </span>
       <span className="min-w-0 [overflow-wrap:anywhere] max-md:line-clamp-2 md:truncate" title={b.consequence.summary}>
-        {g.state === 'blocked' ? <span className="text-blocked">{g.headline} </span> : null}{showConsequence ? b.consequence.summary : null}</span>
+        {g.state !== 'ready' ? <span className={GATE_HEAD[g.state]}>{g.headline} </span> : null}{showConsequence ? b.consequence.summary : null}</span>
     </p>
   );
 }
 
-function Label({ children }: { children: React.ReactNode }) { return <p className="text-[12px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">{children}</p>; }
+// Section labels in sentence case (UX v2: no all-caps labels).
+function Label({ children }: { children: React.ReactNode }) { return <p className="text-[13px] font-medium text-muted-foreground">{children}</p>; }
 
 /** Evidence freshness in one line: QA · Reviews · CI, each current / old / stale / unknown with its age, then commit and policy. */
 export function Freshness({ b }: { b: Brief }) {
@@ -71,7 +74,7 @@ export function GateList({ b, compact = false }: { b: Brief; compact?: boolean }
   if (!g) return null;
   return (
     <div className="grid gap-1.5" data-gate={g.state}>
-      <p className={cn('font-medium', GATE_HEAD[g.state])}>{g.headline}</p>
+      <p className={cn('font-medium', GATE_HEAD[g.state])} data-gate-headline>{g.headline}</p>
       {!compact && <ol className="grid gap-1">{g.items.map((i: Brief) => { const [Icon, tone, word] = GATE_ICON[i.state] || [CircleDashed, 'text-muted-foreground', i.state]; return (
         <li key={i.id} data-gate-item={i.id} data-state={i.state} className="flex items-start gap-2 text-sm">
           <Icon aria-hidden className={cn('mt-0.5 size-4 shrink-0', tone)} /><span className="sr-only">{word}: </span>
