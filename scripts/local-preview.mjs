@@ -262,8 +262,8 @@ if (process.env.SIGMADESK_DECISION_DEMO === '1') {
       store.handle().prepare('UPDATE pr_reviews SET updated_at=? WHERE id=?').run(ago(min), r.id);
     }
     store.kvSet(`diff-files:${t.key}`, JSON.stringify(files));
-    store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head, base: store.kvGet('train:base') || null, cfg: decisionMod.classificationVersion(), files, at: ago(2), ...deploy }));
-    store.kvSet(`decision:ci:${t.key}`, JSON.stringify({ at: ago(ci.min), sha: ci.sha, state: 'OPEN', base: 'main', checks: ci.checks, mergeable: 'MERGEABLE', rollup: [{ name: 'test', conclusion: 'SUCCESS' }] }));
+    store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head, base: store.kvGet('train:base') || null, cfg: decisionMod.classificationVersion(), ci_key: decisionMod.checksPolicyVersion(), files, at: ago(2), ...deploy }));
+    store.kvSet(`decision:ci:${t.key}`, JSON.stringify({ at: ago(ci.min), sha: ci.sha, state: 'OPEN', base: 'main', base_sha: store.kvGet('train:base') || null, checks: ci.checks, mergeable: 'MERGEABLE', rollup: [{ name: 'test', conclusion: 'SUCCESS' }] }));
     const since = JSON.parse(store.kvGet('inbox:since') || '{}'); since[`${t.key}:merge`] = ago(waited); store.kvSet('inbox:since', JSON.stringify(since));
     store.kvSet('inbox:since:seeded', store.now());
     return t;

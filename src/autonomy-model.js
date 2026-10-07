@@ -24,8 +24,12 @@ const R = (state, reasons = []) => ({ state: reasons.length ? 'blocked' : state,
 export function matrix(f) {
   const s = f.settings || {};
   const halted = s.paused === 'true';
-  const budget = f.budgetLeft != null && f.budgetLeft <= 0;
-  const common = [...(halted ? ['The desk is halted (Desk → Resume).'] : []), ...(budget ? ['The daily spend limit is reached.'] : [])];
+  // The scheduler starts a run only when the day's headroom covers that run's full cap (scheduler: headroom < need).
+  const money = (n) => `$${Number(n).toFixed(2)}`;
+  const budgetFor = (kind, cap) => (f.budgetLeft != null && cap != null && f.budgetLeft < cap ? [`The daily budget has ${money(Math.max(0, f.budgetLeft))} left; a ${kind} run reserves ${money(cap)}.`] : []);
+  const halt = halted ? ['The desk is halted (Desk → Resume).'] : [];
+  const caps = f.caps || {};
+  const common = [...halt, ...budgetFor('build', caps.implement ?? 0.01)];
   const mgr = f.names?.manager || 'The manager', sre = f.names?.sre || 'The SRE';
   const am = f.autoMerge || {};
   const trainOn = f.mergeTrain !== false && am.enabled && (f.reviewsRequired ?? 2) > 0;
@@ -40,7 +44,7 @@ export function matrix(f) {
   actions.push({ id: 'groom', label: 'Triage and grooming', scope: 'New tasks; a feature’s plan always waits for your approval',
     mode: f.seats?.manager ? 'autonomous' : 'human-led',
     mode_text: f.seats?.manager ? `${mgr} sizes, staffs and splits new tasks by itself. Feature plans are assisted: you approve each plan.` : `${mgr}'s seat is off, so nobody grooms: new requests wait for you.`,
-    readiness: R('ready', f.seats?.manager ? common : []), control: { kind: 'link', to: 'team', editable: false, text: 'Seat on or off in Team; halt or resume on Desk.' } });
+    readiness: R('ready', f.seats?.manager ? [...halt, ...budgetFor('grooming', caps.groom ?? 0.01)] : []), control: { kind: 'link', to: 'team', editable: false, text: 'Seat on or off in Team; halt or resume on Desk.' } });
 
   actions.push({ id: 'implement', label: 'Implementation', scope: 'Groomed tasks, through QA and two code reviews',
     mode: f.seats?.builders ? 'autonomous' : 'human-led',
@@ -82,7 +86,7 @@ export function matrix(f) {
           : !ops.verify ? 'Verify runs are not allowed to probe (ops.kinds): every production check is yours.'
             : `${sre} verifies with read-only probes once access is granted. ${sre} approves access for others, so ${sre}'s own access is always yours to grant.`,
     // Readiness, separately: can a check actually run now? Grants, halt, budget, and something for the probes to read.
-    readiness: R('ready', opsMode === 'human-led' ? [] : [...common.map((r) => r.replace('.', ': no verify run starts.')),
+    readiness: R('ready', opsMode === 'human-led' ? [] : [...halt.map((r) => r.replace('.', ': no verify run starts.')), ...budgetFor('verify', caps.verify ?? 0.01),
       ...(!sreGrant ? [`${sre} holds no production access: a check waits until you grant it (Inbox request, or Settings → Production access).`] : []),
       ...(ops.targets === 0 ? ['No database or container is configured for the probes, so they have nothing to read.'] : [])]),
     grant: sreGrant || null,

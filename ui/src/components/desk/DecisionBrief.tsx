@@ -19,7 +19,7 @@ const GATE_ICON: Record<string, [typeof Check, string, string]> = {
   ok: [Check, 'text-shipped', 'passed'], yours: [User, 'text-needs', 'yours'], waiting: [Clock, 'text-muted-foreground', 'waiting'],
   blocked: [CircleAlert, 'text-blocked', 'blocked'], unknown: [HelpCircle, 'text-muted-foreground', 'unknown'],
 };
-const FRESH: Record<string, [string, string]> = { current: ['current', 'text-shipped'], old: ['old', 'text-needs'], stale: ['stale', 'text-blocked'], unknown: ['unknown', 'text-muted-foreground'], none: ['none', 'text-blocked'] };
+const FRESH: Record<string, [string, string]> = { current: ['current', 'text-shipped'], old: ['old', 'text-needs'], stale: ['stale', 'text-blocked'], refreshing: ['refreshing', 'text-muted-foreground'], unknown: ['unknown', 'text-muted-foreground'], none: ['none', 'text-blocked'] };
 const TONE: Record<string, string> = { ok: 'text-foreground', deploy: 'text-foreground', unknown: 'text-needs' };
 // Four distinct gate states: green only when every predicate is positively satisfied.
 const GATE_HEAD: Record<string, string> = { ready: 'text-shipped', waiting: 'text-needs', unknown: 'text-muted-foreground', blocked: 'text-blocked' };

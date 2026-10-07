@@ -9,6 +9,7 @@ import * as mergetrain from './mergetrain.js';
 import * as reviews from './reviews.js';
 import * as prs from './prs.js';
 import * as ops from './ops.js';
+import * as runner from './runner.js';
 import { agentById, BUILDERS } from './team.js';
 import * as model from './autonomy-model.js';
 import { policyVersion } from './decision.js';
@@ -16,6 +17,7 @@ import { policyVersion } from './decision.js';
 import { inBusyWindow, budgetHeadroom } from './scheduler.js';
 
 const on = (id) => !!agentById[id] && agentById[id].enabled !== false;
+const cap = (id, kind) => { try { return Number(runner.runBudget(id, kind)); } catch { return null; } };
 const name = (id) => String(agentById[id]?.name || id).split(/\s+/)[0];
 
 /** How many databases and containers the read-only probes can reach (null = could not tell). */
@@ -32,6 +34,8 @@ export function matrix(settings = store.getSettings()) {
     busyWindow: config.limits?.busyWindow || {}, busyNow: busy, windowEnd: busy ? mergetrain.fmtTime(mergetrain.windowEnd()) : null, deployLock: mergetrain.deployState(),
     ops: { configured: config.ops?.enabled === true, on: settings.ops_enabled === 'true', verify: (config.ops?.kinds || []).includes('verify'), targets: probeTargets(settings) },
     policy: access.policy(), grants: grants.filter((g) => g.granted_by !== 'owner'), ownerGrants: grants.filter((g) => g.granted_by === 'owner'), budgetLeft,
+    // The same per-run caps the scheduler reserves before it starts a run (runner.runBudget).
+    caps: { groom: cap('manager', 'groom'), implement: Math.min(...BUILDERS.filter(on).map((b) => cap(b, 'implement')).filter((x) => x != null), Infinity), verify: cap('sre', 'verify') },
     names: { manager: name('manager'), sre: name('sre') }, policyVersion: policyVersion(settings),
   });
 }

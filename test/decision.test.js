@@ -98,7 +98,7 @@ test('brief: "you decide", consequence, releases, wait from the decision start, 
   const d = { id: 'SD-4:merge', key: 'SD-4', kind: 'merge', name: 'Review contracts', verb: 'Merge Review contracts', ticket };
   const b = M.brief({ decision: d, ticket, now: NOW, since: at(190), releases: [{ key: 'SD-7', name: 'Model switch', status: 'todo' }], qaAt: at(60),
     reviews: { ok: true, context: { seat: 'manager', verdict: 'approve', updated_at: at(40) }, independent: { seat: 'principal-be', verdict: 'approve', updated_at: at(35) } },
-    ci: { sha: H, checks: 'passing', mergeable: 'MERGEABLE', at: at(4) }, live: LIVE(), deploy: { state: 'deploys', workflows: [WF[0]] }, targets: { 'deploy-mac-mini.yml': 'alpaca-trader' },
+    ci: { sha: H, checks: 'passing', mergeable: 'MERGEABLE', base_sha: null, at: at(4) }, live: LIVE(), deploy: { state: 'deploys', workflows: [WF[0]] }, targets: { 'deploy-mac-mini.yml': 'alpaca-trader' },
     busy: false, policy: { eligible: false, reason: 'the ticket is marked high-risk' }, pr: 12, policyVersion: 'abc' });
   assert.equal(b.you_decide, 'Merge Review contracts into main');
   assert.equal(b.consequence.summary, 'Merges PR #12 into main → starts Deploy Mac Mini → redeploys alpaca-trader');
@@ -166,6 +166,50 @@ test('the brief runs the live merge predicates (prs.authorizeMerge) on the last 
   const st = Object.fromEntries(b.gate.items.map((i) => [i.id, i.state]));
   assert.equal(st.reviews, 'waiting'); assert.equal(st.mergeable, 'unknown'); assert.equal(st.ci, 'ok');
   assert.equal(b.gate.state, 'waiting'); assert.match(b.gate.headline, /not on the PR yet/);
+});
+
+test('classification never claims what it could not read (repro, review 2): unparseable head workflow, a file list at the cap, an assumed workflow', () => {
+  const base = [{ file: '.github/workflows/deploy.yml', text: 'name: Deploy\non:\n  push:\n    branches: [main]\n    paths: [\"app/**\"]\n' }];
+  const ok = decision.classifyDeploy({ files: ['app/x.py'], baseWorkflows: base });
+  assert.equal(ok.state, 'deploys'); assert.equal(ok.workflows_at, 'base');
+  // valid YAML the parser does not support (inline mapping) at the approved head
+  const head = [{ file: '.github/workflows/deploy.yml', text: 'name: Deploy\non: {push: {branches: [main]}}\n' }];
+  const u = decision.classifyDeploy({ files: ['app/x.py', '.github/workflows/deploy.yml'], baseWorkflows: base, headWorkflows: head });
+  assert.equal(u.state, 'unknown'); assert.match(u.reason, /could not be parsed/);
+  assert.equal(decision.classifyDeploy({ files: ['.github/workflows/deploy.yml'], baseWorkflows: base, headWorkflows: null }).state, 'unknown');
+  const many = [...Array.from({ length: decision.FILE_CAP - 1 }, (_, i) => `docs/f${i}.md`), 'app/late.py'];
+  assert.equal(decision.classifyDeploy({ files: many, baseWorkflows: base }).state, 'unknown', 'a list at the cap may be cut short: never "nothing redeploys"');
+  assert.match(decision.classifyDeploy({ files: many, baseWorkflows: base }).reason, /more than the desk records/);
+  const unreadable = [{ file: '.github/workflows/deploy.yml', text: 'on: {push: {}}\n' }];
+  assert.equal(decision.classifyDeploy({ files: ['app/x.py'], baseWorkflows: unreadable }).state, 'unknown', 'assumed to deploy is not proof');
+  assert.equal(M.deployConsequence({ state: 'deploys', workflows: [{ file: 'x.yml', name: 'X', reason: 'could not read its triggers — assuming it deploys' }] }).state, 'unknown');
+});
+
+test('readiness follows the required-check policy and every new GitHub read at once (repro, review 2)', () => {
+  const t = store.createTicket({ title: 'Policy follower', status: 'ready_for_human', assignee: 'senior-be' });
+  store.updateTicket(t.key, { pr_url: 'https://github.com/x/y/pull/7', head_sha: H, qa_sha: H, risk: 'low', diff_risk: 'low' });
+  for (const [seat, role] of [['manager', 'context'], ['principal-be', 'independent']]) { const r = store.createPrReview({ ticket_key: t.key, seat, role, sha: H }); store.updatePrReview(r.id, { verdict: 'approve', published_comment_id: `c${r.id}` }); }
+  store.kvSet('train:base', 'base-9');
+  store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head: H, base: 'base-9', cfg: decision.classificationVersion(), ci_key: decision.checksPolicyVersion(), state: 'none', workflows: [], workflows_at: 'base', ci_applicable: [], at: store.now() }));
+  const row = (rollup) => ({ key: t.key, head_sha: H, state: 'OPEN', base: 'main', checks: 'passing', mergeable: 'MERGEABLE', rollup });
+  decision.recordCi([row([{ name: 'test', conclusion: 'SUCCESS' }])]);
+  const gate = () => server.snapshot().meta.decision_briefs[`${t.key}:merge`].gate;
+  assert.equal(gate().state, 'ready');
+  // The owner adds a required check in Settings: cached applicability no longer counts.
+  store.kvSet('ci:required', JSON.stringify({ names: ['security'], source: 'owner', at: store.now() }));
+  assert.equal(gate().items.find((i) => i.id === 'ci').state, 'waiting'); assert.match(gate().headline, /security/);
+  store.kvSet('ci:required', JSON.stringify({ names: [], source: 'auto', at: store.now() }));
+  store.kvSet(`decision:deploy:${t.key}`, JSON.stringify({ head: H, base: 'base-9', cfg: decision.classificationVersion(), ci_key: decision.checksPolicyVersion(), state: 'none', workflows: [], workflows_at: 'base', ci_applicable: [], at: store.now() }));
+  assert.equal(gate().state, 'ready');
+  // A check changes while the aggregate does not (still "passing" upstream): recorded at once.
+  decision.recordCi([row([{ name: 'test', conclusion: 'SUCCESS' }, { name: 'lint', conclusion: 'SKIPPED' }])]);
+  assert.equal(gate().items.find((i) => i.id === 'ci').state, 'blocked', 'the skipped check is seen immediately');
+  decision.recordCi([row([{ name: 'test', conclusion: 'SUCCESS' }])]);
+  assert.equal(gate().state, 'ready');
+  // The base moves: the last CI read predates it, so CI is refreshing (unknown), never green.
+  store.kvSet('train:base', 'base-10');
+  const ci = gate().items.find((i) => i.id === 'ci');
+  assert.equal(ci.state, 'unknown'); assert.match(ci.text, /^Refreshing/); assert.notEqual(gate().state, 'ready');
 });
 
 test('Verify in production on a merged ticket: one linked task, idempotent, the ticket stays merged; refused with the reason when nobody can read production', async () => {

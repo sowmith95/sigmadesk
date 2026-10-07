@@ -81,8 +81,9 @@ test('production-read readiness (repro, review P2): no SRE grant, a halted desk,
   assert.match(a.prod_read.readiness.reasons[1], /Devon holds no production access/);
   a = by(matrix(base({ ops: { ...ops, targets: 0 }, ownerGrants: [{ seat: 'sre', expires_at: '2026-10-07T18:00:00Z' }] })));
   assert.deepEqual(a.prod_read.readiness.reasons, ['No database or container is configured for the probes, so they have nothing to read.']);
-  a = by(matrix(base({ ops, budgetLeft: 0, ownerGrants: [{ seat: 'sre' }] })));
-  assert.match(a.prod_read.readiness.reasons[0], /spend limit.*no verify run starts/);
+  a = by(matrix(base({ ops, budgetLeft: 0.01, caps: { verify: 5 }, ownerGrants: [{ seat: 'sre' }] })));
+  assert.deepEqual(a.prod_read.readiness.reasons, ['The daily budget has $0.01 left; a verify run reserves $5.00.'], 'repro: headroom under the run cap blocks, as the scheduler does');
+  assert.equal(by(matrix(base({ ops, budgetLeft: 5, caps: { verify: 5 }, ownerGrants: [{ seat: 'sre' }] }))).prod_read.readiness.state, 'ready');
   a = by(matrix(base({ ops, ownerGrants: [{ seat: 'sre', expires_at: '2026-10-07T18:00:00Z' }] })));
   assert.equal(a.prod_read.readiness.state, 'ready'); assert.equal(a.prod_read.mode, 'assisted');
 });

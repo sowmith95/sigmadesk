@@ -66,7 +66,8 @@ export function deployConsequence(deploy, { targets: map = {}, files = null } = 
   if (deploy.state === 'unknown' || !wfs.length) return unknown(`Which workflows run is unknown (${deploy.reason || 'not readable'}). The desk treats it as deploying.`);
   const names = wfs.map((w) => w.name);
   const assumed = wfs.filter((w) => /assuming/.test(w.reason || ''));
-  steps.push({ text: `Starts ${list(names)} (expected from ${read}${assumed.length ? `; ${list(assumed.map((w) => w.name))} could not be read, so it is assumed to deploy` : ''}).`, tone: 'deploy' });
+  if (assumed.length) return unknown(`Which workflows run is unknown: ${list(assumed.map((w) => w.name))} could not be read. The desk treats it as deploying.`);
+  steps.push({ text: `Starts ${list(names)} (expected from ${read}).`, tone: 'deploy' });
   const t = targetsFor(wfs, map);
   let target = 'unknown';
   if (t.known.length && !t.unknown.length) { target = 'known'; steps.push({ text: `Redeploys ${list(t.services)} (deploy.targets).`, tone: 'deploy' }); }
@@ -98,10 +99,13 @@ export function reviewEvidence({ head, inFlow = true, context = null, independen
   return { state: 'none', sha: head, at, seats: approved.map((r) => r.seat), text: `${approved.length} of 2 approvals at ${short(head)}${rows.length > approved.length ? '; a review is in progress' : ''}.` };
 }
 /** CI as last READ by the desk (GitHub rollup): for this commit, another commit, or never read. */
-export function ciEvidence({ head, ci = null, now = Date.now() }) {
+export function ciEvidence({ head, ci = null, now = Date.now(), baseSha }) {
   if (!ci) return { state: 'unknown', text: 'CI not read yet: the desk has not fetched this PR from GitHub.' };
   const m = minutesSince(ci.at, now);
   const read = `read ${agoText(m)}`;
+  // Read before the base branch moved (or without the base it was read against): refreshing, never green.
+  if (baseSha !== undefined && (ci.base_sha === undefined || (ci.base_sha || null) !== (baseSha || null)))
+    return { state: 'refreshing', sha: ci.sha, at: ci.at, age_minutes: m, checks: ci.checks, text: `Refreshing: CI was ${read}, before the latest move of the base branch.` };
   if (head && ci.sha && ci.sha !== head) return { state: 'stale', sha: ci.sha, at: ci.at, age_minutes: m, checks: ci.checks, text: `CI was read for ${short(ci.sha)}, not the current commit ${short(head)} (${read}).` };
   const what = { passing: 'CI passing', failing: 'CI failing', pending: 'CI still running', none: 'No CI checks reported' }[ci.checks] || `CI ${ci.checks || 'unknown'}`;
   return { state: m != null && m > 60 ? 'old' : 'current', sha: ci.sha || head, at: ci.at, age_minutes: m, checks: ci.checks, mergeable: ci.mergeable || null, text: `${what} (${read}).` };
@@ -140,6 +144,7 @@ export function mergeGate({ qa, reviews, ci, deploy, busy = false, windowEnd = n
   else items.push(G('reviews', 'Reviews', reviews.state === 'current' ? 'ok' : 'unknown', reviews.text));
   if (ci.state === 'unknown') items.push(G('ci', 'CI', 'unknown', ci.text));
   else if (ci.state === 'stale') items.push(G('ci', 'CI', 'unknown', `${ci.text} Re-reading before it counts.`));
+  else if (ci.state === 'refreshing') items.push(G('ci', 'CI', 'unknown', ci.text));
   else if (!live || !live.rolled) items.push(G('ci', 'CI', 'unknown', `${ci.text} The individual checks were not recorded, so the required ones cannot be confirmed.`));
   else if (['ci_failing', 'ci_inconclusive', 'ci_gap'].find(has)) items.push(G('ci', 'CI', 'blocked', said(['ci_failing', 'ci_inconclusive', 'ci_gap'].find(has))));
   else if (['ci_pending', 'ci_none', 'required_missing'].find(has)) items.push(G('ci', 'CI', 'waiting', said(['ci_pending', 'ci_none', 'required_missing'].find(has))));
@@ -204,7 +209,7 @@ export function brief(facts) {
   const qa = qaEvidence({ head, qaSha: t?.qa_sha, qaAt: facts.qaAt, now });
   if (kind === 'merge') {
     const reviews = reviewEvidence({ head, now, nameOf, ...(facts.reviews || {}) });
-    const ci = ciEvidence({ head, ci: facts.ci, now });
+    const ci = ciEvidence({ head, ci: facts.ci, now, baseSha: facts.baseSha ?? null });
     const dep = deployConsequence(facts.deploy || null, { targets: facts.targets, files: facts.files });
     const n = facts.pr || null;
     out.you_decide = d.verb && /^Release/.test(d.verb) ? d.verb : `Merge ${name} into ${baseBranch}`;
