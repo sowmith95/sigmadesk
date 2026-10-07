@@ -198,9 +198,16 @@ export function board(state, extra = {}) {
     const lt = tickets.find((x) => x.key === w.ticket_key);
     const name = lt ? nameOf(lt) : `commit ${String(w.merge_sha || '').slice(0, 7)}`;
     out.needs_you.push({ key: lt?.key || `deploy-${w.id}`, id: `regression:${w.id}`, kind: 'regression', bucket: 'needs_you', ticket: lt, name, priority: w.trading_path ? 'P0' : 'P1',
-      action: 'Check production', verb: `Regression suspected after deploying ${name}`,
+      action: 'Check production', verb: w.hold_kind === 'provisional' ? `Possible regression after deploying ${name} (confirming)` : `Regression suspected after deploying ${name}`,
       reason: `${w.note ? `${w.note}. ` : ''}Every merge that deploys waits until you clear this hold.${w.revert_key ? ` A revert is being prepared in ${w.revert_key}; only you merge it.` : ''}${w.incident_key ? ` Incident: ${w.incident_key}.` : ''}`,
       regression: w, since: w.deployed_at });
+  }
+  // A post-deploy check the exchange calendar could not schedule (year not covered, bad override): the owner's.
+  for (const c of state.meta?.production?.unschedulable || []) {
+    const lt = tickets.find((x) => x.key === c.watch?.ticket_key);
+    const name = lt ? nameOf(lt) : `commit ${String(c.watch?.merge_sha || '').slice(0, 7)}`;
+    out.needs_you.push({ key: lt?.key || `deploy-${c.watch?.id}`, id: `watch-schedule:${c.id}`, kind: 'watch_schedule', bucket: 'needs_you', ticket: lt, name,
+      action: 'Schedule the check', verb: `The ${c.label} of ${name} could not be scheduled`, reason: `${c.summary || ''}. Fix deployWatch.calendar and retry, choose a time, or skip it (the deployment then cannot be fully verified).`, checkpoint: c });
   }
   // A production read access request beyond the EM/SRE's policy (or with no agent approver) is the owner's decision.
   for (const r of state.meta?.access?.owner_requests || []) {

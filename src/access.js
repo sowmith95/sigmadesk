@@ -111,7 +111,11 @@ export function sweep() {
     if (why && why !== 'revoked' && endGrant(g, why)) ended++;
   }
   for (const r of store.openAccessRequests()) {
-    if (r.run_id && !r.ticket_key && !store.getRun(r.run_id)?.token) store.updateAccessRequest(r.id, { status: 'withdrawn', note: 'the asking run ended', decided_at: nowIso() });
+    const asking = r.run_id ? store.getRun(r.run_id) : null;
+    // A post-deploy check's request lives with its checkpoint run (the deployed ticket is done by design).
+    const cpId = asking?.kind === 'watch' ? json(asking.job, {})?.checkpoint : null;
+    if (cpId) { const cp = store.getCheckpoint(cpId); if (!asking.token || cp?.status !== 'sre_running' || cp.run_id !== asking.id) store.updateAccessRequest(r.id, { status: 'withdrawn', note: 'the post-deploy check it was for ended', decided_at: nowIso() }); continue; }
+    if (r.run_id && !r.ticket_key && !asking?.token) store.updateAccessRequest(r.id, { status: 'withdrawn', note: 'the asking run ended', decided_at: nowIso() });
     else if (r.ticket_key && ['done', 'wontdo'].includes(store.getTicket(r.ticket_key)?.status)) store.updateAccessRequest(r.id, { status: 'withdrawn', note: 'the ticket closed', decided_at: nowIso() });
   }
   ops.recheckAll();
@@ -141,9 +145,21 @@ export function seatHasAccess(seat, ticketKey = null) {
 const esc = (s) => String(s ?? '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
 
 // ---------------- post-deploy checkpoint grants (#7) ----------------
-/** Why a post_deploy grant must end now, or null. Checked at every probe call (grantFor) and every sweep. */
+/** What the owner's policy says about a post-deploy grant for this seat, these probes, this long: [] = allowed. */
+function postDeployViolations({ seat, probes, minutes }, pol = policy(), { creating = false } = {}) {
+  const v = [];
+  if (pol.postDeployAutoGrant !== true) v.push('automatic post-deploy access is off in the access policy');
+  if (!pol.seats.includes(seat)) v.push(`${nameOf(seat)} is not a seat the policy allows`);
+  if (!pol.probes.includes('*') && probes.some((p) => !pol.probes.includes(p))) v.push(`probes beyond the policy (${pol.probes.join(', ')})`);
+  if (minutes > pol.maxMinutes) v.push(`${minutes} min is longer than the policy's ${pol.maxMinutes} min`);
+  if (creating && activeAgentGrants() >= pol.maxActive) v.push(`already ${activeAgentGrants()} active agent grants (policy: ${pol.maxActive})`);
+  return v;
+}
+/** Why a post_deploy grant must end now, or null. Checked at every probe call (grantFor) and every sweep: the
+ * policy as it is NOW (flag, seats, probes, longest duration), and the checkpoint/run it was given for. */
 function postDeployEnd(g, run = null) {
-  if (policy().postDeployAutoGrant !== true) return 'policy changed';
+  const span = Math.round((Date.parse(g.expires_at) - Date.parse(g.created_at)) / 60_000);
+  if (postDeployViolations({ seat: g.seat, probes: json(g.probes, []), minutes: span }).length) return 'policy changed';
   const cp = g.watch_checkpoint ? store.getCheckpoint(g.watch_checkpoint) : null;
   const w = cp ? store.getWatch(cp.watch_id) : null;
   if (!cp || !w || w.status !== 'watching' || cp.status !== 'sre_running') return 'deployment no longer watched';
@@ -152,20 +168,36 @@ function postDeployEnd(g, run = null) {
 }
 /**
  * The owner opted in (access.policy.postDeployAutoGrant): the SRE's checkpoint run gets a grant bound to that run and
- * checkpoint, to exactly `probes` (within the policy's probe list), expiring at `minutes`. null when the policy is off or
- * nothing is left after the policy's probe list.
+ * checkpoint, to exactly `probes`, expiring at `minutes` — all within the policy (seats, probes, maxMinutes, maxActive),
+ * and limited to the deployment's resources (`scope`: its target's containers and the freshness databases). null when
+ * the policy does not allow it (the reason is logged); the run then works from the desk's evidence or asks.
  */
-export function postDeployGrant({ run, checkpoint, probes, minutes = 15, target = null }) {
+export function postDeployGrant({ run, checkpoint, probes, minutes = 15, scope = null }) {
   const pol = policy();
-  if (pol.postDeployAutoGrant !== true) return null;
-  const allowed = probes.filter((p) => ops.PROBES[p] && (pol.probes.includes('*') || pol.probes.includes(p)));
-  if (!allowed.length || !run?.id) return null;
-  const mins = Math.max(5, Math.min(Number(minutes) || 15, 60));
+  if (pol.postDeployAutoGrant !== true || !run?.id) return null;
+  let allowed = probes.filter((p) => ops.PROBES[p] && (pol.probes.includes('*') || pol.probes.includes(p)));
+  // No container can be attributed to the target: no container probes at all.
+  if (!scope?.containers?.length) allowed = allowed.filter((p) => !['container_status', 'container_logs'].includes(p));
+  if (!scope?.dbs?.length) allowed = allowed.filter((p) => p !== 'ingest_freshness');
+  const mins = Math.max(5, Math.min(Number(minutes) || 15, 60, pol.maxMinutes));
+  const v = allowed.length ? postDeployViolations({ seat: run.agent_id, probes: allowed, minutes: mins }, pol, { creating: true }) : ['no probe the policy allows fits this deployment'];
+  if (v.length) {
+    store.logEvent({ kind: 'action', agent_id: 'system', run_id: run.id, text: `post-deploy check: no automatic access for ${nameOf(run.agent_id)} (${v.join('; ')})` });
+    return null;
+  }
   const g = store.insertGrant({ seat: run.agent_id, probes: allowed, expires_at: new Date(Date.now() + mins * 60_000).toISOString(), ticket_key: null, run_id: run.id,
-    standing: false, granted_by: 'post_deploy', reason: `post-deploy checkpoint #${checkpoint.id}${target ? ` (${target})` : ''}`, watch_checkpoint: checkpoint.id });
+    standing: false, granted_by: 'post_deploy', reason: `post-deploy checkpoint #${checkpoint.id}${scope?.target ? ` (${scope.target})` : ''}`, watch_checkpoint: checkpoint.id, scope });
   store.logEvent({ kind: 'action', agent_id: 'system', run_id: run.id, ticket_key: run.ticket_key || null,
-    text: `post-deploy check: ${nameOf(run.agent_id)} may read ${describeProbes(allowed)} for this checkpoint run only (at most ${mins} min; the owner's access policy allows post-deploy grants)` });
+    text: `post-deploy check: ${nameOf(run.agent_id)} may read ${describeProbes(allowed)}${scope?.containers?.length ? ` (containers ${scope.containers.join(', ')})` : ''} for this checkpoint run only (at most ${mins} min; the owner's access policy allows post-deploy grants)` });
   return g;
+}
+/** A scoped grant (post-deploy) names the resources it covers: a probe naming another container or database is refused. */
+export function scopeProblem(g, probe, params = {}) {
+  const scope = g?.scope ? json(g.scope, null) : null;
+  if (!scope) return null;
+  if (params.container && !(scope.containers || []).includes(params.container)) return `this post-deploy grant covers only ${(scope.containers || []).join(', ') || 'no containers'}, not ${params.container}`;
+  if (params.db && !(scope.dbs || []).includes(params.db)) return `this post-deploy grant covers only the ${(scope.dbs || []).join(', ') || 'no'} database(s), not ${params.db}`;
+  return null;
 }
 /** Held access now, or ended within the last hour: asking again is a renewal, and renewals are the owner's. */
 function recentAccess(seat) {

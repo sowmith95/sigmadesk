@@ -549,7 +549,11 @@ function migrate() {
     // health: an app probe that answered but reported the application unhealthy (HTTP 5xx) is not evidence of health
     ops_audit: { health: 'TEXT' },
     // a post-deploy checkpoint's run-bound grant names its checkpoint (re-checked at every probe)
-    ops_grants: { watch_checkpoint: 'INTEGER' },
+    ops_grants: { watch_checkpoint: 'INTEGER', scope: 'TEXT' },
+    // hold_status: what the deploy lock recorded when it held (kept when a later observation updates status)
+    deploy_history: { hold_status: 'TEXT' },
+    // hold_kind: provisional (first hard failure, before confirmation) | regression (confirmed)
+    deploy_watches: { hold_kind: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     // prod_access 0: the owner chose "ask me in my Inbox" for this delivery, so its run never gets automatic access
@@ -799,8 +803,9 @@ export function opsExecutedSince(sinceIso, runId = null) {
   return q(sql).get(...(runId == null ? [sinceIso] : [sinceIso, runId])).n;
 }
 export function insertGrant(g) {
-  const info = q('INSERT INTO ops_grants(seat,probes,expires_at,ticket_key,run_id,standing,granted_by,request_id,reason,watch_checkpoint) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
-    g.seat, JSON.stringify(g.probes), g.expires_at ?? null, g.ticket_key ?? null, g.run_id ?? null, g.standing ? 1 : 0, g.granted_by, g.request_id ?? null, g.reason ?? null, g.watch_checkpoint ?? null);
+  const info = q('INSERT INTO ops_grants(seat,probes,expires_at,ticket_key,run_id,standing,granted_by,request_id,reason,watch_checkpoint,scope) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(
+    g.seat, JSON.stringify(g.probes), g.expires_at ?? null, g.ticket_key ?? null, g.run_id ?? null, g.standing ? 1 : 0, g.granted_by, g.request_id ?? null, g.reason ?? null, g.watch_checkpoint ?? null,
+    g.scope ? JSON.stringify(g.scope) : null);
   return getGrant(Number(info.lastInsertRowid));
 }
 export const getGrant = (id) => q('SELECT * FROM ops_grants WHERE id=?').get(id) || null;
@@ -1283,7 +1288,7 @@ export function recordDeploy(d) {
   return { row, created: info.changes > 0 };
 }
 export function updateDeploy(id, patch) {
-  const cols = Object.keys(patch).filter((k) => ['status', 'conclusion', 'completed_at', 'cleared_by'].includes(k));
+  const cols = Object.keys(patch).filter((k) => ['status', 'conclusion', 'started_at', 'completed_at', 'cleared_by', 'hold_status', 'event'].includes(k));
   if (cols.length) q(`UPDATE deploy_history SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
   return q('SELECT * FROM deploy_history WHERE id=?').get(id);
 }
@@ -1308,9 +1313,10 @@ export const watchesForTicket = (k) => q('SELECT * FROM deploy_watches WHERE tic
 export const activeWatches = () => q("SELECT * FROM deploy_watches WHERE status='watching' ORDER BY id").all();
 export const heldWatches = () => q('SELECT * FROM deploy_watches WHERE hold=1 ORDER BY id').all();
 export const watchesSince = (iso) => q('SELECT * FROM deploy_watches WHERE deployed_at >= ? ORDER BY id').all(iso);
+export const watchesOfTarget = () => q("SELECT * FROM deploy_watches WHERE target IS NOT NULL ORDER BY deployed_at DESC, id DESC LIMIT 500").all();
 export const recentWatches = (limit = 30) => q('SELECT * FROM deploy_watches ORDER BY id DESC LIMIT ?').all(limit);
 export function updateWatch(id, patch) {
-  const cols = Object.keys(patch).filter((k) => ['status', 'verdict_note', 'superseded_by', 'hold', 'cleared_by', 'cleared_at', 'incident_key', 'revert_key', 'baseline'].includes(k));
+  const cols = Object.keys(patch).filter((k) => ['status', 'verdict_note', 'superseded_by', 'hold', 'hold_kind', 'cleared_by', 'cleared_at', 'incident_key', 'revert_key', 'baseline'].includes(k));
   if (cols.length) q(`UPDATE deploy_watches SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), now(), id);
   const row = getWatch(id); announce({ type: 'watch', data: row }); return row;
 }

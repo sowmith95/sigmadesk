@@ -15,7 +15,7 @@ import type { BoardItem, Ticket, Comment } from '@/types';
 
 export const STAGE_LABEL: Record<string, string> = { triage: 'Intake', proposed: 'Proposed', todo: 'To do', in_progress: 'Building', qa: 'QA', review: 'Acceptance', needs_human: 'Needs you', ready_for_human: 'Ready for review', done: 'Shipped', wontdo: 'Closed' };
 export const KIND_LABEL: Record<string, string> = { product: 'Product review', question: 'Question', guard: 'Publish guard', merge: 'Ready to merge', publish: 'Ready to publish', design: 'Design decision', council: 'Council verdict', page: 'Production errors', research: 'Research proposal', plan: 'Feature plan', owner_task: 'Your task', epic_review: 'Epic review',
-  deploy: 'Deploy check', regression: 'Regression', conflict: 'Conflict', setup: 'Setup', refresh: 'Branch', stuck: 'Stuck' };
+  deploy: 'Deploy check', regression: 'Regression', watch_schedule: 'Check schedule', conflict: 'Conflict', setup: 'Setup', refresh: 'Branch', stuck: 'Stuck' };
 export const BUCKET_LABEL: Record<string, string> = { needs_you: 'Needs you', blocked: 'Blocked', working: 'Working', queued: 'Queued', shipped: 'Shipped', closed: 'Closed', epic: 'Epic' };
 export const BUCKET_TONE: Record<string, Tone> = { needs_you: 'needs', blocked: 'blocked', shipped: 'shipped' };
 export const firstName = (id?: string | null) => ((id && agentMap()[id]?.name) || '').split(/\s+/)[0] || 'The engineer';
@@ -179,6 +179,13 @@ export function DecisionButton({ it, label, className, size }: { it: BoardItem; 
       const w = (it as BoardItem & { regression?: { id: number } }).regression;
       return <AsyncButton size={size} className={className} confirm="Clear the regression hold? Do this once production is safe: deploying merges continue."
         run={async () => { await api('POST', '/api/deploy/regression-hold/clear', { watch_id: w?.id }); await loadSnapshot(); }} ok="Regression hold cleared">Clear the hold</AsyncButton>;
+    }
+    case 'watch_schedule': {
+      const c = (it as BoardItem & { checkpoint?: { id: number } }).checkpoint;
+      return <span className={cn('inline-flex gap-2', className)}>
+        <AsyncButton size={size} variant="secondary" run={async () => { await api('POST', `/api/deploy/checkpoints/${c?.id}`, { action: 'reschedule' }); await loadSnapshot(); }} ok="Check scheduled">Retry the calendar</AsyncButton>
+        <AsyncButton size={size} confirm="Skip this post-deploy check? The deployment then cannot be fully verified." run={async () => { await api('POST', `/api/deploy/checkpoints/${c?.id}`, { action: 'skip' }); await loadSnapshot(); }} ok="Check skipped">Skip it</AsyncButton>
+      </span>;
     }
     case 'conflict': case 'setup': case 'refresh': case 'stuck': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id, focus: true })}>{text}</Button>;
     case 'owner_task': case 'epic_review': return <Button size={size} className={className} onClick={() => openTicket(t.key, { decision: it.id })}>{text}</Button>;

@@ -299,6 +299,7 @@ async function ownerRoute(req, res) {
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY/production$'))) { const v = deploywatch.ticketView(mm[1]); return v ? send(res, 200, v) : send(res, 404, { error: 'not found' }); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/prod-verify$'))) return send(res, 200, sched.ownerProdVerify(mm[1], await readBody(req)));
   if (req.method === 'GET' && p === '/api/deploys') return send(res, 200, { ...deploywatch.summary(), recent: store.recentDeploys(50), watches: store.recentWatches(30).map((w) => deploywatch.watchView(w)) });
+  if (req.method === 'POST' && (mm = m('^/api/deploy/checkpoints/(\\d+)$'))) { const b = await readBody(req); return send(res, 200, { checkpoint: deploywatch.ownerCheckpoint(mm[1], { action: b.action, due_at: b.due_at }) }); }
   if (req.method === 'POST' && p === '/api/deploy/regression-hold/clear') { const b = await readBody(req); return send(res, 200, { watch: deploywatch.watchView(deploywatch.clearRegressionHold(b.watch_id, { by: 'owner', note: b.note || '' })) }); }
   if (req.method === 'POST' && p === '/api/merge-train/clear-deploy') return send(res, 200, { cleared: mergetrain.ownerClearDeploy(await readBody(req)) });
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/approve-publish$'))) { await sched.ownerApprovePublish(mm[1]); return send(res, 200, { ok: true }); }
@@ -678,6 +679,8 @@ export async function main() {
   prsync.startWebhook((event) => { store.logEvent({ kind: 'github', agent_id: 'github', text: `webhook: ${event} → syncing PRs` }); syncPrs(); });
   setInterval(() => github.flushComments(), 60_000);
   setInterval(() => mergetrain.sweep().catch((err) => console.error('merge train:', err.message)), 60_000); // PR comments, conflict check, merge train
+  // Post-deploy watch on its own timer: monitoring production never depends on the merge train or reviews being on.
+  setInterval(() => deploywatch.sweep({ lock: mergetrain.deployState() }).catch((err) => console.error('post-deploy watch:', err.message)), 60_000);
   setInterval(() => sched.retryPublications(), 5 * 60_000);
   const shutdown = () => { council.cancelAll(); advisors.cancelAll(); runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
   process.on('SIGTERM', shutdown);

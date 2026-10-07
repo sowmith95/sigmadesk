@@ -541,9 +541,12 @@ export async function handle(run, body = {}) {
   if (!probe || probe === 'list') return describeForSeat(run);
   if (probe === 'request') {
     if (config.ops?.enabled !== true) throw refuse('production read access is not configured on this desk', 403);
-    const ticketScoped = body.ticket === true || body.ticket === 'true';
+    // A post-deploy check asks for ITS run only: the deployed ticket is done, so a ticket-bound request would be
+    // withdrawn at once; this one lives and ends with the checkpoint run.
+    const watchRun = run.kind === 'watch';
+    const ticketScoped = watchRun || body.ticket === true || body.ticket === 'true';
     const r = access.request({ seat: run.agent_id, probes: body.probes || body.body || '*', why: typeof body.why === 'string' ? body.why : '',
-      minutes: ticketScoped ? null : access.parseDuration(body.for), ticketScoped, ticketKey: run.ticket_key || null, runId: run.id });
+      minutes: ticketScoped ? null : access.parseDuration(body.for), ticketScoped, ticketKey: watchRun ? null : run.ticket_key || null, runId: run.id });
     return r.message;
   }
   const raw = Object.fromEntries(Object.entries(body).filter(([k]) => !['probe', 'body'].includes(k)));
@@ -553,6 +556,8 @@ export async function handle(run, body = {}) {
   let lim = limits();
   let params;
   try { params = validate(probe, raw, lim); } catch (err) { audit({ outcome: 'refused', detail: err.message }); throw err; }
+  const scoped = access.scopeProblem(access.grantFor(run, probe), probe, params);
+  if (scoped) { audit({ params, outcome: 'refused', detail: scoped }); throw refuse(scoped, 403); }
   const p = PROBES[probe];
   const fromCache = (pr) => { const out = wrap(probe, pr, { ...cached(cacheKey(probe, pr)), ms: 0 }, { cached: true, lim }); audit({ params: pr, duration_ms: 0, bytes: Buffer.byteLength(out), outcome: 'cached' }); return out; };
   if (cached(cacheKey(probe, params))) return fromCache(params);
@@ -569,6 +574,8 @@ export async function handle(run, body = {}) {
     if (late) { audit({ params, outcome: 'refused', detail: late }); throw refuse(late, 403); }
     lim = limits();
     try { params = validate(probe, raw, lim); } catch (err) { audit({ params, outcome: 'refused', detail: err.message }); throw err; }
+    const scoped2 = access.scopeProblem(access.grantFor(run, probe), probe, params);
+    if (scoped2) { audit({ params, outcome: 'refused', detail: scoped2 }); throw refuse(scoped2, 403); }
     if (cached(cacheKey(probe, params))) return fromCache(params);
     const late2 = budgetProblem(run.id, lim, true);
     if (late2) { audit({ params, outcome: 'refused', detail: late2 }); throw refuse(late2, 429); }
@@ -625,7 +632,9 @@ export async function deskProbe(probe, raw = {}, { ticketKey = null, purpose = '
   let lim = limits();
   let params;
   try { params = validate(probe, raw, lim); } catch (err) { audit({ outcome: 'refused', detail: err.message }); return out({ outcome: 'refused', text: err.message }); }
-  const hour = store.opsExecutedSince(hourAgo()) + reserved.total;
+  // The desk's own checks leave room for the SRE's follow-up probes (deployWatch.sreReserveProbes, default one run's worth).
+  const keep = Number.isFinite(Number(config.deployWatch?.sreReserveProbes)) ? Number(config.deployWatch.sreReserveProbes) : lim.perRun;
+  const hour = store.opsExecutedSince(hourAgo()) + reserved.total + keep;
   if (hour >= lim.perHour) { const why = `the desk's hourly probe budget is used up (${lim.perHour}${lim.busy ? ' during market hours' : ''})`; audit({ params, outcome: 'refused', detail: why }); return out({ outcome: 'refused', text: why }, params); }
   const p = PROBES[probe];
   const op = { id: `desk-${++opSeq}`, runId: null, seat: 'desk', probe, grantId: null, handles: new Set(), cancelled: null, timer: null };

@@ -100,6 +100,7 @@ const doneTicket = (extra = {}) => { const t = store.createTicket({ title: `Chan
 const reset = () => {
   store.kvSet('train:deploy', 'null'); store.kvSet('train:deploy-pending', '[]');
   for (const w of store.recentWatches(1000)) store.updateWatch(w.id, { status: 'superseded', hold: 0 });
+  store.handle().exec("UPDATE deploy_watches SET target = 'retired-by-test'"); // every test restarts the same timeline
   for (const s of ['pending', 'needs_sre', 'sre_running', 'running']) for (const c of store.checkpointsByStatus(s)) store.updateCheckpoint(c.id, { status: 'superseded' });
   docker(); app.status = 200; app.body = '{"status":"ok"}'; fs.writeFileSync(psqlCtl, '{}'); setGh('branch-runs.json', []);
   store.kvSet('deploywatch:reconciled', '');
@@ -171,7 +172,7 @@ test('deploy history + watch are written with the lock release; a crash in betwe
   const m = sha();
   lockFor(t.key, m);
   setGh(`runs-${m}.json`, [run(77, 1, m)]);
-  dw.hooks.beforeWatch = () => { throw new Error('simulated crash'); };
+  dw.hooks.beforeWatch = () => { throw Object.assign(new Error('simulated crash'), { simulatedCrash: true }); };
   await assert.rejects(train.deployLock(at(4)), /simulated crash/);
   assert.equal(JSON.parse(store.kvGet('train:deploy')).state, 'running', 'the lock is still held');
   assert.equal(store.deploysForSha(m).length, 0, 'no history row without its release');
@@ -256,7 +257,8 @@ test('a healthy deploy: the desk verifies every checkpoint itself (fresh, struct
   for (const [min, name] of [[9, 'smoke'], [34, 'settle']]) {
     dw.clock.now = () => at(min);
     const r = await dw.sweep({ now: at(min) });
-    assert.equal(r.checkpoints.find((x) => x.id)?.verdict, 'verified', name);
+    const got = r.checkpoints.find((x) => x.id);
+    assert.equal(got?.verdict, 'verified', name);
   }
   const smoke = store.checkpointsOf(w.id).find((c) => c.name === 'smoke');
   const ev = JSON.parse(smoke.evidence);
@@ -273,6 +275,10 @@ test('a healthy deploy: the desk verifies every checkpoint itself (fresh, struct
   dw.clock.now = () => open;
   await dw.sweep({ now: open });
   assert.equal(store.getWatch(w.id).status, 'verified');
+  // Review #1: a limited verification (no ticket criteria) is not counted as production-verified.
+  const k = dw.summary(open).kpis;
+  assert.equal(k.verified, 0);
+  assert.equal(k.verified_limited, 1);
   assert.ok(store.listComments(t.key).some((c) => /verified\*\* \(limited\)/.test(c.body)));
   assert.ok(store.listOutbox(t.key).some((o) => /Production T\+5 min smoke check: verified/.test(o.body)), 'posted to the PR through the outbox');
   assert.equal(dw.ticketView(t.key).watches[0].status, 'verified');
@@ -285,8 +291,12 @@ test('5xx after a deploy: confirmed once, then regression → page, hold, P0 inc
   const { m, w } = await deployed(t);
   app.status = 502;
   dw.clock.now = () => at(9);
-  assert.equal((await dw.sweep({ now: at(9) })).checkpoints[0].status, 'retry', 'one confirming look before paging');
-  assert.equal(store.getWatch(w.id).hold, 0);
+  assert.equal((await dw.sweep({ now: at(9) })).checkpoints[0].status, 'retry', 'one confirming look before the incident');
+  // Review #2: the FIRST hard failure already holds the train and pages the owner (before retries or revert prep).
+  assert.deepEqual([store.getWatch(w.id).hold, store.getWatch(w.id).hold_kind], [1, 'provisional']);
+  assert.equal(dw.regressionHold().id, w.id);
+  assert.ok(store.listComments(t.key).some((c) => /Possible regression/.test(c.body)));
+  assert.equal(store.getWatch(w.id).incident_key, null, 'no incident yet: confirmation first');
   dw.clock.now = () => at(12);
   const r = await dw.sweep({ now: at(12) });
   assert.equal(r.checkpoints[0].verdict, 'regression');
@@ -305,7 +315,8 @@ test('5xx after a deploy: confirmed once, then regression → page, hold, P0 inc
   assert.equal(reviews.autoMergePolicy({ ...rev, risk: 'low', diff_risk: 'low' }).eligible, false, 'a revert is never merged by the train');
   assert.match(train.mergeState({ ...rev, status: 'ready_for_human', review_stage: 'approved', pr_url: 'x' }).reason, /only the owner merges reverts/);
   assert.ok(store.checkpointsOf(w.id).filter((c) => c.name !== 'smoke').every((c) => c.status === 'superseded'), 'the owner decides from here');
-  assert.ok(store.listComments(t.key).some((c) => /Regression suspected/.test(c.body) && /migrations/.test(c.body)));
+  assert.ok(store.listComments(t.key).some((c) => /Regression suspected/.test(c.body)));
+  assert.ok(store.listComments(t.key).some((c) => /Incident: /.test(c.body) && /migrations/.test(c.body)), 'the tickets follow the hold');
   // The merge train holds deploying merges: the live gate refuses a desk merge that redeploys.
   const k = store.createTicket({ title: 'next', status: 'ready_for_human' }).key;
   store.updateTicket(k, { head_sha: 'f'.repeat(40), review_stage: 'merging' });
@@ -514,7 +525,7 @@ test('logs since the deploy: a new error signature at the threshold is a regress
   const smoke = store.checkpointsOf(w.id).find((c) => c.name === 'smoke');
   assert.equal(smoke.verdict, 'regression');
   const item = JSON.parse(smoke.evidence).items.find((i) => i.probe === 'container_logs');
-  assert.match(item.observed, /1 new error signature\(s\), 3 line\(s\)/, 'the pre-deploy line is outside the window');
+  assert.match(item.observed, /^new: .*×3$/, 'the pre-deploy line is outside the window');
   dw.clearRegressionHold(w.id);
   // The same errors with no baseline at all: the SRE is asked instead of paging the owner.
   reset();
@@ -531,4 +542,255 @@ test('logs since the deploy: a new error signature at the threshold is a regress
   const s2 = store.checkpointsOf(w2.id).find((c) => c.name === 'smoke');
   assert.equal(s2.status, 'needs_sre');
   assert.match(JSON.parse(s2.evidence).items.find((i) => i.probe === 'container_logs').note, /no trusted baseline/);
+});
+
+// ---------------- review fixes (Codex review of the first version) ----------------
+const sha40 = (m) => JSON.stringify({ status: 'ok', git_sha: m.slice(0, 12) });
+
+test('review #1: verified needs a matching identity and complete healthy evidence; an unhealthy probe vetoes the SRE', async () => {
+  reset();
+  const t = doneTicket();
+  const { w } = await deployed(t); // the app does not report its commit
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const smoke = store.checkpointsOf(w.id).find((c) => c.name === 'smoke');
+  assert.equal(smoke.verdict, 'inconclusive');
+  assert.match(smoke.summary, /identity unresolved/);
+  // Partial evidence (a health check still starting) is inconclusive, never verified.
+  reset();
+  const t2 = doneTicket();
+  const { m: m2, w: w2 } = await deployed(t2);
+  app.body = sha40(m2);
+  docker({ inspect: '/alpaca-trader\tstarting\t0\t2026-10-03T15:01:00Z\tfalse\timg' });
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const s2 = store.checkpointsOf(w2.id).find((c) => c.name === 'smoke');
+  assert.deepEqual([s2.verdict, /partial evidence/.test(s2.summary)], ['inconclusive', true]);
+  // The SRE cannot say verified while any probe in its run answered 5xx, even if another probe was fine.
+  reset();
+  const t3 = doneTicket();
+  const { m: m3, w: w3 } = await deployed(t3);
+  app.body = sha40(m3);
+  docker({ inspect: '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' });
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const cp = dw.claimJob(dw.nextJobs()[0].checkpoint);
+  const r = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t3.key, token: `v${++seq}`, model: 'x', job: { checkpoint: cp.id } });
+  store.updateCheckpoint(cp.id, { run_id: r.id });
+  const g = access.ownerGrant({ seat: 'sre', probes: ['*'], minutes: 30, reason: 'test' });
+  ops.clearCache();
+  await ops.handle(r, { probe: 'container_status' });
+  app.status = 503;
+  await ops.handle(r, { probe: 'app_health' });
+  await assert.rejects(sched.deskAction(r, 'watch', { action: 'verified', body: 'restart was benign' }), /UNHEALTHY/);
+  // A foreign identity also vetoes it.
+  app.status = 200;
+  store.handle().exec(`UPDATE ops_audit SET health = NULL WHERE run_id = ${r.id}`);
+  const ev = JSON.parse(store.getCheckpoint(cp.id).evidence);
+  store.updateCheckpoint(cp.id, { evidence: JSON.stringify({ ...ev, identity: { ...ev.identity, status: 'mismatch' } }) });
+  await assert.rejects(sched.deskAction(r, 'watch', { action: 'verified', body: 'x' }), /identity/);
+  store.endGrant(g.id, 'owner', 'reset');
+});
+
+test('review #3: post-deploy grants obey the policy (seats, maxActive, maxMinutes, probes) and the deployment\'s resources', async () => {
+  reset();
+  const base = access.validatePolicy(access.policy());
+  const t = doneTicket();
+  const { m, w } = await deployed(t);
+  app.body = sha40(m);
+  docker({ inspect: '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' });
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const cp = dw.claimJob(dw.nextJobs()[0].checkpoint);
+  const mk = () => store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t.key, token: `p${++seq}`, model: 'x', job: { checkpoint: cp.id } });
+  access.setPolicy({ ...base, postDeployAutoGrant: true, seats: ['dba'] });
+  assert.equal(dw.jobStarted(store.getCheckpoint(cp.id), mk()), null, 'the SRE is not a seat the policy allows');
+  access.setPolicy({ ...base, postDeployAutoGrant: true, maxActive: 0 });
+  assert.equal(dw.jobStarted(store.getCheckpoint(cp.id), mk()), null, 'no room under maxActive');
+  access.setPolicy({ ...base, postDeployAutoGrant: true, maxMinutes: 5 });
+  const r = mk();
+  const g = dw.jobStarted(store.getCheckpoint(cp.id), r);
+  assert.ok(Date.parse(g.expires_at) - Date.now() <= 5 * 60_000 + 1000, 'capped at the policy\'s longest grant');
+  assert.deepEqual(JSON.parse(g.scope).containers, ['alpaca-trader'], 'scoped to the target\'s containers');
+  config.ops.containers = ['alpaca-trader', 'broker-gateway'];
+  ops.clearCache();
+  await assert.rejects(ops.handle(r, { probe: 'container_logs', container: 'broker-gateway' }), /covers only alpaca-trader/);
+  assert.match(await ops.handle(r, { probe: 'container_logs', container: 'alpaca-trader' }), /ops-result/);
+  config.ops.containers = ['alpaca-trader'];
+  // The owner narrows the probe list: the grant ends at the very next probe.
+  access.setPolicy({ ...base, postDeployAutoGrant: true, maxMinutes: 5, probes: ['app_health'] });
+  assert.ok(ops.denial(r, 'app_health'));
+  assert.equal(store.getGrant(g.id).revoked_by, 'policy changed');
+  access.setPolicy({ ...base, postDeployAutoGrant: false });
+  assert.equal(w.id > 0, true);
+});
+
+test('review #4: known error signatures count when their RATE rises; an untrusted baseline never excuses staleness', async () => {
+  reset();
+  docker({ logs: '2026-10-03T14:50:00Z ERROR cache miss storm id=1' }); // the baseline: once in 30 minutes
+  const t = doneTicket();
+  const { m, w } = await deployed(t);
+  app.body = sha40(m);
+  const storm = Array.from({ length: 10 }, (_, i) => `2026-10-03T15:0${5 + (i % 4)}:${String(i).padStart(2, '0')}.000Z ERROR cache miss storm id=${i}`).join('\n');
+  docker({ logs: storm });
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const ev = JSON.parse(store.checkpointsOf(w.id).find((c) => c.name === 'smoke').evidence);
+  const logs = ev.items.find((i) => i.probe === 'container_logs');
+  assert.equal(logs.result, 'fail', 'a known signature at ~10× its before-rate');
+  assert.match(logs.observed, /rate .*\/min → .*\/min/);
+  dw.clearRegressionHold(w.id);
+  // Freshness: stale during the session with an UNTRUSTED baseline that was also stale → still a failure.
+  fs.writeFileSync(psqlCtl, JSON.stringify({ out: 'source\tlatest\tlag_s\nbars\t2026-10-07 14:40:00+00\t900\n' }));
+  const fake = (baseline) => ({ id: 0, merge_sha: m, deployed_at: '2026-10-07T14:30:00.000Z', target: 'x', ticket_key: null, workflows: '[]', baseline: JSON.stringify(baseline) });
+  const cpx = { name: 'settle', due_at: '2026-10-07T15:00:00.000Z', attempts: 1, evidence: null };
+  const open = new Date('2026-10-07T15:00:00Z');
+  const fr = (b) => dw.observe(fake(b), cpx, open).then((e) => e.items.find((i) => i.probe === 'ingest_freshness').result);
+  assert.equal(await fr({ trusted: false, coverage: [], freshness: { rows: { bars: { lag_s: 900 } } } }), 'fail');
+  assert.equal(await fr({ trusted: true, coverage: [], freshness: { rows: { bars: { lag_s: 900 } } } }), 'unknown', 'only a trusted "already stale" excuses it');
+  fs.writeFileSync(psqlCtl, '{}');
+});
+
+test('review #5: only a matched target supersedes; an older deployment found later is superseded at once (watermark)', () => {
+  reset();
+  const mk = (target, completed, key) => { const m = sha(); const row = store.recordDeploy({ deploy_key: key, merge_sha: m, workflow: '.github/workflows/deploy.yml', run_id: 70000 + seq, target, status: 'success', completed_at: completed, source: 'external' }).row;
+    return store.transaction(() => dw.createWatchFor({ deployKey: key, mergeSha: m, ticketKey: null, pr: null, rows: [row], source: 'external' })); };
+  const trading = mk('alpaca-trader', at(10).toISOString(), `k${++seq}`);
+  const unknown = mk(null, at(20).toISOString(), `k${++seq}`);
+  assert.equal(store.getWatch(trading.id).status, 'watching', 'an unmapped deployment does not cancel a trading watch');
+  assert.equal(store.getWatch(unknown.id).status, 'watching', 'and is itself monitored');
+  const newer = mk('alpaca-trader', at(30).toISOString(), `k${++seq}`);
+  assert.equal(store.getWatch(trading.id).status, 'superseded');
+  const older = mk('alpaca-trader', at(5).toISOString(), `k${++seq}`);
+  assert.deepEqual([store.getWatch(older.id).status, store.getWatch(older.id).superseded_by], ['superseded', newer.id]);
+  assert.equal(store.checkpointsOf(older.id).length, 0, 'nothing is scheduled for it');
+  assert.equal(store.getWatch(unknown.id).trading_path, 1, 'no ticket to classify: treated as trading-path');
+});
+
+test('review #6: unknown risk is high — criteria are required unless BOTH classifications are low', () => {
+  assert.match(dw.criteriaBlock({ risk: null, diff_risk: 'low' }), /not classified low/);
+  assert.match(dw.criteriaBlock({ risk: 'low', diff_risk: null }), /not classified low/);
+  assert.match(dw.criteriaBlock({ risk: 'high', diff_risk: 'low' }), /changes the trading path/);
+  assert.equal(dw.criteriaBlock({ risk: 'low', diff_risk: 'low' }), null);
+  assert.equal(dw.tradingPath(null), true, 'an external deployment is trading-path');
+  const t = store.createTicket({ title: 'Unclassified', status: 'ready_for_human' });
+  store.updateTicket(t.key, { review_stage: 'approved', pr_url: 'https://github.com/owner/demo/pull/11' });
+  assert.equal(train.mergeState(store.getTicket(t.key)).blocked, 'criteria');
+});
+
+test('review #7: a deploy that completes after escalation (and an owner clear) still gets a watch; the hold record stays', async () => {
+  reset();
+  const t = doneTicket();
+  const m = sha();
+  lockFor(t.key, m);
+  setGh(`runs-${m}.json`, [run(4321, 1, m, { status: 'in_progress', conclusion: null })]);
+  assert.equal((await train.deployLock(new Date(T0.getTime() + 60 * 60_000))).state, 'escalated');
+  train.ownerClearDeploy({ merge_sha: m });
+  const held = store.deploysForSha(m)[0];
+  assert.deepEqual([held.status, held.hold_status, held.cleared_by, held.run_id], ['unknown', 'unknown', 'owner', 4321]);
+  setGh('branch-runs.json', [run(4321, 1, m, { updated_at: at(70).toISOString() })]);
+  const out = await dw.reconcile({ now: at(71), force: true });
+  assert.equal(out.recorded[0].late, true);
+  const after = store.deploysForSha(m)[0];
+  assert.deepEqual([after.status, after.hold_status, after.cleared_by], ['success', 'unknown', 'owner'], 'the observation moved on; the hold history did not');
+  const w = store.watchByKey(after.deploy_key);
+  assert.equal(w.status, 'watching');
+  assert.equal(dw.ticketView(t.key).deploys[0].held_as, 'unknown');
+});
+
+test('review #8: the merge train checks due post-deploy smoke checks before merging, and monitoring has its own timer', async () => {
+  reset();
+  const t = doneTicket();
+  const { m, w } = await deployed(t);
+  app.body = sha40(m); app.status = 500;
+  dw.clock.now = () => at(9);
+  store.setSetting('github_sync', 'false');
+  await train.sweep({ now: at(9) });
+  store.setSetting('github_sync', 'true');
+  assert.equal(store.getWatch(w.id).hold, 1, 'the provisional hold exists before the train considered anything');
+  dw.clearRegressionHold(w.id);
+  const srv = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+  assert.match(srv, /setInterval\(\(\) => deploywatch\.sweep\(/, 'its own timer, independent of the merge train and reviews');
+});
+
+test('review #9: a post-deploy run\'s access request lives with its checkpoint run, not the (done) ticket', async () => {
+  reset();
+  const t = doneTicket();
+  const { m, w } = await deployed(t);
+  app.body = sha40(m);
+  docker({ inspect: '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' });
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const cp = dw.claimJob(dw.nextJobs()[0].checkpoint);
+  const r = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t.key, token: `q${++seq}`, model: 'x', job: { checkpoint: cp.id } });
+  store.updateCheckpoint(cp.id, { run_id: r.id });
+  await ops.handle(r, { probe: 'request', probes: ['app_health'], why: 'look at /health after the restart' });
+  const req = store.openAccessRequests().find((x) => x.run_id === r.id);
+  assert.ok(req && !req.ticket_key && req.ticket_scoped === 1);
+  access.sweep();
+  assert.ok(store.openAccessRequests().some((x) => x.id === req.id), 'still open although the ticket is done');
+  await dw.jobEnded(cp.id, { refused: 'test' });
+  access.sweep();
+  assert.equal(store.getAccessRequest(req.id).status, 'withdrawn');
+  assert.equal(w.id > 0, true);
+});
+
+test('review #10: a small market-hours allowance rotates through every container\'s logs across retries, then verifies', async () => {
+  reset();
+  config.ops.containers = ['alpaca-trader', 'ingestor', 'precompute'];
+  config.deployWatch.targetContainers = { 'alpaca-trader': ['alpaca-trader', 'ingestor', 'precompute'] };
+  const ps = config.ops.containers.map((c) => `${c}\trunning\tUp 1 minute\t1 minute ago`).join('\n');
+  const ins = config.ops.containers.map((c) => `/${c}\thealthy\t0\t2026-10-03T15:01:00Z\tfalse\timg`).join('\n');
+  docker({ ps, inspect: ins });
+  config.ops.busy.perHour = 100000;
+  ops.setNow(() => new Date('2026-10-07T15:00:00Z')); // market hours: 4 probes per checkpoint attempt
+  const t = doneTicket();
+  const { m, w } = await deployed(t);
+  app.body = sha40(m);
+  docker({ ps, inspect: ins });
+  const smoke = () => store.checkpointsOf(w.id).find((c) => c.name === 'smoke');
+  for (const min of [9, 11, 16]) { dw.clock.now = () => at(min); await dw.sweep({ now: at(min) }); }
+  const ev = JSON.parse(smoke().evidence);
+  assert.deepEqual(ev.items.filter((i) => i.probe === 'container_logs').map((i) => i.container).sort(), ['alpaca-trader', 'ingestor', 'precompute']);
+  assert.equal(smoke().verdict, 'verified', 'complete after rotating');
+  assert.equal(smoke().attempts, 3);
+  ops.setNow(() => new Date('2026-10-03T15:00:00Z'));
+  config.ops.containers = ['alpaca-trader'];
+  delete config.deployWatch.targetContainers;
+});
+
+test('review #11: calendar config is validated; an uncovered year fails closed to the owner; a recording error never wedges the lock', async () => {
+  const { validateConfig } = await import('../src/config.js');
+  const saved = config.deployWatch.calendar;
+  config.deployWatch.calendar = { timezone: 'Mars/Olympus', holidays: ['2026-13-40'], earlyCloses: { '2026-11-27': '1pm' } };
+  const problems = validateConfig(config).join('\n');
+  assert.match(problems, /timezone "Mars\/Olympus"/);
+  assert.match(problems, /holidays must be/);
+  assert.match(problems, /earlyCloses must map/);
+  // A year outside the table: the release still happens; the session-open check waits for the owner.
+  reset();
+  config.deployWatch.calendar = { replace: true, years: [] };
+  const t = doneTicket();
+  const { w } = await deployed(t);
+  assert.equal(store.kvGet('train:deploy'), 'null', 'the lock was released');
+  const open = store.checkpointsOf(w.id).find((c) => c.name === 'session_open');
+  assert.equal(open.status, 'unschedulable');
+  const s = dw.summary(at(5));
+  assert.equal(s.unschedulable[0].id, open.id);
+  const B = attention.board({ tickets: store.listTickets(), agents: [], meta: { production: s }, incidents: [] });
+  assert.ok(B.needs_you.some((x) => x.kind === 'watch_schedule'));
+  assert.throws(() => dw.ownerCheckpoint(open.id), /Still cannot schedule/);
+  config.deployWatch.calendar = saved;
+  assert.equal(dw.ownerCheckpoint(open.id).status, 'pending', 'retried after the fix');
+  // A bug while recording a finished deploy escalates the lock (owner-clearable) instead of leaving it "running".
+  reset();
+  const t2 = doneTicket();
+  const m2 = sha();
+  lockFor(t2.key, m2);
+  setGh(`runs-${m2}.json`, [run(8080, 1, m2)]);
+  dw.hooks.beforeWatch = () => { throw new Error('disk full'); };
+  const l = await train.deployLock(at(4));
+  dw.hooks.beforeWatch = null;
+  assert.deepEqual([l.state, /could not be recorded/.test(l.note)], ['escalated', true]);
+  assert.ok(train.ownerClearDeploy({ merge_sha: m2 }));
 });

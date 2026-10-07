@@ -445,6 +445,14 @@ export function validateConfig(c = config) {
   if (!Array.isArray(rs.programs) || !rs.programs.every((p) => p && typeof p.id === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(p.id))) problems.push('research.programs must be a list of programs with kebab-case ids');
   if (!rs.connectors || typeof rs.connectors !== 'object' || Array.isArray(rs.connectors) || !Object.keys(rs.connectors).every((k) => /^[a-z0-9][a-z0-9-]{0,39}$/.test(k))) problems.push('research.connectors must map kebab-case names to connector definitions');
   if (!(Number.isInteger(rs.review?.minReviewers) && rs.review.minReviewers >= 1 && rs.review.minReviewers <= 3) || !Array.isArray(rs.review?.reviewers)) problems.push('research.review needs minReviewers 1-3 and a reviewers list');
+  // Post-deploy watch calendar (#7): a bad override must fail at load, never inside a deploy-lock release.
+  const dwc = c.deployWatch?.calendar || {};
+  const day = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v)) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`));
+  if (dwc.timezone !== undefined && !tzOk(dwc.timezone)) problems.push(`deployWatch.calendar.timezone "${dwc.timezone}" is not a time zone`);
+  if ((dwc.open !== undefined && !hhmm(dwc.open)) || (dwc.close !== undefined && !hhmm(dwc.close)) || (dwc.open && dwc.close && dwc.open >= dwc.close)) problems.push('deployWatch.calendar open/close must be HH:MM with open before close');
+  if (dwc.holidays !== undefined && !(Array.isArray(dwc.holidays) && dwc.holidays.every(day))) problems.push('deployWatch.calendar.holidays must be a list of YYYY-MM-DD dates');
+  if (dwc.earlyCloses !== undefined && !(dwc.earlyCloses && typeof dwc.earlyCloses === 'object' && Object.entries(dwc.earlyCloses).every(([d, t]) => day(d) && hhmm(t)))) problems.push('deployWatch.calendar.earlyCloses must map YYYY-MM-DD to HH:MM');
+  if (dwc.years !== undefined && !(Array.isArray(dwc.years) && dwc.years.every((y) => Number.isInteger(y) && y >= 2000 && y < 2100))) problems.push('deployWatch.calendar.years must be a list of years');
   const modelList = (v) => Array.isArray(v) && v.every((id) => typeof id === 'string' && /^[\w.:-]{1,80}$/.test(id));
   for (const id of ['claude', 'codex', 'perplexity']) if (!modelList(c.engines[id]?.models)) problems.push(`engines.${id}.models must be a list of model ids`);
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');

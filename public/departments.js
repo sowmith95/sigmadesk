@@ -77,7 +77,7 @@ export const seatIndex = (deps) => Object.fromEntries(deps.flatMap((d) => d.seat
 export function departmentOf(item, deps, seats = seatIndex(deps)) {
   const has = (id) => deps.some((d) => d.id === id);
   const t = item?.ticket || null;
-  if ((item?.kind === 'page' || item?.kind === 'regression') && has('reliability')) return 'reliability';
+  if ((item?.kind === 'page' || item?.kind === 'regression' || item?.kind === 'watch_schedule') && has('reliability')) return 'reliability';
   if (item?.kind === 'deploy' && has('qa')) return 'qa';
   if (item?.kind === 'access' && seats[item.access?.seat]) return seats[item.access.seat];
   if (item?.worker && seats[item.worker]) return seats[item.worker];
@@ -312,7 +312,7 @@ export function departmentKpis(state, deps, { now = Date.now(), board = null } =
     kpi('Merged', String(merged.length), { source: 'tickets done with a PR (done_at)', at: nowIso, window: win }),
     p ? kpi('Deployed', String(p.deployed), { source: `distinct successful deployments in the deploy history${p.failed ? ` (${p.failed} failed)` : ''}`, at: p.observed_at || nowIso, window: win, tone: p.failed ? 'needs' : 'neutral' })
       : UNKNOWN('Deployed', 'the server sent no deploy history', 'deploy history'),
-    p ? kpi('Production-verified', `${p.verified} of ${p.deployed}`, { source: `deployments whose post-deploy checks all passed${p.watching ? `; ${p.watching} still being watched` : ''}${p.regression ? `; ${p.regression} regression suspected` : ''}${p.inconclusive ? `; ${p.inconclusive} inconclusive` : ''}`,
+    p ? kpi('Production-verified', `${p.verified} of ${p.deployed}`, { source: `deployments whose post-deploy checks all passed against their own criteria with a matching deployment identity${p.verified_limited ? `; ${p.verified_limited} more passed general health only (limited, not counted)` : ''}${p.watching ? `; ${p.watching} still being watched` : ''}${p.regression ? `; ${p.regression} regression suspected` : ''}${p.inconclusive ? `; ${p.inconclusive} inconclusive` : ''}`,
       at: p.observed_at || nowIso, window: win, tone: p.regression ? 'blocked' : 'neutral' })
       : UNKNOWN('Production-verified', 'the server sent no post-deploy verdicts', 'post-deploy watch'),
   ];
@@ -321,7 +321,7 @@ export function departmentKpis(state, deps, { now = Date.now(), board = null } =
 
 // ---------------- exceptions (the wall leads with these) ----------------
 const KIND_LABEL = { guard: 'publish approval', merge: 'merge', publish: 'publish approval', question: 'question', design: 'design decision', council: 'council verdict',
-  plan: 'plan review', deploy: 'deploy hold', regression: 'regression hold', access: 'access request', page: 'error page', conflict: 'conflict', setup: 'setup step', refresh: 'branch refresh',
+  plan: 'plan review', deploy: 'deploy hold', regression: 'regression hold', watch_schedule: 'post-deploy check schedule', access: 'access request', page: 'error page', conflict: 'conflict', setup: 'setup step', refresh: 'branch refresh',
   stuck: 'stuck task', owner_task: 'your task', epic_review: 'epic question', product: 'review feedback', research: 'research decision' };
 export const decisionLabel = (kind) => KIND_LABEL[kind] || 'decision';
 

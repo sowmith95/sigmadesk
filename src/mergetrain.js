@@ -178,21 +178,32 @@ async function refreshLock(now, depth) {
     if (t) { say(t, marker, text, l.merge_sha); notify('needs_human', t, 'deploy needs you'); }
     else store.logEvent({ kind: 'error', agent_id: 'github', text: text.replace(/\*\*/g, '') });
   };
+  // Recording the outcome must never wedge the lock: if it throws, the lock is escalated (owner-clearable) instead.
+  const recordingFailed = (e) => {
+    if (e?.simulatedCrash) throw e;
+    const next = { ...l, state: 'escalated', note: `the deploy result could not be recorded (${String(e.message).slice(0, 120)})` };
+    if (!casLock(l.id, next)) return lockGet();
+    tell(`deploy-record-failed:${l.merge_sha || l.at}`, `⚠️ **The deploy after this merge finished, but SigmaDesk could not record it** (${next.note}). Deploying merges are held until you check it and clear the deploy hold.`);
+    return next;
+  };
   if (failed.length) {
     const next = { ...l, state: 'failed', note: failed.map((x) => `${label(x.file)}: ${x.run.conclusion}`).join(', ') };
-    if (!casLock(l.id, next, () => deploywatch.recordLockOutcome(l, 'failed', states))) return lockGet(); // the lock changed while GitHub was polled: this result is stale
+    let ok; try { ok = casLock(l.id, next, () => deploywatch.recordLockOutcome(l, 'failed', states)); } catch (e) { return recordingFailed(e); }
+    if (!ok) return lockGet(); // the lock changed while GitHub was polled: this result is stale
     tell(`deploy-failed:${l.merge_sha}`, `🚨 **The deploy after this merge failed** (${next.note}). SigmaDesk will not merge anything else that redeploys until you check it and clear the deploy hold.`);
     return next;
   }
   if (runs && expected.length && states.every((x) => x.run?.status === 'completed')) {
-    if (!releaseLock(l.id, { outcome: 'success', states })) return lockGet(); // stale result for a lock that is no longer current
+    let ok; try { ok = releaseLock(l.id, { outcome: 'success', states }); } catch (e) { return recordingFailed(e); }
+    if (!ok) return lockGet(); // stale result for a lock that is no longer current
     return depth < 5 ? refreshLock(now, depth + 1) : lockGet();
   }
   if (age > (Number(config.deploy?.waitMinutes) || 45)) {
     const missing = !l.merge_sha ? ['the merge commit is unknown'] : runs == null ? ['GitHub runs could not be read']
       : !expected.length ? ['which workflows deploy is unknown'] : states.filter((x) => x.run?.status !== 'completed').map((x) => `${label(x.file)} ${x.run ? x.run.status : 'never started'}`);
     const next = { ...l, state: 'escalated', note: missing.join(', ') };
-    if (!casLock(l.id, next, () => deploywatch.recordLockOutcome(l, 'unknown', states))) return lockGet();
+    let ok; try { ok = casLock(l.id, next, () => deploywatch.recordLockOutcome(l, 'unknown', states)); } catch (e) { return recordingFailed(e); }
+    if (!ok) return lockGet();
     tell(`deploy-timeout:${l.merge_sha || l.at}`, `⏳ **The deploy after this merge has not finished in ${Math.round(age)} minutes** (${next.note}). SigmaDesk is holding further deploying merges until you check it and clear the deploy hold.`);
     return next;
   }
@@ -950,6 +961,9 @@ export function sweep({ now = new Date() } = {}) {
         }
       } catch (err) { store.logEvent({ kind: 'github', agent_id: 'github', text: `base watcher: ${String(err.message).slice(0, 200)}` }); snap = null; }
     }
+    // Post-deploy watch BEFORE any merge this minute: a due smoke check that sees a hard failure holds the train now
+    // (it also runs on its own timer, so monitoring never depends on the merge train being on).
+    await deploywatch.sweep({ now: deploywatch.clock.now(), lock: lockGet() }).catch((err) => store.logEvent({ kind: 'error', agent_id: 'system', text: `post-deploy watch: ${String(err.message).slice(0, 200)}` }));
     const results = [];
     // The train is serialized: while the queue front is being brought up to date (QA + re-confirm), nothing behind it
     // merges — otherwise every merge would push it behind again.
@@ -964,8 +978,6 @@ export function sweep({ now = new Date() } = {}) {
       if (['merged', 'updated'].includes(r.action)) moved = true;
       results.push({ key: t.key, ...r });
     }
-    // Post-deploy watch: reconcile deploys the lock never saw, then run the checkpoints that are due.
-    await deploywatch.sweep({ now: deploywatch.clock.now(), lock: lockGet() }).catch((err) => store.logEvent({ kind: 'error', agent_id: 'system', text: `post-deploy watch: ${String(err.message).slice(0, 200)}` }));
     return results;
   })().finally(() => { sweeping = null; });
   return sweeping;

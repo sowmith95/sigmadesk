@@ -1520,8 +1520,9 @@ export async function deskAction(run, cmd, body = {}) {
       const sha = await runner.headSha(dir);
       // "How to verify in production" (#7): what read-only production checks should show after the deploy.
       const vp = typeof body['verify-prod'] === 'string' ? store.redact(body['verify-prod'].trim()).slice(0, 1500) : '';
-      need(vp || ticket.prod_verify || !deploywatch.tradingPath(ticket) || config.deployWatch?.requireCriteriaForTradingPath === false,
-        'this ticket changes the trading path: add --verify-prod "<what read-only production checks should show after the deploy, and when>"');
+      // The diff is classified later: at submit the ticket's own risk decides (unknown counts as high, like everywhere).
+      need(vp || ticket.prod_verify || ticket.risk === 'low' || config.deployWatch?.requireCriteriaForTradingPath === false,
+        `this ticket ${ticket.risk === 'high' ? 'changes the trading path' : 'has no low risk classification, so it counts as trading-path'}: add --verify-prod "<what read-only production checks should show after the deploy, and when>"`);
       if (vp) store.updateTicket(ticket.key, { prod_verify: vp, prod_verify_by: agentId });
       store.addComment(ticket.key, agentId, `🚀 **Submitted for QA** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}${vp ? `\n\n**How to verify in production:** ${vp}` : ''}`);
       store.addContributor(ticket.key, agentId);

@@ -20,7 +20,7 @@ const PRIORITY = { P0: 0, P1: 1, P2: 2, P3: 3 };
 // A rough sense of the effort, so a spare five minutes finds the right item.
 export const TIME_HINT = { question: 'quick', guard: 'quick', publish: 'quick', epic_review: 'quick', page: 'now', merge: '5 min', research: '5 min',
   plan: '10 min', design: '10 min', council: '10 min', product: '10 min', owner_task: 'needs time',
-  deploy: '5 min', regression: 'now', conflict: '10 min', setup: 'quick', refresh: 'quick', stuck: '10 min' };
+  deploy: '5 min', regression: 'now', watch_schedule: '5 min', conflict: '10 min', setup: 'quick', refresh: 'quick', stuck: '10 min' };
 const OPEN_INCIDENT = new Set(['watching', 'investigating', 'paged', 'ticketed']);
 export const SNOOZE_MAX_DAYS = 30;
 

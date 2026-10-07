@@ -20,7 +20,7 @@ const WATCH: Record<string, { label: string; tone: Tone }> = {
 };
 const wf = (r: { workflow: string; run_id: number; run_attempt: number }) => `${r.workflow.split('/').pop()}${r.run_id ? ` #${r.run_id}${r.run_attempt > 1 ? ` (attempt ${r.run_attempt})` : ''}` : ''}`;
 const CP_TEXT = (c: Checkpoint) => (c.status === 'done' ? `${c.verdict}${c.verdict === 'verified' && c.limited ? ' (limited)' : ''}` : c.status === 'superseded' ? 'not run (superseded)'
-  : c.status === 'needs_sre' || c.status === 'sre_running' ? 'with the SRE' : `due ${hhmm(c.due_at)}`);
+  : c.status === 'needs_sre' || c.status === 'sre_running' ? 'with the SRE' : c.status === 'unschedulable' ? 'could not be scheduled (your Inbox)' : `due ${hhmm(c.due_at)}`);
 
 export function Production({ t }: { t: Ticket }) {
   const [v, setV] = useState<View | null>(null);

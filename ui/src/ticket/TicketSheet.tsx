@@ -11,7 +11,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Panel } from '@/components/desk/Panel';
 import { AsyncButton } from '@/components/desk/AsyncButton';
 import { Tag, Key, Named } from '@/components/desk/Bits';
-import { KIND_LABEL, BUCKET_LABEL, BUCKET_TONE, cardFor, RunCard, Reviews, prReviewsOf, firstName } from '@/components/desk/Work';
+import { KIND_LABEL, BUCKET_LABEL, BUCKET_TONE, cardFor, RunCard, Reviews, prReviewsOf, firstName, DecisionButton } from '@/components/desk/Work';
 import { Conversation, Brief, PrSummary, ProductReview, ResearchReview, Details, Block, type ConvState } from './parts';
 import { Lineage, EpicTree, EpicProgress, childrenOf, isFeatureRoot } from '@/components/desk/Epic';
 import { NextStep, GateSuggestions, EpicReview, OwnerTaskActions } from '@/components/desk/Flow';
@@ -94,6 +94,7 @@ function Footer({ t, dec, d, onDecided, replyRef, onTyping, toMessage, condensed
       <AsyncButton data-primary size="lg" confirm="Clear the deploy hold? Do this after checking the deploy runs: deploying merges continue." run={async () => { await api('POST', '/api/merge-train/clear-deploy', { merge_sha: lock?.merge_sha }); done(); await refresh(); }} ok="Deploy hold cleared">Clear the hold</AsyncButton>
     </div>;
   }
+  if (dec?.kind === 'watch_schedule') return <div className={row}><span className="flex-1 text-sm text-muted-foreground">{dec.reason}</span><DecisionButton it={dec} /></div>;
   if (dec?.kind === 'regression') {
     const w = (dec as BoardItem & { regression?: { id: number } }).regression;
     return <div className={row}><span className="flex-1 text-sm text-muted-foreground">Check production first; the revert (if any) is yours to merge.</span>

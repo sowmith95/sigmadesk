@@ -4,9 +4,9 @@
 // 09:30–16:00 America/New_York (early closes end at 13:00). Wall-clock times are converted with the IANA zone, so DST
 // changes are handled by Intl, never by fixed offsets. The owner can extend or replace the table in the config:
 //   deployWatch.calendar = { timezone, open: "09:30", close: "16:00",
-//                            holidays: ["2028-01-17", ...], earlyCloses: { "2028-11-24": "13:00" }, replace: false }
-// replace: true uses only the configured lists. A year the table does not cover is reported (`known: false`), so a
-// checkpoint scheduled from the weekday rule alone says so in its evidence.
+//                            years: [2028], holidays: ["2028-01-17", ...], earlyCloses: { "2028-11-24": "13:00" }, replace: false }
+// replace: true uses only the configured lists. A year the table does not cover is reported (`known: false`) and the
+// post-deploy watch refuses to guess: its session-open checkpoint is marked unschedulable and goes to the owner.
 import { config } from './config.js';
 
 export const BUILTIN = {
@@ -27,8 +27,9 @@ export function calendar(over = config.deployWatch?.calendar || {}) {
   const replace = o.replace === true;
   const holidays = new Set([...(replace ? [] : BUILTIN.holidays), ...(Array.isArray(o.holidays) ? o.holidays.map(String) : [])]);
   const earlyCloses = { ...(replace ? {} : BUILTIN.earlyCloses), ...(o.earlyCloses && typeof o.earlyCloses === 'object' ? o.earlyCloses : {}) };
-  const years = new Set([...(replace ? [] : BUILTIN.years), ...(Array.isArray(o.years) ? o.years.map(Number) : []),
-    ...[...holidays].map((d) => Number(d.slice(0, 4)))]);
+  // A year counts as covered only when listed (built in, or deployWatch.calendar.years): one holiday added for a new
+  // year does not make the rest of that year's closures known. Uncovered years fail closed (unschedulable → owner).
+  const years = new Set([...(replace ? [] : BUILTIN.years), ...(Array.isArray(o.years) ? o.years.map(Number) : [])]);
   return { timezone: o.timezone || BUILTIN.timezone, open: o.open || BUILTIN.open, close: o.close || BUILTIN.close, holidays, earlyCloses, years };
 }
 
