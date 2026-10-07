@@ -26,6 +26,7 @@ import * as epicReview from './epic-review.js';
 import * as ops from './ops.js';
 import * as access from './access.js';
 import * as mentions from './mentions.js';
+import * as deploywatch from './deploywatch.js';
 import * as flow from '../public/flow.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
@@ -351,6 +352,37 @@ async function launchVerify(t, fence) {
   setStatus(t.key, 'in_progress', { progress_msg: 'verifying in production' });
   await launch({ fence, agentId: 'sre', kind: 'verify', ticket: store.getTicket(t.key), cwd, prompt: promptFor('verify', { ticket: t, comments: store.listComments(t.key) }),
     outcome: (after) => after.status !== 'in_progress' || !!after.owner_task });
+}
+
+// ---------------- post-deploy checkpoints (#7): the SRE interprets anomalies / ticket criteria ----------------
+/**
+ * One capped, read-only `watch` run of the SRE for a checkpoint the desk's own probes could not settle. Admission is the
+ * mention rule (a hard dollar cap, or time and steps on a plan-billed engine) against what is left of THIS checkpoint's
+ * allowance (watch.budgetUsd) across attempts. It never owns a ticket, never publishes, and ends with desk watch.
+ */
+export async function launchWatch(job, fence) {
+  const cp = deploywatch.claimJob(job.checkpoint);
+  const w = store.getWatch(cp.watch_id);
+  let result = {};
+  try {
+    const { cwd } = await readonlyJob('sre', null);
+    store.updateAgent('sre', { current_ticket: w?.ticket_key || null, current_kind: 'watch', last_action: 'checking production after a deploy' });
+    let exhausted = false;
+    const p = runner.startRun({ fence, agentId: 'sre', kind: 'watch', ticketKey: w?.ticket_key || null, cwd, job: { checkpoint: cp.id, watch: cp.watch_id },
+      prompt: deploywatch.prompt(cp),
+      admit: (agent) => { const a = deploywatch.admit(store.getCheckpoint(cp.id), agent); if (a.exhausted) exhausted = true; return a; },
+      onEnd: (run, { steps }) => deploywatch.chargeJob(cp.id, run, steps),
+      onStart: (run) => {
+        if (store.getCheckpoint(cp.id)?.status !== 'sre_running') { runner.killRun(run.id, 'the checkpoint was superseded'); return; }
+        deploywatch.jobStarted(cp, run, { minutes: Number(config.watch?.maxMinutes) || config.limits.runTimeoutMin.watch || 15 });
+      } });
+    const r = await p;
+    if (r.run && !store.kvGet(`watch-charged:${r.run.id}`)) deploywatch.chargeJob(cp.id, r.run, r.steps);
+    result = { refused: r.refused || null, exhausted, failure: !!r.failure || !!r.aborted };
+  } finally {
+    store.updateAgent('sre', { status: 'idle', current_ticket: null, current_run: null, current_kind: null });
+    await deploywatch.jobEnded(cp.id, result).catch((err) => store.logEvent({ kind: 'error', agent_id: 'system', text: `post-deploy check: ${err.message}` }));
+  }
 }
 
 async function launchTriage(t, fence) {
@@ -925,6 +957,11 @@ export async function tick() {
         ? (watch.triageIncidents().investigate || []).sort((a, b) => watch.windowCount(b.signature) - watch.windowCount(a.signature))[0] : null;
       if (next) go('sre', (f) => launchInvestigation(next, f), null, 'investigate');
     }
+    // 1c. Post-deploy checkpoints the desk's own probes could not settle: the SRE interprets them (capped).
+    for (const job of deploywatch.nextJobs()) {
+      if (slots <= 0 || !agentIdle('sre')) break;
+      go('sre', (f) => launchWatch(job, f), null, 'watch');
+    }
     // 2. QA before new implementation: settle work in flight first.
     const qa = store.ticketsByStatus('qa').find((t) => !t.active_run);
     if (qa && slots > 0 && agentIdle('qa')) go('qa', (f) => launchQa(qa, f), null, 'qa');
@@ -1113,6 +1150,17 @@ export function recoverOrphans() {
     else store.updateMention(m.id, { status: 'queued', run_id: null, reason: 'interrupted by a desk restart' });
   }
   mergetrain.recover(); // interrupted conflict resolutions go back to pending (durable, keyed by PR/base/head)
+  // Post-deploy checkpoints: spend is rebuilt from the run rows (never a fresh allowance after a crash), then an
+  // interrupted desk check is due again and an interrupted SRE run is asked again (bounded by sreMaxAttempts).
+  for (const cp of [...store.checkpointsByStatus('sre_running'), ...store.checkpointsByStatus('needs_sre')]) {
+    const runs = store.runsOfCheckpoint(cp.id);
+    const usd = runs.reduce((a, r) => a + (r.cost_usd || 0), 0);
+    const ms = runs.reduce((a, r) => a + Math.max(0, Date.parse(r.ended_at || store.now()) - Date.parse(r.started_at || store.now())), 0);
+    const steps = runs.reduce((a, r) => a + (r.steps || 0), 0);
+    store.updateCheckpoint(cp.id, { spent_usd: Math.max(usd, cp.spent_usd || 0), spent_ms: Math.max(ms, cp.spent_ms || 0), steps_used: Math.max(steps, cp.steps_used || 0) });
+    for (const r of runs) store.kvSet(`watch-charged:${r.id}`, '1');
+  }
+  deploywatch.recover();
   for (const a of store.listAgentStates()) store.updateAgent(a.id, { status: 'idle', current_ticket: null, current_run: null, current_kind: null, meeting: null });
   for (const t of store.listTickets()) {
     if (t.active_run) store.updateTicket(t.key, { active_run: null, ...(t.status === 'in_progress' ? { status: 'todo' } : {}) });
@@ -1129,7 +1177,7 @@ const PERMS = {
   route: ['support'], submit: ENGINEERS, lesson: BUILDERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
   review: ['manager', ...ENGINEERS], respond: ENGINEERS, resolve: ENGINEERS,
-  'continue-rebase': BUILDERS, verify: ['sre'], access: ['manager', 'sre'],
+  'continue-rebase': BUILDERS, verify: ['sre'], watch: ['sre'], access: ['manager', 'sre'],
 };
 const PRIORITY = /^P[0-3]$/;
 const consultsByRun = new Map();
@@ -1171,6 +1219,9 @@ export async function deskAction(run, cmd, body = {}) {
   } else need(!['reply', 'handoff'].includes(cmd), `desk ${cmd} only works in a run where the owner tagged you`);
   if (run.kind === 'access_review') need(['show', 'list', 'access'].includes(cmd), 'an access review decides one request: desk access approve|deny|owner');
   if (run.kind === 'verify') need(['show', 'list', 'comment', 'progress', 'ops', 'verify', 'context-file'].includes(cmd), 'a verify run reads production through desk ops and finishes with desk verify done|owner');
+  // A post-deploy checkpoint run reads and decides; it never comments, submits, publishes or changes a ticket.
+  if (run.kind === 'watch') need(['show', 'list', 'ops', 'watch', 'context-file'].includes(cmd), 'a post-deploy check reads production through desk ops and finishes with desk watch verified|regression|inconclusive');
+  else need(cmd !== 'watch', 'desk watch only works inside a post-deploy check run');
   if (PERMS[cmd]) need(PERMS[cmd].includes(agentId), `${agentById[agentId].role} cannot run "${cmd}"`);
   const key = body.key || run.ticket_key;
   const ticket = key ? store.getTicket(key) : null;
@@ -1467,7 +1518,12 @@ export async function deskAction(run, cmd, body = {}) {
       const dir = runner.workspaceDir(ticket.key);
       need(await runner.commitsAhead(dir) > 0, 'no commits on your branch yet — git add + git commit your work first');
       const sha = await runner.headSha(dir);
-      store.addComment(ticket.key, agentId, `🚀 **Submitted for QA** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
+      // "How to verify in production" (#7): what read-only production checks should show after the deploy.
+      const vp = typeof body['verify-prod'] === 'string' ? store.redact(body['verify-prod'].trim()).slice(0, 1500) : '';
+      need(vp || ticket.prod_verify || !deploywatch.tradingPath(ticket) || config.deployWatch?.requireCriteriaForTradingPath === false,
+        'this ticket changes the trading path: add --verify-prod "<what read-only production checks should show after the deploy, and when>"');
+      if (vp) store.updateTicket(ticket.key, { prod_verify: vp, prod_verify_by: agentId });
+      store.addComment(ticket.key, agentId, `🚀 **Submitted for QA** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}${vp ? `\n\n**How to verify in production:** ${vp}` : ''}`);
       store.addContributor(ticket.key, agentId);
       setStatus(ticket.key, 'qa', { head_sha: sha, progress: 90, progress_msg: 'waiting for QA', builder: ticket.builder || agentId });
       ev(`submitted ${ticket.key} for QA (${sha.slice(0, 7)})`);
@@ -1580,7 +1636,10 @@ export async function deskAction(run, cmd, body = {}) {
       need(body.body, 'say what you found (done) or why no read-only probe can answer it (owner)');
       if (body.action === 'done') {
         // "Verified" must rest on evidence: at least one successful, audited probe in THIS run.
-        need(store.opsSucceededInRun(run.id) > 0, 'no successful production probe in this run yet: run the desk ops probe that answers the question first (or desk verify owner "<why>")');
+        // Fresh and healthy only: a cached answer was observed for someone else, and an app answering 5xx is not health.
+        need(store.opsSucceededInRun(run.id) > 0, store.opsUnhealthyInRun(run.id)
+          ? 'the only production evidence in this run shows the application UNHEALTHY (HTTP 5xx): that is not a verification — report what is broken (desk verify owner "<what production shows>")'
+          : 'no fresh successful production probe in this run yet (cached answers do not count): run the desk ops probe that answers the question first (or desk verify owner "<why>")');
         store.addComment(ticket.key, agentId, `🔎 **Verified in production (read-only probes):** ${body.body}`);
         store.kvSet(`verify:${ticket.key}`, 'done');
         setStatus(ticket.key, 'done', { progress: 100, progress_msg: 'verified in production' });
@@ -1595,6 +1654,8 @@ export async function deskAction(run, cmd, body = {}) {
       github.flushComments();
       return 'Handed to the owner. Stop now.';
     }
+    case 'watch':
+      return deploywatch.command(run, body);
     case 'review':
       return reviews.reviewVerdict(run, ticket, body);
     case 'respond':
@@ -2064,6 +2125,17 @@ export async function ownerDecision(key, { decision, message = '', expected_upda
     github.syncIssueState(key); if (t.parent_key) rollupParent(t.parent_key);
   } else setStatus(key, t.status === 'ready_for_human' ? 'todo' : t.resume_status || 'todo', patch);
   github.flushComments(); return store.getTicket(key);
+}
+
+/** The owner writes (or replaces) a ticket's "How to verify in production" criteria. Empty text clears them. */
+export function ownerProdVerify(key, { text = '' } = {}) {
+  const t = store.getTicket(key);
+  need(t, 'no such ticket');
+  const v = store.redact(String(text || '').trim()).slice(0, 1500);
+  store.updateTicket(key, { prod_verify: v || null, prod_verify_by: v ? 'owner' : null });
+  store.addComment(key, 'owner', v ? `🔎 **How to verify in production** (set by the owner): ${v}` : '🔎 The owner removed the "How to verify in production" criteria.');
+  github.flushComments();
+  return store.getTicket(key);
 }
 
 /**

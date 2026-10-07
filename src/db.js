@@ -410,6 +410,81 @@ CREATE TABLE IF NOT EXISTS ops_requests (
   grant_id INTEGER,
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- Post-deploy watch (#7). One row per deploy workflow run (attempt) of a merge commit, written in the same transaction
+-- that releases or holds the deploy lock (or by reconciliation for deploys the desk did not see). status: success |
+-- failed | unknown (never confirmed; owner-cleared holds stay failed/unknown). run_id 0 = no run was ever seen.
+CREATE TABLE IF NOT EXISTS deploy_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  deploy_key TEXT NOT NULL,       -- one deployment: the lock id, or run:<id>:<attempt> for reconciled runs
+  merge_sha TEXT NOT NULL,
+  ticket_key TEXT,
+  pr INTEGER,
+  workflow TEXT NOT NULL,         -- workflow file
+  run_id INTEGER NOT NULL DEFAULT 0,
+  run_attempt INTEGER NOT NULL DEFAULT 1,
+  target TEXT,                    -- deploy.targets[workflow] (service/environment), null = unknown target
+  status TEXT NOT NULL,
+  conclusion TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  source TEXT NOT NULL,           -- desk | owner | external
+  event TEXT,                     -- the run's trigger (push, workflow_dispatch, …) when known
+  cleared_by TEXT,                -- the owner cleared this hold (status stays failed/unknown)
+  recorded_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(merge_sha, workflow, run_id, run_attempt)
+);
+CREATE INDEX IF NOT EXISTS deploy_history_key ON deploy_history(deploy_key);
+CREATE INDEX IF NOT EXISTS deploy_history_ticket ON deploy_history(ticket_key);
+-- A durable watch over one successful deployment, with checkpoints (T+5 smoke, T+30, next session open + 5).
+CREATE TABLE IF NOT EXISTS deploy_watches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  deploy_key TEXT UNIQUE NOT NULL,
+  merge_sha TEXT NOT NULL,
+  ticket_key TEXT,
+  pr INTEGER,
+  target TEXT,
+  workflows TEXT,                 -- JSON [{workflow, run_id, run_attempt}]
+  source TEXT,
+  deployed_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'watching', -- watching | verified | regression | inconclusive | superseded
+  verdict_note TEXT,
+  baseline TEXT,                  -- JSON, captured at merge (bounded timestamps)
+  criteria TEXT,                  -- the ticket's "How to verify in production" text, if any
+  criteria_source TEXT,           -- ticket | derived
+  trading_path INTEGER NOT NULL DEFAULT 0,
+  superseded_by INTEGER,
+  hold INTEGER NOT NULL DEFAULT 0, -- 1 while a suspected regression holds deploying merges (owner clears)
+  cleared_by TEXT,
+  cleared_at TEXT,
+  incident_key TEXT,
+  revert_key TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS deploy_watches_status ON deploy_watches(status);
+CREATE TABLE IF NOT EXISTS watch_checkpoints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  watch_id INTEGER NOT NULL,
+  name TEXT NOT NULL,             -- smoke | settle | session_open
+  due_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | running | needs_sre | sre_running | done | superseded
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  verdict TEXT,                   -- verified | regression | inconclusive
+  limited INTEGER NOT NULL DEFAULT 0,
+  summary TEXT,
+  evidence TEXT,                  -- JSON: identity, items [{criterion, probe, observed_at, threshold, observed, result, note}], coverage
+  sre_reason TEXT,
+  sre_attempts INTEGER NOT NULL DEFAULT 0,
+  run_id INTEGER,
+  spent_usd REAL DEFAULT 0,
+  spent_ms INTEGER DEFAULT 0,
+  steps_used INTEGER DEFAULT 0,
+  completed_at TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(watch_id, name)
+);
+CREATE INDEX IF NOT EXISTS watch_checkpoints_status ON watch_checkpoints(status, due_at);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -466,7 +541,15 @@ function migrate() {
       // the owner set this priority: grooming, epic reviews and the program manager leave it alone
       priority_pinned: 'INTEGER DEFAULT 0',
       // when it shipped (set once on done; later edits move updated_at, never this)
-      done_at: 'TEXT' },
+      done_at: 'TEXT',
+      // "How to verify in production" (#7): the builder's criteria at submit (or the owner's), and who wrote them
+      prod_verify: 'TEXT', prod_verify_by: 'TEXT',
+      // a revert prepared after a suspected regression: only the owner merges it (never the merge train)
+      owner_merge_only: 'INTEGER DEFAULT 0' },
+    // health: an app probe that answered but reported the application unhealthy (HTTP 5xx) is not evidence of health
+    ops_audit: { health: 'TEXT' },
+    // a post-deploy checkpoint's run-bound grant names its checkpoint (re-checked at every probe)
+    ops_grants: { watch_checkpoint: 'INTEGER' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     // prod_access 0: the owner chose "ask me in my Inbox" for this delivery, so its run never gets automatic access
@@ -646,7 +729,8 @@ const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', '
   'branch', 'pr_url', 'issue_number', 'progress', 'progress_msg', 'qa_loops', 'stalls', 'head_sha', 'origin_session', 'after_key', 'active_run', 'resume_status', 'parent_key',
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
   'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base',
-  'research_program', 'research_run', 'research_policy', 'research_review', 'research_generation', 'research_revisions', 'research_sources']);
+  'research_program', 'research_run', 'research_policy', 'research_review', 'research_generation', 'research_revisions', 'research_sources',
+  'prod_verify', 'prod_verify_by', 'owner_merge_only']);
 
 export function updateTicket(key, patch) {
   // When it shipped, recorded once by whichever path finishes it (merge sync, epic roll-up, owner).
@@ -704,9 +788,9 @@ export const sanitizeForGithub = (text) => redact(scrubValues(text));
 
 // ---------- ops audit ----------
 export function insertOpsAudit(a) {
-  const info = q('INSERT INTO ops_audit(run_id,agent_id,ticket_key,incident_id,probe,params,duration_ms,bytes,outcome,detail) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
+  const info = q('INSERT INTO ops_audit(run_id,agent_id,ticket_key,incident_id,probe,params,duration_ms,bytes,outcome,detail,health) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(
     a.run_id ?? null, a.agent_id ?? null, a.ticket_key ?? null, a.incident_id ?? null, String(a.probe), redact(JSON.stringify(a.params ?? {})).slice(0, 1000),
-    a.duration_ms ?? null, a.bytes ?? null, String(a.outcome), a.detail == null ? null : redact(String(a.detail)).slice(0, 500));
+    a.duration_ms ?? null, a.bytes ?? null, String(a.outcome), a.detail == null ? null : redact(String(a.detail)).slice(0, 500), a.health ?? null);
   return Number(info.lastInsertRowid);
 }
 /** Probes that actually reached production (cache hits and refusals excluded), optionally for one run. */
@@ -715,8 +799,8 @@ export function opsExecutedSince(sinceIso, runId = null) {
   return q(sql).get(...(runId == null ? [sinceIso] : [sinceIso, runId])).n;
 }
 export function insertGrant(g) {
-  const info = q('INSERT INTO ops_grants(seat,probes,expires_at,ticket_key,run_id,standing,granted_by,request_id,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(
-    g.seat, JSON.stringify(g.probes), g.expires_at ?? null, g.ticket_key ?? null, g.run_id ?? null, g.standing ? 1 : 0, g.granted_by, g.request_id ?? null, g.reason ?? null);
+  const info = q('INSERT INTO ops_grants(seat,probes,expires_at,ticket_key,run_id,standing,granted_by,request_id,reason,watch_checkpoint) VALUES (?,?,?,?,?,?,?,?,?,?)').run(
+    g.seat, JSON.stringify(g.probes), g.expires_at ?? null, g.ticket_key ?? null, g.run_id ?? null, g.standing ? 1 : 0, g.granted_by, g.request_id ?? null, g.reason ?? null, g.watch_checkpoint ?? null);
   return getGrant(Number(info.lastInsertRowid));
 }
 export const getGrant = (id) => q('SELECT * FROM ops_grants WHERE id=?').get(id) || null;
@@ -741,7 +825,10 @@ export function updateAccessRequest(id, patch) {
 }
 export const openAccessRequests = () => q("SELECT * FROM ops_requests WHERE status IN ('pending','reviewing','owner') ORDER BY id").all();
 export const accessRequestHistory = (limit = 50) => q('SELECT * FROM ops_requests ORDER BY id DESC LIMIT ?').all(limit);
-export function opsSucceededInRun(runId) { return q("SELECT COUNT(*) n FROM ops_audit WHERE run_id=? AND outcome IN ('ok','cached')").get(runId).n; }
+/** Fresh evidence only: probes that reached production in this run and did not report the application unhealthy. A
+ * cached answer was observed for someone else, earlier: it never counts as this run's evidence. */
+export function opsSucceededInRun(runId) { return q("SELECT COUNT(*) n FROM ops_audit WHERE run_id=? AND outcome='ok' AND COALESCE(health,'') <> 'unhealthy'").get(runId).n; }
+export function opsUnhealthyInRun(runId) { return q("SELECT COUNT(*) n FROM ops_audit WHERE run_id=? AND outcome='ok' AND health='unhealthy'").get(runId).n; }
 export function listOpsAudit(limit = 50) {
   return q('SELECT * FROM ops_audit ORDER BY id DESC LIMIT ?').all(limit);
 }
@@ -1152,6 +1239,7 @@ export const mentionsFor = (key) => q('SELECT * FROM mention_deliveries WHERE ti
 export const mentionsOfComment = (commentId) => q('SELECT * FROM mention_deliveries WHERE comment_id=? ORDER BY id').all(commentId);
 export const openMentions = () => q("SELECT * FROM mention_deliveries WHERE status IN ('queued','working') ORDER BY id").all();
 /** Every run that served this delivery (the server-owned run job names it): the source of truth for its allowance. */
+export const runsOfCheckpoint = (id) => q("SELECT * FROM runs WHERE kind='watch' AND json_extract(job, '$.checkpoint') = ? ORDER BY id").all(id);
 export const runsOfMention = (id) => q("SELECT * FROM runs WHERE kind='mention' AND json_extract(job, '$.mention') = ? ORDER BY id").all(id);
 export const mentionsSince = (key, iso) => q('SELECT COUNT(*) n FROM mention_deliveries WHERE ticket_key=? AND created_at>=?').get(key, iso).n;
 /** One delivery per (comment, seat): a repeat is ignored and the existing row returned. */
@@ -1184,6 +1272,62 @@ export function updateDiscussion(id, patch) {
   if (cols.length) q(`UPDATE owner_discussions SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
   const d = getDiscussion(id); announce({ type: 'discussion', data: d }); return d;
 }
+// ---------- post-deploy watch (#7) ----------
+const DH_COLS = ['deploy_key', 'merge_sha', 'ticket_key', 'pr', 'workflow', 'run_id', 'run_attempt', 'target', 'status', 'conclusion', 'started_at', 'completed_at', 'source', 'event', 'cleared_by'];
+/** Insert a deploy run row once (merge sha, workflow, run, attempt); returns {row, created}. */
+export function recordDeploy(d) {
+  const v = { run_id: 0, run_attempt: 1, ...d };
+  const info = q(`INSERT OR IGNORE INTO deploy_history(${DH_COLS.join(',')}) VALUES (${DH_COLS.map(() => '?').join(',')})`).run(...DH_COLS.map((c) => v[c] ?? null));
+  const row = q('SELECT * FROM deploy_history WHERE merge_sha=? AND workflow=? AND run_id=? AND run_attempt=?').get(v.merge_sha, v.workflow, v.run_id || 0, v.run_attempt || 1);
+  if (info.changes) announce({ type: 'deploy', data: row });
+  return { row, created: info.changes > 0 };
+}
+export function updateDeploy(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['status', 'conclusion', 'completed_at', 'cleared_by'].includes(k));
+  if (cols.length) q(`UPDATE deploy_history SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
+  return q('SELECT * FROM deploy_history WHERE id=?').get(id);
+}
+export const deploysByKey = (k) => q('SELECT * FROM deploy_history WHERE deploy_key=? ORDER BY id').all(k);
+export const deploysForTicket = (k) => q('SELECT * FROM deploy_history WHERE ticket_key=? ORDER BY id').all(k);
+export const deploysForSha = (sha) => q('SELECT * FROM deploy_history WHERE merge_sha=? ORDER BY id').all(sha);
+export const deployRun = (runId, attempt) => q('SELECT * FROM deploy_history WHERE run_id=? AND run_attempt=? LIMIT 1').get(runId, attempt) || null;
+export const deploysSince = (iso) => q('SELECT * FROM deploy_history WHERE COALESCE(completed_at, recorded_at) >= ? ORDER BY id').all(iso);
+export const deployWorkflowsSeen = () => q('SELECT DISTINCT workflow FROM deploy_history').all().map((r) => r.workflow);
+export const recentDeploys = (limit = 50) => q('SELECT * FROM deploy_history ORDER BY id DESC LIMIT ?').all(limit);
+
+const W_COLS = ['deploy_key', 'merge_sha', 'ticket_key', 'pr', 'target', 'workflows', 'source', 'deployed_at', 'baseline', 'criteria', 'criteria_source', 'trading_path'];
+export function createWatch(w) {
+  const info = q(`INSERT OR IGNORE INTO deploy_watches(${W_COLS.join(',')}) VALUES (${W_COLS.map(() => '?').join(',')})`).run(...W_COLS.map((c) => (w[c] === undefined ? null : w[c])));
+  const row = q('SELECT * FROM deploy_watches WHERE deploy_key=?').get(w.deploy_key);
+  if (info.changes) announce({ type: 'watch', data: row });
+  return { watch: row, created: info.changes > 0 };
+}
+export const getWatch = (id) => q('SELECT * FROM deploy_watches WHERE id=?').get(id) || null;
+export const watchByKey = (k) => q('SELECT * FROM deploy_watches WHERE deploy_key=?').get(k) || null;
+export const watchesForTicket = (k) => q('SELECT * FROM deploy_watches WHERE ticket_key=? ORDER BY id').all(k);
+export const activeWatches = () => q("SELECT * FROM deploy_watches WHERE status='watching' ORDER BY id").all();
+export const heldWatches = () => q('SELECT * FROM deploy_watches WHERE hold=1 ORDER BY id').all();
+export const watchesSince = (iso) => q('SELECT * FROM deploy_watches WHERE deployed_at >= ? ORDER BY id').all(iso);
+export const recentWatches = (limit = 30) => q('SELECT * FROM deploy_watches ORDER BY id DESC LIMIT ?').all(limit);
+export function updateWatch(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['status', 'verdict_note', 'superseded_by', 'hold', 'cleared_by', 'cleared_at', 'incident_key', 'revert_key', 'baseline'].includes(k));
+  if (cols.length) q(`UPDATE deploy_watches SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), now(), id);
+  const row = getWatch(id); announce({ type: 'watch', data: row }); return row;
+}
+export function createCheckpoint(c) {
+  q('INSERT OR IGNORE INTO watch_checkpoints(watch_id,name,due_at,next_attempt_at) VALUES (?,?,?,?)').run(c.watch_id, c.name, c.due_at, c.due_at);
+  return q('SELECT * FROM watch_checkpoints WHERE watch_id=? AND name=?').get(c.watch_id, c.name);
+}
+export const getCheckpoint = (id) => q('SELECT * FROM watch_checkpoints WHERE id=?').get(id) || null;
+export const checkpointsOf = (watchId) => q('SELECT * FROM watch_checkpoints WHERE watch_id=? ORDER BY due_at, id').all(watchId);
+export const dueCheckpoints = (at) => q("SELECT * FROM watch_checkpoints WHERE status='pending' AND COALESCE(next_attempt_at, due_at) <= ? ORDER BY due_at, id").all(at);
+export const checkpointsByStatus = (status) => q('SELECT * FROM watch_checkpoints WHERE status=? ORDER BY due_at, id').all(status);
+export function updateCheckpoint(id, patch) {
+  const cols = Object.keys(patch).filter((k) => ['status', 'attempts', 'next_attempt_at', 'verdict', 'limited', 'summary', 'evidence', 'sre_reason', 'sre_attempts', 'run_id', 'spent_usd', 'spent_ms', 'steps_used', 'completed_at'].includes(k));
+  if (cols.length) q(`UPDATE watch_checkpoints SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
+  const row = getCheckpoint(id); announce({ type: 'checkpoint', data: row }); return row;
+}
+
 export function kvGet(key) {
   db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
   return q('SELECT value FROM kv WHERE key=?').get(key)?.value ?? null;

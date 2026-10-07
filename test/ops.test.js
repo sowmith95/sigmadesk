@@ -653,7 +653,7 @@ test('routing: a read-only production check goes to the SRE (not the owner); wri
   const vr = mkRun('sre', 'verify', k);
   await rejects(sched.deskAction(vr, 'groom', { key: k }), /a verify run reads production/);
   // "Verified" needs evidence: a successful probe in this run.
-  await rejects(sched.deskAction(vr, 'verify', { action: 'done', body: 'looks fine' }), /no successful production probe in this run/);
+  await rejects(sched.deskAction(vr, 'verify', { action: 'done', body: 'looks fine' }), /no fresh successful production probe in this run/);
   grant('sre'); resetPsql();
   await ops.handle(vr, { probe: 'timescale_jobs', db: 'timescale' });
   assert.match(await sched.deskAction(vr, 'verify', { action: 'done', body: 'job 1003 fails: chunk lock timeout since 09:41' }), /Recorded/);

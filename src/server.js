@@ -24,6 +24,7 @@ import * as prsync from './prsync.js';
 import * as prs from './prs.js';
 import * as reviews from './reviews.js';
 import * as mergetrain from './mergetrain.js';
+import * as deploywatch from './deploywatch.js';
 import * as refresh from './refresh.js';
 import { nameOf } from '../public/names.js';
 import * as dispatch from './dispatch.js';
@@ -87,6 +88,7 @@ export function snapshot({ inbox = true } = {}) {
       merge_states: mergeStates(undefined, mergeReasons), // per ticket ready to merge: queued / scheduled / held / owner / merging … (the request tracker reads it)
       merge_reasons: mergeReasons,
       deploy_lock: mergetrain.deployState(), // as stored (refreshed by the PR sync loop): the request tracker reads it
+      production: deploywatch.summary(), // post-deploy watch (#7): regression holds, active watches, deployment KPIs
       lessons: store.listLessons(),
       groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
       research: research.status(settings), research_reviews: researchReview.summaries(), ops: ops.describe(settings), access: access.summary(),
@@ -293,6 +295,11 @@ async function ownerRoute(req, res) {
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/merge-hold$'))) { const b = await readBody(req); return send(res, 200, mergetrain.setHold(mm[1], b.hold !== false, b.reason)); }
   if (req.method === 'GET' && p === '/api/ci/required-checks') return send(res, 200, { ...prs.requiredChecks(), history: JSON.parse(store.kvGet('ci:history') || '[]'), workflows: JSON.parse(store.kvGet('ci:check-files') || '{}') });
   if (req.method === 'POST' && p === '/api/ci/required-checks') { const b = await readBody(req); return send(res, 200, prs.setRequiredChecks(b.names || [], b.learn === true ? 'auto' : 'owner')); }
+  // ---- post-deploy watch (#7) ----
+  if (req.method === 'GET' && (mm = m('^/api/tickets/KEY/production$'))) { const v = deploywatch.ticketView(mm[1]); return v ? send(res, 200, v) : send(res, 404, { error: 'not found' }); }
+  if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/prod-verify$'))) return send(res, 200, sched.ownerProdVerify(mm[1], await readBody(req)));
+  if (req.method === 'GET' && p === '/api/deploys') return send(res, 200, { ...deploywatch.summary(), recent: store.recentDeploys(50), watches: store.recentWatches(30).map((w) => deploywatch.watchView(w)) });
+  if (req.method === 'POST' && p === '/api/deploy/regression-hold/clear') { const b = await readBody(req); return send(res, 200, { watch: deploywatch.watchView(deploywatch.clearRegressionHold(b.watch_id, { by: 'owner', note: b.note || '' })) }); }
   if (req.method === 'POST' && p === '/api/merge-train/clear-deploy') return send(res, 200, { cleared: mergetrain.ownerClearDeploy(await readBody(req)) });
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/approve-publish$'))) { await sched.ownerApprovePublish(mm[1]); return send(res, 200, { ok: true }); }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/name$'))) {

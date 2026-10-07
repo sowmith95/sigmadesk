@@ -48,7 +48,7 @@ const DEFAULTS = {
     busyWindow: { enabled: false, timezone: 'America/New_York', days: [1, 2, 3, 4, 5], start: '09:30', end: '16:15', maxConcurrent: 1 },
     dailyBudgetUsd: 150,
     runBudgetUsd: { fable: 8, opus: 5, sonnet: 3, haiku: 0.75 },
-    runTimeoutMin: { implement: 45, qa: 20, review: 20, pr_review: 25, respond: 45, resolve: 30, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, verify: 15, access_review: 5, design: 20, council_review: 5, feature_groom: 25, epic_review: 20, mention: 15 },
+    runTimeoutMin: { implement: 45, qa: 20, review: 20, pr_review: 25, respond: 45, resolve: 30, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, verify: 15, watch: 15, access_review: 5, design: 20, council_review: 5, feature_groom: 25, epic_review: 20, mention: 15 },
     maxQaLoops: 2,
     planHoldAt: 0.8, // hold new runs when the Claude plan's 5-hour window is this full (leave room for you)
     maxConsultsPerGroom: 1,
@@ -91,6 +91,28 @@ const DEFAULTS = {
     workflows: 'auto',
     waitMinutes: 45, // after a deploying merge, wait this long for its deploy run before asking the owner
     graceMinutes: 3, // no deploy run seen this long after the merge = the merge did not trigger one
+    // Which service/environment each deploying workflow redeploys, e.g. {"deploy-mac-mini.yml": "alpaca-trader"}.
+    // Part of every deployment's identity; a workflow without an entry deploys an "unknown target".
+    targets: {},
+  },
+  // Post-deploy watch (#7): after a deploy finishes, the desk itself checks production at T+5 min (smoke), T+30 min
+  // and the next exchange session open + 5 min, against a baseline captured at merge. The SRE model is woken only for
+  // anomalies or a ticket's own "how to verify in production" criteria (budget: watch.budgetUsd per checkpoint).
+  deployWatch: {
+    enabled: true,
+    checkpoints: { smokeMinutes: 5, settleMinutes: 30, sessionOpenOffsetMinutes: 5 },
+    // NYSE calendar override/extension (src/exchange-calendar.js): { holidays: [...], earlyCloses: {date: "13:00"}, replace }
+    calendar: {},
+    freshnessMaxLagSeconds: 300, // an ingest source lagging more than this (while the session is open) is stale
+    newSignatureMinCount: 3, // a NEW error signature seen this often after the deploy = regression suspected
+    maxLogContainers: 3, // containers whose logs since the deploy are read per checkpoint
+    retryMinutes: [2, 5, 10], // a checkpoint that could not observe (or saw a hard failure once) is retried after these
+    overdueMinutes: 20, // a checkpoint run this late says so in its evidence
+    missedHours: 6, // a smoke/T+30 checkpoint this late is not run any more: inconclusive (the desk was down)
+    baselineMaxAgeMinutes: 60, // a baseline older than this before the merge is not a baseline
+    sreMaxAttempts: 2, // SRE interpretation runs per checkpoint (interruptions), then inconclusive
+    // Trading-path (high-risk) tickets without "How to verify in production" criteria cannot merge.
+    requireCriteriaForTradingPath: true,
   },
   // Merge train: serialized merges, a free conflict check after every base move, real conflicts to the builder.
   mergeTrain: {
@@ -135,6 +157,11 @@ const DEFAULTS = {
     stormSignatures: 8, // this many new signatures at once = outage: one page to the owner, no tickets
     maxInvestigationsPerHour: 4,
     regressionGraceMinutes: 45, // a resolved signature seen again after this long = regression
+    // Post-deploy checkpoint interpretation by the SRE (deployWatch): a hard cap per checkpoint across its attempts, or
+    // for a plan-billed engine without a cap, these time and step limits.
+    budgetUsd: 1,
+    maxMinutes: 10,
+    maxSteps: 40,
   },
   // Push to your phone when the desk needs you (Discord/Slack webhook or an ntfy.sh topic URL).
   notify: {
@@ -182,7 +209,7 @@ const DEFAULTS = {
   ops: {
     enabled: false,
     // Run kinds in which a seat holding a grant may probe. WHO may probe is decided by grants (access.*), not here.
-    kinds: ['investigate', 'consult', 'verify', 'design', 'mention'],
+    kinds: ['investigate', 'consult', 'verify', 'design', 'mention', 'watch'],
     // Host psql binary (a path, or [path, ...fixed args]). Empty = `psql` on PATH. Wrappers that reach into containers
     // (docker/podman/kubectl exec, ssh, a shell) are refused: credentials stay in the owner's pgpass/service file.
     psql: '',
@@ -222,6 +249,9 @@ const DEFAULTS = {
       // The owner tagged a seat in a ticket conversation: a read-only probe request from that tagged run is granted for
       // that run only (at most 60 min), within this policy. Approver seats and renewals still go to the owner.
       ownerMentionAutoGrant: true,
+      // Post-deploy checkpoint runs get a run-bound grant to exactly the probes the checkpoint needs, expiring with the
+      // run, re-checked at every probe (switching this off ends them). Off unless the owner opts in.
+      postDeployAutoGrant: false,
     },
   },
   // Per-agent overrides keyed by agent id, e.g. {"junior": {"model": "haiku"}, "pm": {"enabled": false}}

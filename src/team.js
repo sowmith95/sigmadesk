@@ -145,7 +145,7 @@ export function permissionsFor(kind, cwd = '/nonexistent', opts = {}) {
   // dontAsk silently denies harmless commands Claude Code wants to confirm, e.g. anything with $(...).
   const extra = [...(config.project.extraAllowedBash || []), ...(config.sandbox.enabled && kind !== 'triage' ? ['Bash(*)'] : [])];
   if (kind === 'implement' || kind === 'respond' || kind === 'resolve') return { tools: TOOLSET.write, allow: [...READ_RULES, ...TEST_RULES, ...WRITE_RULES, ...writeRules(cwd), ...extra] };
-  if (kind === 'qa' || kind === 'review' || kind === 'pr_review' || kind === 'investigate' || kind === 'verify') return { tools: TOOLSET.read, allow: [...READ_RULES, ...TEST_RULES, ...extra] };
+  if (kind === 'qa' || kind === 'review' || kind === 'pr_review' || kind === 'investigate' || kind === 'verify' || kind === 'watch') return { tools: TOOLSET.read, allow: [...READ_RULES, ...TEST_RULES, ...extra] };
   if (kind === 'triage') return { tools: TOOLSET.triage, allow: ['Read', 'Grep', 'Glob', 'Bash(desk *)'] };
   if (kind === 'design') return { tools: TOOLSET.read, allow: [...READ_RULES, ...extra] };
   if (kind === 'research' || kind === 'research_revision') {
@@ -410,7 +410,8 @@ Optional: --type bug|feature|task --priority P0-P3. Be fast; do not investigate 
 - Start with \`desk progress 5 "reading code"\` and report at each milestone (or keep a TodoWrite list).
 - Run only the tests relevant to your change (the playbook says how).
 - Commit as you go (git add / git commit). Do not push.
-- Finish with: desk submit "<summary: what changed, how you tested it, risks>". If QA failed before, fix every QA note.
+- Finish with: desk submit --verify-prod "<how to verify in production>" "<summary: what changed, how you tested it, risks>". If QA failed before, fix every QA note.
+- --verify-prod: what someone with read-only production access should see once this is deployed (a log line, a health or freshness value, an error that stops) and when (right after the deploy, or at the next market open). Trading-path changes cannot merge without it.
 - Fixing QA notes? If the mistake is one the team should not repeat, propose one sentence: desk lesson "<lesson>".`;
     case 'qa':
       return `${head}\nYou are the independent risk check for branch ${t.branch} (cwd is its clone, at the submitted commit).
@@ -481,6 +482,7 @@ Your cwd is a read-only snapshot of exactly commit ${x.sha} (detached). Inspect 
   git log --oneline origin/${config.project.baseBranch}..HEAD
   git diff origin/${config.project.baseBranch}...HEAD
 Check correctness, edge cases, failure modes, tests, scope creep, and anything risky (money, orders, auth, data, deploys).
+How to verify in production (from the builder; the desk checks it after the deploy): ${t.prod_verify ? `"${String(t.prod_verify).replace(/\s+/g, ' ').slice(0, 600)}"` : '(none given)'}. Check that it is concrete, observable with read-only probes and would catch this change failing; a vague or missing one on trading-path work is a blocking finding.
 Run tests if it helps. Do not edit, commit or push — nothing you change here is ever used.
 ${x.thread ? `\nEarlier review conversation on this ticket (finding ids in brackets):\n${x.thread}\nIf the author pushed back and convinced you, approve and say so. A point you still hold must be raised again as a new finding.\n` : ''}
 Write for the owner, who will read your words on the GitHub PR: plain language, short, concrete. No jargon dumps.
