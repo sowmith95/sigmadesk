@@ -418,6 +418,59 @@ answers it with probes under a ticket-scoped grant; it comes to you only if no p
    desk passes psql an environment without any inherited `PG*` variables. Passwords in the config are refused.
 4. Restart the desk, turn on **Settings → Production read access**, and grant (or let the EM approve) access as needed.
 
+## Post-deploy watch: does the change work in production?
+
+A merge is not a deploy, and a deploy is not a verified change. After every deploying merge the desk records the
+deploy and then checks production itself.
+
+- **Deploy history.** One row per deploy workflow run of a merge commit: workflow, run id, **run attempt**, target,
+  status, completion time and source (`desk`, `owner` or `external`). It is written in the same transaction that
+  releases (or holds) the merge train's deploy lock, so a crash never leaves a released lock without its record and its
+  watch. A failed or never-confirmed deploy stays `failed`/`unknown` in the history even after you clear the hold.
+  Every ~10 minutes the desk also compares GitHub's recent runs of the deploying workflows with the history: a re-run
+  (a new attempt), a manual `workflow_dispatch` or a push it missed becomes an `external` deployment.
+- **Targets.** `deploy.targets` names what each deploying workflow redeploys, e.g.
+  `{"deploy-mac-mini.yml": "alpaca-trader"}`. Without an entry the deployment's target is "unknown". A newer
+  deployment of the same (or an unknown) target **supersedes** the older watch: its remaining checks stop.
+- **Checkpoints.** T+5 min (smoke), T+30 min, and the **next exchange session open + 5 min**. The calendar is a small
+  built-in NYSE table for 2026–2027 (holidays, 13:00 early closes, regular session 09:30–16:00 America/New_York, DST
+  through the time zone database). Extend or replace it with `deployWatch.calendar`:
+  `{"holidays": ["2028-01-17"], "earlyCloses": {"2028-11-24": "13:00"}, "replace": false}`. A year outside the table
+  falls back to the weekday rule and the ticket comment says so — add the year before it starts.
+- **Baselines.** Just before a deploying merge the desk reads production (container restarts, start times and images,
+  error signatures in the last 30 minutes of logs, ingest freshness). The baseline is only trusted when it finished
+  before the deploy run started and is at most `deployWatch.baselineMaxAgeMinutes` old; otherwise the evidence says so.
+- **Deterministic checks first.** At each checkpoint the desk runs fresh read-only probes itself (never cached): app
+  `/health` (**HTTP 5xx = unhealthy**, whatever the probe's own outcome), container state/health/restarts against the
+  baseline, logs since the deploy (timestamped lines only) diffed against known error signatures, and ingest freshness
+  (stale data while the market is closed is "unknown", not a failure). Each checkpoint stores structured evidence:
+  criterion, probe, observation time, threshold, observed value, result, coverage limits, and the deployment identity
+  (workflow runs, container images, and the commit the app reports on `/health` when it does). A hard failure is
+  confirmed by one more look a couple of minutes later; a check that observed nothing is retried
+  (`deployWatch.retryMinutes`), then inconclusive. A check missed by more than `deployWatch.missedHours` is recorded as
+  missed. During market hours the probe allowance per checkpoint is the busy-window per-run limit.
+- **The SRE model only when needed.** Anomalies (one restart, a new error signature below
+  `deployWatch.newSignatureMinCount`, a 3xx/4xx health answer) and the ticket's own criteria (at T+30, and at the
+  session open for trading-path work) go to the SRE in a capped `watch` run: `watch.budgetUsd` (default $1) per
+  checkpoint across attempts on a capped engine, or `watch.maxMinutes`/`watch.maxSteps` on a plan-billed one. "Verified"
+  from the SRE needs a fresh probe in that run. Watch and verify runs never publish or merge anything; a watch run cannot even comment.
+- **Access.** `access.policy.postDeployAutoGrant` is **off** by default (also for desks saved before it existed). When
+  you switch it on (Access sheet), a checkpoint's SRE run gets a grant bound to that run and checkpoint, to exactly the
+  checkpoint's probes, expiring with the run; it is re-checked at every probe and ends when you switch the policy off or
+  the deployment stops being watched. Off, the SRE works from the desk's evidence or asks you for access.
+- **"How to verify in production".** Builders write it with `desk submit --verify-prod "<what read-only checks should
+  show, and when>"`; reviewers check it; you can set it on a ticket (`POST /api/tickets/KEY/prod-verify`).
+  **Trading-path (high-risk) tickets without it cannot merge** (desk or owner), with that reason on the ticket. Others
+  merge; their checks are general health only and every verdict says "limited".
+- **Verdicts.** `verified`, `regression suspected` or `inconclusive`, posted on the ticket and the PR. A suspected
+  regression pages you (Inbox, never snoozable), **holds every further deploying merge of the train until you clear it**
+  (Inbox → Clear the hold; you can still merge yourself, e.g. the revert), files an incident ticket (P0 on the trading
+  path) and a revert ticket for the builder who made the change. The revert goes through the normal flow (QA, two
+  reviews) and is persisted as **owner-only merge**; its description has the right `git revert` for the merge commit's
+  parents (`-m 1` for a two-parent merge) and flags database migrations and order/broker code a revert cannot undo.
+- **Team KPIs.** Deployed and production-verified count distinct deployments over the same 7-day window
+  ("2 of 3 verified"); regressions and deploy holds lead the Team Wall's exceptions.
+
 ## Quick start
 
 Requirements: Node ≥ 22.13, git, at least one engine — the [Claude Code CLI](https://code.claude.com) and/or the
