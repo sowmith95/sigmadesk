@@ -21,6 +21,7 @@ import { Participants } from './Mentions';
 import { MessageBar, type BarHandle } from './MessageBar';
 import { PersonSheet } from '@/components/desk/PeopleSheet';
 import { DecisionLead } from '@/components/desk/DecisionBrief';
+import { AutonomyLine } from '@/components/desk/Autonomy';
 import type { Board, BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -173,6 +174,7 @@ export function TicketSheet() {
       {nameOf(t) !== t.title && <span className="truncate text-sm text-muted-foreground">{t.title}</span>}
     </div>
     <Participants tkey={t.key} list={d?.participants || []} onPerson={setPerson} />
+    <AutonomyLine a={d?.autonomy} onOpen={() => setTab('details')} />
     </div>
   );
   const shownTab = dec || tab !== 'decision' ? tab : 'conversation';

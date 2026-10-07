@@ -285,4 +285,5 @@ if (process.env.SIGMADESK_DECISION_DEMO === '1') {
   store.updateTicket(shipped.key, { pr_url: 'https://github.com/test/fixture/pull/9', done_at: ago(26 * 60) });
   const access = await import('../src/access.js');
   access.ownerGrant({ seat: 'sre', probes: ['*'], minutes: 45, ticket_key: null, standing: false, reason: 'Preview: checking the fill counts' });
+  store.addParticipants(contracts.key, ['sre'], 'owner'); // the SRE's timed grant shows in that ticket's autonomy line
 }

@@ -13,6 +13,7 @@ import { Markdown, Inline } from '@/components/desk/Markdown';
 import { cardFor, EvidenceList, CiTag, Disclose, STAGE_LABEL } from '@/components/desk/Work';
 import { cn } from '@/lib/utils';
 import { Deliveries } from './Mentions';
+import { TicketAutonomy } from '@/components/desk/Autonomy';
 import type { BoardItem, Ticket } from '@/types';
 
 type Detail = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -289,6 +290,7 @@ export function Details({ t, d }: { t: Ticket; d: Detail | null }) {
   const Fact = ({ k, children }: { k: string; children: ReactNode }) => <div className="grid grid-cols-[120px_1fr] gap-3"><span className="text-sm text-muted-foreground">{k}</span><span className="min-w-0 [overflow-wrap:anywhere]">{children}</span></div>;
   return (
     <div className="grid gap-5">
+      <TicketAutonomy t={t} a={d?.autonomy} />
       <Block title="Description"><div className="max-h-[50vh] overflow-auto">{t.description ? <Markdown text={t.description} self={t.key} /> : <p className="text-muted-foreground">No description provided.</p>}</div></Block>
       <Block title="Ticket">
         <Sel label="Stage" field="status" options={Object.entries(STAGE_LABEL).filter(([k]) => k !== 'done' || t.status === 'done')} value={t.status} ok="Stage changed" />

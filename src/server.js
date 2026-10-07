@@ -38,6 +38,7 @@ import * as connectors from './connectors.js';
 import * as ops from './ops.js';
 import * as access from './access.js';
 import * as decision from './decision.js';
+import * as autonomy from './autonomy.js';
 
 const PUBLIC = path.join(config.root, 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -117,6 +118,7 @@ export function snapshot({ inbox = true } = {}) {
   snap.meta.snoozes = inboxState.snoozes(B.decisions || [], { incidents: snap.incidents || [], protectedKeys: snap.meta.protected_tickets });
   // One server-owned decision snapshot per decision (consequence, gate, evidence freshness): Inbox and ticket read the same.
   snap.meta.decision_briefs = decision.briefs(snap, B);
+  snap.meta.autonomy = autonomy.matrix(snap.settings); // per action: authorized mode + readiness (read-only description)
   Object.defineProperty(snap, 'board', { value: B, enumerable: false });
   return snap;
 }
@@ -256,12 +258,13 @@ async function ownerRoute(req, res) {
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY$'))) {
     const t = store.getTicket(mm[1]);
     if (!t) return send(res, 404, { error: 'not found' });
-    return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), research_reviews: researchReview.forTicket(t.key), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), mentions: store.mentionsFor(t.key), participants: store.participantsOf(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
+    return send(res, 200, { ticket: t, refresh: refresh.publicState(t.key), product_reviews: ['plan','feedback'].map(p => productReview.current(t.key,p)).filter(Boolean), research_reviews: researchReview.forTicket(t.key), autonomy: autonomy.forTicket(t), comments: store.listComments(t.key), discussions: store.ticketDiscussions(t.key), mentions: store.mentionsFor(t.key), participants: store.participantsOf(t.key), reviews: store.listArchitectureReviews(t.key), pr_reviews: reviews.summary(t.key), merge_state: mergetrain.mergeState(t), conflict_jobs: mergetrain.conflictJobsView(t.key), events: store.recentEvents({ ticket_key: t.key, limit: 600 }) });
   }
   if (req.method === 'GET' && (mm = m('^/api/tickets/KEY/decision-brief$'))) {
     const snap = snapshot();
     return send(res, 200, await decision.ticketBrief(mm[1], snap, snap.board, { decisionId: url.searchParams.get('decision') }));
   }
+  if (req.method === 'GET' && p === '/api/autonomy') return send(res, 200, autonomy.matrix());
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/verify-task$'))) { const b = await readBody(req); return send(res, 200, decision.verifyTask(mm[1], { what: b.what })); }
   if (req.method === 'POST' && p === '/api/inbox/snooze') {
     const body = await readBody(req); // read first: validate against the state after the request arrived

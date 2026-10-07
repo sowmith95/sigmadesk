@@ -87,3 +87,34 @@ test('quick asks: the desk answers first, a routed ask reports its delivery; Ver
   assert.deepEqual(errors, []);
   await page.close();
 });
+
+for (const [w, h] of [[390, 844], [1440, 900]]) {
+  test(`${w}px: Settings → Autonomy shows mode and readiness per action; only existing write paths are switches; the ticket line opens Who acts`, { skip, timeout: 60_000 }, async () => {
+    const { page, errors } = await openPage(browser, preview.url, { width: w, height: h });
+    await page.evaluate(() => { location.hash = '#/settings'; });
+    const m = page.locator('[data-autonomy-matrix]');
+    await m.waitFor();
+    assert.deepEqual(await m.locator('[data-action]').evaluateAll((n) => n.map((x) => x.getAttribute('data-action'))), ['groom', 'implement', 'merge_low', 'merge_high', 'deploy_timing', 'prod_read', 'tag_access', 'publish']);
+    const row = (id) => m.locator(`[data-action="${id}"]`);
+    assert.equal(await row('merge_low').locator('[data-mode]').getAttribute('data-mode'), 'autonomous');
+    assert.equal(await row('merge_low').getAttribute('data-ready'), 'blocked', 'the halted preview desk blocks it without changing its mode');
+    assert.equal(await row('merge_high').locator('[data-mode]').getAttribute('data-mode'), 'assisted');
+    assert.equal(await row('prod_read').locator('[data-mode]').getAttribute('data-mode'), 'assisted');
+    assert.equal(await m.locator('[data-control]').evaluateAll((n) => n.map((x) => x.getAttribute('data-control')).join(',')), 'ops_enabled,ownerMentionAutoGrant,open_draft_prs');
+    assert.match(await row('merge_low').locator('[data-readonly]').innerText(), /Read-only here.*review\.autoMerge\.enabled/);
+    assert.equal(await m.locator('[data-not-representable]').count(), 2);
+    if (w <= 400) assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+
+    const snap = await state();
+    const k = snap.tickets.find((t) => t.title.startsWith('Preserve review contracts')).key;
+    await page.evaluate((key) => { location.hash = `#/inbox/${key}`; }, k);
+    const line = page.locator('[data-autonomy-line]');
+    await line.waitFor();
+    assert.match(await line.innerText(), /^Merge needs you \(risk high\) · prod read expires \d/);
+    await line.click();
+    await page.waitForSelector('[data-ticket-autonomy]');
+    assert.equal(await page.getByRole('button', { name: 'Hold the merge' }).count(), 1, 'the existing hold control sits with it');
+    assert.deepEqual(errors, []);
+    await page.close();
+  });
+}
