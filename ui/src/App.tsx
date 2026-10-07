@@ -21,6 +21,9 @@ const ResearchPage = lazy(() => import('@/pages/Research'));
 const PrsPage = lazy(() => import('@/pages/Prs'));
 const PrPanel = lazy(() => import('@/pages/Prs').then((m) => ({ default: m.PrPanel })));
 const DeskPage = lazy(() => import('@/pages/Desk'));
+const TeamWall = lazy(() => import('@/pages/TeamWall'));
+/** `/?wall=1`: Team → Wall mode on a TV or second monitor, without the desk chrome. */
+const WALL = new URLSearchParams(location.search).get('wall') === '1';
 const SettingsPage = lazy(() => import('@/pages/Settings'));
 const FeaturesPage = lazy(() => import('@/pages/Features'));
 const NewFeatureDialog = lazy(() => import('@/pages/Features').then((m) => ({ default: m.NewFeatureDialog })));
@@ -55,6 +58,13 @@ export function App() {
   const B = currentBoard() as Board;
   useEffect(() => { if (S.loaded) { for (const it of B.needs_you) S.seen.add(it.id); S.painted = true; } });
   const page = S.view as string;
+  if (WALL) return (
+    <TooltipProvider delayDuration={300}>
+      {!S.loaded && !S.loadError ? <Loading /> : <Boundary resetKey="wall"><Suspense fallback={<Loading />}><TeamWall /></Suspense></Boundary>}
+      <Overlay />
+      <Toaster position="top-center" />
+    </TooltipProvider>
+  );
   const content = !S.loaded && !S.loadError ? <Loading />
     : ({ inbox: <InboxPage />, work: <WorkPage />, features: <FeaturesPage />, team: <TeamPage />, research: <ResearchPage />, prs: <PrsPage />, desk: <DeskPage />, settings: <SettingsPage /> } as Record<string, ReactNode>)[page] ?? <InboxPage />;
   return (
