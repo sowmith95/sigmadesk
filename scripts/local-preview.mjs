@@ -163,3 +163,74 @@ if (process.env.SIGMADESK_MENTIONS_DEMO === '1') {
   store.updateMention(f.id, { status: 'failed', reason: 'Devon ended without an answer; tried 3 times', attempts: 3, ended_at: store.now() });
   store.createMention({ ticket_key: t.key, comment_id: c.id, seat_id: 'senior-fe', status: 'blocked', reason: 'Quinn is switched off (Settings → Team), so nobody would read this. Switch Quinn on, or tag someone else.' });
 }
+
+// Team demo (SIGMADESK_TEAM_DEMO=1): a busy desk for the Team overview and its Wall mode. Most seats are switched on (the
+// desk stays paused, so the scheduler starts nothing); fixture runs post steps every 15 s (working), one went quiet, one
+// stalled; hand-off events (QA, review, slices, a tag, a verify, an access grant) are logged as the desk logs them, and a
+// new one arrives every 20 s. No model is called.
+if (process.env.SIGMADESK_TEAM_DEMO === '1') {
+  store.setSetting('paused', 'true');
+  const overrides = JSON.parse(store.getSettings().team);
+  for (const id of Object.keys(overrides)) overrides[id] = { ...overrides[id], enabled: !['support', 'quant-research'].includes(id) };
+  store.setSetting('team', JSON.stringify(overrides)); team.applyTeamOverrides(overrides);
+  const db = store.handle();
+  const ago = (ms) => new Date(Date.now() - ms).toISOString();
+  const backdate = (ev, ms) => { db.prepare('UPDATE events SET ts=? WHERE id=?').run(ago(ms), ev.id); return ev; };
+  const byTitle = (s) => store.listTickets().find((t) => t.title.startsWith(s));
+  const T = {
+    composer: byTitle('Improve the mobile navigation'), fallback: byTitle('Verify provider fallback'), contracts: byTitle('Preserve review contracts'),
+    sre: byTitle('Add a clear SRE source-health summary'), compare: byTitle('Compare task-specific models'), queued: byTitle('Expose why a queued ticket'),
+    verify: byTitle('Verify fills on the production box'), audit: byTitle('Audit contract and DDL'), normalize: byTitle('Normalize equity fills'), replay: byTitle('Replay yesterday'),
+  };
+  // Release facts: one change merged this week, a production check reported, and an open backend defect.
+  const merged = store.createTicket({ title: 'Show fills per strategy on the dashboard', status: 'done', assignee: 'senior-fe', priority: 'P2', area: 'frontend', complexity: 'S', reporter: 'owner' });
+  store.updateTicket(merged.key, { pr_url: 'https://github.com/test/fixture/pull/12', done_at: ago(26 * 3600_000) });
+  store.createTicket({ title: 'Partial fills double-count fees', status: 'todo', type: 'bug', assignee: 'senior-be', priority: 'P1', area: 'backend', complexity: 'S', reporter: 'sre' });
+  // Live runs.
+  const live = (agent_id, ticket_key, kind, startedMs) => {
+    const run = store.createRun({ agent_id, ticket_key, kind, token: `demo-${agent_id}`, model: 'demo:fixture' });
+    store.updateRun(run.id, { started_at: ago(startedMs), cost_usd: 0.05 });
+    store.updateAgent(agent_id, { status: 'working', current_ticket: ticket_key, current_run: run.id, current_kind: kind });
+    return run;
+  };
+  store.updateTicket(T.composer.key, { status: 'review', assignee: 'senior-fe' });
+  const R = {
+    sfe: live('senior-fe', T.queued.key, 'implement', 14 * 60_000), pfe: live('principal-fe', T.composer.key, 'review', 6 * 60_000),
+    sbe: live('senior-be', T.contracts.key, 'respond', 11 * 60_000), qa: live('qa', T.fallback.key, 'qa', 7 * 60_000),
+    em: live('manager', T.compare.key, 'groom', 5 * 60_000), dba: live('dba', T.audit.key, 'implement', 9 * 60_000),
+    jr: live('junior', T.sre.key, 'implement', 8 * 60_000), sre: live('sre', T.verify.key, 'verify', 6 * 60_000), pm: live('pm', null, 'research', 3 * 60_000),
+  };
+  const step = (who, run, key, kind, text, ms) => backdate(store.logEvent({ run_id: run.id, agent_id: who, ticket_key: key, kind, text }), ms);
+  step('dba', R.dba, T.audit.key, 'tool', 'Editing migrations/0042_fill_audit.sql', 90_000); // quiet: last step 90 s ago
+  step('sre', R.sre, T.verify.key, 'tool', '$ desk probe db.count fills --since yesterday', 2 * 60_000);
+  // Hand-offs in the last 15 minutes, worded exactly as the desk words them.
+  const at = (agent_id, ticket_key, kind, text, ms, run_id = null) => backdate(store.logEvent({ agent_id, ticket_key, kind, text, run_id }), ms);
+  at('manager', T.queued.key, 'action', `groomed ${T.queued.key} → S/frontend, staffed Senior Frontend Engineer`, 14.5 * 60_000);
+  at('senior-fe', T.queued.key, 'pickup', `Senior Frontend Engineer picked up ${T.queued.key}`, 14 * 60_000);
+  at('principal-be', T.normalize.key, 'action', `sliced ${T.normalize.key} (M) for Senior Backend Engineer`, 12 * 60_000);
+  at('principal-be', T.replay.key, 'action', `sliced ${T.replay.key} (S) for Junior Engineer after ${T.normalize.key}`, 11.5 * 60_000);
+  at('senior-be', T.fallback.key, 'action', `submitted ${T.fallback.key} for QA (4be91c2)`, 8 * 60_000);
+  at('qa', T.fallback.key, 'pickup', `QA picked up ${T.fallback.key}`, 7 * 60_000);
+  at('senior-fe', T.composer.key, 'action', `submitted ${T.composer.key} for QA (a17c0de)`, 9 * 60_000);
+  at('principal-fe', T.composer.key, 'pickup', `Principal Frontend Engineer is reviewing ${T.composer.key} at a17c0de (frontend reviewer)`, 6 * 60_000);
+  at('sre', T.verify.key, 'pickup', `verifying in production: ${T.verify.title}`, 6 * 60_000);
+  at('sre', T.verify.key, 'run', 'Site Reliability Engineer started mention on opus (high)', 4.5 * 60_000);
+  at('manager', null, 'action', 'Morgan gave Devon production read access for 1 hour to use the read-only probes — counting yesterday\'s fills', 3.5 * 60_000);
+  at('sre', T.verify.key, 'action', "answered the owner's tag: yes — 1,284 fills yesterday, matching the broker", 2.5 * 60_000);
+  at('sre', T.verify.key, 'action', 'verified in production: yesterday\'s fill count matches the broker', 2 * 60_000);
+  at('manager', T.compare.key, 'pickup', `Engineering Manager is grooming ${T.compare.key}`, 5 * 60_000);
+  // Live: working seats post a step every 15 s; a fresh hand-off arrives every 20 s.
+  const steps = [['senior-fe', R.sfe, T.queued.key, 'tool', 'Editing ui/src/pages/Work.tsx'], ['principal-fe', R.pfe, T.composer.key, 'action', 'Drafting the review'],
+    ['senior-be', R.sbe, T.contracts.key, 'tool', '$ npm test -- reviews'], ['qa', R.qa, T.fallback.key, 'tool', '$ node --test test/usage.test.js'],
+    ['manager', R.em, T.compare.key, 'plan', '✓ Read the proposal\n▸ Size the comparison\n· Staff it'], ['pm', R.pm, null, 'say', 'Comparing three desks’ review flows']];
+  const tick = () => { for (const [who, run, key, kind, text] of steps) store.logEvent({ run_id: run.id, agent_id: who, ticket_key: key, kind, text }); };
+  tick(); setInterval(tick, 15_000).unref();
+  const handoffs = [
+    () => ['qa', T.fallback.key, 'pickup', `QA picked up ${T.fallback.key}`],
+    () => ['principal-be', T.replay.key, 'action', `sliced ${T.replay.key} (S) for Junior Engineer`],
+    () => ['principal-fe', T.composer.key, 'pickup', `Principal Frontend Engineer is reviewing ${T.composer.key} at a17c0de (frontend reviewer)`],
+    () => ['sre', T.verify.key, 'action', "answered the owner's tag: the counts match"],
+  ];
+  let h = 0;
+  setInterval(() => { const [a, k, kind, text] = handoffs[h++ % handoffs.length](); store.logEvent({ agent_id: a, ticket_key: k, kind, text }); }, 20_000).unref();
+}

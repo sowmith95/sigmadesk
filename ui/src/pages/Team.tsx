@@ -7,6 +7,7 @@ import { SwitchRow } from '@/components/desk/Fields';
 import { toast } from '@/store.js';
 import { TeamStats } from '@/components/desk/TeamStats';
 import { Lessons } from '@/components/desk/Lessons';
+import { TeamOverviewSection } from '@/components/team/Departments';
 import type { Agent, Run } from '@/types';
 
 export function TeamPage() {
@@ -21,6 +22,7 @@ export function TeamPage() {
         <div className="w-full sm:w-auto sm:min-w-72"><SwitchRow label="Automatic fallback" hint="When a provider is low or down, seats use another. Limits and gates still apply." checked={S.settings.auto_fallback === 'true'}
           onChange={async (on) => { try { await api('POST', '/api/settings', { key: 'auto_fallback', value: String(on) }); await loadSnapshot(); toast('Fallback policy updated'); } catch (e) { toast((e as Error).message, true); } }} /></div>
       </div>
+      <TeamOverviewSection />
       <TeamStats />
       <Lessons />
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
