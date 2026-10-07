@@ -140,6 +140,15 @@ const containers = () => config.ops.containers || [];
 const logContainers = () => containers().slice(0, Number(DW().maxLogContainers) || 3);
 /** The containers a target's checks (and its checkpoint grants) may name: deployWatch.targetContainers, or the
  * allowlisted container named like the target. [] = none can be attributed to it. */
+/** The resources a checkpoint grant may read right now: the watch's current, non-retired components only. */
+export function liveScope(g) {
+  const cp = g?.watch_checkpoint ? store.getCheckpoint(g.watch_checkpoint) : null;
+  const w = cp ? store.getWatch(cp.watch_id) : null;
+  if (!w || w.status !== 'watching') return { target: null, containers: [], dbs: [] };
+  const retired = retiredContainers(w);
+  return { target: w.target, containers: targetContainers(w.target).filter((c) => !retired.has(c)), dbs: freshnessDbs() };
+}
+access.setScopeResolver(liveScope);
 export function targetContainers(target) {
   const map = DW().targetContainers || {};
   const out = new Set();
@@ -380,6 +389,62 @@ export async function reconcile({ now = clock.now(), force = false, lock = null 
 // ---------------- checkpoints: deterministic checks first ----------------
 const item = (criterion, probe, observedAt, threshold, observed, result, note = null, extra = {}) => ({ criterion, probe, observed_at: observedAt, threshold, observed, result, note, ...extra });
 const REQUIRED = new Set(['app_health', 'container_status', 'container_logs', 'ingest_freshness']);
+/**
+ * Evidence identity: { criterion, kind, resource } — the probe kind and the exact resource it observed (container name,
+ * database id, the app endpoint, the watch desk). Every comparison (anomaly settlement, verification coverage, the
+ * provisional hold's failure set and its release, coverage gaps) uses this key, never criterion text alone.
+ */
+export function resourceOf(i) {
+  if (i.resource) return i.resource;
+  if (i.probe === 'app_health') return 'app';
+  if (i.probe === 'container_status' || i.probe === 'container_logs') return i.container || null;
+  if (i.probe === 'ingest_freshness') return i.db || null;
+  return 'watch-desk';
+}
+export const withIdentity = (i) => ({ ...i, kind: i.kind || i.probe, resource: resourceOf(i) });
+export const evKey = (i) => `${i.kind || i.probe}|${i.resource ?? resourceOf(i) ?? '?'}|${i.criterion}`;
+/** The resources an audited probe call actually observed (stored with the audit row by ops.js). */
+const auditResources = (a) => json(a.resources, null) || [];
+/** Is this (anomalous) evidence item settled by a fresh, healthy probe of the same kind on the same resource? */
+export const settledBy = (audit, i) => audit.some((a) => a.outcome === 'ok' && a.health !== 'unhealthy' && a.probe === (i.kind || i.probe) && auditResources(a).includes(i.resource ?? resourceOf(i)));
+/**
+ * Why "verified" cannot be accepted, given the checkpoint's evidence (ev), the desk's fresh re-observation (re) and the
+ * SRE run's audited probes: [] = acceptable. Required = every key in ev or re that is not "n/a". Each must appear in re,
+ * observed on its own resource, as pass (or n/a), or as an anomaly settled by its own probe on its own resource.
+ */
+export function verificationProblems(ev, re, audit) {
+  const out = [];
+  const reAll = new Map();
+  for (const i of re.items || []) reAll.set(evKey(i), [...(reAll.get(evKey(i)) || []), i]);
+  for (const i of re.items || []) if (i.result === 'fail') out.push(`failure: ${i.criterion} (${i.observed})`);
+  const resKey = (i) => `${i.kind || i.probe}|${i.resource ?? resourceOf(i)}`;
+  const reByRes = new Map();
+  for (const i of re.items || []) reByRes.set(resKey(i), [...(reByRes.get(resKey(i)) || []), i]);
+  // An earlier "could not be read" is a resource-level gap: settled only when that resource is now read and fully clear.
+  for (const i of ev.items || []) {
+    if (i.result !== 'unknown') continue;
+    const now = reByRes.get(resKey(i)) || [];
+    if (!now.length || now.some((x) => x.result === 'unknown' || x.incomplete)) out.push(`unresolved: ${i.criterion} [${i.resource ?? resourceOf(i)}]`);
+  }
+  const required = new Map([...(ev.items || []).filter((i) => i.result !== 'unknown'), ...(re.items || [])].filter((i) => i.result !== 'n/a').map((i) => [evKey(i), i]));
+  for (const [k, orig] of required) {
+    const all = reAll.get(k) || [];
+    if (!all.length) { out.push(`no fresh evidence: ${orig.criterion} [${orig.resource ?? resourceOf(orig)}]`); continue; }
+    for (const now of all) { // every observation under the key must be acceptable, never just one of them
+      if (now.result === 'pass' || now.result === 'n/a') continue;
+      if (now.result === 'anomaly' && settledBy(audit, now)) continue;
+      if (now.result === 'anomaly') out.push(`not settled by a fresh probe of its own resource: ${now.criterion} [${now.resource}]`);
+      else if (now.result !== 'fail') out.push(`unresolved: ${now.criterion} [${now.resource}]`);
+    }
+  }
+  if (re.identity?.status !== 'match') out.push('deployment identity');
+  return [...new Set(out)];
+}
+/** Positive recovery: every failed key was re-observed (fresh, not carried) as passing on its own resource. */
+export const recovered = (failedKeys, ev) => failedKeys.length > 0 && failedKeys.every((k) => {
+  const seen = (ev.items || []).filter((i) => evKey(i) === k);
+  return seen.length > 0 && seen.every((i) => i.result === 'pass' && !i.carried);
+});
 function healthItem(r, identity) {
   const at = r.observed_at;
   const c = 'the app answers healthy on its health endpoint';
@@ -391,11 +456,13 @@ function healthItem(r, identity) {
 }
 function containerItems(r, baseline, cp, identity) {
   const at = r.observed_at;
-  if (r.outcome !== 'ok') return [item('allowlisted containers run and are stable', 'container_status', at, 'running', 'not read', 'unknown', r.text.slice(0, 160), { incomplete: r.outcome === 'refused' })];
+  if (r.outcome !== 'ok') return containers().map((name) => item(`container ${name} runs`, 'container_status', at, 'running', 'not read', 'unknown', r.text.slice(0, 160), { container: name, incomplete: r.outcome === 'refused' }));
   const now = parseContainers(r.text);
   const before = baseline?.trusted ? baseline?.containers?.rows || null : null;
-  return containers().map((name) => {
-    const c = now[name]; const b = before?.[name];
+  return containers().map((name) => ({ ...containerItem(name, now[name], before?.[name], !!before, at, cp, identity), container: name }));
+}
+function containerItem(name, c, b, hadBefore, at, cp, identity) {
+  {
     const th = 'running, not unhealthy, not OOM-killed, no restarts since the deploy';
     const crit = `container ${name} runs`;
     if (!c || c.missing) return item(crit, 'container_status', at, th, 'not found', 'fail');
@@ -409,8 +476,8 @@ function containerItems(r, baseline, cp, identity) {
     if (restarts >= 2) return item(crit, 'container_status', at, th, obs, 'fail', `${restarts} restarts since ${sameStart ? 'the baseline' : 'it was started'}`);
     if (restarts === 1) return item(crit, 'container_status', at, th, obs, 'anomaly', 'restarted once since the deploy');
     if (c.health === 'starting') return item(crit, 'container_status', at, th, obs, cp.name === 'smoke' ? 'unknown' : 'anomaly', 'its health check has not passed yet');
-    return item(crit, 'container_status', at, th, obs, 'pass', before ? null : 'no trusted baseline: restarts are counted from its start');
-  });
+    return item(crit, 'container_status', at, th, obs, 'pass', hadBefore ? null : 'no trusted baseline: restarts are counted from its start');
+  }
 }
 function freshnessItems(r, baseline, now, db) {
   const at = r.observed_at;
@@ -511,7 +578,7 @@ export async function observe(w, cp, now = clock.now()) {
   else {
     if (config.ops.appHealth?.baseUrl) { const r = await probe('app_health'); if (r) items.push(healthItem(r, identity)); }
     else coverage.push('no app health endpoint is configured (ops.appHealth)');
-    if (containers().length) { const r = await probe('container_status'); if (r) items.push(...containerItems(r, baseline, cp, identity).filter((i) => !retired.has(i.criterion.replace(/^container (.*) runs$/, '$1')))); }
+    if (containers().length) { const r = await probe('container_status'); if (r) items.push(...containerItems(r, baseline, cp, identity).filter((i) => !retired.has(i.container))); }
     else coverage.push('no containers are allowlisted (ops.containers): container state was not checked');
     const span = Math.ceil((now.getTime() - Date.parse(w.deployed_at)) / 60_000) + 1;
     const maxMin = lim.maxLogHours * 60;
@@ -557,7 +624,7 @@ export async function observe(w, cp, now = clock.now()) {
   const late = Math.max(0, Math.round((now.getTime() - Date.parse(cp.due_at)) / 60_000));
   if (late > (Number(DW().overdueMinutes) || 20)) coverage.push(`this check ran ${late} min late`);
   const missingRequired = items.some((i) => i.incomplete && REQUIRED.has(i.probe));
-  return { checkpoint: cp.name, observed_at: iso(now), deployment: { merge_sha: w.merge_sha, deployed_at: w.deployed_at, target: w.target || 'unknown', source: w.source }, identity, items, coverage: [...new Set(coverage)],
+  return { checkpoint: cp.name, observed_at: iso(now), deployment: { merge_sha: w.merge_sha, deployed_at: w.deployed_at, target: w.target || 'unknown', source: w.source }, identity, items: items.map(withIdentity), coverage: [...new Set(coverage)],
     probes_used: used, allowance, fresh: true, late_minutes: late, incomplete: incomplete || missingRequired, gaps };
 }
 
@@ -625,11 +692,10 @@ function liftProvisional(w, ev, why) {
   const fresh = store.getWatch(w.id);
   if (!fresh?.hold || fresh.hold_kind !== 'provisional') return false;
   const failed = json(store.kvGet(provisionalKey(w.id)), []) || [];
-  const recovered = failed.length > 0 && failed.every((c) => (ev.items || []).some((i) => i.criterion === c && i.result === 'pass' && !i.carried));
-  if (!recovered) return false;
+  if (!recovered(failed, ev)) return false;
   store.updateWatch(w.id, { hold: 0, cleared_by: 'desk (not confirmed)', cleared_at: iso(clock.now()) });
   const t = w.ticket_key ? store.getTicket(w.ticket_key) : null;
-  if (t) say(t, `provisional-lifted:${w.id}`, `▶️ The failed checks passed again on a fresh look (${failed.join('; ')}; ${why}); the provisional hold is lifted and the watch continues.`, w.merge_sha);
+  if (t) say(t, `provisional-lifted:${w.id}`, `▶️ The failed checks passed again on a fresh look (${failed.map((k) => k.split('|').slice(1).reverse().join(' on ')).join('; ')}; ${why}); the provisional hold is lifted and the watch continues.`, w.merge_sha);
   store.kvSet(provisionalKey(w.id), '[]');
   return true;
 }
@@ -648,7 +714,7 @@ export async function runCheckpoint(cp, now = clock.now()) {
   const ev = await observe(w, cp, now);
   if (store.getWatch(w.id)?.status !== 'watching') { store.updateCheckpoint(cp.id, { status: 'superseded', completed_at: iso(clock.now()), evidence: JSON.stringify(ev) }); return { status: 'superseded' }; }
   const d = decide(w, cp, ev);
-  if (d.provisional) provisionalHold(w, cp, d.reason, ev.items.filter((i) => i.result === 'fail').map((i) => i.criterion));
+  if (d.provisional) provisionalHold(w, cp, d.reason, ev.items.filter((i) => i.result === 'fail').map(evKey));
   else if (d.verdict !== 'regression') liftProvisional(w, ev, d.reason);
   const waits = DW().retryMinutes || [2, 5, 10];
   if (d.retry && attempts <= waits.length) {
@@ -890,24 +956,17 @@ export async function command(run, body) {
     if ((ev.items || []).some((i) => i.result === 'fail')) throw err('the desk\'s evidence has an unresolved failure: that vetoes "verified"');
     if (!fresh) throw err(`nothing was checked with a fresh probe in this run (cached answers do not count): run the probe that settles ${/criteria/.test(cp.sre_reason || '') ? "the ticket's criteria" : 'the anomaly'}, or say inconclusive`);
     if (ev.identity?.status !== 'match') throw err('production is not shown to run this deployment (deployment identity unresolved or different): say inconclusive');
-    // Every criterion needs its OWN evidence: an anomaly is only settled by a fresh healthy probe of that same kind
-    // (and container/database) in this run; an unrelated probe never stands in for it.
-    const audit = store.opsAuditOfRun(run.id).filter((a) => a.outcome === 'ok' && a.health !== 'unhealthy');
-    const covers = (i) => audit.some((a) => { const p = json(a.params, {}) || {}; return a.probe === i.probe && (!i.container || p.container === i.container) && (!i.db || p.db === i.db); });
-    const unsettled = (ev.items || []).filter((i) => i.result === 'anomaly' && !covers(i));
-    if (unsettled.length) throw err(`not settled by a fresh probe of its own in this run: ${unsettled.map((i) => i.criterion).join('; ')} — check each, or say inconclusive`);
   }
   let finalEv = ev;
   if (action === 'verified') {
-    // The desk confirms every required criterion afresh before accepting "verified": anything still unread, unknown or
-    // failing (e.g. freshness) leaves the checkpoint unresolved.
+    // The desk takes its own fresh look; every required evidence key (kind + exact resource + criterion) must then be
+    // healthy, or an anomaly settled by this run's own probe of that same resource. Nothing else stands in for it.
     const w = store.getWatch(cp.watch_id);
     const re = await observe(w, { ...cp, evidence: null }, clock.now());
-    const bad = re.items.filter((i) => i.result === 'fail');
-    const open = re.items.filter((i) => i.result === 'unknown' || i.incomplete);
-    if (bad.length) throw err(`the desk's fresh look shows a failure: ${bad.map((i) => `${i.criterion} (${i.observed})`).join('; ')} — say regression`);
-    if (open.length || re.identity?.status !== 'match') throw err(`not every required criterion has fresh healthy evidence (${[...open.map((i) => i.criterion), ...(re.identity?.status !== 'match' ? ['deployment identity'] : [])].join('; ')}) — say inconclusive`);
-    finalEv = { ...re, sre_settled: (ev.items || []).filter((i) => i.result === 'anomaly').map((i) => i.criterion) };
+    const problems = verificationProblems(ev, re, store.opsAuditOfRun(run.id));
+    if (problems.some((p) => p.startsWith('failure:'))) throw err(`the desk's fresh look shows a ${problems.filter((p) => p.startsWith('failure:')).join('; ')} — say regression`);
+    if (problems.length) throw err(`not every required criterion has fresh healthy evidence from its own resource: ${problems.join('; ')} — check those, or say inconclusive`);
+    finalEv = { ...re, sre_settled: (re.items || []).filter((i) => i.result === 'anomaly').map(evKey) };
   }
   const limited = action === 'verified' && store.getWatch(cp.watch_id)?.criteria_source !== 'ticket';
   await finish(cp, action, { summary: text, evidence: finalEv, limited, author: run.agent_id, sre: { seat: run.agent_id, verdict: action, text, run_id: run.id, fresh_probes: fresh, at: iso(clock.now()) } });

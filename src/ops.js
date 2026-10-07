@@ -361,12 +361,14 @@ async function containerStatus(op, only = null) {
     // image: the configured image reference and the image id the container actually runs (deployment identity).
     const ins = await dockerRun(op, ['inspect', '--format', '{{.Name}}\t{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}\t{{.RestartCount}}\t{{.State.StartedAt}}\t{{.State.OOMKilled}}\t{{.Config.Image}}@{{.Image}}', ...present], 10000);
     if (ins.reason === 'cancelled') return finishProcess(ins, op);
-    text += `# health\nname\thealth\trestarts\tstarted\toom_killed\timage\n${ins.code === 0 ? ins.stdout.replace(/^\//gm, '') : '(inspect failed)'}\n`;
+    // Only rows of the containers asked for (and allowed) are kept, whatever the CLI returned.
+    const keep = (out) => out.split('\n').filter((l) => l && allow.has(l.split('\t')[0])).join('\n');
+    text += `# health\nname\thealth\trestarts\tstarted\toom_killed\timage\n${ins.code === 0 ? keep(ins.stdout.replace(/^\//gm, '')) : '(inspect failed)'}\n`;
   }
   if (running.length) {
     const st = await dockerRun(op, ['stats', '--no-stream', '--format', '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}', ...running], 20000);
     if (st.reason === 'cancelled') return finishProcess(st, op);
-    text += `# resources\nname\tcpu\tmem\tmem_pct\n${st.code === 0 ? st.stdout : `(stats ${st.reason || 'failed'})`}\n`;
+    text += `# resources\nname\tcpu\tmem\tmem_pct\n${st.code === 0 ? st.stdout.split('\n').filter((l) => l && allow.has(l.split('\t')[0])).join('\n') : `(stats ${st.reason || 'failed'})`}\n`;
   }
   return { outcome: 'ok', text, ms: Date.now() - started };
 }
@@ -596,7 +598,7 @@ export async function handle(run, body = {}) {
     if (op.cancelled && r.outcome === 'ok') r = { outcome: 'cancelled', text: `cancelled: ${op.cancelled}`, ms: r.ms };
     if (r.outcome === 'ok' && !scopedTo) cache.set(cacheKey(probe, params), { at: Date.now(), outcome: r.outcome, text: r.text, health: r.health });
     const out = wrap(probe, params, r, { cached: false, lim });
-    audit({ params, duration_ms: r.ms, bytes: Buffer.byteLength(out), outcome: r.outcome, health: r.health === 'unreachable' ? 'unhealthy' : r.health || null,
+    audit({ params, duration_ms: r.ms, bytes: Buffer.byteLength(out), outcome: r.outcome, health: r.health === 'unreachable' ? 'unhealthy' : r.health || null, resources: observedResources(probe, params, r, scopedTo),
       detail: r.outcome === 'ok' ? (r.health === 'unhealthy' ? `HTTP ${r.status}: application unhealthy` : null) : clean(r.text).slice(0, 300) });
     const who = agentById[run.agent_id]?.name || run.agent_id;
     const secs = `${(r.ms / 1000).toFixed(1)}s`;
@@ -609,6 +611,19 @@ export async function handle(run, body = {}) {
     closeOp(op);
     unreserve(run.id);
   }
+}
+
+/** The resources a successful probe call actually observed: the evidence identity post-deploy checks match on. */
+export function observedResources(probe, params, r, only = null) {
+  if (r.outcome !== 'ok') return [];
+  if (probe === 'app_health') return ['app'];
+  if (probe === 'container_logs') return [params.container];
+  if (['ingest_freshness', 'db_health', 'timescale_jobs'].includes(probe)) return [params.db];
+  if (probe === 'container_status') {
+    const esc = (n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return (config.ops.containers || []).filter((n) => (!only || only.includes(n)) && (new RegExp(`^/?${esc(n)}\t`, 'm').test(r.text) || new RegExp(`not found: .*\\b${esc(n)}\\b`).test(r.text)));
+  }
+  return [];
 }
 
 // ---------------- the desk's own checks (post-deploy watch, #7) ----------------
@@ -658,7 +673,7 @@ export async function deskProbe(probe, raw = {}, { ticketKey = null, purpose = '
     } catch (err) { r = { outcome: err.refused ? 'refused' : 'error', text: err.refused ? err.message : 'probe failed', ms: 0 }; }
     const at = observed();
     const text = clean(r.text);
-    audit({ params, duration_ms: r.ms, bytes: Buffer.byteLength(text), outcome: r.outcome, health: r.health === 'unreachable' ? 'unhealthy' : r.health || null,
+    audit({ params, duration_ms: r.ms, bytes: Buffer.byteLength(text), outcome: r.outcome, health: r.health === 'unreachable' ? 'unhealthy' : r.health || null, resources: observedResources(probe, params, r),
       detail: `${purpose}${r.outcome === 'ok' ? (r.health === 'unhealthy' ? `: HTTP ${r.status} unhealthy` : '') : `: ${text.slice(0, 200)}`}` });
     return out({ ...r, text, observed_at: at }, params);
   } finally {

@@ -547,7 +547,7 @@ function migrate() {
       // a revert prepared after a suspected regression: only the owner merges it (never the merge train)
       owner_merge_only: 'INTEGER DEFAULT 0' },
     // health: an app probe that answered but reported the application unhealthy (HTTP 5xx) is not evidence of health
-    ops_audit: { health: 'TEXT' },
+    ops_audit: { health: 'TEXT', resources: 'TEXT' }, // resources: what the call actually observed (containers, database, app)
     // a post-deploy checkpoint's run-bound grant names its checkpoint (re-checked at every probe)
     ops_grants: { watch_checkpoint: 'INTEGER', scope: 'TEXT' },
     // hold_status: what the deploy lock recorded when it held (kept when a later observation updates status)
@@ -792,9 +792,9 @@ export const sanitizeForGithub = (text) => redact(scrubValues(text));
 
 // ---------- ops audit ----------
 export function insertOpsAudit(a) {
-  const info = q('INSERT INTO ops_audit(run_id,agent_id,ticket_key,incident_id,probe,params,duration_ms,bytes,outcome,detail,health) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(
+  const info = q('INSERT INTO ops_audit(run_id,agent_id,ticket_key,incident_id,probe,params,duration_ms,bytes,outcome,detail,health,resources) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(
     a.run_id ?? null, a.agent_id ?? null, a.ticket_key ?? null, a.incident_id ?? null, String(a.probe), redact(JSON.stringify(a.params ?? {})).slice(0, 1000),
-    a.duration_ms ?? null, a.bytes ?? null, String(a.outcome), a.detail == null ? null : redact(String(a.detail)).slice(0, 500), a.health ?? null);
+    a.duration_ms ?? null, a.bytes ?? null, String(a.outcome), a.detail == null ? null : redact(String(a.detail)).slice(0, 500), a.health ?? null, a.resources ? JSON.stringify(a.resources) : null);
   return Number(info.lastInsertRowid);
 }
 /** Probes that actually reached production (cache hits and refusals excluded), optionally for one run. */

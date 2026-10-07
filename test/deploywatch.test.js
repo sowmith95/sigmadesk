@@ -47,7 +47,8 @@ const fakePsql = path.join(tmp, 'psql');
 fs.writeFileSync(fakePsql, `#!/usr/bin/env node
 const fs = require('fs');
 const c = (() => { try { return JSON.parse(fs.readFileSync(${JSON.stringify(psqlCtl)}, 'utf8')); } catch { return {}; } })();
-process.stdin.on('data', () => {}); process.stdin.on('end', () => { process.stdout.write(c.out || 'source\\tlatest\\tlag_s\\nbars\\t2026-10-03 15:00:00+00\\t4\\n'); process.exit(0); });
+const db = ((process.argv.join(' ').match(/dbname=(\\S+)/) || [])[1]);
+process.stdin.on('data', () => {}); process.stdin.on('end', () => { process.stdout.write((c.byDb && c.byDb[db]) || c.out || 'source\\tlatest\\tlag_s\\nbars\\t2026-10-03 15:00:00+00\\t4\\n'); process.exit(0); });
 `);
 fs.chmodSync(fakePsql, 0o755);
 
@@ -928,4 +929,106 @@ test('round 2 #5: two freshness databases cannot starve logs; an impossible allo
   delete config.ops.databases.ts2;
   config.ops.freshness = [{ label: 'bars', db: 'timescale' }];
   ops.setNow(() => new Date('2026-10-03T15:00:00Z'));
+});
+
+// ---------------- round-3: evidence identity {criterion, kind, resource} and live grant scope ----------------
+const mkGrantRun = async (t, w, cfg = {}) => {
+  const base = access.validatePolicy(access.policy());
+  access.setPolicy({ ...base, postDeployAutoGrant: true, ...cfg });
+  const cp = dw.claimJob(store.checkpointsByStatus('needs_sre').find((c) => c.watch_id === w.id));
+  const r = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t?.key || null, token: `g${++seq}${Math.random()}`, model: 'x', job: { checkpoint: cp.id } });
+  const g = dw.jobStarted(store.getCheckpoint(cp.id), r);
+  return { cp, r, g, done: () => access.setPolicy({ ...base, postDeployAutoGrant: false }) };
+};
+
+test('round 3: a trader-scoped container_status never settles the broker\'s anomaly', async () => {
+  reset();
+  config.ops.containers = ['alpaca-trader', 'broker'];
+  const ps = 'alpaca-trader\trunning\tUp\t1m\nbroker\trunning\tUp\t1m';
+  const t = doneTicket();
+  docker({ ps, inspect: '/alpaca-trader\thealthy\t0\t2026-10-03T15:01:00Z\tfalse\timg\n/broker\thealthy\t0\t2026-10-03T14:00:00Z\tfalse\timg' });
+  const { m, w } = await deployed(t);
+  app.body = sha40(m);
+  docker({ ps, inspect: '/alpaca-trader\thealthy\t0\t2026-10-03T15:01:00Z\tfalse\timg\n/broker\thealthy\t1\t2026-10-03T14:00:00Z\tfalse\timg' }); // broker restarted once
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const { cp, r, done } = await mkGrantRun(t, w);
+  const out = await ops.handle(r, { probe: 'container_status' });
+  assert.doesNotMatch(out, /broker/, 'the grant only sees the trader');
+  assert.deepEqual(JSON.parse(store.opsAuditOfRun(r.id).at(-1).resources), ['alpaca-trader']);
+  await assert.rejects(sched.deskAction(r, 'watch', { action: 'verified', body: 'fine' }), /container broker runs \[broker\]/);
+  assert.equal(store.getCheckpoint(cp.id).status, 'sre_running', 'not verified');
+  done();
+  config.ops.containers = ['alpaca-trader'];
+});
+
+test('round 3: two databases with the same source label — A\'s failure is released only by a healthy read of A', async () => {
+  const bars = (lag) => `source\tlatest\tlag_s\nbars\t2026-10-07 14:55:00+00\t${lag}\n`;
+  config.ops.databases.ts2 = { host: '127.0.0.1', port: 5433, dbname: 'ts2', user: 'ro' };
+  config.ops.freshness = [{ label: 'bars', db: 'timescale' }, { label: 'bars', db: 'ts2' }];
+  const m = sha();
+  const w = { id: 0, merge_sha: m, deployed_at: '2026-10-07T14:30:00.000Z', target: 'x', ticket_key: null, workflows: '[]', baseline: JSON.stringify({ trusted: true, coverage: [], freshness: { rows: { bars: { lag_s: 4 } } } }) };
+  const look = async (byDb) => { fs.writeFileSync(psqlCtl, JSON.stringify({ byDb })); return dw.observe(w, { name: 'settle', due_at: '2026-10-07T15:00:00.000Z', attempts: 1, evidence: null }, new Date('2026-10-07T15:00:00Z')); };
+  const ev1 = await look({ ts: bars(900), ts2: bars(4) });
+  const failed = ev1.items.filter((i) => i.result === 'fail').map(dw.evKey);
+  assert.deepEqual(failed, ['ingest_freshness|timescale|ingest bars is fresh']);
+  const ev2 = await look({ ts: 'source\tlatest\tlag_s\n', ts2: bars(4) }); // A reports nothing; B (same label) passes
+  assert.equal(dw.recovered(failed, ev2), false, 'B\'s pass is not A\'s recovery');
+  assert.equal(dw.recovered(failed, await look({ ts: bars(5), ts2: bars(900) })), true, 'a healthy read of A releases A');
+  delete config.ops.databases.ts2;
+  config.ops.freshness = [{ label: 'bars', db: 'timescale' }];
+  fs.writeFileSync(psqlCtl, '{}');
+});
+
+test('round 3: grant scope is live — a component retired by a newer deployment is refused at once (both directions)', async () => {
+  for (const [retire, keep] of [['ingestor', 'alpaca-trader'], ['alpaca-trader', 'ingestor']]) {
+    reset();
+    config.ops.containers = ['alpaca-trader', 'ingestor'];
+    const ps = 'alpaca-trader\trunning\tUp\t1m\ningestor\trunning\tUp\t1m';
+    docker({ ps, inspect: '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg\n/ingestor\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' });
+    const mk = (targets, completed, key) => { const m = sha(); const rows = targets.map((tg, i) => store.recordDeploy({ deploy_key: key, merge_sha: m, workflow: `.github/workflows/${tg}.yml`, run_id: 90000 + seq * 10 + i, target: tg, status: 'success', completed_at: completed, source: 'external' }).row);
+      return store.transaction(() => dw.createWatchFor({ deployKey: key, mergeSha: m, ticketKey: null, pr: null, rows, source: 'external' })); };
+    const w = mk(['alpaca-trader', 'ingestor'], at(3).toISOString(), `lv${++seq}`);
+    app.body = sha40(w.merge_sha);
+    dw.clock.now = () => at(9);
+    await dw.sweep({ now: at(9) });
+    const { r, done } = await mkGrantRun(null, w);
+    assert.match(await ops.handle(r, { probe: 'container_logs', container: retire }), /ops-result/, 'both components readable before');
+    mk([retire], at(12).toISOString(), `nv${++seq}`); // a newer deployment takes over one component
+    await assert.rejects(ops.handle(r, { probe: 'container_logs', container: retire }), new RegExp(`covers only ${keep}`));
+    const st = await ops.handle(r, { probe: 'container_status' });
+    assert.doesNotMatch(st, new RegExp(`^${retire}\\t`, 'm'));
+    assert.match(st, new RegExp(keep));
+    done();
+  }
+  config.ops.containers = ['alpaca-trader'];
+});
+
+test('round 3 property: verified ⇒ every required key has fresh healthy evidence from its own resource; release ⇒ every failed key re-observed healthy', () => {
+  let x = 7;
+  const rnd = (n) => { x = (x * 1103515245 + 12345) % 2147483648; return x % n; };
+  const pick = (a) => a[rnd(a.length)];
+  const KINDS = { app_health: ['app'], container_status: ['trader', 'broker', 'ingestor'], container_logs: ['trader', 'broker'], ingest_freshness: ['dbA', 'dbB'] };
+  const RES = ['pass', 'fail', 'anomaly', 'unknown', 'n/a'];
+  const mkItem = () => { const kind = pick(Object.keys(KINDS)); const resource = pick(KINDS[kind]); return { criterion: pick(['c1', 'c2']), probe: kind, kind, resource, result: pick(RES), carried: rnd(5) === 0 }; };
+  for (let n = 0; n < 2000; n++) {
+    const ev = { items: Array.from({ length: 1 + rnd(5) }, mkItem) };
+    const re = { items: Array.from({ length: 1 + rnd(6) }, mkItem), identity: { status: rnd(6) ? 'match' : 'unresolved' } };
+    const audit = Array.from({ length: rnd(4) }, () => { const k = pick(Object.keys(KINDS)); return { probe: k, outcome: rnd(5) ? 'ok' : 'error', health: rnd(6) ? null : 'unhealthy', resources: JSON.stringify([pick(KINDS[k])]) }; });
+    if (!dw.verificationProblems(ev, re, audit).length) {
+      // Oracle, written independently: every non-n/a key of ev (resolved ones) and re has a fresh pass/n/a item with the
+      // same kind+resource+criterion in re, or an anomaly with an ok, healthy audit row of that kind on that resource.
+      assert.equal(re.identity.status, 'match');
+      const k = (i) => `${i.kind}|${i.resource}|${i.criterion}`;
+      for (const i of [...ev.items.filter((y) => y.result !== 'unknown'), ...re.items].filter((y) => y.result !== 'n/a')) {
+        const all = re.items.filter((y) => k(y) === k(i));
+        assert.ok(all.length, `missing ${k(i)}`);
+        for (const now of all) assert.ok(now.result === 'pass' || now.result === 'n/a'
+          || (now.result === 'anomaly' && audit.some((a) => a.outcome === 'ok' && a.health !== 'unhealthy' && a.probe === now.kind && JSON.parse(a.resources).includes(now.resource))), `${k(i)} is ${now.result}`);
+      }
+      for (const i of ev.items.filter((y) => y.result === 'unknown')) assert.ok(re.items.some((y) => y.kind === i.kind && y.resource === i.resource), `unknown ${i.kind}|${i.resource} never re-read`);
+    }
+    const failed = [...new Set(ev.items.filter((i) => i.result === 'fail').map(dw.evKey))];
+    if (dw.recovered(failed, re)) for (const f of failed) { const seen = re.items.filter((y) => `${y.kind}|${y.resource}|${y.criterion}` === f); assert.ok(seen.length && seen.every((y) => y.result === 'pass' && !y.carried), `released without ${f}`); }
+  }
 });

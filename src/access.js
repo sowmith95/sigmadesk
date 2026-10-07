@@ -203,7 +203,11 @@ export function postDeployGrant({ run, checkpoint, probes, minutes = 15, scope =
   return g;
 }
 /** A scoped grant (post-deploy) names the resources it covers: a probe naming another container or database is refused. */
-export const scopeOf = (g) => (g?.scope ? json(g.scope, null) : null);
+// A post-deploy grant's resources are derived LIVE from its watch at every probe (deploywatch registers the resolver),
+// so a newer deployment that takes over a component narrows the grant immediately; other grants use the stored scope.
+let scopeResolver = null;
+export function setScopeResolver(fn) { scopeResolver = fn; }
+export const scopeOf = (g) => (g?.granted_by === 'post_deploy' && scopeResolver ? scopeResolver(g) : g?.scope ? json(g.scope, null) : null);
 export function scopeProblem(g, probe, params = {}) {
   const scope = scopeOf(g);
   if (!scope) return null;

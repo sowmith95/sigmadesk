@@ -469,6 +469,10 @@ deploy and then checks production itself.
   and each anomaly was re-checked with its own probe; a check that observed nothing is retried
   (`deployWatch.retryMinutes`), then inconclusive. A check missed by more than `deployWatch.missedHours` is recorded as
   missed. During market hours the probe allowance per checkpoint is the busy-window per-run limit.
+- **Evidence identity.** Every piece of evidence is keyed by `{criterion, kind, resource}` (probe kind and the exact
+  container, database or endpoint it observed; audited probe calls record what they observed). Settling an anomaly,
+  accepting "verified", the provisional hold's failure set and its release, and coverage gaps all match on that key: a
+  trader-scoped status never settles the broker, and database A's failure is released only by a healthy read of A.
 - **The SRE model only when needed.** Anomalies (one restart, a new error signature below
   `deployWatch.newSignatureMinCount`, a 3xx/4xx health answer) and the ticket's own criteria (at T+30, and at the
   session open for trading-path work) go to the SRE in a capped `watch` run: `watch.budgetUsd` (default $1) per
@@ -476,7 +480,8 @@ deploy and then checks production itself.
   from the SRE needs a fresh probe in that run. Watch and verify runs never publish or merge anything; a watch run cannot even comment.
 - **Access.** `access.policy.postDeployAutoGrant` is **off** by default (also for desks saved before it existed). When
   you switch it on (Access sheet), a checkpoint's SRE run gets a grant bound to that run and checkpoint, within the policy (allowed seats, probes,
-  longest duration, active grants), limited to the deployment's containers and databases (container status shows only those), expiring with the run;
+  longest duration, active grants), limited to the deployment's containers and databases — derived live from the watch at every probe, so a component a
+  newer deployment took over is refused at once (container status shows only the rest) — expiring with the run;
   lowering `maxActive` ends the oldest agent grants beyond it; the
   policy is re-checked at every probe (narrowing it ends the grant) and the grant ends when the deployment stops being
   watched. An access request from a check run lives and ends with that run, not with the (done) ticket. Off, the SRE works from the desk's evidence or asks you for access.
