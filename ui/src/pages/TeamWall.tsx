@@ -14,7 +14,7 @@ import { Counts, KpiRow, WaitingPill, useSeatTap } from '@/components/team/Depar
 import { teamOverview, openDecision, STATE_TEXT, type DeptFlow, type Exception, type TeamOverview } from '@/components/team/model';
 
 const EX: Record<string, { label: string; icon: typeof Rocket; cls: string }> = {
-  deploy: { label: 'Deploy hold', icon: Rocket, cls: 'border-l-blocked text-blocked' }, incident: { label: 'Incident', icon: Siren, cls: 'border-l-blocked text-blocked' },
+  regression: { label: 'Regression hold', icon: Siren, cls: 'border-l-blocked text-blocked' }, deploy: { label: 'Deploy hold', icon: Rocket, cls: 'border-l-blocked text-blocked' }, incident: { label: 'Incident', icon: Siren, cls: 'border-l-blocked text-blocked' },
   stalled: { label: 'Stalled run', icon: TimerOff, cls: 'border-l-needs text-needs' }, approval: { label: 'Waiting for you', icon: AlertTriangle, cls: 'border-l-needs text-needs' },
 };
 function ExceptionCard({ e, now, onSeat }: { e: Exception; now: number; onSeat: (id: string) => void }) {

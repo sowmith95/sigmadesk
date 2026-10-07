@@ -151,8 +151,14 @@ test('KPIs say their source, time and window, and unknown ones say why; merged, 
   assert.equal(v('qa', 'Deployment hold').value, 'failed deploy · 25 min'); assert.equal(v('qa', 'Deployment hold').tone, 'blocked');
   assert.equal(v('reliability', 'Active production incidents').value, '1 · oldest 40 min');
   assert.equal(v('reliability', 'Latest healthy observation').value, '0 min ago');
-  assert.deepEqual(release.map((r) => [r.label, r.value]), [['Merged', '1'], ['Deployed', null], ['Production-verified', '1']]);
-  assert.match(release[1].unknown, /deploy lock/);
+  // Without deploy history from the server, deployed and verified are unknown: a "verified in production" event is a
+  // verification report, not a deployment, so it is never counted as one (#7).
+  assert.deepEqual(release.map((r) => [r.label, r.value]), [['Merged', '1'], ['Deployed', null], ['Production-verified', null]]);
+  assert.match(release[1].unknown, /deploy history/);
+  // With the post-deploy watch summary: distinct deployments, one window, verified as "x of deployed".
+  const withHistory = departmentKpis({ ...state, meta: { ...state.meta, production: { kpis: { window_days: 7, since: at(7 * 86400_000), observed_at: at(0), deployments: 3, deployed: 2, failed: 1, verified: 1, regression: 0, inconclusive: 0, watching: 1, superseded: 0 } } } }, deps, { now: NOW }).release;
+  assert.deepEqual(withHistory.map((r) => [r.label, r.value]), [['Merged', '1'], ['Deployed', '2'], ['Production-verified', '1 of 2']]);
+  assert.ok(withHistory.every((r) => r.window === 'last 7 days'), 'one window for all three');
 });
 
 test('exceptions lead with deploy holds, incidents and stalled runs, then approvals oldest first', () => {
