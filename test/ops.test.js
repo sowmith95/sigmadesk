@@ -589,7 +589,7 @@ test('childEnv: an explicit allowlist, a project.env schema and an isolated tool
     const toml = fs.readFileSync(path.join(codexHome(), 'config.toml'), 'utf8');
     for (const g of ['"**/.env.*" = "none"', '"**/*.pem" = "none"', '"**/credentials.json" = "none"']) assert.equal(toml.split(g).length - 1, 3, `${g} in every profile (seat, review, tagged)`);
     assert.ok(!toml.includes(`"${os.homedir()}" = "read"`), 'codex never reads the whole home folder');
-    // A read-only path holding a secret-looking file is never handed to Codex.
+    // A read-only path holding a secret-looking file is still handed to Codex, with those files denied.
     const { secretFileUnder } = await import('../src/engines/codex.js');
     const clean = path.join(tmp, 'ro-clean'), dirty = path.join(tmp, 'ro-dirty');
     fs.mkdirSync(path.join(clean, 'lib'), { recursive: true }); fs.writeFileSync(path.join(clean, 'lib', 'a.py'), 'x');
@@ -598,7 +598,10 @@ test('childEnv: an explicit allowlist, a project.env schema and an isolated tool
     const savedRo = config.project.readOnlyPaths; config.project.readOnlyPaths = [clean, dirty];
     const toml2 = fs.readFileSync(path.join(codexHome(), 'config.toml'), 'utf8');
     config.project.readOnlyPaths = savedRo;
-    assert.ok(toml2.includes(`${JSON.stringify(clean)} = "read"`) && !toml2.includes(JSON.stringify(dirty)));
+    // Both trees are readable (a venv must stay executable); the secret-looking files inside are denied by rooted globs.
+    assert.ok(toml2.includes(`${JSON.stringify(clean)} = "read"`) && toml2.includes(`${JSON.stringify(dirty)} = "read"`));
+    assert.ok(toml2.includes(`${JSON.stringify(path.join(dirty, '**/.env.*'))} = "none"`) && toml2.includes(`${JSON.stringify(path.join(dirty, '**/*.pem'))} = "none"`));
+    assert.ok(toml2.indexOf(`${JSON.stringify(dirty)} = "read"`) < toml2.indexOf(`${JSON.stringify(path.join(dirty, '**/*.pem'))} = "none"`), 'deny globs follow the read entry');
   } finally { config.root = savedRoot; }
   // project.env schema: credential-looking names or values never reach a seat.
   config.project.env = { TZ: 'UTC', DB_URI: 'x', LOG_LEVEL: 'debug', UPSTREAM: 'https://user:pa55word@api.example/x', CONN: 'postgresql://a@b/c', LONG: 'Zm9vYmFyYmF6cXV4cXV1eHF1dXhxdXV4cXV1eA', lower_case: 'x', NOTE: 'token=abc' };

@@ -14,9 +14,8 @@ const short = (s, n = 180) => { const t = String(s ?? '').replace(/\s+/g, ' ').t
 // codex wraps commands as `/bin/bash -lc '<cmd>'`; show just the command
 const unwrap = (cmd) => String(cmd || '').replace(/^\/bin\/(ba|z)?sh -l?c\s+(['"])([\s\S]*)\2$/, '$3');
 
-// A read-only path that holds a secret-looking file is not handed to Codex at all (fail closed): Codex's deny globs are
-// verified inside workspace roots only. Scans a bounded tree (depth 5, 20k entries); an unreadable or oversized tree
-// counts as containing secrets.
+// Does a tree hold a secret-looking file? (Kept for diagnostics and tests; read-only trees are no longer dropped for it —
+// their secret-looking files are denied by rooted globs instead.) Scans a bounded tree (depth 5, 20k entries).
 const SECRET_NAME = /^(\.env(\..*)?|\.envrc|.*\.(pem|key|p12|pfx|keystore|jks)|id_(rsa|ecdsa|ed25519).*|credentials(\.json)?|.*credentials.*\.json|service-account.*\.json|\.npmrc|\.pypirc|\.netrc|\.pgpass.*|\.git-credentials|secrets\.(ya?ml|json))$/;
 export function secretFileUnder(root, limit = 20000) {
   let seen = 0;
@@ -49,7 +48,12 @@ export function codexHome() {
   const hm = os.homedir();
   const readable = ['/System', '/usr', '/private/etc', '/opt/homebrew', '/Library/Developer/CommandLineTools',
     path.dirname(path.dirname(process.execPath)), path.join(config.root, 'bin'), path.join(hm, '.gitconfig'), path.join(hm, '.config', 'git'),
-    ...config.project.readOnlyPaths.filter((p) => !secretFileUnder(p))].filter((p, i, a) => p && a.indexOf(p) === i && fs.existsSync(p));
+    ...config.project.readOnlyPaths].filter((p, i, a) => p && a.indexOf(p) === i && fs.existsSync(p));
+  // Secret-looking files inside the owner's read-only trees (a Python venv ships cacert.pem, botocore/credentials.py …)
+  // stay unreadable through rooted deny globs, which Codex honours outside workspace roots too (verified with a real
+  // run: "<root>/**/*.pem" = "none" blocks the read while "<root>" = "read" still lets its binaries execute). Dropping
+  // the whole tree instead silently removed the project's venv, so QA on Codex could not run pytest at all.
+  const roDeny = config.project.readOnlyPaths.filter((p) => p && fs.existsSync(p)).flatMap((p) => SECRET_GLOBS.map((g) => path.join(p, g)));
   const q = (p) => JSON.stringify(p);
   fs.writeFileSync(path.join(home, 'config.toml'), [
     'approval_policy = "never"',
@@ -60,6 +64,7 @@ export function codexHome() {
     '":minimal" = "read"',
     '":tmpdir" = "write"',
     ...readable.map((p) => `${q(p)} = "read"`),
+    ...roDeny.map((p) => `${q(p)} = "none"`),
     '',
     '[permissions.sigmadesk_seat.filesystem.":workspace_roots"]',
     '"." = "write"',
