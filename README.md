@@ -418,6 +418,36 @@ answers it with probes under a ticket-scoped grant; it comes to you only if no p
    desk passes psql an environment without any inherited `PG*` variables. Passwords in the config are refused.
 4. Restart the desk, turn on **Settings → Production read access**, and grant (or let the EM approve) access as needed.
 
+## Packages and documentation without network (`desk pkg`, `desk fetch`)
+
+Seats still have **no network**: no egress allowlist is opened for any engine (Claude `allowedDomains` stays empty,
+every Codex permission profile keeps `network.enabled = false`). Two narrow desk-run doors cover what seats need:
+
+- **Python packages, owner-approved, per ticket.** A build run asks with exact pins:
+  `desk pkg request name==version [...] --why "…" [--dev]` (canonical names; extras, markers, URLs, ranges and pip
+  options are refused). The *desk* resolves the whole set with the shared venv's pip — wheels only, PyPI only, with
+  the shared venv's current distributions as constraints, so nothing that exists changes version (a request that
+  would replace one is refused) — in a scrubbed environment (no `PIP_*` from your shell, `PIP_CONFIG_FILE=/dev/null`),
+  then downloads every wheel itself from `files.pythonhosted.org` (redirects re-checked, size and time caps) and
+  verifies each sha256. The set is staged under `data/pkg/<id>/`. Your Inbox shows a **Package install** card with
+  the requester, ticket, reason and every wheel (transitive ones too) with its version, size and sha256; only you
+  approve (Access sheet: approve, decline, revoke). No probe grant, owner tag or post-deploy grant covers packages.
+- **Offline install inside the sandbox.** Runs of that seat on that ticket started after the approval can read that
+  stage (Claude `allowRead`, a per-run Codex profile override) and nothing else new. `desk pkg install` runs
+  `python -m venv --without-pip .venv` on the shared interpreter, layers the shared venv's site-packages read-only
+  through a `.pth` file (not `--system-site-packages`), and installs with
+  `pip install --no-index --no-deps --require-hashes --find-links <stage>` using pip from a wheel in the stage, with
+  `PYTHONDONTWRITEBYTECODE=1` and a desk-owned CA bundle copy (`data/pkg/ca.pem`). The desk then reads the venv back
+  (never executing it) and records its fingerprint (Python, platform, full lock, hashes) on the ticket. QA counts
+  Python tests only when run with `.venv/bin/python` and names the fingerprint; the merge brief says "adds N
+  dependencies (runtime/dev)", and reviewers are asked to check the requirements file change. Revoking, expiry
+  (`packages.grantHours`) or the ticket closing deletes the stage and refuses further installs; the workspace venv dies
+  with the workspace. The shared venv is never written.
+- **Documentation.** `desk fetch <https-url>` makes the *desk* fetch one page from `fetch.hosts` (default
+  `docs.python.org`, `nodejs.org`, `docs.github.com`; edit it in the config): HTTPS only, exact host names checked
+  before DNS, IP literals and private/link-local addresses refused, every redirect re-validated, size and time caps.
+  HTML comes back as plain text marked untrusted, and every fetch is an event on the ticket.
+
 ## Post-deploy watch: does the change work in production?
 
 A merge is not a deploy, and a deploy is not a verified change. After every deploying merge the desk records the
