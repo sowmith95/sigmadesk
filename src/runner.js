@@ -16,6 +16,7 @@ import * as context from './context.js';
 import * as ops from './ops.js';
 import { SECRET_GLOBS } from './secret-globs.js';
 import * as access from './access.js';
+import * as packages from './packages.js';
 
 const pexec = promisify(execFile);
 const children = new Map(); // runId -> ChildProcess
@@ -421,7 +422,8 @@ export function canResume(run, maxAgeHours) {
   if (run.provenance && run.provenance !== provenanceOf(seat, run.kind)) return false;
   // A Codex session keeps the permission profile it was created under (a profile change is invisible to `exec resume`),
   // so a session from an older profile starts fresh instead — otherwise a sandbox fix never reaches resumed work.
-  if (provider === 'codex' && run.profile_hash !== ENGINES.codex.profileHash()) return false;
+  // The profile includes the run's package stages (#8): a grant approved or ended since then starts a fresh session.
+  if (provider === 'codex' && run.profile_hash !== ENGINES.codex.profileHash(packages.readPathsFor(run.agent_id, run.ticket_key, run.kind).paths)) return false;
   const ended = Date.parse(run.ended_at || run.started_at);
   const transcript = provider === 'codex' || fs.existsSync(sessionFile(run.cwd, run.session_id));
   return Date.now() - ended < maxAgeHours * 3600_000 && transcript && fs.existsSync(run.cwd);
@@ -446,11 +448,12 @@ export const HOME_TOOLCHAINS = ['~/.local/share/mise', '~/.local/bin', '~/.nvm',
   '~/Library/Caches/pip', '~/.cache/ms-playwright', '~/Library/Caches/ms-playwright'];
 const expand = (p) => (p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
 /** What a seat may read under the owner's home: its clone, other read-only trees it was given, the desk CLI, toolchains. */
-export function readAllowlist(cwd, extraDirs = [], socketPath = config.socketPath) {
+// extraRead: this run's package stages (#8) — desk-owned, read-only, only for the seat and ticket that were granted.
+export function readAllowlist(cwd, extraDirs = [], socketPath = config.socketPath, extraRead = []) {
   return [cwd, ...extraDirs, ...(config.project.readOnlyPaths || []), path.join(config.root, 'bin'), socketPath,
-    ...HOME_TOOLCHAINS, ...(config.sandbox.allowRead || [])].filter(Boolean);
+    ...HOME_TOOLCHAINS, ...(config.sandbox.allowRead || []), ...extraRead].filter(Boolean);
 }
-export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketPath = config.socketPath) {
+export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketPath = config.socketPath, extraRead = []) {
   const deny = [...config.sandbox.denyRead,
     // desk state: run tokens, verdict codes, config, private notes, and every seat's session transcript
     path.join(config.root, 'data'), config.dataDir, config.configFile, path.join(config.root, 'local'), '~/.claude', '~/.codex',
@@ -474,7 +477,7 @@ export function sandboxSettings(cwd, extraDirs = [], kind = 'implement', socketP
       // The whole home folder is denied to shell commands; allowRead re-opens only the seat's trees, the desk CLI and
       // toolchains. Credential paths and secret-looking files are denied more specifically and stay closed.
       // readOnlyPaths and other seats' clones stay readable but are explicitly write-protected.
-      filesystem: { denyRead: ['~', ...deny, ...secretFiles], allowRead: readAllowlist(cwd, extraDirs, socketPath),
+      filesystem: { denyRead: ['~', ...deny, ...secretFiles], allowRead: readAllowlist(cwd, extraDirs, socketPath, extraRead),
         allowWrite: READ_ONLY_KINDS.has(kind) ? [] : [cwd], denyWrite: [...config.project.readOnlyPaths, ...extraDirs, config.project.repoPath, ...(READ_ONLY_KINDS.has(kind) ? [cwd] : [])].filter(Boolean) },
     },
     permissions: {
@@ -545,7 +548,7 @@ export function jobPermissions(kind, job) {
   if (kind === 'research_review' || kind === 'connector_assessment') return { web: !!job?.web };
   return {};
 }
-export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath, job = null, capUsd = null } = {}) {
+export function buildCommand(agent, kind, cwd, { resume = null, fork = false, extraDirs = [], socketPath = config.socketPath, job = null, capUsd = null, extraRead = [] } = {}) {
   const charter = kind === 'council_review' ? 'You are a read-only engineering reviewer. Use only the frozen supplied brief. Never call tools, edit files, contact services, or grant QA/merge approval. Return your analysis as text.'
     : kind === 'product_review' ? productReviewCharter(agent.id)
       : kind === 'feature_groom' ? featureGroomCharter()
@@ -554,8 +557,8 @@ export function buildCommand(agent, kind, cwd, { resume = null, fork = false, ex
         : kind === 'research_review' || kind === 'connector_assessment' ? readOnlyReviewCharter(agent.id, kind) : charterFor(agent.id);
   const mcpServers = RESEARCH_KINDS.has(kind) && job?.connectors?.length ? connectors.mcpServersFor(job.connectors) : undefined;
   const cmd = engineOf(agent).command({
-    seat: agent, kind, cwd, resume, fork, extraDirs, mcpServers,
-    perms: permissionsFor(kind, cwd, jobPermissions(kind, job)), denyRules: DENY_RULES, charter, settings: sandboxSettings(cwd, extraDirs, kind, socketPath),
+    seat: agent, kind, cwd, resume, fork, extraDirs, mcpServers, extraRead,
+    perms: permissionsFor(kind, cwd, jobPermissions(kind, job)), denyRules: DENY_RULES, charter, settings: sandboxSettings(cwd, extraDirs, kind, socketPath, extraRead),
   });
   // Conflict resolutions (merge train, #3) and tagged runs (@mentions) get their own, lower hard spend cap.
   const cap = Math.min(kindCap(kind) ?? Infinity, capUsd ?? Infinity); // capUsd: what is left of a job's allowance
@@ -668,8 +671,11 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const limits = admitted?.limits || null;
   if (ENGINES[agent.engine || 'claude']?.supports && !ENGINES[agent.engine || 'claude'].supports(kind)) throw Object.assign(new Error(`${agentId}: ${ENGINES[agent.engine].label} cannot run ${kind}`), { status: 409 });
   const token = crypto.randomBytes(18).toString('hex');
+  // Approved package stages this seat may read in this run (#8): fixed at launch, like the rest of the sandbox.
+  const pkg = packages.readPathsFor(agentId, ticketKey, kind);
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job,
-    profile_hash: (agent.engine || 'claude') === 'codex' ? ENGINES.codex.profileHash() : null });
+    profile_hash: (agent.engine || 'claude') === 'codex' ? ENGINES.codex.profileHash(pkg.paths) : null });
+  packages.recordLaunch(run.id, pkg.ids);
   // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
   if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
   store.updateRun(run.id, { reserve_usd: Math.min(capped(kind, engineOf(agent).budgetUsd(agent)), limits?.usd ?? Infinity) });
@@ -731,7 +737,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   let sock, cmd, env;
   try {
     sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
-    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job, capUsd: limits?.usd ?? null });
+    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job, capUsd: limits?.usd ?? null, extraRead: pkg.paths });
     env = { ...childEnv(token, engine.id), ...cmd.env };
     isolateTools(env, engine.id, toolHome(run.id));
     if (kind === 'council_review') { delete env.DESK_RUN_TOKEN; delete env.DESK_SOCKET; }

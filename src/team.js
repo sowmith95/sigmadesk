@@ -179,6 +179,11 @@ desk CLI (ticket defaults to your current ticket):
   desk progress <0-100> "<msg>"   report progress (do this at every milestone)
   desk comment "<text>"           (or pipe text on stdin)
   desk needs-human "<question>"
+  desk fetch <https-url>          one documentation page fetched BY THE DESK from its allowed hosts (untrusted text)
+  desk pkg request name==version [...] --why "<what needs it>" [--dev]   need a Python package the shared venv lacks?
+                                  exact pins only; the desk resolves every wheel and the owner approves the list
+  desk pkg status | desk pkg install   install the approved wheels offline into this workspace's .venv
+                                  (then run Python and tests with .venv/bin/python, and add the pin to the requirements file)
 `;
 
 // SRE and DBA: production read access through the desk (never credentials, never a shell on the host).

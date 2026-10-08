@@ -5,6 +5,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawnSync, execFileSync } from 'node:child_process';
 
 const USAGE = `usage:
   desk show [KEY] | desk list [status]
@@ -39,6 +40,9 @@ const USAGE = `usage:
   desk context-file <path> [--page N]   (Perplexity seats: a desk-built file/diff block to send verbatim on the same thread)
   desk incident file --title T --severity P0-P3 --area A   (analysis on stdin)
   desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>"
+  desk pkg request name==version [...] --why "<what needs it>" [--dev]   (build runs: the desk resolves every wheel; the owner approves)
+  desk pkg status | desk pkg install   (install: offline, into this workspace's .venv, from the approved wheels)
+  desk fetch <https-url>   (the desk fetches one page from its allowed documentation hosts; the text is untrusted)
   desk ops list | desk ops <probe> [--param value]   (seats holding a production read access grant)
   desk ops request <probe…|all> --why "<what you must check>" [--for 1h | --ticket]
   desk access list | desk access approve <id> [--for 1h | --ticket] "<why>" | desk access deny|owner <id> "<why>" | desk access revoke <id> "<why>"   (EM/SRE)
@@ -83,6 +87,8 @@ switch (cmd) {
   case 'route': takeKey(); body.to = pos.shift(); body.body = pos.join(' '); break;
   case 'consult': body.agent = pos.shift(); body.body = pos.join(' '); break;
   case 'qa': case 'accept': case 'review': body.verdict = pos.shift(); body.body = pos.join(' '); break;
+  case 'pkg': body.action = pos.shift() || 'status'; if (body.action === 'request') body.specs = pos.splice(0); break;
+  case 'fetch': body.url = pos.shift(); break;
   case 'ops': body.probe = pos.shift() || 'list'; if (body.probe === 'request') body.probes = pos.splice(0); break;
   case 'access': body.action = pos.shift() || 'list'; if (/^\d+$/.test(pos[0] || '')) body.id = pos.shift(); body.body = pos.join(' '); break;
   case 'respond': case 'resolve': case 'verify': case 'watch': case 'handoff': body.action = pos.shift(); body.body = pos.join(' '); break;
@@ -96,7 +102,7 @@ switch (cmd) {
 if (typeof body.findings === 'string' && body.findings.startsWith('@')) {
   try { body.findings = fs.readFileSync(path.resolve(body.findings.slice(1)), 'utf8'); } catch (e) { console.error(`desk: cannot read ${body.findings.slice(1)} (${e.message})`); process.exit(2); }
 }
-if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file', 'ops', 'access'].includes(cmd)) body.body = await stdinText();
+if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file', 'ops', 'access', 'pkg', 'fetch'].includes(cmd)) body.body = await stdinText();
 else if (['groom', 'propose', 'create-task', 'incident', 'design', 'revise', 'connector-propose'].includes(cmd) && !body.body) body.body = await stdinText();
 
 const token = process.env.DESK_RUN_TOKEN;
@@ -110,38 +116,84 @@ function finish(status, j) {
   process.exit(0);
 }
 
-if (mailbox) {
-  // File transport: drop a request into the mailbox, wait for the desk's reply file.
-  const id = crypto.randomBytes(8).toString('hex');
-  const tmp = path.join(mailbox, `.req-${id}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify({ token, cmd, body }));
-  fs.renameSync(tmp, path.join(mailbox, `req-${id}.json`));
-  const res = path.join(mailbox, `res-${id}.json`);
-  const deadline = Date.now() + 15 * 60_000;
-  const wait = () => {
-    if (fs.existsSync(res)) {
-      const j = JSON.parse(fs.readFileSync(res, 'utf8'));
-      fs.unlinkSync(res);
-      return finish(j.error ? 400 : 200, j);
+/** One request to the desk over this run's transport → { status, j }. */
+function send(command, payloadBody) {
+  return new Promise((resolve) => {
+    if (mailbox) {
+      // File transport: drop a request into the mailbox, wait for the desk's reply file.
+      const id = crypto.randomBytes(8).toString('hex');
+      const tmp = path.join(mailbox, `.req-${id}.tmp`);
+      fs.writeFileSync(tmp, JSON.stringify({ token, cmd: command, body: payloadBody }));
+      fs.renameSync(tmp, path.join(mailbox, `req-${id}.json`));
+      const res = path.join(mailbox, `res-${id}.json`);
+      const deadline = Date.now() + 15 * 60_000;
+      const wait = () => {
+        if (fs.existsSync(res)) {
+          const j = JSON.parse(fs.readFileSync(res, 'utf8'));
+          fs.unlinkSync(res);
+          return resolve({ status: j.error ? 400 : 200, j });
+        }
+        if (Date.now() > deadline) { console.error('desk: timed out waiting for the desk'); process.exit(1); }
+        setTimeout(wait, 250);
+      };
+      wait();
+      return;
     }
-    if (Date.now() > deadline) { console.error('desk: timed out waiting for the desk'); process.exit(1); }
-    setTimeout(wait, 250);
-  };
-  wait();
-} else {
-  const payload = JSON.stringify(body);
-  const req = http.request({ socketPath, path: `/desk/${cmd}`, method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Authorization: `Bearer ${token}` },
-    timeout: 15 * 60_000 }, (res) => {
-    let data = '';
-    res.on('data', (c) => { data += c; });
-    res.on('end', () => {
-      let j;
-      try { j = JSON.parse(data); } catch { j = { error: data }; }
-      finish(res.statusCode, j);
+    const payload = JSON.stringify(payloadBody);
+    const req = http.request({ socketPath, path: `/desk/${command}`, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Authorization: `Bearer ${token}` },
+      timeout: 15 * 60_000 }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        let j;
+        try { j = JSON.parse(data); } catch { j = { error: data }; }
+        resolve({ status: res.statusCode, j });
+      });
     });
+    req.on('error', (e) => { console.error(`desk: cannot reach the desk (${e.message})`); process.exit(1); });
+    req.on('timeout', () => { req.destroy(new Error('timeout')); });
+    req.end(payload);
   });
-  req.on('error', (e) => { console.error(`desk: cannot reach the desk (${e.message})`); process.exit(1); });
-  req.on('timeout', () => { req.destroy(new Error('timeout')); });
-  req.end(payload);
 }
+
+/**
+ * desk pkg install: the desk hands over the exact offline steps (after checking the grant); they run HERE, inside this
+ * run's sandbox (no network; the approved wheels are readable, nothing else new). Each step prints what it does.
+ * Then the desk reads the venv back and records its fingerprint.
+ */
+function runSteps(plan) {
+  const base = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(PIP_|PYTHON|VIRTUAL_ENV$|CONDA)/.test(k)));
+  for (const st of plan.steps) {
+    if (st.unless && fs.existsSync(st.unless)) { console.log(`- ${st.label}: already there`); continue; }
+    console.log(`- ${st.label}`);
+    try {
+      if (st.write) { fs.mkdirSync(path.dirname(st.write.path), { recursive: true }); fs.writeFileSync(st.write.path, st.write.text); continue; }
+      if (st.exclude) {
+        const p = execFileSync('git', ['-C', st.exclude.ws, 'rev-parse', '--git-path', 'info/exclude'], { encoding: 'utf8' }).trim();
+        const file = path.resolve(st.exclude.ws, p);
+        const have = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+        if (!have.split('\n').includes(st.exclude.line)) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.appendFileSync(file, `${have && !have.endsWith('\n') ? '\n' : ''}${st.exclude.line}\n`); }
+        continue;
+      }
+      console.log(`  $ ${st.argv.map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.split("'").join(`'\\''`)}'`)).join(' ').slice(0, 600)}`);
+      const r = spawnSync(st.argv[0], st.argv.slice(1), { env: { ...base, ...(st.env || {}) }, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+      const out = `${r.stdout || ''}${r.stderr || ''}`;
+      if (out.trim()) console.log(out.trim().split('\n').slice(-40).map((l) => `  ${l}`).join('\n'));
+      if (r.status !== 0) return { ok: false, step: st.label, output: (r.error ? r.error.message : out).slice(-2000) };
+    } catch (e) {
+      return { ok: false, step: st.label, output: String(e.message).slice(-2000) };
+    }
+  }
+  return { ok: true };
+}
+
+const first = await send(cmd, body);
+if (cmd === 'pkg' && body.action === 'install' && first.status < 400 && !first.j.error && first.j.output?.plan) {
+  const plan = first.j.output.plan;
+  if (plan.skipped?.length) console.log(`(request ${plan.skipped.map((x) => `#${x}`).join(', ')} was approved after this run started: not readable here)`);
+  const result = runSteps(plan);
+  const done = await send('pkg', { action: 'installed', ...result });
+  if (!result.ok) { console.error(`desk pkg install: failed at "${result.step}"`); if (done.j.output) console.error(done.j.output); process.exit(1); }
+  finish(done.status, done.j);
+} else finish(first.status, first.j);

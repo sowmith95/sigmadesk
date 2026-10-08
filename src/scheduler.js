@@ -25,6 +25,8 @@ import * as features from './features.js';
 import * as epicReview from './epic-review.js';
 import * as ops from './ops.js';
 import * as access from './access.js';
+import * as packages from './packages.js';
+import * as netfetch from './netfetch.js';
 import * as mentions from './mentions.js';
 import * as deploywatch from './deploywatch.js';
 import * as flow from '../public/flow.js';
@@ -54,6 +56,32 @@ export function isTestCommand(cmd) {
     const s = seg.trim().replace(/^\(+/, '').replace(/^(?:cd\s+\S+\s*)$/, '');
     return re.test(s);
   });
+}
+
+// A Python test segment (pytest, tox, nox, python -m …): in a workspace with its own venv (#8) it must run through it.
+const PY_TEST = /(^|\/)(pytest|py\.test|tox|nox)\b|(^|\/)python3?(\.\d+)?\s/;
+/**
+ * Does this command's Python test run use the workspace venv? Explicitly (.venv/bin/python, .venv/bin/pytest, with a
+ * relative or absolute path), through PATH=…/.venv/bin, or after sourcing .venv/bin/activate in an earlier segment.
+ * Non-Python test commands (npm test, go test, …) are not affected.
+ */
+export function testUsesVenv(cmd, ws = '') {
+  const segs = String(cmd).split(/&&|\|\||;|\n/).map((x) => x.trim().replace(/^\(+/, ''));
+  const venvBin = (p) => /(^|\/)\.venv\/bin\//.test(p) && (!p.startsWith('/') || !ws || p.startsWith(`${ws}/.venv/bin/`));
+  let activated = false, sawTest = false;
+  for (const seg of segs) {
+    if (/^(source|\.)\s+(\S*\/)?\.venv\/bin\/activate\b/.test(seg)) { activated = true; continue; }
+    if (!isTestCommand(seg)) continue;
+    sawTest = true;
+    const words = seg.split(/\s+/);
+    const envs = []; let i = 0;
+    while (i < words.length && /^[A-Z_]+=/.test(words[i])) envs.push(words[i++]);
+    const exe = words[i] || '';
+    if (!PY_TEST.test(`${exe} `)) continue; // not a Python test
+    const viaPath = envs.some((e) => /^PATH=[^:]*\.venv\/bin(:|$)/.test(e));
+    if (!(venvBin(exe) || viaPath || activated)) return false;
+  }
+  return sawTest;
 }
 
 // ---------------- limits ----------------
@@ -946,6 +974,7 @@ export async function tick() {
     if (triage && slots > 0 && agentIdle('support')) go('support', (f) => launchTriage(triage, f), null, 'triage');
     // 1a. Production access: end grants whose time/ticket/run is over; the EM/SRE reviews pending requests.
     access.sweep();
+    packages.sweep(); // package grants: expiry, closed tickets, resolutions a restart interrupted
     if (verifyReady() || ops.enabled(s)) {
       const rv = slots > 0 ? access.nextReview((id) => agentIdle(id)) : null;
       if (rv) go(rv.approver, (f) => launchAccessReview(rv.request, rv.approver, f), null, 'access_review');
@@ -1562,7 +1591,13 @@ export async function deskAction(run, cmd, body = {}) {
       const docsOnly = await runner.headSha(runner.workspaceDir(ticket.key))
         .then((sha) => runner.stageApproved(ticket.key, runner.workspaceDir(ticket.key), sha))
         .then(({ files }) => files.length > 0 && files.every(isDocPath), () => false); // any doubt → not docs-only
-      need(docsOnly || ran.some((e) => e.ok && isTestCommand(e.cmd)), `no passing test run in your session yet — run the relevant tests (e.g. ${ran.length ? 'the playbook test command' : 'pytest / npm test'}) and pass only if they succeed`);
+      // A workspace with its own venv (approved package installs, #8): Python tests count only when run with it.
+      const wsDir = runner.workspaceDir(ticket.key);
+      const venv = packages.qaEnvironment(ticket.key, wsDir);
+      const counts = (e) => e.ok && isTestCommand(e.cmd) && (!venv.venv || testUsesVenv(e.cmd, wsDir));
+      need(docsOnly || ran.some(counts), venv.venv && ran.some((e) => e.ok && isTestCommand(e.cmd))
+        ? 'this workspace has its own venv (.venv, from approved package installs): run the tests with it — e.g. .venv/bin/python -m pytest … — and pass only if they succeed'
+        : `no passing test run in your session yet — run the relevant tests (e.g. ${ran.length ? 'the playbook test command' : 'pytest / npm test'}) and pass only if they succeed`);
       // The verdict only counts for the exact commit that was submitted.
       const sha = await runner.headSha(runner.workspaceDir(ticket.key));
       need(!ticket.head_sha || sha === ticket.head_sha, `HEAD moved since submission (${sha.slice(0, 7)} ≠ ${String(ticket.head_sha).slice(0, 7)}); QA must not commit`);
@@ -1570,7 +1605,7 @@ export async function deskAction(run, cmd, body = {}) {
         need(store.getTicket(ticket.key)?.status === 'qa', 'the ticket left QA while you were checking it'); // re-checked after the async checks
         refresh.recordQa(ticket.key, sha);
         store.recordQaVerdict({ ...fact, sha, verdict: 'pass' });
-        store.addComment(ticket.key, agentId, `✅ **QA passed** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}`);
+        store.addComment(ticket.key, agentId, `✅ **QA passed** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}${venv.venv ? `\n\n_${venv.note}_` : ''}`);
         ev(`QA passed ${ticket.key}`);
       });
       teamStats.invalidate();
@@ -1617,6 +1652,20 @@ export async function deskAction(run, cmd, body = {}) {
       publishBranch(ticket.key);
       return 'Recorded. Stop now.';
     }
+    case 'pkg': {
+      // Package installs (#8): requests are resolved by the desk and approved by the owner; the install itself runs
+      // offline inside this seat's sandbox (bin/desk executes the plan, then reports back for verification).
+      const a = String(body.action || 'status');
+      if (a === 'status') return packages.statusText(run);
+      if (a === 'request') return packages.request(run, { specs: body.specs, why: body.why === true ? '' : body.why, dev: body.dev === true || body.dev === 'true' });
+      if (a === 'install') return { plan: packages.installPlan(run) };
+      if (a === 'installed') return packages.recordInstall(run, { ok: body.ok === true, step: body.step, output: body.output });
+      throw Object.assign(new Error('desk pkg request|status|install'), { status: 400 });
+    }
+    case 'fetch':
+      // The desk fetches one page from its documentation allowlist for the seat (seats have no network).
+      need(typeof body.url === 'string' && body.url, 'desk fetch <https-url>');
+      return netfetch.deskFetch(run, body.url);
     case 'ops':
       // Production read probes: gating (setting, seat, run kind), budgets and redaction live in ops.js, so the socket
       // and the mailbox transport get exactly the same answer.
@@ -2290,3 +2339,12 @@ export const prActions = {
     setStatus(t.key, 'done', { progress: 100, progress_msg: 'landed via another PR' });
   },
 };
+
+// An approved package request (#8) resumes its ticket when the seat parked it waiting for that approval, so the next
+// run (whose sandbox can read the approved wheels) starts without the owner having to answer twice.
+packages.setOnApproved((r) => {
+  const t = store.getTicket(r.ticket_key);
+  if (t?.status !== 'needs_human' || t.active_run) return;
+  const asked = store.listComments(t.key).slice(-6).some((c) => c.author === r.seat && /package request #\d+/.test(String(c.body || '')) && String(c.body).includes(`#${r.id}`));
+  if (asked) setStatus(t.key, t.resume_status || 'todo', { resume_status: null, stalls: 0, progress_msg: `package request #${r.id} approved — install it with desk pkg install` });
+});
