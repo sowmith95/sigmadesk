@@ -13,6 +13,7 @@ import { KIND_LABEL, NowLine, cardFor, Clamp, DecisionButton, firstName, reasonT
 import { Lineage } from '@/components/desk/Epic';
 import { BriefLine, DecisionLead, briefOf } from '@/components/desk/DecisionBrief';
 import { ProgramUpdate } from '@/components/desk/Program';
+import { PackageRequestRow, type PkgRequest } from '@/components/desk/Packages';
 import { LANES, reasons, snoozePresets } from '../../../public/inbox.js';
 import { cn } from '@/lib/utils';
 import type { Board, BoardItem } from '@/types';
@@ -103,6 +104,7 @@ function InboxRow({ it, hero = false }: { it: Row; hero?: boolean }) {
       {open && <div className="grid gap-3 pl-9">
         <div className="max-w-[68ch] text-sm"><Clamp id={`reason-${it.id}`} text={clean(reason)} /></div>
         {t && <DecisionLead it={it} t={t} inline full={['merge', 'publish', 'guard', 'deploy', 'access'].includes(it.kind || '')} />}
+        {it.kind === 'packages' && (it as BoardItem & { packages?: PkgRequest }).packages && <div className="rounded-lg border bg-card"><PackageRequestRow r={(it as BoardItem & { packages: PkgRequest }).packages} /></div>}
         {!!it.waiting?.length && <p className="text-sm text-muted-foreground">
           {it.kind === 'epic_review' ? 'Also answers: ' : `${it.waiting.length} more question${it.waiting.length === 1 ? '' : 's'} wait${it.waiting.length === 1 ? 's' : ''} on this: `}
           {it.waiting.map((w, i) => <span key={w.id}>{i > 0 && ', '}<button type="button" className="hover:text-foreground hover:underline" onClick={() => openTicket(w.key, { decision: w.id })}>{w.name}</button></span>)}</p>}

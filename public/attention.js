@@ -216,6 +216,17 @@ export function board(state, extra = {}) {
     out.needs_you.push({ key: `access-${r.id}`, id: `access:${r.id}`, kind: 'access', bucket: 'needs_you', name: who, access: r, ticket_key: r.ticket_key || null,
       action: 'Review access', verb: `Grant ${who} production read access${span}?`, reason: `${r.why || ''}${r.owner_reason ? ` (${r.owner_reason})` : ''}`.trim() });
   }
+  // A resolved package request (#8): only the owner lets a seat install packages, with the full wheel list in view.
+  for (const r of state.meta?.packages?.owner_requests || []) {
+    const who = (state.agents || []).find((a) => a.id === r.seat)?.name || r.seat_name || r.seat;
+    const adds = r.additions || [];
+    const lt = tickets.find((x) => x.key === r.ticket_key) || null;
+    const size = r.total_bytes ? ` · ${(r.total_bytes / 1e6).toFixed(1)} MB` : '';
+    const transitive = adds.length - (r.specs || []).length;
+    out.needs_you.push({ key: `packages-${r.id}`, id: `packages:${r.id}`, kind: 'packages', bucket: 'needs_you', name: who, packages: r, ticket_key: r.ticket_key || null, ticket: null, ticket_name: lt ? nameOf(lt) : r.ticket_key,
+      action: 'Review packages', verb: `Let ${who} install ${adds.length} package${adds.length === 1 ? '' : 's'} for ${r.ticket_key}?`,
+      reason: `${r.why || ''} — ${adds.map((x) => `${x.name}==${x.version}`).join(', ')}${transitive > 0 ? ` (${transitive} pulled in as dependencies)` : ''}${size}${r.dev ? ' · dev/test only' : ''}`.trim(), since: r.created_at });
+  }
   // An epic review's one question (and its proposed closes) is the owner's single decision for that epic.
   const byKey = new Map(tickets.map((t) => [t.key, t]));
   const covered = new Map();
@@ -257,7 +268,7 @@ export function board(state, extra = {}) {
   // `decisions` keeps every decision (the ticket sheet, Work page and palette find a ticket's decision there);
   // `needs_you` is the grouped Inbox list the counts describe.
   out.decisions = [...out.needs_you];
-  const rank = { guard: 0, deploy: 0, regression: 0, access: 1, owner_task: 1, conflict: 1, setup: 1, refresh: 1, stuck: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
+  const rank = { guard: 0, deploy: 0, regression: 0, access: 1, packages: 1, owner_task: 1, conflict: 1, setup: 1, refresh: 1, stuck: 1, epic_review: 1, question: 1, page: 2, merge: 3, publish: 4, plan: 5, design: 6, council: 7, research: 8 };
   out.decisions.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || age(a) - age(b));
   // The Inbox: grouped rows in lanes and order (public/inbox.js); snoozed rows are set aside, not resolved, and are
   // not counted as needing you until they wake. Every decision stays in `decisions` for sheets, trackers and search.

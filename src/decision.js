@@ -12,6 +12,7 @@ import * as mergetrain from './mergetrain.js';
 import * as reviews from './reviews.js';
 import * as prs from './prs.js';
 import * as access from './access.js';
+import * as packages from './packages.js';
 import * as ops from './ops.js';
 import * as github from './github.js';
 import * as runner from './runner.js';
@@ -204,6 +205,8 @@ export function briefFor(d, snap, { ix = flow.index(snap.tickets), now = Date.no
     facts.guardReasons = g?.reasons || [];
   }
   if (d.kind === 'deploy') facts.pending = mergetrain.pendingDeploys().length;
+  // Dependencies the ticket adds through approved package installs (#8): the merge and publish briefs say so.
+  if (['merge', 'publish', 'guard'].includes(d.kind) && t) { try { facts.dependencies = packages.ticketDependencies(t.key); } catch { facts.dependencies = null; } }
   if (d.kind === 'access' && d.access) {
     const r = d.access;
     let v = [];

@@ -5,11 +5,13 @@ import { Input } from '@/components/ui/input';
 import { Panel } from '@/components/desk/Panel';
 import { AsyncButton } from '@/components/desk/AsyncButton';
 import { Section } from '@/components/desk/Bits';
+import { PackageRequestRow, type PkgRequest } from '@/components/desk/Packages';
 
 type Grant = { id: number; seat: string; seat_name: string; probes: string[]; expires_at: string | null; ticket_key: string | null; run_id: number | null; standing: number; granted_by: string; reason: string | null; created_at: string; revoked_at?: string | null; revoked_by?: string | null };
 type Req = { id: number; seat: string; seat_name: string; probes: string[]; why: string; minutes: number | null; ticket_scoped: number; ticket_key: string | null; status: string; approver_name?: string | null; owner_reason?: string | null; decided_by?: string | null; note?: string | null; created_at: string };
 type Policy = { approvers: string[]; seats: string[]; probes: string[]; maxMinutes: number; maxActive: number; ticketMaxHours: number; ownerMentionAutoGrant?: boolean; postDeployAutoGrant?: boolean };
-type Data = { grants: Grant[]; requests: Req[]; policy: Policy; probes: string[]; seats: { id: string; name: string; role: string }[]; history: { grants: Grant[]; requests: Req[] } };
+type Data = { grants: Grant[]; requests: Req[]; policy: Policy; probes: string[]; seats: { id: string; name: string; role: string }[]; history: { grants: Grant[]; requests: Req[] };
+  packages?: { requests: PkgRequest[]; history: PkgRequest[] } };
 
 const probesText = (p: string[]) => (p.includes('*') ? 'all read-only probes' : p.join(', '));
 const left = (iso: string | null, now: number) => {
@@ -55,6 +57,16 @@ export function AccessPanel() {
               <span className="flex gap-2"><AsyncButton size="sm" run={async () => { await api('POST', `/api/access/requests/${r.id}/approve`, {}); await after(); }} ok="Granted">Grant {reqSpan(r)}</AsyncButton>
                 <AsyncButton size="sm" variant="secondary" run={async () => { await api('POST', `/api/access/requests/${r.id}/deny`, { reason: 'declined by the owner' }); await after(); }} ok="Declined">Decline</AsyncButton></span></div>))
             : <p className="px-4 py-3 text-muted-foreground">No open requests.</p>}
+        </div></Section>
+        <Section title="Package installs"><div className="divide-y rounded-lg border bg-card" data-packages-section>
+          {(() => {
+            // Open requests first (the ones that need you on top), then the last few that ended (declined, revoked, expired).
+            const open = d.packages?.requests || [];
+            const ended = (d.packages?.history || []).filter((r) => !open.some((o) => o.id === r.id)).slice(0, 5);
+            const rows = [...open.filter((r) => r.status === 'owner'), ...open.filter((r) => r.status !== 'owner'), ...ended];
+            return rows.length ? rows.map((r) => <PackageRequestRow key={r.id} r={r} onDone={load} />)
+              : <p className="px-4 py-3 text-muted-foreground">No package requests. Seats ask with desk pkg request; only you approve.</p>;
+          })()}
         </div></Section>
         <Section title="Grant access"><div className="grid gap-2 rounded-lg border bg-card p-4">
           <div className="flex flex-wrap gap-2">
