@@ -4,6 +4,7 @@
 // allowlist and blocks the network; that also blocks unix sockets, so Codex seats talk to the desk through a file
 // mailbox inside their own workspace.
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -78,6 +79,7 @@ export function codexHome() {
     '[permissions.sigmadesk_review.filesystem]',
     '":minimal" = "read"', '":tmpdir" = "write"',
     ...readable.map((p) => `${q(p)} = "read"`),
+    ...roDeny.map((p) => `${q(p)} = "none"`),
     '[permissions.sigmadesk_review.filesystem.":workspace_roots"]',
     '"." = "read"', '".git" = "read"', ...SECRET_GLOBS.map((g) => `${q(g)} = "none"`),
     '[permissions.sigmadesk_review.network]', 'enabled = false',
@@ -86,6 +88,7 @@ export function codexHome() {
     '[permissions.sigmadesk_tagged.filesystem]',
     '":minimal" = "read"', '":tmpdir" = "write"',
     ...readable.map((p) => `${q(p)} = "read"`),
+    ...roDeny.map((p) => `${q(p)} = "none"`),
     '[permissions.sigmadesk_tagged.filesystem.":workspace_roots"]',
     '"." = "read"', '".git" = "read"', '".desk-mailbox" = "write"', ...SECRET_GLOBS.map((g) => `${q(g)} = "none"`),
     '[permissions.sigmadesk_tagged.network]', 'enabled = false',
@@ -118,8 +121,14 @@ export function codexInvocation(bin = codexBin()) {
   return { bin, prefix: [] };
 }
 
+/** Hash of the permission profile Codex sessions are created under. A Codex session keeps the sandbox policy it
+ *  started with, so a run is resumable only while this hash still matches (see runner.canResume). */
+export function profileHash() {
+  return crypto.createHash('sha256').update(fs.readFileSync(path.join(codexHome(), 'config.toml'))).digest('hex').slice(0, 16);
+}
 export const codex = {
   id: 'codex',
+  profileHash,
   label: 'Codex (OpenAI)',
   isolation: { reads: 'restricted', writes: 'workspace only', network: 'blocked', note: 'Codex permission profile (beta): reads denied outside system/toolchain paths and the seat clone; writes only in the clone; no network.' },
   costNote: 'Token usage reported by Codex; USD only if you set engines.codex.pricing (notional on a ChatGPT plan).',

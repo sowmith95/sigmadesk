@@ -565,7 +565,8 @@ function migrate() {
       program: 'TEXT', job: 'TEXT',
       // tool calls and commands counted for a step-bounded run (tagged runs), persisted as they happen
       steps: 'INTEGER DEFAULT 0',
-      pid_start: 'TEXT' }, // the engine process's start time: a restart only signals a pid that is provably the same process
+      pid_start: 'TEXT', // the engine process's start time: a restart only signals a pid that is provably the same process
+      profile_hash: 'TEXT' }, // Codex: hash of the permission profile the session was created under (a changed profile is never resumed)
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -883,9 +884,9 @@ export function updateAgent(id, patch) {
 // ---------- runs ----------
 const publicRun = (r) => { if (!r) return r; const { token, nonce, ...rest } = r; return rest; };
 export function createRun(r) {
-  const info = q('INSERT INTO runs(agent_id,ticket_key,kind,token,model,cwd,resumed_from,incident_id,nonce,provenance,program,job) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(
+  const info = q('INSERT INTO runs(agent_id,ticket_key,kind,token,model,cwd,resumed_from,incident_id,nonce,provenance,program,job,profile_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(
     r.agent_id, r.ticket_key ?? null, r.kind, r.token, r.model, r.cwd ?? null, r.resumed_from ?? null, r.incident_id ?? null, r.nonce ?? null, r.provenance ?? null,
-    r.program ?? null, r.job ? JSON.stringify(r.job) : null);
+    r.program ?? null, r.job ? JSON.stringify(r.job) : null, r.profile_hash ?? null);
   const run = getRun(info.lastInsertRowid);
   announce({ type: 'run', data: publicRun(run) });
   return run;

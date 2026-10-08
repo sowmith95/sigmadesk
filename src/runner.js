@@ -419,6 +419,9 @@ export function canResume(run, maxAgeHours) {
   const [provider, ...modelParts] = String(run.model || '').split(':');
   if (!seat || provider !== engineOf(seat).id || modelParts.join(':') !== (seat.model || 'default')) return false;
   if (run.provenance && run.provenance !== provenanceOf(seat, run.kind)) return false;
+  // A Codex session keeps the permission profile it was created under (a profile change is invisible to `exec resume`),
+  // so a session from an older profile starts fresh instead — otherwise a sandbox fix never reaches resumed work.
+  if (provider === 'codex' && run.profile_hash !== ENGINES.codex.profileHash()) return false;
   const ended = Date.parse(run.ended_at || run.started_at);
   const transcript = provider === 'codex' || fs.existsSync(sessionFile(run.cwd, run.session_id));
   return Date.now() - ended < maxAgeHours * 3600_000 && transcript && fs.existsSync(run.cwd);
@@ -665,7 +668,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const limits = admitted?.limits || null;
   if (ENGINES[agent.engine || 'claude']?.supports && !ENGINES[agent.engine || 'claude'].supports(kind)) throw Object.assign(new Error(`${agentId}: ${ENGINES[agent.engine].label} cannot run ${kind}`), { status: 409 });
   const token = crypto.randomBytes(18).toString('hex');
-  const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job });
+  const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job,
+    profile_hash: (agent.engine || 'claude') === 'codex' ? ENGINES.codex.profileHash() : null });
   // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
   if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
   store.updateRun(run.id, { reserve_usd: Math.min(capped(kind, engineOf(agent).budgetUsd(agent)), limits?.usd ?? Infinity) });

@@ -602,6 +602,7 @@ test('childEnv: an explicit allowlist, a project.env schema and an isolated tool
     assert.ok(toml2.includes(`${JSON.stringify(clean)} = "read"`) && toml2.includes(`${JSON.stringify(dirty)} = "read"`));
     assert.ok(toml2.includes(`${JSON.stringify(path.join(dirty, '**/.env.*'))} = "none"`) && toml2.includes(`${JSON.stringify(path.join(dirty, '**/*.pem'))} = "none"`));
     assert.ok(toml2.indexOf(`${JSON.stringify(dirty)} = "read"`) < toml2.indexOf(`${JSON.stringify(path.join(dirty, '**/*.pem'))} = "none"`), 'deny globs follow the read entry');
+    assert.equal(toml2.split(`${JSON.stringify(path.join(dirty, '**/*.pem'))} = "none"`).length - 1, 3, 'rooted denies in every profile (seat, review, tagged)');
   } finally { config.root = savedRoot; }
   // project.env schema: credential-looking names or values never reach a seat.
   config.project.env = { TZ: 'UTC', DB_URI: 'x', LOG_LEVEL: 'debug', UPSTREAM: 'https://user:pa55word@api.example/x', CONN: 'postgresql://a@b/c', LONG: 'Zm9vYmFyYmF6cXV4cXV1eHF1dXhxdXV4cXV1eA', lower_case: 'x', NOTE: 'token=abc' };

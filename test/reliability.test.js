@@ -123,9 +123,10 @@ test('Codex launchers support native binaries and Node scripts and preserve the 
   } finally { if (savedHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = savedHome; }
 });
 
-test('resume is provider/model compatible and reservations survive team changes', () => {
+test('resume is provider/model compatible and reservations survive team changes', async () => {
   clearHolds();
-  const run = store.createRun({ agent_id: 'qa', kind: 'qa', token: 'test', model: 'codex:default', cwd: repo });
+  const { codex } = await import('../src/engines/codex.js');
+  const run = store.createRun({ agent_id: 'qa', kind: 'qa', token: 'test', model: 'codex:default', cwd: repo, profile_hash: codex.profileHash() });
   store.updateRun(run.id, { reserve_usd: 2, session_id: 'thread', ended_at: store.now(), status: 'success' });
   const ended = store.getRun(run.id);
   assert.equal(runner.canResume(ended, 2), false);
@@ -134,6 +135,14 @@ test('resume is provider/model compatible and reservations survive team changes'
   team.applyTeamOverrides({ qa: { engine: 'codex', model: 'different-model' } });
   assert.equal(runner.canResume(ended, 2), false);
   assert.equal(runner.reservationFor(ended), 2);
+  // A Codex session is pinned to the permission profile it was created under: a stale or missing hash, or a profile
+  // change since (here: a new read-only path), means a fresh session instead of a resume.
+  team.applyTeamOverrides({ qa: { engine: 'codex', model: '' } });
+  assert.equal(runner.canResume({ ...ended, profile_hash: 'stale' }, 2), false);
+  assert.equal(runner.canResume({ ...ended, profile_hash: null }, 2), false);
+  const savedRo = config.project.readOnlyPaths; config.project.readOnlyPaths = [...savedRo, repo];
+  try { assert.equal(runner.canResume(ended, 2), false, 'profile changed since the session was created'); } finally { config.project.readOnlyPaths = savedRo; }
+  assert.equal(runner.canResume(ended, 2), true);
   team.applyTeamOverrides({});
 });
 
