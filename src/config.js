@@ -236,6 +236,7 @@ const DEFAULTS = {
     maxPendingTotal: 10,
     maxStagedMB: 1500,
     pendingHours: 48,
+    resolveProxyMB: 0, // all of one resolution's traffic through the desk proxy; 0 = max(50 MB, maxTotalMB)
     maxUnpackedMB: 1000, // one wheel's contents, unpacked (zip-bomb guard when the desk reads its RECORD)
     // The resolver's interpreter may not live under these (nor under the workspaces): places seats can write.
     untrustedRoots: [os.tmpdir(), '/tmp', '/private/tmp'],

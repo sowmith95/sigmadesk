@@ -25,7 +25,14 @@ export function _setLookup(fn) { lookup = fn || dns.lookup; }
  */
 export function startProxy({ hosts = RESOLVER_HOSTS, maxBytes = 500e6, maxMs = 300_000, signal = null } = {}) {
   const token = crypto.randomBytes(18).toString('hex');
-  const stats = { bytes: 0, refused: [], tunnels: 0 };
+  const stats = { bytes: 0, refused: [], tunnels: 0, capped: false };
+  // One AGGREGATE byte budget per resolution: request heads, early bytes and both directions of every tunnel. Once it
+  // is spent, every tunnel closes and every new CONNECT is refused; the resolution then fails on stats.capped.
+  const spend = (n) => {
+    stats.bytes += n;
+    if (stats.bytes > maxBytes && !stats.capped) { stats.capped = true; stats.refused.push(`byte cap (${maxBytes}) reached`); for (const s of sockets) s.destroy(); }
+    return !stats.capped;
+  };
   const sockets = new Set();
   const server = http.createServer((req, res) => { stats.refused.push(`${req.method} ${String(req.url).slice(0, 120)}: not CONNECT`); res.writeHead(405); res.end(); });
   const track = (s) => { sockets.add(s); s.on('close', () => sockets.delete(s)); s.on('error', () => {}); };
@@ -42,6 +49,11 @@ export function startProxy({ hosts = RESOLVER_HOSTS, maxBytes = 500e6, maxMs = 3
   server.on('connect', (req, client, head) => {
     track(client);
     const refuse = (code, why) => { stats.refused.push(`${req.url}: ${why}`); client.end(`HTTP/1.1 ${code} ${why}\r\nContent-Length: 0\r\n\r\n`); };
+    // The request head and anything sent with it count too.
+    const headBytes = Buffer.byteLength(`${req.method} ${req.url} HTTP/${req.httpVersion}\r\n${req.rawHeaders.map((v, i) => (i % 2 ? `${v}\r\n` : `${v}: `)).join('')}\r\n`) + (head?.length || 0);
+    if (stats.capped) return refuse(429, 'Too Many Requests (this resolution spent its byte budget)');
+    if (!spend(headBytes)) { client.destroy(); return; }
+    client.on('data', (c) => { if (!spend(c.length)) client.destroy(); }); // bytes before (and after) the 200, whoever reads them
     if (!authOk(req.headers['proxy-authorization'])) return refuse(407, 'Proxy Authentication Required');
     const m = String(req.url).match(/^([a-z0-9.-]+):(\d+)$/i);
     const host = m?.[1].toLowerCase().replace(/\.$/, '');
@@ -56,13 +68,8 @@ export function startProxy({ hosts = RESOLVER_HOSTS, maxBytes = 500e6, maxMs = 3
         stats.tunnels++;
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         if (head?.length) upstream.write(head);
-        const count = (dir) => (chunk) => {
-          stats.bytes += chunk.length;
-          if (stats.bytes > maxBytes) { stats.refused.push(`byte cap (${maxBytes}) reached`); client.destroy(); upstream.destroy(); return; }
-          (dir === 'up' ? upstream : client).write(chunk);
-        };
-        client.on('data', count('up'));
-        upstream.on('data', count('down'));
+        client.on('data', (c) => { if (!stats.capped) upstream.write(c); }); // already counted above
+        upstream.on('data', (c) => { if (spend(c.length)) client.write(c); else upstream.destroy(); });
         client.on('end', () => upstream.end());
         upstream.on('end', () => client.end());
       });

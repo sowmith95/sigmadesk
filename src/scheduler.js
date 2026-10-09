@@ -1605,7 +1605,7 @@ export async function deskAction(run, cmd, body = {}) {
       // exit status, recorded with the fingerprint and the commit) — as a command of its own, not chained.
       const wsDir = runner.workspaceDir(ticket.key);
       const venv = packages.qaEnvironment(ticket.key, wsDir);
-      need(!venv.venv || venv.fingerprint, `this workspace's .venv is not what the owner approved (${venv.error}): QA cannot pass on it — fail it (desk qa fail --reason tests "<what is wrong with the venv>")`);
+      need(!venv.venv || venv.fingerprint, `QA cannot pass on this workspace: ${venv.error}. Fail it (desk qa fail --reason tests "<what is wrong with the environment>")`);
       const headNow = await runner.headSha(wsDir).catch(() => null);
       const deskTested = packages.testRecords(run.id).filter((x) => x.status === 0 && !x.problem && x.sha === headNow && (!venv.venv || x.fp?.installed_sha256 === venv.fingerprint.installed_sha256));
       const ranDeskTest = ran.some((e) => e.ok && /^\s*desk\s+test\s/.test(e.cmd) && !/&&|\|\||;|\||\n|`|\$\(/.test(e.cmd));

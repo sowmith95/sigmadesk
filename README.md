@@ -430,7 +430,8 @@ every Codex permission profile keeps `network.enabled = false`). Two narrow desk
   only, `--index-url https://pypi.org/simple` only, in a scrubbed environment (no `PIP_*` or proxy settings from your shell,
   `PIP_CONFIG_FILE=/dev/null`, temp cwd and HOME, hard time and disk limits), and all of its traffic goes through a
   desk proxy that lives for that resolution only: CONNECT to `pypi.org:443` and `files.pythonhosted.org:443` and
-  nothing else, with a per-resolution token and byte/time caps. The constraints are the complete ticket
+  nothing else, with a per-resolution token, one aggregate byte budget over every tunnel (spent = all tunnels closed, new
+  CONNECTs refused, the resolution failed) and a time cap. The constraints are the complete ticket
   lock — the shared venv's distributions read statically from their METADATA, plus what was already approved for the
   ticket — so nothing existing changes version. pip's answer is only a proposal: the desk downloads every wheel itself
   from `files.pythonhosted.org` (one deadline across DNS/headers/body, redirects re-checked, size caps), binds it to the
@@ -445,9 +446,13 @@ every Codex permission profile keeps `network.enabled = false`). Two narrow desk
   `PYTHONDONTWRITEBYTECODE=1` and a desk-owned CA bundle copy (`data/pkg/ca.pem`). The desk then reads the venv back
   (never executing it): interpreter identity, every installed file hashed against the approved inventories, no
   unexpected file, `.pth`, `sitecustomize` or bytecode, the shared venv unchanged; that fingerprint is recorded on the
-  ticket. With a `.venv`, QA passes only through `desk test pytest|unittest …` (the canonical interpreter, the real exit
-  status and pytest's junit report or unittest's summary — at least one test run, none failing — recorded with the
-  fingerprint and the commit); an unverifiable or incomplete venv (an approved request not installed) blocks QA; the merge brief says "adds N
+  ticket. With a `.venv`, QA passes only through `desk test pytest|unittest …` (the canonical interpreter; arguments by allowlist — paths
+  or node ids in the workspace, `-k`, `-m`, `-x`, `-q`, `-v`, `--maxfail=N`; the desk adds `-p no:cacheprovider`, `-n 0`
+  with xdist and its own `--junitxml`, and drops `PYTEST_ADDOPTS`/`PYTEST_PLUGINS`; the real exit status and pytest's
+  junit report or unittest's summary — at least one test run, none failing — recorded with the fingerprint and the
+  commit). Once anything is approved for a ticket, its tests count only in a verified, complete `.venv`: nothing under
+  the venv root may differ from the wheels' RECORDs, pip's exact console-script wrappers and the venv's own interpreter
+  shebang; the merge brief says "adds N
   dependencies (runtime/dev)", and reviewers are asked to check the requirements file change. Revoking, expiry
   (`packages.grantHours`) or the ticket closing deletes the stage and refuses further installs; the workspace venv dies
   with the workspace. The shared venv is never written.

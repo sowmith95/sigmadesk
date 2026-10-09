@@ -307,13 +307,15 @@ export async function resolveRequest(id, signal = null) {
     // Every connection pip makes goes through a desk proxy for this resolution only: CONNECT to pypi.org:443 and
     // files.pythonhosted.org:443 and nothing else, with its own token, byte and time caps (closed on revoke).
     const timeoutMs = (Number(P().resolveTimeoutSeconds) || 180) * 1000;
-    const proxy = await startProxy({ hosts: RESOLVER_HOSTS, maxBytes: Math.max(50e6, maxTotal), maxMs: timeoutMs + 5000, signal });
+    const proxyBytes = (Number(P().resolveProxyMB) || 0) * 1e6 || Math.max(50e6, maxTotal);
+    const proxy = await startProxy({ hosts: RESOLVER_HOSTS, maxBytes: proxyBytes, maxMs: timeoutMs + 5000, signal });
     const argv = [env.python, '-I', '-S', path.join(env.site, 'pip'), 'install', '--dry-run', '--target', path.join(work, 'target'), '--only-binary=:all:', '--no-cache-dir',
       '--disable-pip-version-check', '--no-input', '--timeout', '30', '--retries', '1', '--proxy', proxy.url, '--index-url', PYPI_INDEX, '--report', report, '-c', constraints,
       ...specs.map((s) => `${s.name}==${s.version}`), `pip==${pipVersion}`];
     let res;
     try { res = await runResolver(argv, { env: scrubbedEnv(work), cwd: work, timeoutMs, watchDir: work, maxBytes: Math.max(50e6, maxTotal), signal }); } finally { proxy.close(); }
     if (proxy.stats.refused.length && res.code !== 0) res.err = `${res.err}\nERROR: the desk proxy refused: ${proxy.stats.refused.slice(0, 3).join('; ')}`;
+    if (proxy.stats.capped) throw err(`resolution stopped: pip's traffic exceeded the ${mb(proxyBytes)} byte budget of the desk proxy`);
     cancelled();
     if (res.code !== 0) {
       const tail = (res.err || '').trim().split('\n').filter((l) => /ERROR|conflict|requested|No matching|Could not find/i.test(l)).slice(-6).join(' · ');
@@ -569,6 +571,9 @@ export function installSteps({ ws, env, stages, ca }) {
   const adds = stages.flatMap((s) => s.adds);
   return [
     { label: 'create the workspace venv on the shared interpreter (no pip, no system site-packages)', argv: [env.python, '-I', '-m', 'venv', '--without-pip', venv], unless: path.join(venv, 'pyvenv.cfg'), env: e },
+    // Nothing unverifiable stays in the venv: its activation scripts (and 3.13's .gitignore) are not needed — tests run
+    // through desk test with the interpreter itself.
+    { label: 'remove the venv\'s activation scripts', remove: ['activate', 'activate.csh', 'activate.fish', 'Activate.ps1'].map((f) => path.join(venv, 'bin', f)).concat(path.join(venv, '.gitignore')) },
     { label: 'layer the shared venv read-only (.pth)', write: { path: path.join(site, PTH_NAME), text: pthText(env.site) } },
     { label: 'scratch space for pip', write: { path: path.join(venv, '.tmp', '.keep'), text: '' } },
     { label: 'keep .venv out of git', exclude: { ws, line: '/.venv/' } },
@@ -627,6 +632,29 @@ function walk(dir, max = 200_000) {
 }
 const PIP_WRITES = new Set(['INSTALLER', 'REQUESTED', 'RECORD', 'direct_url.json']);
 const STARTUP = (f) => !f.includes('/') && (f.endsWith('.pth') || f === 'sitecustomize.py' || f === 'usercustomize.py');
+/** [name, "module:attr"] for every console/gui script an entry_points.txt declares. */
+export function entryPoints(text) {
+  const out = [];
+  let section = '';
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue;
+    const sec = line.match(/^\[(.+)\]$/);
+    if (sec) { section = sec[1].trim(); continue; }
+    if (section !== 'console_scripts' && section !== 'gui_scripts') continue;
+    const m = line.match(/^([^=\s]+)\s*=\s*([^\s[]+)/);
+    if (m) out.push([m[1], m[2]]);
+  }
+  return out;
+}
+/** pip's console-script wrapper, byte for byte (PipScriptMaker.script_template + distlib's shebang for this interpreter). */
+export function consoleScript(exe, spec) {
+  const [module, suffix = ''] = spec.split(':');
+  const q = exe.includes(' ') ? `"${exe}"` : exe;
+  const max = process.platform === 'darwin' ? 512 : 127;
+  const shebang = !q.includes(' ') && Buffer.byteLength(q) + 3 <= max ? `#!${q}\n` : `#!/bin/sh\n'''exec' ${q} "$0" "$@"\n' '''\n`;
+  return `${shebang}import sys\nfrom ${module} import ${suffix.split('.')[0]}\nif __name__ == '__main__':\n    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n    sys.exit(${suffix}())\n`;
+}
 /**
  * The workspace venv's fingerprint, from what is actually on disk, against what the owner approved:
  *  - interpreter identity: .venv/bin/python resolves to the shared venv's interpreter, same Python version, no system
@@ -706,11 +734,41 @@ export function fingerprint(ticketKey, ws, { including = [], requireAll = true }
     if (!st.isFile()) throw err(`${o.dest} in .venv is not a regular file`, 409);
     const body = fs.readFileSync(dest);
     let ok;
-    if (o.shebang) { const nl = body.indexOf(10); ok = nl > 0 && /^#!.*python[\d.]*\s*$/.test(body.subarray(0, nl).toString()) && crypto.createHash('sha256').update(body.subarray(nl + 1)).digest('hex') === o.rest_sha256; }
+    // pip's fix_script: "#!python…" becomes exactly "#!<this venv's interpreter>\n" — no other interpreter is accepted.
+    if (o.shebang) { const first = Buffer.from(`#!${vpy}\n`); ok = body.subarray(0, first.length).equals(first) && crypto.createHash('sha256').update(body.subarray(first.length)).digest('hex') === o.rest_sha256; }
     else ok = crypto.createHash('sha256').update(body).digest('hex') === o.sha256;
     if (!ok) throw err(`${o.dest} in .venv was changed after the install`, 409);
     lines.push(`${o.dest}\t${o.sha256}`);
   }
+  // Console-script wrappers pip generates from entry_points.txt (verified above as part of each wheel): their exact text
+  // is deterministic, so it is regenerated here and compared byte for byte.
+  const wrappers = new Map();
+  for (const di of distInfos) {
+    const ep = readSmall(path.join(site, di, 'entry_points.txt'), 1_000_000);
+    for (const [name, spec] of entryPoints(ep || '')) wrappers.set(`bin/${name}`, consoleScript(vpy, spec));
+  }
+  // Everything else under the venv root is unexpected: only the interpreter links, pyvenv.cfg and pip's scratch marker.
+  const pythons = new Set(['bin/python', 'bin/python3', `bin/python${env.xy}`]);
+  const outsideDests = new Set(outside.map((o) => o.dest));
+  const prefix = `lib/python${env.xy}/site-packages/`;
+  const visit = (dir, rel) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name, pth = path.join(dir, e.name);
+      if (`${r}/` === prefix || r.startsWith(prefix)) continue; // site-packages: verified file by file above
+      if (e.isSymbolicLink()) {
+        if (pythons.has(r) && realpath(pth) === realpath(env.python)) continue;
+        if (r === 'lib64' && fs.readlinkSync(pth) === 'lib') continue;
+        throw err(`.venv contains a link nobody approved (${r})`, 409);
+      }
+      if (e.isDirectory()) { visit(pth, r); continue; }
+      if (!e.isFile()) throw err(`.venv contains a special file (${r})`, 409);
+      if (r === 'pyvenv.cfg' || r === '.tmp/.keep' || outsideDests.has(r)) continue;
+      const want = wrappers.get(r);
+      if (want != null) { if (!fs.readFileSync(pth).equals(Buffer.from(want))) throw err(`${r} is not the console script pip generates for its entry point`, 409); lines.push(`${r}\t${sha256File(pth)}`); continue; }
+      throw err(`.venv holds a file no approved wheel installs: ${r}`, 409);
+    }
+  };
+  visit(venv, '');
   const missing = [...expected.keys()].filter((f) => !seen.has(f));
   if (missing.length) throw err(`.venv is missing ${missing.length} file(s) of the approved packages (${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''}): run desk pkg install`, 409);
   const lock = [...nowLock, ...added.map((a) => `${a.name}==${a.version}`)].sort();
@@ -742,14 +800,44 @@ export const recordedFingerprint = (key) => json(store.kvGet(`venv:${key}`), nul
 
 /** For the QA gate: no .venv, or a .venv that is (fingerprint) or is not (error) what was approved. Never fails open. */
 export function qaEnvironment(ticketKey, ws) {
-  if (!hasVenv(ws)) return { venv: false };
+  if (!hasVenv(ws)) {
+    // A ticket with approved packages is tested in its venv or not at all: the shared venv alone is not that environment.
+    const approved = store.pkgRequestsForTicket(ticketKey).filter((r) => r.decided_by === 'owner' && (r.status === 'approved' || r.installed_at));
+    return approved.length ? { venv: true, fingerprint: null, error: `${ticketKey} has approved package request ${approved.map((r) => `#${r.id}`).join(', ')}, but this workspace has no .venv: run desk pkg install (tests on the shared venv alone do not count)` } : { venv: false };
+  }
   try { return { venv: true, fingerprint: fingerprint(ticketKey, ws), error: null }; } catch (e) { return { venv: true, fingerprint: null, error: e.message }; }
 }
 
 // ---------------- desk test: the canonical interpreter, the real exit status ----------------
 // Test runners only, and only ways of running them that actually run tests and report them.
 export const TEST_RUNNERS = ['pytest', 'unittest'];
-const PYTEST_REFUSED = /^(--junit-?xml|--co$|--collect-only|--setup-plan|--setup-only|--fixtures|--markers|--version$|-V$|-h$|--help$|-p|-o$|--override-ini|-c$|--config-file|--rootdir|--confcutdir|--noconftest|--pyargs|--import-mode|--basetemp)/;
+/**
+ * desk test arguments, by ALLOWLIST. pytest: positional paths or node ids inside the workspace, -k <expr>, -m <expr>,
+ * -x, -q, -v, --maxfail=<n>. unittest: discover, -s/-t <dir inside the workspace>, -p <glob>, -v, -q, -f, dotted test
+ * names. Any other token starting with "-" (attached forms like -c… -o… -p… included) is refused. Returns the args.
+ */
+export function checkTestArgs(args, ws) {
+  const [runner, ...rest] = args;
+  const insideWs = (p) => { const file = String(p).split('::')[0]; const abs = path.resolve(ws, file); return !!file && !file.includes('\0') && (abs === ws || abs.startsWith(`${ws}/`)); };
+  const refuse = (tok, why) => err(`desk test refuses ${String(tok).slice(0, 80)}: ${why}`);
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (runner === 'pytest') {
+      if (['-x', '-q', '-v'].includes(a)) continue;
+      if (a === '-k' || a === '-m') { const v = rest[++i]; if (v == null || v.startsWith('-')) throw refuse(a, 'needs an expression'); continue; }
+      if (/^--maxfail=\d{1,5}$/.test(a)) continue;
+      if (a.startsWith('-')) throw refuse(a, 'allowed: paths or node ids, -k EXPR, -m EXPR, -x, -q, -v, --maxfail=N');
+      if (!insideWs(a)) throw refuse(a, 'test paths must be inside the workspace');
+    } else {
+      if (['-v', '-q', '-f'].includes(a) || (a === 'discover' && i === 0)) continue;
+      if (a === '-s' || a === '-t') { const v = rest[++i]; if (v == null || !insideWs(v)) throw refuse(a, 'needs a directory inside the workspace'); continue; }
+      if (a === '-p') { const v = rest[++i]; if (v == null || !/^[\w*?.[\]-]{1,80}$/.test(v)) throw refuse(a, 'needs a file pattern'); continue; }
+      if (a.startsWith('-')) throw refuse(a, 'allowed: discover, -s DIR, -t DIR, -p PATTERN, -v, -q, -f, test names');
+      if (!/^[A-Za-z_][\w]*(\.[A-Za-z_]\w*)*$/.test(a)) throw refuse(a, 'not a dotted test name');
+    }
+  }
+  return args;
+}
 const junitPath = (ws, id) => path.join(ws, '.git', `sigmadesk-test-${id}.xml`);
 /** Count what a junit XML says ran: { tests, failures, errors, skipped } summed over its <testsuite> elements. */
 export function junitCounts(xml) {
@@ -777,11 +865,11 @@ export function testPlan(run, args, { ws, sha }) {
   if (!Array.isArray(args) || !args.length) throw err('desk test <module> [args…], e.g. desk test pytest tests/test_x.py -q');
   if (args.length > 64 || args.some((a) => typeof a !== 'string' || a.length > 1000 || a.includes('\0'))) throw err('too many or invalid arguments');
   if (!TEST_RUNNERS.includes(args[0])) throw err(`desk test runs a test runner: ${TEST_RUNNERS.join(' or ')} (got "${String(args[0]).slice(0, 60)}")`);
-  const bad = args[0] === 'pytest' ? args.slice(1).find((a) => PYTEST_REFUSED.test(a)) : args.slice(1).find((a) => /^(-h|--help)$/.test(a));
-  if (bad) throw err(`desk test refuses ${bad}: it must run the whole selection and report it (narrow with paths, ::node ids, -k or -m instead)`);
+  checkTestArgs(args, ws);
   let py, fp = null;
-  if (hasVenv(ws)) {
-    const env = qaEnvironment(run.ticket_key, ws);
+  const qenv = qaEnvironment(run.ticket_key, ws);
+  if (qenv.venv) {
+    const env = qenv;
     if (!env.fingerprint) throw err(`this workspace's .venv is not what the owner approved (${env.error}): it cannot be tested. Run desk pkg install again, or ask the owner`, 409);
     fp = env.fingerprint;
     py = path.join(ws, '.venv', 'bin', 'python');
@@ -790,8 +878,10 @@ export function testPlan(run, args, { ws, sha }) {
   const plan = { id: crypto.randomBytes(6).toString('hex'), args, sha, fp, at: nowIso() };
   testPlans.set(run.id, plan);
   // pytest writes a junit report the desk reads afterwards: what ran, what failed (exit 0 with nothing collected is not a pass).
-  const extra = args[0] === 'pytest' ? [`--junitxml=${junitPath(ws, plan.id)}`] : [];
-  return { id: plan.id, cwd: ws, argv: [py, '-B', '-s', '-m', ...args, ...extra], env: { PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1' }, interpreter: py };
+  // The desk's own options come last: no parallel workers (one process, one report), no cache, its junit report.
+  const xdist = !!(staticDistributions(sharedEnv().site)['pytest-xdist'] || ticketLock(run.ticket_key)['pytest-xdist']);
+  const extra = args[0] === 'pytest' ? [...(xdist ? ['-n', '0'] : []), '-p', 'no:cacheprovider', `--junitxml=${junitPath(ws, plan.id)}`] : [];
+  return { id: plan.id, cwd: ws, argv: [py, '-B', '-s', '-m', ...args, ...extra], env: { PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1' }, scrub: ['PYTEST_ADDOPTS', 'PYTEST_PLUGINS', 'PYTEST_DISABLE_PLUGIN_AUTOLOAD'], interpreter: py };
 }
 /** The seat's `desk test` finished: re-verify the venv and commit, then record the exit status for the QA gate. */
 export function testResult(run, { id, status, output = '' }, { ws, sha }) {

@@ -52,7 +52,11 @@ if (ctl.connect) {
   // Pretend pip (or a malicious index) reaches for another host through the proxy it was given.
   const u = new URL(a[a.indexOf('--proxy') + 1]);
   const req = require('http').request({ host: u.hostname, port: u.port, method: 'CONNECT', path: ctl.connect, headers: { 'Proxy-Authorization': 'Basic ' + Buffer.from(u.username + ':' + u.password).toString('base64') } });
-  req.on('connect', (res, sock) => { fs.appendFileSync(${JSON.stringify(pipLog)}, JSON.stringify({ connect: ctl.connect, status: res.statusCode }) + '\\n'); sock.destroy(); finish(); });
+  req.on('connect', (res, sock) => {
+    fs.appendFileSync(${JSON.stringify(pipLog)}, JSON.stringify({ connect: ctl.connect, status: res.statusCode }) + '\\n');
+    if (ctl.send && res.statusCode === 200) { sock.on('error', () => {}); sock.on('close', finish); sock.write(Buffer.alloc(ctl.send)); setTimeout(() => sock.destroy(), 2000); }
+    else { sock.destroy(); finish(); }
+  });
   req.on('error', (e) => { fs.appendFileSync(${JSON.stringify(pipLog)}, JSON.stringify({ connect: ctl.connect, error: e.message }) + '\\n'); finish(); });
   req.end();
 } else finish();
@@ -137,7 +141,7 @@ function wheel(name, version, { host = 'files.pythonhosted.org', file = null, bo
   return { download_info: { url, archive_info: { hash: `sha256=${badHash ? 'f'.repeat(64) : sha(content)}`, hashes: { sha256: badHash ? 'f'.repeat(64) : sha(content) } } },
     is_direct: direct, requested, metadata: { name, version } };
 }
-function setPip({ report = null, code = 0, stderr = '', hang = false, connect = null }) { fs.writeFileSync(pipCtl, JSON.stringify({ report, code, stderr, hang, connect })); fs.rmSync(pipLog, { force: true }); }
+function setPip({ report = null, code = 0, stderr = '', hang = false, connect = null, send = 0 }) { fs.writeFileSync(pipCtl, JSON.stringify({ report, code, stderr, hang, connect, send })); fs.rmSync(pipLog, { force: true }); }
 const pipCalls = () => fs.readFileSync(pipLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
 function fakeNet({ addresses = {}, hold = null } = {}) {
   netfetch._setLookup((host, _o, cb) => cb(null, [{ address: addresses[host] || '151.101.0.223', family: 4 }]));
@@ -179,6 +183,7 @@ function simulateInstall(wsDir, pins) {
     fs.mkdirSync(path.dirname(path.join(vsite, rel)), { recursive: true }); fs.writeFileSync(path.join(vsite, rel), data);
     const di = rel.split('/')[0];
     if (di.endsWith('.dist-info')) for (const f of ['INSTALLER', 'RECORD', 'REQUESTED']) fs.writeFileSync(path.join(vsite, di, f), 'pip\n');
+    if (rel.endsWith('.dist-info/entry_points.txt')) for (const [n, spec] of packages.entryPoints(data.toString())) fs.writeFileSync(path.join(dv, 'bin', n), packages.consoleScript(path.join(dv, 'bin', 'python'), spec));
   }
   return vsite;
 }
@@ -447,7 +452,8 @@ test('offline install: exact steps (venv --without-pip, .pth layering, scrubbed 
   packages.recordLaunch(run.id, packages.readPathsFor('junior', t.key, 'implement').ids);
   const plan = packages.installPlan(run);
   const w = ws(t.key), stage = packages.stageDir(r.id), dotvenv = path.join(w, '.venv');
-  const [mk, pth, scratch, exclude, install, verify] = plan.steps;
+  const [mk, unactivate, pth, scratch, exclude, install, verify] = plan.steps;
+  assert.deepEqual(unactivate.remove, ['activate', 'activate.csh', 'activate.fish', 'Activate.ps1'].map((f) => path.join(dotvenv, 'bin', f)).concat(path.join(dotvenv, '.gitignore')));
   assert.equal(scratch.write.path, path.join(dotvenv, '.tmp', '.keep'));
   assert.deepEqual(mk.argv, [fakePy, '-I', '-m', 'venv', '--without-pip', dotvenv]);
   assert.ok(!mk.argv.includes('--system-site-packages'));
@@ -603,8 +609,9 @@ test('desk pkg install: bin/desk runs the plan inside the run (scrubbed pip env)
 });
 test('desk test: bin/desk passes arguments through, runs the canonical interpreter in the workspace and reports the real exit status', async () => {
   const cwd = fs.mkdtempSync(path.join(tmp, 'dt-'));
-  const plan = { id: 'abc', cwd, argv: [process.execPath, '-e', 'console.log(process.cwd(), process.argv.slice(1).join(" ")); process.exit(3)', '--', '-q', '--maxfail', '1'], env: { PYTHONDONTWRITEBYTECODE: '1' } };
-  const { code, stdout, seen } = await deskCli(['test', 'pytest', '-q', '--maxfail', '1'], (req) => (req.body.action === 'plan' ? { test: plan } : `Exit ${req.body.status} (failed)`));
+  const plan = { id: 'abc', cwd, argv: [process.execPath, '-e', 'console.log(process.cwd(), process.argv.slice(1).join(" "), "ADDOPTS=" + process.env.PYTEST_ADDOPTS, "X=" + process.env.SIGMA_X); process.exit(3)', '--', '-q', '--maxfail', '1'], env: { PYTHONDONTWRITEBYTECODE: '1' }, scrub: ['SIGMA_X'] };
+  const { code, stdout, seen } = await deskCli(['test', 'pytest', '-q', '--maxfail', '1'], (req) => (req.body.action === 'plan' ? { test: plan } : `Exit ${req.body.status} (failed)`), { PYTEST_ADDOPTS: '--co', SIGMA_X: 'leak' });
+  assert.match(stdout, /ADDOPTS=undefined X=undefined/, 'PYTEST_* and the plan\'s scrub list never reach the tests');
   assert.equal(code, 3, stdout);
   assert.deepEqual(seen[0].body, { action: 'plan', args: ['pytest', '-q', '--maxfail', '1'] }, 'flags are the test\'s, not the desk\'s');
   assert.deepEqual({ ...seen[1].body, output: undefined }, { action: 'result', id: 'abc', status: 3, output: undefined });
@@ -641,17 +648,23 @@ test('QA never fails open: an invalid .venv blocks QA; with a valid one QA passe
   await rejects(pass(), /QA passes only through desk test/);
   // An invalid venv: QA cannot pass at all, and desk test refuses to run on it.
   fs.writeFileSync(path.join(vsite, 'evil.pth'), 'x');
-  await rejects(pass(), /\.venv is not what the owner approved \(.*startup hook/);
+  await rejects(pass(), /QA cannot pass on this workspace: \.venv has a startup hook/);
   await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest'] }), /not what the owner approved/);
   fs.rmSync(path.join(vsite, 'evil.pth'));
   // desk test: the canonical interpreter, in the workspace; the exit status is what counts.
   await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['json.tool', '--help'] }), /runs a test runner: pytest or unittest/);
   await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['os; import x'] }), /runs a test runner/);
-  for (const flag of ['--co', '--collect-only', '--junitxml=/tmp/x.xml', '-p', 'no:junitxml', '--setup-plan', '--version', '-o'].filter((f) => f.startsWith('-')))
-    await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', flag] }), /desk test refuses/);
+  for (const bad of [['--co'], ['--collect-only'], ['--junitxml=/tmp/x.xml'], ['-p', 'no:junitxml'], ['--setup-plan'], ['--version'], ['-o'], ['-c/tmp/skip.ini'], ['-oaddopts=--setup-only'],
+    ['-pno:x'], ['-qq'], ['--maxfail=1x'], ['-k'], ['-k', '--co'], ['/etc/passwd'], ['../other/tests'], ['tests', '--rootdir=/']])
+    await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', ...bad] }), /desk test refuses/);
+  for (const bad of [['discover', '-s', '/tmp'], ['discover', '--locals'], ['-b'], ['os;x']])
+    await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['unittest', ...bad] }), /desk test refuses/);
+  const okArgs = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', 'tests/test_x.py::test_a', '-k', 'not slow', '-m', 'unit', '-x', '-q', '-v', '--maxfail=2'] })).test;
+  assert.deepEqual(okArgs.argv.slice(-3, -1), ['-p', 'no:cacheprovider']);
+  assert.deepEqual(okArgs.scrub, ['PYTEST_ADDOPTS', 'PYTEST_PLUGINS', 'PYTEST_DISABLE_PLUGIN_AUTOLOAD']);
   const junit = (id, attrs) => fs.writeFileSync(path.join(wsDir, '.git', `sigmadesk-test-${id}.xml`), `<?xml version="1.0"?><testsuites><testsuite name="pytest" ${attrs} time="0.1"></testsuite></testsuites>`);
   let p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
-  assert.deepEqual(p.argv.slice(0, -1), [path.join(wsDir, '.venv', 'bin', 'python'), '-B', '-s', '-m', 'pytest', '-q']);
+  assert.deepEqual(p.argv.slice(0, -3), [path.join(wsDir, '.venv', 'bin', 'python'), '-B', '-s', '-m', 'pytest', '-q']);
   assert.equal(p.cwd, wsDir);
   assert.ok(p.argv.at(-1) === `--junitxml=${path.join(wsDir, '.git', `sigmadesk-test-${p.id}.xml`)}`, 'the desk asks pytest for a report it reads afterwards');
   junit(p.id, 'errors="0" failures="2" skipped="0" tests="5"');
@@ -886,4 +899,109 @@ test('fingerprint completeness: every approved request must be installed; files 
   const r2 = await resolved(mkRun('junior', 'implement', t.key), ['other==1.0'], { install: [wheel('other', '1.0', { requested: true }), wheel('pip', '24.0')] });
   packages.decide(r2.id, 'approve', { by: 'owner' });
   assert.match(packages.qaEnvironment(t.key, w).error, new RegExp(`#${r2.id} is approved but not installed`));
+});
+
+// ---------------- round 3 ----------------
+test('proxy byte cap is aggregate: two tunnels that together exceed it are both closed, new CONNECTs get 429, the resolution fails', async () => {
+  const proxyMod = await import('../src/pkgproxy.js');
+  const netMod = await import('node:net');
+  const http = await import('node:http');
+  const echo = netMod.createServer((s) => s.pipe(s));
+  await new Promise((r) => echo.listen(0, '127.0.0.1', r));
+  proxyMod._setConnector((_h, _p, cb) => netMod.connect({ host: '127.0.0.1', port: echo.address().port }, cb));
+  proxyMod._setLookup((_h, _o, cb) => cb(null, [{ address: '151.101.0.223', family: 4 }]));
+  const p = await proxyMod.startProxy({ maxBytes: 3000 });
+  const tunnel = (target) => new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: p.port, method: 'CONNECT', path: target, headers: { 'Proxy-Authorization': `Basic ${Buffer.from(`sigmadesk:${p.token}`).toString('base64')}` } });
+    req.on('connect', (res, sock) => { sock.on('error', () => {}); sock.resume(); resolve({ status: res.statusCode, sock }); });
+    req.on('error', (e) => resolve({ error: e.message }));
+    req.end();
+  });
+  const a = await tunnel('pypi.org:443'), b = await tunnel('files.pythonhosted.org:443');
+  assert.equal(a.status, 200); assert.equal(b.status, 200);
+  const closedA = new Promise((r) => a.sock.on('close', r)), closedB = new Promise((r) => b.sock.on('close', r));
+  a.sock.write(Buffer.alloc(900)); // each tunnel alone stays under the cap (echoed: 1800 bytes counted per tunnel)…
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(!p.stats.capped);
+  b.sock.write(Buffer.alloc(900)); // …together they exceed it
+  await Promise.all([closedA, closedB]);
+  assert.equal(p.stats.capped, true);
+  const c = await tunnel('pypi.org:443');
+  assert.equal(c.status, 429, 'no new tunnels once the budget is spent');
+  p.close(); echo.close();
+  // In a resolution: pip's traffic beyond packages.resolveProxyMB fails the request, whatever pip itself says.
+  const t = store.createTicket({ title: 'proxy cap', status: 'in_progress' });
+  config.packages.resolveProxyMB = 0.002;
+  const echo2 = netMod.createServer((s) => s.pipe(s));
+  await new Promise((r) => echo2.listen(0, '127.0.0.1', r));
+  proxyMod._setConnector((_h, _p, cb) => netMod.connect({ host: '127.0.0.1', port: echo2.address().port }, cb));
+  try {
+    setPip({ connect: 'pypi.org:443', send: 5000, report: goodReport() });
+    fakeNet();
+    packages.request(mkRun('junior', 'implement', t.key), { specs: ['humanize==4.9.0'], why: 'w' });
+    await packages.settled();
+    const r = store.pkgRequestsForTicket(t.key).at(-1);
+    assert.equal(r.status, 'failed');
+    assert.match(r.error, /exceeded the .* byte budget of the desk proxy/);
+  } finally { config.packages.resolveProxyMB = 0; proxyMod._setConnector(null); proxyMod._setLookup(null); echo2.close(); }
+});
+
+test('QA requires the workspace venv once anything is approved: no .venv plus ordinary passing tests is refused', async () => {
+  const t = store.createTicket({ title: 'no venv', status: 'in_progress' });
+  const r = await resolved(mkRun('junior', 'implement', t.key), ['humanize==4.9.0'], goodReport());
+  packages.decide(r.id, 'approve', { by: 'owner' });
+  store.updateTicket(t.key, { status: 'qa' });
+  const wsDir = ws(t.key);
+  assert.ok(!fs.existsSync(path.join(wsDir, '.venv')));
+  const qaRun = store.createRun({ agent_id: 'qa', kind: 'qa', ticket_key: t.key, token: `tok-qa-${++tokenN}`, model: 'x', nonce: 'qa87654321', cwd: wsDir });
+  runner.applyEvents([{ type: 'cmd-start', id: 'a', cmd: 'python -m pytest tests -q' }, { type: 'cmd-end', id: 'a', ok: true }], { run: qaRun, cwd: wsDir, state: {} });
+  await rejects(sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'qa87654321', body: 'ok' }), new RegExp(`QA cannot pass on this workspace: ${t.key} has approved package request #${r.id}, but this workspace has no \\.venv`));
+  await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest'] }), /has no \.venv/);
+  // Declined or never approved: the shared venv stays the environment.
+  const t2 = store.createTicket({ title: 'declined', status: 'in_progress' });
+  const r2 = await resolved(mkRun('junior', 'implement', t2.key), ['humanize==4.9.0'], goodReport());
+  packages.decide(r2.id, 'deny', {});
+  assert.deepEqual(packages.qaEnvironment(t2.key, ws(t2.key)), { venv: false });
+});
+
+test('venv root: only RECORD files, pip\'s exact console-script wrappers and exact shebangs; anything else (activation scripts too) is refused', async () => {
+  const t = store.createTicket({ title: 'scripts', status: 'in_progress' });
+  const r = await resolved(mkRun('junior', 'implement', t.key), ['clipkg==1.0'], { install: [wheel('clipkg', '1.0', { requested: true, files: {
+    'clipkg/__init__.py': '', 'clipkg/cli.py': 'def main():\n    return 0\n', 'clipkg-1.0.dist-info/entry_points.txt': '[console_scripts]\nclip = clipkg.cli:main\n\n[gui_scripts]\nclip-gui = clipkg.cli:main [gui]\n',
+    'clipkg-1.0.data/scripts/clip-raw': '#!python\nprint(1)\n' } }), wheel('pip', '24.0')] });
+  packages.decide(r.id, 'approve', { by: 'owner' });
+  const run = mkRun('junior', 'implement', t.key);
+  packages.recordLaunch(run.id, packages.readPathsFor('junior', t.key, 'implement').ids);
+  const plan = packages.installPlan(run);
+  const rm = plan.steps.find((x) => x.remove);
+  assert.ok(rm.remove.includes(path.join(ws(t.key), '.venv', 'bin', 'activate')), 'the venv\'s activation scripts are removed by the install');
+  const w = ws(t.key), bin = path.join(w, '.venv', 'bin'), vpy = path.join(bin, 'python');
+  simulateInstall(w, ['clipkg==1.0']);
+  packages.recordInstall(run, { ok: true });
+  const ok = () => packages.fingerprint(t.key, w);
+  ok();
+  // pip's wrapper template, exactly (shebang to this venv's interpreter).
+  assert.equal(fs.readFileSync(path.join(bin, 'clip'), 'utf8'), `#!${vpy}\nimport sys\nfrom clipkg.cli import main\nif __name__ == '__main__':\n    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n    sys.exit(main())\n`);
+  assert.equal(packages.consoleScript('/a b/python', 'm:f').split('\n')[0], '#!/bin/sh', 'a path with a space uses distlib\'s /bin/sh form');
+  const reset = () => { simulateInstall(w, ['clipkg==1.0']); ok(); };
+  const wrapper = path.join(bin, 'clip');
+  fs.writeFileSync(wrapper, fs.readFileSync(wrapper, 'utf8').replace('sys.exit(main())', 'import os; os.system("x"); sys.exit(main())'));
+  throws(ok, /bin\/clip is not the console script pip generates/);
+  reset();
+  fs.writeFileSync(wrapper, fs.readFileSync(wrapper, 'utf8').replace(`#!${vpy}`, '#!/usr/bin/python3'));
+  throws(ok, /bin\/clip is not the console script pip generates/);
+  reset();
+  const raw = path.join(bin, 'clip-raw');
+  fs.writeFileSync(raw, fs.readFileSync(raw, 'utf8').replace(`#!${vpy}`, `#!${fakePy}`)); // another interpreter, even the shared one
+  throws(ok, /bin\/clip-raw in \.venv was changed after the install/);
+  reset();
+  for (const [f, re] of [['bin/activate', /no approved wheel installs: bin\/activate/], ['bin/evil', /no approved wheel installs: bin\/evil/], ['include/x.h', /include\/x\.h/], ['.tmp/stash.py', /\.tmp\/stash\.py/], ['etc/jupyter/x.json', /etc\/jupyter/]]) {
+    fs.mkdirSync(path.dirname(path.join(w, '.venv', f)), { recursive: true }); fs.writeFileSync(path.join(w, '.venv', f), 'x');
+    throws(ok, re);
+    fs.rmSync(path.join(w, '.venv', f));
+  }
+  fs.symlinkSync(process.execPath, path.join(bin, 'python3'));
+  throws(ok, /a link nobody approved \(bin\/python3\)/);
+  fs.rmSync(path.join(bin, 'python3')); fs.symlinkSync(fakePy, path.join(bin, 'python3'));
+  ok(); // an interpreter link to the shared interpreter is the venv's own
 });

@@ -172,6 +172,7 @@ function runSteps(plan) {
     if (st.unless && fs.existsSync(st.unless)) { console.log(`- ${st.label}: already there`); continue; }
     console.log(`- ${st.label}`);
     try {
+      if (st.remove) { for (const f of st.remove) { try { if (!fs.lstatSync(f).isDirectory()) fs.rmSync(f); } catch { /* not there */ } } continue; }
       if (st.write) { fs.mkdirSync(path.dirname(st.write.path), { recursive: true }); fs.writeFileSync(st.write.path, st.write.text); continue; }
       if (st.exclude) {
         const p = execFileSync('git', ['-C', st.exclude.ws, 'rev-parse', '--git-path', 'info/exclude'], { encoding: 'utf8' }).trim();
@@ -192,7 +193,7 @@ function runSteps(plan) {
   return { ok: true };
 }
 
-const scrubbed = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(PIP_|PYTHON|VIRTUAL_ENV$|CONDA)/.test(k)));
+const scrubbed = (also = []) => Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(PIP_|PYTHON|PYTEST_|VIRTUAL_ENV$|CONDA)/.test(k) && !also.includes(k)));
 const first = await send(cmd, body);
 if (cmd === 'test' && first.status < 400 && !first.j.error && first.j.output?.test) {
   // Run the desk's canonical interpreter here, in this run's sandbox and workspace; the exit status goes back as-is.
@@ -202,7 +203,7 @@ if (cmd === 'test' && first.status < 400 && !first.j.error && first.j.output?.te
   let tail = '';
   const keep = (c) => { tail = (tail + c).slice(-65_536); };
   const status = await new Promise((resolve) => {
-    const child = spawn(t.argv[0], t.argv.slice(1), { cwd: t.cwd, env: { ...scrubbed(), ...(t.env || {}) }, stdio: ['inherit', 'pipe', 'pipe'] });
+    const child = spawn(t.argv[0], t.argv.slice(1), { cwd: t.cwd, env: { ...scrubbed(t.scrub || []), ...(t.env || {}) }, stdio: ['inherit', 'pipe', 'pipe'] });
     child.stdout.on('data', (c) => { process.stdout.write(c); keep(c); });
     child.stderr.on('data', (c) => { process.stderr.write(c); keep(c); });
     child.on('error', (e) => { console.error(`desk test: ${e.message}`); resolve(-1); });
