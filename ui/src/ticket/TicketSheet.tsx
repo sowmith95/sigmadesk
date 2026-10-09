@@ -20,6 +20,7 @@ import { PresenceStrip } from '@/components/desk/Presence';
 import { Participants } from './Mentions';
 import { MessageBar, type BarHandle } from './MessageBar';
 import { Production } from './Production';
+import { TicketPackages } from '@/components/desk/Packages';
 import { PersonSheet } from '@/components/desk/PeopleSheet';
 import { DecisionLead } from '@/components/desk/DecisionBrief';
 import { AutonomyLine } from '@/components/desk/Autonomy';
@@ -212,6 +213,7 @@ export function TicketSheet() {
         {decisions.map((x) => <Button key={x.id} size="sm" variant={dec?.id === x.id ? 'default' : 'secondary'} aria-pressed={dec?.id === x.id} onClick={() => { setDecisionId(x.id); setTab('decision'); }}>{label(x)}</Button>)}</div>}
       {isFeatureRoot(t) && <p className="text-[13px] text-muted-foreground">A feature: its plan, tasks and grooming are on <button type="button" className="text-primary hover:underline" onClick={() => openFeature(t.key)}>its feature page</button>.</p>}
       <Production t={t} />
+      <TicketPackages ticketKey={t.key} sig={t.updated_at} />
       {gone && <p role="status" className="rounded-md bg-blocked/15 px-3 py-2">That decision was resolved or changed while you were reading. Nothing was submitted.</p>}
       {!dec && it && ['blocked', 'queued', 'epic'].includes(it.bucket) && <p className="rounded-md bg-secondary px-3 py-2"><Named text={humanReason(clean(it.reason), S.tickets)} /></p>}
       <Tabs data-sheet-tabs value={shownTab} onValueChange={setTab} className="min-w-0 scroll-mt-2 gap-4">

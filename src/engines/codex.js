@@ -32,6 +32,29 @@ export function secretFileUnder(root, limit = 20000) {
   };
   try { return fs.statSync(root).isDirectory() ? walk(root, 0) : SECRET_NAME.test(path.basename(root)); } catch { return false; }
 }
+/** The seat profiles' filesystem rules outside the workspace: readable system/toolchain/owner trees, and the rooted
+ * deny globs for secret-looking files inside the owner's read-only trees. */
+function seatFilesystem() {
+  const hm = os.homedir();
+  const readable = ['/System', '/usr', '/private/etc', '/opt/homebrew', '/Library/Developer/CommandLineTools',
+    path.dirname(path.dirname(process.execPath)), path.join(config.root, 'bin'), path.join(hm, '.gitconfig'), path.join(hm, '.config', 'git'),
+    ...config.project.readOnlyPaths].filter((p, i, a) => p && a.indexOf(p) === i && fs.existsSync(p));
+  const roDeny = config.project.readOnlyPaths.filter((p) => p && fs.existsSync(p)).flatMap((p) => SECRET_GLOBS.map((g) => path.join(p, g)));
+  return { readable, roDeny };
+}
+/**
+ * A run with approved package stages (#8) reads them through a per-run override of the seat profile's filesystem table
+ * (`-c permissions.sigmadesk_seat.filesystem={…}`, an inline TOML table, so paths with dots stay one key; verified with
+ * `codex sandbox`). The shared config.toml never changes, other runs never see the stage, and the network section is
+ * not touched: it stays off.
+ */
+export function seatFilesystemOverride(extraRead = []) {
+  const { readable, roDeny } = seatFilesystem();
+  const q = (p) => JSON.stringify(p);
+  const entries = ['":minimal" = "read"', '":tmpdir" = "write"', ...readable.map((p) => `${q(p)} = "read"`), ...extraRead.map((p) => `${q(p)} = "read"`), ...roDeny.map((p) => `${q(p)} = "none"`),
+    `":workspace_roots" = { "." = "write", ".git" = "write", ${SECRET_GLOBS.map((g) => `${q(g)} = "none"`).join(', ')} }`];
+  return `permissions.sigmadesk_seat.filesystem={ ${entries.join(', ')} }`;
+}
 export function codexHome() {
   const home = path.join(config.home ? config.dataDir : path.join(config.root, 'data'), 'codex-home');
   fs.mkdirSync(home, { recursive: true });
@@ -46,15 +69,11 @@ export function codexHome() {
     'shell_snapshot', 'realtime_conversation', 'tool_suggest', 'worktrees'];
   // Permission profile (Codex beta): deny reads from the filesystem root, allow only system/toolchain paths, the
   // owner's read-only paths and the seat's own clone (+ its .git, which Codex otherwise keeps read-only).
-  const hm = os.homedir();
-  const readable = ['/System', '/usr', '/private/etc', '/opt/homebrew', '/Library/Developer/CommandLineTools',
-    path.dirname(path.dirname(process.execPath)), path.join(config.root, 'bin'), path.join(hm, '.gitconfig'), path.join(hm, '.config', 'git'),
-    ...config.project.readOnlyPaths].filter((p, i, a) => p && a.indexOf(p) === i && fs.existsSync(p));
+  const { readable, roDeny } = seatFilesystem();
   // Secret-looking files inside the owner's read-only trees (a Python venv ships cacert.pem, botocore/credentials.py …)
   // stay unreadable through rooted deny globs, which Codex honours outside workspace roots too (verified with a real
   // run: "<root>/**/*.pem" = "none" blocks the read while "<root>" = "read" still lets its binaries execute). Dropping
   // the whole tree instead silently removed the project's venv, so QA on Codex could not run pytest at all.
-  const roDeny = config.project.readOnlyPaths.filter((p) => p && fs.existsSync(p)).flatMap((p) => SECRET_GLOBS.map((g) => path.join(p, g)));
   const q = (p) => JSON.stringify(p);
   fs.writeFileSync(path.join(home, 'config.toml'), [
     'approval_policy = "never"',
@@ -123,8 +142,10 @@ export function codexInvocation(bin = codexBin()) {
 
 /** Hash of the permission profile Codex sessions are created under. A Codex session keeps the sandbox policy it
  *  started with, so a run is resumable only while this hash still matches (see runner.canResume). */
-export function profileHash() {
-  return crypto.createHash('sha256').update(fs.readFileSync(path.join(codexHome(), 'config.toml'))).digest('hex').slice(0, 16);
+export function profileHash(extraRead = []) {
+  const h = crypto.createHash('sha256').update(fs.readFileSync(path.join(codexHome(), 'config.toml')));
+  if (extraRead.length) h.update(`\0${seatFilesystemOverride(extraRead)}`); // a run's package stages are part of its profile
+  return h.digest('hex').slice(0, 16);
 }
 export const codex = {
   id: 'codex',
@@ -155,13 +176,15 @@ export const codex = {
   },
   budgetUsd: () => config.engines?.codex?.reserveUsd ?? 2,
 
-  command({ seat, charter, cwd, resume, extraDirs = [], kind }) {
+  command({ seat, charter, cwd, resume, extraDirs = [], kind, extraRead = [] }) {
     const effort = seat.effort;
     const model = seat.model || userModel();
     const common = ['--json', '--skip-git-repo-check', ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : []),
       ...(['council_review','product_review','feature_groom'].includes(kind) ? ['-c', 'default_permissions="sigmadesk_review"'] : []),
       ...(kind === 'mention' ? ['-c', 'default_permissions="sigmadesk_tagged"'] : []),
-      ...(kind === 'council_review' ? ['-c', 'features.shell_tool=false'] : [])];
+      ...(kind === 'council_review' ? ['-c', 'features.shell_tool=false'] : []),
+      // Package stages (#8) only ever extend the build profile (sigmadesk_seat), and only for the granted run.
+      ...(extraRead.length && !['council_review', 'product_review', 'feature_groom', 'mention'].includes(kind) ? ['-c', seatFilesystemOverride(extraRead)] : [])];
     const args = resume
       ? ['exec', 'resume', ...common, resume, '-']
       : ['exec', ...common, '-C', cwd, '-'];

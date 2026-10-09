@@ -8,6 +8,7 @@
 // reviewer re-reviews with the thread). Every verdict and answer is mirrored to the PR as a plain-language comment
 // through a durable outbox. Two approvals at one commit → auto-merge (low risk only, outside the busy window) or
 // "waiting for your merge". The database is authoritative; GitHub comments/labels are a mirror.
+import * as packages from './packages.js';
 import { config } from './config.js';
 import { agentById, PRINCIPALS, promptFor } from './team.js';
 import * as store from './db.js';
@@ -369,8 +370,11 @@ export async function prepareSnapshot(t, seat) {
 }
 export function reviewPrompt(t, row, code, reconfirm = null) {
   const why = row.role === 'context' ? whyContext(t, row.seat) : 'a senior/principal who neither built nor designed it';
-  return promptFor('pr_review', { ticket: t, comments: store.listComments(t.key).slice(-12),
+  const prompt = promptFor('pr_review', { ticket: t, comments: store.listComments(t.key).slice(-12),
     extra: { code, role: row.role, why, sha: row.sha, author: `${nameOf(t.assignee)} (${roleOf(t.assignee)})`, thread: threadFor(t.key), reconfirm } });
+  // Approved package installs (#8): the reviewer checks that the requirements change declares exactly what was added.
+  const deps = packages.dependencyText(packages.ticketDependencies(t.key));
+  return deps ? `${prompt}\n\nDependencies: this ticket ${deps} (installed offline from wheels the owner approved). Check the requirements file change: every runtime pin in the runtime requirements, dev/test pins only in the dev/test requirements, exact versions matching these, nothing else added — and raise a finding if it is missing or different.` : prompt;
 }
 const cut = (s, n) => (s.length > n ? `${s.slice(0, n)}\n… (truncated)` : s);
 /**

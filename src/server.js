@@ -38,6 +38,7 @@ import * as researchReview from './research-review.js';
 import * as connectors from './connectors.js';
 import * as ops from './ops.js';
 import * as access from './access.js';
+import * as packages from './packages.js';
 import * as decision from './decision.js';
 import * as autonomy from './autonomy.js';
 
@@ -93,7 +94,7 @@ export function snapshot({ inbox = true } = {}) {
       production: deploywatch.summary(), // post-deploy watch (#7): regression holds, active watches, deployment KPIs
       lessons: store.listLessons(),
       groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
-      research: research.status(settings), research_reviews: researchReview.summaries(), ops: ops.describe(settings), access: access.summary(),
+      research: research.status(settings), research_reviews: researchReview.summaries(), ops: ops.describe(settings), access: access.summary(), packages: packages.summary(),
       decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
     },
   };
@@ -388,6 +389,15 @@ async function ownerRoute(req, res) {
     const b = await readBody(req);
     return send(res, 200, { ok: true, message: access.revoke(Number(mm[1]), 'owner', String(b.reason || '').slice(0, 300)) });
   }
+  // Package installs (#8): only the owner approves, declines or revokes a resolved wheel set.
+  if (req.method === 'GET' && p === '/api/packages') { packages.sweep(); return send(res, 200, packages.details()); }
+  if (req.method === 'POST' && (mm = m('^/api/packages/(\\d+)/(approve|deny|revoke)$'))) {
+    const b = await readBody(req);
+    const why = String(b.reason || '').slice(0, 300);
+    const out = mm[2] === 'revoke' ? packages.revoke(Number(mm[1]), 'owner', why) : packages.decide(Number(mm[1]), mm[2], { by: 'owner', note: why });
+    return send(res, 200, { ok: true, message: out });
+  }
+  if (req.method === 'GET' && (mm = m('^/api/tickets/KEY/packages$'))) return send(res, 200, packages.forTicket(mm[1]));
   if (req.method === 'POST' && p === '/api/access/revoke-all') return send(res, 200, { ok: true, revoked: access.revokeAll('owner') });
   if (req.method === 'POST' && p === '/api/access/policy') { const b = await readBody(req); return send(res, 200, { ok: true, policy: access.setPolicy(b.policy) }); }
   if (req.method === 'GET' && p === '/api/engines') {
@@ -664,7 +674,7 @@ export async function main() {
   setInterval(() => sched.tick(), 15_000);
   setInterval(pollMailboxes, 400);
   // Production access expiry, ticket/run endings: enforced even while the scheduler is halted.
-  setInterval(() => { try { access.sweep(); } catch { /* next pass */ } }, 10_000);
+  setInterval(() => { try { access.sweep(); } catch { /* next pass */ } try { packages.sweep(); } catch { /* next pass */ } }, 10_000);
   if (config.watch.enabled) {
     let polling = false; // serialize: overlapping polls would read the same cursor twice and double-count
     const loop = async () => {

@@ -204,6 +204,43 @@ const DEFAULTS = {
     allowedDomains: [], // network hosts agent shells may reach (package registries etc.). Empty = none.
     denyRead: ['~/.ssh', '~/.aws', '~/.config/gh', '~/.codex', '~/.docker', '~/.kube', '~/.gnupg', '~/.netrc', '~/Library/Keychains'],
   },
+  // `desk fetch <https-url>` (#8): the DESK fetches one document for a seat (seats have no network) from these hosts
+  // only (exact names, owner-editable), HTTPS only, private addresses refused, every redirect re-checked; HTML comes
+  // back as plain text marked untrusted, and every fetch is a desk event.
+  fetch: {
+    enabled: true,
+    hosts: ['docs.python.org', 'nodejs.org', 'docs.github.com'],
+    maxBytes: 2_000_000,
+    maxChars: 60_000,
+    timeoutSeconds: 15,
+    maxPerRun: 20,
+  },
+  // Package installs (#8): a seat asks for exact pins (`desk pkg request name==version`); the desk resolves the full
+  // wheel set from PyPI only (no existing distribution in the shared venv may change version), stages it under
+  // data/pkg/<id>/ and the OWNER approves the manifest; the seat then installs it offline into <workspace>/.venv,
+  // layered read-only on the shared venv. The shared venv itself is never written.
+  packages: {
+    enabled: true,
+    python: '', // the shared venv's interpreter; empty = <first project.readOnlyPaths entry with pyvenv.cfg>/bin/python
+    maxPackages: 10, // pins per request
+    maxFiles: 60, // wheels in one resolved set (transitive included)
+    maxTotalMB: 300, // all wheels of one request together
+    maxFileMB: 150,
+    resolveTimeoutSeconds: 180,
+    downloadTimeoutSeconds: 120, // per wheel
+    grantHours: 24, // an approved set may be installed for this long (and only while its ticket is open)
+    // Budgets for sets nobody approved yet: open requests per seat / per run / in total, all staged wheels together,
+    // and how long an unanswered request keeps its stage.
+    maxPendingPerSeat: 3,
+    maxPendingPerRun: 2,
+    maxPendingTotal: 10,
+    maxStagedMB: 1500,
+    pendingHours: 48,
+    resolveProxyMB: 0, // all of one resolution's traffic through the desk proxy; 0 = max(50 MB, maxTotalMB)
+    maxUnpackedMB: 1000, // one wheel's contents, unpacked (zip-bomb guard when the desk reads its RECORD)
+    // The resolver's interpreter may not live under these (nor under the workspaces): places seats can write.
+    untrustedRoots: [os.tmpdir(), '/tmp', '/private/tmp'],
+  },
   // Production read access ("desk ops"): named, read-only probes the DESK runs for SRE/DBA seats. Seats never get
   // credentials or a shell on the host. Off unless ops.enabled here AND the owner's Settings toggle (ops_enabled).
   // See README "Production read access" and scripts/provision-role.sql.
@@ -345,6 +382,7 @@ export function loadConfig(file = deskPaths({ home: homeOf(process.env), legacyR
   c.advisors.keyFile = expandHome(c.advisors.keyFile);
   c.ops.pgpassFile = expandHome(c.ops.pgpassFile);
   c.ops.pgServiceFile = expandHome(c.ops.pgServiceFile);
+  c.packages.python = expandHome(c.packages.python || '');
   const pathClaude = which('claude');
   c.bins.claude = c.bins.claude || (pathClaude && !wrapperProblem(pathClaude) ? pathClaude : path.join(os.homedir(), '.local/bin/claude'));
   c.bins.gh = c.bins.gh || which('gh') || 'gh';
@@ -427,6 +465,9 @@ export function validateConfig(c = config) {
     problems.push('deploy.targets must map workflow file names to a service name or a list of service names');
   const home = os.homedir();
   for (const p of c.project.readOnlyPaths || []) if (path.resolve(p) === home || home.startsWith(`${path.resolve(p)}/`)) problems.push(`project.readOnlyPaths: ${p} would expose your home folder to every seat`);
+  const hostRe = /^(?=.{1,253}$)(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$/;
+  if (!Array.isArray(c.fetch?.hosts) || !c.fetch.hosts.every((h) => typeof h === 'string' && hostRe.test(h) && !/^\d+(\.\d+)*$/.test(h)))
+    problems.push('fetch.hosts must be a list of exact lowercase host names (no IP addresses, wildcards, schemes or ports)');
   if (c.github.sync && !c.project.githubRepo) problems.push('github.sync is on but project.githubRepo is unknown');
   if (!fs.existsSync(c.project.playbook)) problems.push(`playbook not found: ${c.project.playbook}`);
   if (!(c.engines.fallbackCooldownMinutes >= 1 && c.engines.fallbackCooldownMinutes <= 1440)) problems.push('engines.fallbackCooldownMinutes must be between 1 and 1440');

@@ -410,6 +410,35 @@ CREATE TABLE IF NOT EXISTS ops_requests (
   grant_id INTEGER,
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- Package installs (#8): a seat asks for exact pins; the desk resolves the full wheel set (transitive pins, hashes,
+-- sizes) and stages it under data/pkg/<id>/; the owner approves the manifest; the seat installs it OFFLINE into its
+-- workspace venv. One row is both the request and, once approved, the grant (a capability separate from probe grants).
+CREATE TABLE IF NOT EXISTS pkg_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  seat TEXT NOT NULL,
+  ticket_key TEXT NOT NULL,
+  run_id INTEGER,
+  why TEXT,
+  specs TEXT NOT NULL,            -- JSON list of the requested "name==version" pins (canonical names)
+  dev INTEGER NOT NULL DEFAULT 0, -- a test/dev-only dependency (else runtime)
+  status TEXT NOT NULL DEFAULT 'resolving', -- resolving | owner | approved | denied | failed | revoked | expired | closed | withdrawn
+  manifest TEXT,                  -- JSON: [{name, version, filename, url, sha256, size, requested, role}]
+  total_bytes INTEGER,
+  base_lock TEXT,                 -- JSON: the shared venv's distributions at resolution ({name: version})
+  error TEXT,
+  decided_by TEXT,
+  decided_at TEXT,
+  note TEXT,
+  expires_at TEXT,
+  revoked_at TEXT,
+  revoked_by TEXT,
+  installed_at TEXT,
+  install_run INTEGER,
+  fingerprint TEXT,               -- JSON: the workspace venv the desk verified after the seat's offline install
+  inventory TEXT,                 -- JSON: per added wheel, the files it installs (from its RECORD, each re-hashed)
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS pkg_requests_ticket ON pkg_requests(ticket_key, status);
 -- Post-deploy watch (#7). One row per deploy workflow run (attempt) of a merge commit, written in the same transaction
 -- that releases or holds the deploy lock (or by reconciliation for deploys the desk did not see). status: success |
 -- failed | unknown (never confirmed; owner-cleared holds stay failed/unknown). run_id 0 = no run was ever seen.
@@ -842,6 +871,33 @@ export function updateAccessRequest(id, patch) {
   return getAccessRequest(id);
 }
 export const openAccessRequests = () => q("SELECT * FROM ops_requests WHERE status IN ('pending','reviewing','owner') ORDER BY id").all();
+// ---------- package installs (#8) ----------
+const PKG_COLS = ['inventory', 'status', 'manifest', 'total_bytes', 'base_lock', 'error', 'decided_by', 'decided_at', 'note', 'expires_at', 'revoked_at', 'revoked_by', 'installed_at', 'install_run', 'fingerprint', 'run_id'];
+export function insertPkgRequest(r) {
+  const info = q('INSERT INTO pkg_requests(seat,ticket_key,run_id,why,specs,dev,status) VALUES (?,?,?,?,?,?,?)').run(
+    r.seat, r.ticket_key, r.run_id ?? null, r.why ?? null, JSON.stringify(r.specs), r.dev ? 1 : 0, r.status || 'resolving');
+  const row = getPkgRequest(Number(info.lastInsertRowid));
+  announce({ type: 'packages', data: { id: row.id } });
+  return row;
+}
+export const getPkgRequest = (id) => q('SELECT * FROM pkg_requests WHERE id=?').get(id) || null;
+/** Move a request out of one of `from` (a terminal state set by a revoke is never overwritten by a late resolution). */
+export function transitionPkgRequest(id, from, patch) {
+  const keys = Object.keys(patch).filter((k) => PKG_COLS.includes(k));
+  const val = (v) => (v !== null && typeof v === 'object' ? JSON.stringify(v) : v ?? null);
+  const n = q(`UPDATE pkg_requests SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=? AND status IN (${from.map(() => '?').join(',')})`).run(...keys.map((k) => val(patch[k])), id, ...from).changes;
+  if (n) announce({ type: 'packages', data: { id } });
+  return n > 0;
+}
+export function updatePkgRequest(id, patch) {
+  const keys = Object.keys(patch).filter((k) => PKG_COLS.includes(k));
+  if (keys.length) q(`UPDATE pkg_requests SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=?`).run(...keys.map((k) => (patch[k] !== null && typeof patch[k] === 'object' ? JSON.stringify(patch[k]) : patch[k] ?? null)), id);
+  announce({ type: 'packages', data: { id } });
+  return getPkgRequest(id);
+}
+export const openPkgRequests = () => q("SELECT * FROM pkg_requests WHERE status IN ('resolving','owner','approved') ORDER BY id").all();
+export const pkgRequestsForTicket = (key) => q('SELECT * FROM pkg_requests WHERE ticket_key=? ORDER BY id').all(key);
+export const pkgRequestHistory = (limit = 50) => q('SELECT * FROM pkg_requests ORDER BY id DESC LIMIT ?').all(limit);
 export const accessRequestHistory = (limit = 50) => q('SELECT * FROM ops_requests ORDER BY id DESC LIMIT ?').all(limit);
 /** Fresh evidence only: probes that reached production in this run and did not report the application unhealthy. A
  * cached answer was observed for someone else, earlier: it never counts as this run's evidence. */

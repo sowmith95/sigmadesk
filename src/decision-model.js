@@ -214,9 +214,10 @@ export function brief(facts) {
     const dep = deployConsequence(facts.deploy || null, { targets: facts.targets, files: facts.files });
     const n = facts.pr || null;
     out.you_decide = d.verb && /^Release/.test(d.verb) ? d.verb : `Merge ${name} into ${baseBranch}`;
-    out.consequence = { summary: [`Merges${n ? ` PR #${n}` : ''} into ${baseBranch}`, dep.state === 'none' ? 'nothing redeploys'
+    const deps = dependencySteps(facts.dependencies);
+    out.consequence = { summary: [`Merges${n ? ` PR #${n}` : ''} into ${baseBranch}`, deps.summary, dep.state === 'none' ? 'nothing redeploys'
       : dep.state === 'unknown' ? 'what it starts is unknown' : `starts ${list(dep.workflows)}`, dep.state === 'deploys' ? (dep.target === 'known' ? `redeploys ${list(dep.targets)}` : 'deployment target unknown') : null].filter(Boolean).join(' → '),
-    steps: [{ text: `Merges${n ? ` PR #${n}` : ''} into ${baseBranch}${head ? ` at ${short(head)}` : ''}.`, tone: 'ok' }, ...dep.steps], deploy: dep };
+    steps: [{ text: `Merges${n ? ` PR #${n}` : ''} into ${baseBranch}${head ? ` at ${short(head)}` : ''}.`, tone: 'ok' }, ...deps.steps, ...dep.steps], deploy: dep, dependencies: facts.dependencies || null };
     out.gate = mergeGate({ qa, reviews, ci, deploy: dep, busy: facts.busy, windowEnd: facts.windowEnd, lock: facts.lock, policy: facts.policy, hold: t?.merge_hold || null, live: facts.live || null });
     out.evidence = { ...out.evidence, qa, reviews, ci };
     const human = [];
@@ -232,7 +233,9 @@ export function brief(facts) {
       { text: 'Pull-request CI runs on the pushed commit; then two code reviewers check this exact commit.', tone: 'ok' }];
     const wf = (facts.files || []).filter(isWorkflowFile);
     if (wf.length) steps.push({ text: `It edits ${list(wf.map(base))}: once pushed, that workflow code runs on your CI runners with the repository's secrets.`, tone: 'deploy' });
-    out.consequence = { summary: 'Pushes the branch → opens a draft PR → CI and two reviews. Nothing merges.', steps };
+    const deps = dependencySteps(facts.dependencies);
+    steps.push(...deps.steps);
+    out.consequence = { summary: `Pushes the branch → opens a draft PR → CI and two reviews.${deps.summary ? ` It ${deps.summary}.` : ''} Nothing merges.`, steps, dependencies: facts.dependencies || null };
     out.gate = publishGate({ qa, guard: kind === 'guard', guardReasons: reasons, githubSync: settings.github_sync !== 'false', draftPrs: settings.open_draft_prs !== 'false' });
     out.evidence = { ...out.evidence, qa };
     const am = facts.autoMerge || {};
@@ -244,6 +247,20 @@ export function brief(facts) {
       { text: `Deploying merges continue one at a time${facts.pending ? ` (${plural(facts.pending, 'merge')} queued)` : ''}.`, tone: 'deploy' }] };
     out.gate = overall([G('deploy', 'Deploy', 'yours', `${lock.state === 'failed' ? 'Its deploy run failed' : 'Its deploy run was never confirmed'}${lock.note ? `: ${lock.note}` : ''}. Check the runs first.`)]);
     out.human = ['Whether production is healthy: clearing the hold only lets the next deploying merge go.'];
+  } else if (kind === 'packages') {
+    const r = d.packages || {};
+    const adds = r.additions || [];
+    const mbs = r.total_bytes ? ` (${(r.total_bytes / 1e6).toFixed(1)} MB)` : '';
+    out.you_decide = d.verb;
+    out.consequence = { summary: `Lets ${d.name} install ${plural(adds.length, 'package')}${mbs} offline into ${r.ticket_key || 'the ticket'}'s workspace venv.`,
+      steps: [{ text: `Installs exactly these wheels from the desk's stage, hash-checked: ${list(adds.map((x) => `${x.name}==${x.version}`))}.`, tone: 'ok' },
+        { text: 'pip\'s resolution was only a proposal: the desk downloaded each wheel itself, bound it to its sha256 and read its file list; the installed venv is verified against it file by file.', tone: 'ok' },
+        ...((r.startup || []).length ? [{ text: `Startup code: ${list(r.startup.map((x) => `${x.name} (${x.files.join(', ')})`))} runs at every Python start in that venv.`, tone: 'deploy' }] : []),
+        { text: 'The shared venv does not change: the workspace venv layers on it read-only, and nothing already there changes version.', tone: 'ok' },
+        { text: 'Wheels run their code when imported inside the seat\'s sandbox (no network, writes only in its workspace).', tone: 'unknown' },
+        { text: `The ticket must add the dependency to the right requirements file${r.dev ? ' (development/test only)' : ''}; reviewers check that change.`, tone: 'deploy' }] };
+    out.gate = overall([G('owner', 'Package install', 'yours', 'Only you approve package installs (no probe grant, tag or policy covers them).')]);
+    out.human = ['Whether the dependency belongs in the product: approving the install does not approve the requirements change.'];
   } else if (kind === 'access') {
     const r = d.access || {};
     out.you_decide = d.verb;
@@ -274,6 +291,14 @@ export function brief(facts) {
     if (head && ['question', 'conflict', 'stuck', 'setup', 'refresh'].includes(kind)) out.evidence = { ...out.evidence, qa };
   }
   return out;
+}
+
+/** "adds N dependencies (runtime/dev)" from the ticket's approved package installs (#8). */
+function dependencySteps(d) {
+  const n = d ? d.runtime.length + d.dev.length : 0;
+  if (!n) return { summary: null, steps: [] };
+  const summary = `adds ${plural(n, 'dependency', 'dependencies')} (${d.runtime.length} runtime, ${d.dev.length} dev)`;
+  return { summary, steps: [{ text: `It ${summary}${d.transitive ? `, +${d.transitive} transitive` : ''}: ${list([...d.runtime, ...d.dev.map((x) => `${x} (dev)`)])}. Check the requirements file change declares exactly these pins.`, tone: 'deploy' }] };
 }
 
 // ---------------- "What remains before merge?" ----------------

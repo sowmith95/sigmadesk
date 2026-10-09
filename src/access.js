@@ -8,11 +8,14 @@
 // - Validity is checked at EVERY probe call (no cached authorization). Revocation is immediate: probes in flight for
 //   a seat that lost access are cancelled.
 // - Every grant, denial, revocation and expiry is a desk event and, when a ticket is involved, a plain-language comment.
+// - Package installs (#8) are a separate capability with their own table and rules (src/packages.js): no probe grant —
+//   not "*", not an owner-mention or post-deploy grant — ever covers them. Only "Revoke all" ends both.
 import { config } from './config.js';
 import * as store from './db.js';
 import { agentById } from './team.js';
 import { notify } from './notify.js';
 import * as ops from './ops.js';
+import * as packages from './packages.js';
 
 const nowIso = () => new Date().toISOString();
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
@@ -402,6 +405,7 @@ export function revokeAll(by = 'owner', reason = 'emergency: revoke all') {
   for (const g of store.openGrants()) if (endGrant(g, by, reason)) n++;
   for (const r of store.openAccessRequests()) store.updateAccessRequest(r.id, { status: 'denied', decided_by: by, decided_at: nowIso(), note: reason });
   ops.cancelAll();
+  n += packages.revokeAll(by, reason);
   return n;
 }
 
@@ -449,7 +453,8 @@ export function details() {
   const pol = policy();
   return { ...summary(), policy: pol, probes: probeIds(), seats: Object.keys(agentById).map((id) => ({ id, name: nameOf(id), role: agentById[id].role })),
     mention_access: Object.fromEntries(Object.keys(agentById).map((id) => [id, ownerMentionPreview(id, pol)])),
-    history: { grants: store.grantHistory(50).map(view), requests: store.accessRequestHistory(50).map((r) => ({ ...r, probes: json(r.probes, []), seat_name: nameOf(r.seat) })) } };
+    history: { grants: store.grantHistory(50).map(view), requests: store.accessRequestHistory(50).map((r) => ({ ...r, probes: json(r.probes, []), seat_name: nameOf(r.seat) })) },
+    packages: packages.details() };
 }
 /** `desk access list` / `desk ops list` text. */
 export function listText(seat = null) {
