@@ -671,21 +671,21 @@ export function fingerprint(ticketKey, ws, { including = [], requireAll = true }
   const env = sharedEnv();
   const cfg = readSmall(path.join(venv, 'pyvenv.cfg'), 8192);
   if (cfg == null) throw err('.venv has no pyvenv.cfg', 409);
-  if (/^include-system-site-packages\s*=\s*true/mi.test(cfg)) throw err('.venv was created with system site-packages: recreate it with desk pkg install', 409);
-  const version = cfg.match(/^version(?:_info)?\s*=\s*(\S+)/m)?.[1];
-  if (version !== env.version) throw err(`.venv says Python ${version || 'unknown'}, the shared venv is ${env.version}`, 409);
   const vpy = path.join(venv, 'bin', 'python');
   // Every key of pyvenv.cfg is known and points at the shared venv's interpreter: `home` is its directory, `executable`
   // the interpreter itself, `command` exactly how desk pkg install created this venv.
   const keys = {};
   for (const line of cfg.split(/\r?\n/)) {
     if (!line.trim()) continue;
-    const m = line.match(/^\s*([A-Za-z_-]+)\s*=\s*(.*?)\s*$/);
+    const m = line.match(/^([a-z][a-z_-]*)[ \t]*=[ \t]*(.*?)[ \t]*$/); // strict: no leading whitespace, exact lowercase keys
     if (!m) throw err(`.venv/pyvenv.cfg has an unreadable line: ${line.slice(0, 80)}`, 409);
-    keys[m[1].toLowerCase()] = m[2];
+    if (m[1] in keys) throw err(`.venv/pyvenv.cfg sets ${m[1]} twice`, 409);
+    keys[m[1]] = m[2];
   }
   const unknown = Object.keys(keys).filter((k) => !['home', 'include-system-site-packages', 'version', 'version_info', 'executable', 'command'].includes(k));
   if (unknown.length) throw err(`.venv/pyvenv.cfg has keys nobody expects (${unknown.join(', ')})`, 409);
+  if (String(keys['include-system-site-packages'] ?? '').trim().toLowerCase() !== 'false') throw err(`.venv/pyvenv.cfg must say include-system-site-packages = false (it says ${keys['include-system-site-packages'] ?? 'nothing'}): no system site-packages; recreate it with desk pkg install`, 409);
+  if (keys.version !== env.version) throw err(`.venv says Python ${keys.version || 'unknown'}, the shared venv is ${env.version}`, 409);
   const interpReal = realpath(env.python);
   if (!keys.home || realpath(keys.home) !== path.dirname(interpReal)) throw err(`.venv/pyvenv.cfg home is ${keys.home || 'missing'}, not the shared interpreter's directory`, 409);
   if (keys.executable != null && realpath(keys.executable) !== interpReal) throw err(`.venv/pyvenv.cfg executable is ${keys.executable}, not the shared interpreter`, 409);
@@ -855,6 +855,12 @@ export function checkTestArgs(args, ws) {
     return real === wsReal || real.startsWith(`${wsReal}/`);
   };
   const refuse = (tok, why) => err(`desk test refuses ${String(tok).slice(0, 80)}: ${why}`);
+  // pytest expands @file in ANY position (an option's value included): no token, and no --opt=value value, may start
+  // with @; no newlines or NUL anywhere.
+  for (const a of rest.map(String)) {
+    if (a.startsWith('@') || (a.startsWith('-') && a.includes('=') && a.slice(a.indexOf('=') + 1).startsWith('@'))) throw refuse(a, 'arguments may not start with @ (pytest reads them as argument files)');
+    if (/[\n\r\0]/.test(a)) throw refuse(JSON.stringify(a), 'arguments may not contain newlines or NUL');
+  }
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (runner === 'pytest') {
@@ -898,7 +904,7 @@ const testPlans = new Map(); // runId -> { id, args, sha, fp }
  */
 export function testPlan(run, args, { ws, sha }) {
   if (!Array.isArray(args) || !args.length) throw err('desk test <module> [args…], e.g. desk test pytest tests/test_x.py -q');
-  if (args.length > 64 || args.some((a) => typeof a !== 'string' || a.length > 1000 || a.includes('\0'))) throw err('too many or invalid arguments');
+  if (args.length > 64 || args.some((a) => typeof a !== 'string' || a.length > 1000)) throw err('desk test refuses these arguments: at most 64, each a string of at most 1000 characters');
   if (!TEST_RUNNERS.includes(args[0])) throw err(`desk test runs a test runner: ${TEST_RUNNERS.join(' or ')} (got "${String(args[0]).slice(0, 60)}")`);
   checkTestArgs(args, ws);
   let py, fp = null;

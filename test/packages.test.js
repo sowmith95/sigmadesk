@@ -534,8 +534,18 @@ test('fingerprint comes from what is on disk: missing, modified, extra files, st
     [goodCfg(dv).replace(`executable = ${fakePy}`, `executable = ${process.execPath}`), /executable is .*, not the shared interpreter/],
     [goodCfg(dv).replace(`command = ${fakePy} -m venv`, 'command = /usr/bin/python3 -m venv'), /command is not how desk pkg install creates the venv/],
     [`${goodCfg(dv)}prompt = x\n`, /keys nobody expects \(prompt\)/],
+    // round 5: include-system-site-packages must be present and exactly false; a strict parser.
+    [goodCfg(dv).replace('include-system-site-packages = false\n', ''), /must say include-system-site-packages = false \(it says nothing\)/],
+    [goodCfg(dv).replace('include-system-site-packages = false', '  include-system-site-packages = false'), /unreadable line/],
+    [goodCfg(dv).replace('include-system-site-packages = false', 'include-system-site-packages = no'), /it says no/],
+    [goodCfg(dv).replace('include-system-site-packages = false', 'include-system-site-packages = false # really'), /it says false # really/],
+    [goodCfg(dv).replace('include-system-site-packages = false', 'Include-System-Site-Packages = false'), /unreadable line/],
+    [`${goodCfg(dv)}include-system-site-packages = true\n`, /sets include-system-site-packages twice/],
+    [goodCfg(dv).replace('version = 3.12.4\n', ''), /says Python unknown/],
   ]) { fs.writeFileSync(cfg, text); throws(ok, re); }
   fs.writeFileSync(cfg, goodCfg(dv).replace(/^executable.*\n^command.*\n/m, '')); // executable/command are optional (older venv versions)
+  ok();
+  fs.writeFileSync(cfg, goodCfg(dv).replace('include-system-site-packages = false', 'include-system-site-packages = False')); // case-insensitive value
   ok();
   fs.writeFileSync(cfg, goodCfg(dv));
   assert.equal(ok().installed_sha256, base.installed_sha256, 'pyvenv.cfg is part of the fingerprint');
@@ -677,9 +687,9 @@ test('QA never fails open: an invalid .venv blocks QA; with a valid one QA passe
   await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['os; import x'] }), /runs a test runner/);
   for (const bad of [['--co'], ['--collect-only'], ['--junitxml=/tmp/x.xml'], ['-p', 'no:junitxml'], ['--setup-plan'], ['--version'], ['-o'], ['-c/tmp/skip.ini'], ['-oaddopts=--setup-only'],
     ['-pno:x'], ['-qq'], ['--maxfail=1x'], ['-k'], ['-k', '--co'], ['/etc/passwd'], ['../other/tests'], ['tests', '--rootdir=/'],
-    ['@args.txt'], ['@/tmp/args'], ['tests/missing_test.py'], ['tests/test_x.py::../../x'], ['outlink'], ['outlink/test_y.py'], ['tests/test_x.py::']])
+    ['@args.txt'], ['@/tmp/args'], ['-k', '@args.txt'], ['-m', '@x'], ['--maxfail=@1'], ['-k', 'a\nb'], ['-k', 'a\u0000b'], ['tests', '-k', 'x\rdel'], ['tests/missing_test.py'], ['tests/test_x.py::../../x'], ['outlink'], ['outlink/test_y.py'], ['tests/test_x.py::']])
     await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', ...bad] }), /desk test refuses/);
-  for (const bad of [['discover', '-s', '/tmp'], ['discover', '--locals'], ['-b'], ['os;x']])
+  for (const bad of [['discover', '-s', '/tmp'], ['discover', '--locals'], ['-b'], ['os;x'], ['discover', '-p', '@x'], ['discover', '-s', '@tests']])
     await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['unittest', ...bad] }), /desk test refuses/);
   const okArgs = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', 'tests/test_x.py::test_a', 'tests/test_x.py::TestA::test_b[a/b]', 'tests', '-k', 'not slow', '-m', 'unit', '-x', '-q', '-v', '--maxfail=2'] })).test;
   assert.deepEqual(okArgs.argv.slice(-3, -1), ['-p', 'no:cacheprovider']);
