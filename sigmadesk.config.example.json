@@ -48,6 +48,16 @@
       "haiku": 0.75
     }
   },
+  "delegation": {
+    "kinds": {
+      "owner_task": "shadow",
+      "question": "shadow",
+      "research": "shadow",
+      "loop_limit": "shadow",
+      "design": "shadow"
+    },
+    "peerAccess": false
+  },
   "github": {
     "sync": true,
     "openDraftPrs": true,

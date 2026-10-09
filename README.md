@@ -152,6 +152,57 @@ same provider, budget and concurrency gates. This follows the compact approve/ed
 Completed design proposals have their own decision target: approval/rejection records the design decision; corrections
 queue a revised manager response. Those decisions preserve the underlying task state and its implementation/merge gates.
 
+## Delegation: Morgan and Devon decide for you
+
+Most owner decisions are routine. **Settings → Autonomy → Decisions made for you** sets, per kind of decision, who
+decides:
+
+- **You decide**: nothing runs; the decision waits for you.
+- **Shadow** (the default for every kind): Morgan (EM) or Devon (SRE) decides, the decision is recorded and shown on your
+  card ("Morgan would decide: …"), and you still decide. Compare for a while before switching a kind on.
+- **Morgan decides / Devon decides**: the decision is applied for you, posted on the ticket as theirs ("decided for the
+  owner"), and listed in the Inbox under **Decided for you** (last 24 hours) with **Override** (your decision replaces
+  theirs, posted as yours) and **Reopen** (the decision comes back to you; nothing that already happened is undone).
+
+| Kind | Delegate | What the delegate may do | Stays yours |
+|---|---|---|---|
+| Owner tasks | Morgan, by rule (no model run) | a read-only production check goes to Devon's probes; a missing package becomes a package request on the ticket | writes, restarts, credentials, business decisions, and any step filed without a kind |
+| Engineers' questions | Morgan | answer a factual engineering question on a positively low-risk ticket | money, credentials, product preference, trading semantics, schema effects, high or unknown risk, stale evidence, a missing standing rule, Morgan's own question |
+| Research-review holds | Morgan | send the proposal back with corrections or a narrower scope (once per proposal, for its whole life) | approving it past the reviewer's dissent |
+| QA and review loop limits | Morgan | rescope, or reassign to another builder (once per ticket) | clearing a QA, CI or reviewer failure; a disagreement Morgan is a party to |
+| Design and plan reviews | Morgan or Devon | approve or reject a recommendation on a positively low-risk ticket (a backend change can alter trading without any UI change) | a design the delegate wrote; council corrections (they queue a paid council) |
+
+Never delegable in v1: budget, policies and this matrix; merges of high-risk work, revert merges and releasing holds;
+publish-guard holds; standing and renewal production access; package installs.
+
+- **Structured reasons only.** Every hold records why (`hold_kind`), who asked (`hold_seat`) and what it refers to
+  (`hold_ref`); owner tasks record their kind (`desk create-task --owner "<why>" --owner-kind
+  check|package|write|restart|credential|business|other`). Delegation never classifies message text.
+- **One record per decision and evidence version** (`delegated_decisions`): the decision brief you see, the policy and
+  delegation versions, the delegate, the actions it may take, attempts, spend and the outcome. A new question, hold or
+  revision is a new decision.
+- **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and answers with
+  `desk decide answer|approve|changes|reject|escalate "<text>" --why "<evidence and your standing rule>"`: up to $0.75 on
+  an engine with a spending cap, or 6 minutes and 30 steps on a plan-billed one; an engine with neither is refused. A run
+  that ends without deciding, or a decision not started within 30 minutes, comes to you with the reason. Escalations carry
+  a one-line recommendation, so your tap is yes or no. At most 40 decision runs a day; one slot stays free for QA and
+  incidents.
+- **Rules before the run and again at apply**, with no model call: never the asker's own question, the author's own
+  proposal or plan, or a review the delegate is party to; questions and designs only on positively low-risk tickets;
+  lifetime limits that survive revisions. A decision is applied in one transaction after re-checking that it is the same
+  version under the same policy; otherwise nothing is applied.
+- **Escalate everything** (Settings) makes every decision yours at once and stops decisions in progress; so does any
+  change to the matrix for the decisions in flight. `delegation.enabled: false` in the config (or
+  `SIGMADESK_DELEGATION=off`) turns delegation off whatever is saved.
+- **Peer access** (off by default): Morgan and Devon may grant each other production read access for one ticket, within
+  your access policy. Renewals and standing grants stay yours.
+- **Incidents.** From a log investigation Devon can hold every deploying merge and prepare an owner-only revert
+  (`desk incident regression "<why>"`), and pages you at P0 when trading may be affected (`desk incident page "<why>"
+  --trading`). Only you merge the revert and clear the hold.
+- **What it saved.** `/api/state` (`meta.delegation`) and `GET /api/delegation` report, per kind over 7 days, the owner
+  interventions avoided (each decision counted once; overrides and reopens excluded), escalations, shadow decisions and
+  the spend; `GET /api/delegation/<id>` is the audit record with the brief it was based on.
+
 ## Architecture Review Board and model selection
 
 Open a ticket → **Architecture review** → **Desktop / API review**. Choose a design reviewer and an independent challenger from a different model
@@ -649,6 +700,7 @@ Everything lives in `sigmadesk.config.json` (gitignored). See `sigmadesk.config.
 | `pm.*` | PM persona, competitors to study, cadence. |
 | `sandbox.*` | Extra allowed domains (e.g. a package registry) and paths to keep unreadable. |
 | `notify.*` | A Discord/Slack webhook or ntfy.sh topic: get pinged when a ticket needs you, a PR is ready, or the SRE pages. |
+| `delegation.*` | Who decides each kind of owner decision (`kinds`: owner, shadow, em or sre), peer access, and the bounds of a decision run. Settings → Autonomy edits win; `SIGMADESK_DELEGATION=off` and `SIGMADESK_DELEGATION_<KIND>=<mode>` override the file. |
 
 Live knobs (concurrency, budget, PM cadence, GitHub sync, draft PRs) are also editable in the UI under **Limits**.
 
@@ -656,7 +708,7 @@ Live knobs (concurrency, budget, PM cadence, GitHub sync, draft PRs) are also ed
 
 Agents talk to the desk only through `bin/desk` over the socket: `desk progress 40 "writing tests"`, `desk comment`,
 `desk needs-human "<question>"`, `desk propose`, `desk groom`, `desk consult`, `desk submit`, `desk qa pass|fail`,
-`desk accept pass|changes`, `desk incident file|mute|page`, `desk context-file <path>` (Perplexity seats). Run `bin/desk --help` for the full list.
+`desk accept pass|changes`, `desk incident file|mute|page|regression`, `desk decide …` (decision runs), `desk context-file <path>` (Perplexity seats). Run `bin/desk --help` for the full list.
 Every subcommand also accepts `--help` or `-h`; help never submits a desk action.
 
 ## How it compares
