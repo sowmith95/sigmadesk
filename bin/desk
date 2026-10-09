@@ -39,7 +39,8 @@ const USAGE = `usage:
   desk resolve done "<how you combined both sides>" | desk resolve stuck "<why the owner must decide>"
   desk context-file <path> [--page N]   (Perplexity seats: a desk-built file/diff block to send verbatim on the same thread)
   desk incident file --title T --severity P0-P3 --area A   (analysis on stdin)
-  desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>"
+  desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>" [--trading]
+  desk incident regression "<why a recent deployment caused it>"   (holds deploying merges, prepares an owner-only revert)
   desk pkg request name==version [...] --why "<what needs it>" [--dev]   (build runs: the desk resolves every wheel; the owner approves)
   desk pkg status | desk pkg install   (install: offline, into this workspace's .venv, from the approved wheels)
   desk test pytest|unittest [args…]   (runs the tests with the canonical interpreter — this workspace's .venv if any — and records the exit status and what ran; QA uses it)

@@ -447,3 +447,26 @@ test('owner-only writes: settings refuse the delegation keys; the API validates 
   assert.ok(d.never.some((x) => /Budget, policies and this matrix/.test(x)));
   assert.deepEqual(d.kinds.find((k) => k.id === 'design').modes, ['owner', 'shadow', 'em', 'sre']);
 });
+
+test('incidents: the SRE holds deploying merges and prepares an owner-only revert; the revert merge and the hold release stay yours', async () => {
+  reset();
+  const deploywatch = await import('../src/deploywatch.js');
+  const shipped = ticket({ status: 'done', builder: 'senior-be', assignee: 'senior-be', pr_url: 'https://github.com/o/r/pull/7' });
+  const sha = 'a'.repeat(40);
+  store.createWatch({ deploy_key: `d-${sha}`, merge_sha: sha, ticket_key: shipped.key, pr: 7, target: 'trader', workflows: '[]', source: 'desk', deployed_at: new Date(Date.now() - 3600_000).toISOString(), trading_path: 1 });
+  const inc = store.recordIncident({ signature: `sig-${Math.random()}`, normalized: 'KeyError: price', source_index: 0, label: 'trader', project: 'p', line: 'KeyError: price', ts: store.now() });
+  store.updateIncident(inc.id, { status: 'investigating' });
+  const run = store.createRun({ agent_id: 'sre', kind: 'investigate', incident_id: inc.id, token: `inv-${Math.random()}`, model: 'claude:opus' });
+  await assert.rejects(sched.deskAction(run, 'incident', { action: 'regression', body: '' }), /say why a recent deployment caused it/);
+  const out = await sched.deskAction(run, 'incident', { action: 'regression', body: 'KeyError since the deploy: the new price parser drops the field.' });
+  assert.match(out, /Held every deploying merge and paged the owner; a revert is being prepared in D-\d+ \(only the owner merges it\)/);
+  const w = deploywatch.regressionHold();
+  assert.deepEqual([w.merge_sha, w.status, w.hold, w.hold_kind], [sha, 'regression', 1, 'regression'], 'every deploying merge now waits for the owner');
+  const revert = store.getTicket(w.revert_key);
+  assert.deepEqual([revert.owner_merge_only, revert.risk], [1, 'high'], 'only the owner merges the revert');
+  assert.equal(store.getIncident(inc.id).status, 'paged');
+  assert.ok(store.listComments(shipped.key).some((c) => c.author === 'sre' && /suspects deploying[\s\S]*Deploying merges are on hold until you clear it/.test(c.body)));
+  // Nothing on record to hold: the SRE pages instead.
+  store.updateWatch(w.id, { status: 'superseded', hold: 0 });
+  await assert.rejects(deploywatch.sreSuspects({ why: 'x', hours: 24 }), /no deployment in the last 24 hours is on record/);
+});

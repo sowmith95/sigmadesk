@@ -812,12 +812,12 @@ async function launchInvestigation(inc, fence) {
   }
 }
 
-function pageOwner(incidents, why) {
+function pageOwner(incidents, why, { trading = false } = {}) {
   const top = incidents.slice(0, 12);
   const t = store.createTicket({
-    title: incidents.length > 1 ? `Error storm: ${incidents.length} new error signatures` : `Needs you: ${incidents[0].normalized.slice(0, 90)}`,
+    title: incidents.length > 1 ? `Error storm: ${incidents.length} new error signatures` : `${trading ? 'Trading may be affected' : 'Needs you'}: ${incidents[0].normalized.slice(0, 90)}`,
     description: `${why}\n\n${top.map((i) => `- **${i.label}** (${i.count}×, last ${i.last_seen}): \`${i.normalized.slice(0, 160)}\``).join('\n')}`,
-    type: 'bug', status: 'needs_human', priority: incidents.length > 1 ? 'P0' : 'P1', reporter: 'sre', source: 'watch',
+    type: 'bug', status: 'needs_human', priority: incidents.length > 1 || trading ? 'P0' : 'P1', reporter: 'sre', source: 'watch',
   });
   store.updateTicket(t.key, { resume_status: 'proposed', hold_kind: 'page', hold_seat: 'sre' });
   notify('page', t, 'SRE paged you');
@@ -1777,7 +1777,16 @@ export async function deskAction(run, cmd, body = {}) {
       need(run.kind === 'investigate' && run.incident_id, 'incident commands only work inside an investigation');
       const inc = store.getIncident(run.incident_id);
       need(inc && inc.status === 'investigating', 'incident already decided');
-      need(['file', 'mute', 'page'].includes(body.action), 'desk incident file|mute|page');
+      need(['file', 'mute', 'page', 'regression'].includes(body.action), 'desk incident file|mute|page|regression');
+      // The SRE decides for the owner (#9): hold every deploying merge and prepare a revert. It only stops things; the
+      // owner merges the revert and clears the hold.
+      if (body.action === 'regression') {
+        need(body.body, 'say why a recent deployment caused it');
+        const w = await deploywatch.sreSuspects({ why: String(body.body), incidentId: inc.id });
+        store.updateIncident(inc.id, { status: 'paged', ticket_key: w.incident_key || null, note: String(body.body).slice(0, 500) });
+        store.logEvent({ run_id: run.id, agent_id: agentId, kind: 'action', text: `held deploying merges: suspected regression from ${w.ticket_key || w.merge_sha.slice(0, 7)} (incident #${inc.id})` });
+        return `Held every deploying merge and paged the owner; ${w.revert_key ? `a revert is being prepared in ${w.revert_key} (only the owner merges it)` : 'the revert ticket follows'}${w.incident_key ? `; incident ${w.incident_key}` : ''}. Stop now.`;
+      }
       if (body.action === 'mute') {
         need(body.body, 'say why it is noise');
         if (inc.count >= (config.watch.muteNeedsOwnerAbove ?? 20)) {
@@ -1790,7 +1799,7 @@ export async function deskAction(run, cmd, body = {}) {
       }
       if (body.action === 'page') {
         need(body.body, 'say why the owner must act');
-        const t = pageOwner([inc], body.body);
+        const t = pageOwner([inc], body.body, { trading: body.trading === true || body.trading === 'true' });
         return `Paged the owner (${t.key}). Stop now.`;
       }
       need(body.title && body.body, 'title and body (stdin) required');
