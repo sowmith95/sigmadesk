@@ -56,6 +56,7 @@ export function applyDelta(S, m) {
     }
     case 'lessons': out.meta = true; break;
     case 'packages': out.meta = true; break; // a package request moved (#8): the Inbox card and Access sheet refresh
+    case 'delegation': out.meta = true; break; // a delegated decision moved (#9): the Inbox and its "Decided for you" lane refresh
     case 'inbox': out.meta = true; break; // a snooze changed on another device
     case 'epic-review': {
       const list = (S.meta.epic_reviews ||= []);

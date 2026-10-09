@@ -7,6 +7,7 @@ import { Check, CircleAlert, CircleDashed, Clock, HelpCircle, User } from 'lucid
 import { S, openTicket, refreshMeta } from '@/store.js';
 import { cn } from '@/lib/utils';
 import type { BoardItem, Ticket } from '@/types';
+import { DelegateNote } from './Delegation';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export type Brief = Record<string, any>;
@@ -97,6 +98,7 @@ export function DecisionLead({ it, t, full = true, inline = false }: { it: Board
   return (
     <section aria-label="Decision summary" data-decision-lead={b.kind} className={cn('grid gap-3', !inline && 'rounded-lg border border-l-[3px] border-l-needs bg-card p-4')}>
       {!inline && <div className="grid gap-1"><Label>You decide</Label><p className="text-[17px] font-semibold leading-snug" data-you-decide>{b.you_decide}</p></div>}
+      <DelegateNote it={it} />
       <p className="flex flex-wrap gap-x-3 gap-y-1 text-[13px] text-muted-foreground"><span data-wait>{b.wait?.text}</span>
         <span data-releases>{rel.length ? <>Unblocks {rel.slice(0, 3).map((r: Brief, i: number) => <span key={r.key}>{i > 0 && ', '}<button type="button" className="text-foreground hover:underline" onClick={() => openTicket(r.key)}>{r.name}</button></span>)}{rel.length > 3 ? ` and ${rel.length - 3} more` : ''}</> : b.releases?.text}</span></p>
       {stale && <p role="status" className="rounded-md bg-needs/15 px-3 py-2 text-sm">This summary is for commit <span className="font-mono">{short(b.evidence?.head_sha)}</span>; the ticket is now at <span className="font-mono">{short((t || it.ticket)?.head_sha)}</span>. Refreshing.</p>}

@@ -309,3 +309,41 @@ test('the Inbox: do first, lanes, compact rows, and a snooze that leaves the cou
   assert.deepEqual(errors, []);
   await page.close();
 });
+
+test('delegation (#9): Decided for you with Override, the delegate\'s take on an open decision, and who decides in Settings', { skip, timeout: 90_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 1280, height: 900 });
+  const lane = page.locator('[data-lane="decided"]');
+  await lane.waitFor();
+  const row = lane.locator('article[data-status="applied"]').first();
+  const id = await row.getAttribute('data-decided');
+  assert.match(await row.textContent(), /Morgan answered Riley: Only in utils\/net\.py/);
+  assert.equal(await page.locator('[data-lane="unblock"] [data-decided]').count(), 0, 'decided rows are not in the lanes that need you');
+  await row.getByRole('button', { name: 'Override' }).click();
+  await row.getByLabel('Your decision instead').fill('Wait for the count first.');
+  await row.getByRole('button', { name: 'Post my decision' }).click();
+  await page.waitForSelector(`[data-decided="${id}"][data-status="overridden"]`);
+  const rec = (await api('GET', `/api/delegation/${id}`)).body;
+  assert.deepEqual([rec.status, rec.override_note], ['overridden', 'Wait for the count first.']);
+  assert.ok(rec.brief?.you_decide, 'the audit keeps the brief it was based on');
+  // An open decision carries what Morgan would decide (shadow) or why it is yours (escalated), on the card and in the panel.
+  const take = page.locator('[data-lane] article:has([data-take])').first();
+  assert.match(await take.locator('[data-take]').textContent(), /Morgan (would decide|left it for you)/);
+  await take.locator('h3 button').click();
+  await page.waitForSelector('[data-panel] [data-delegate-note]');
+  assert.match(await page.locator('[data-panel] [data-delegate-note]').textContent(), /Nothing was changed/);
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('[data-panel]', { state: 'detached' });
+  // Settings → Autonomy: one row per kind; a mode change is saved as the whole matrix.
+  await go(page, '#/settings');
+  const q = page.locator('[data-delegation-kind="question"]');
+  await q.waitFor();
+  assert.equal(await q.getAttribute('data-mode'), 'shadow', 'every kind starts in shadow');
+  await q.getByRole('radio', { name: 'Morgan decides' }).click();
+  await page.waitForSelector('[data-delegation-kind="question"][data-mode="em"]');
+  assert.equal((await api('GET', '/api/delegation')).body.kinds.find((k) => k.id === 'question').mode, 'em');
+  await page.locator('[data-delegation-kind="question"]').getByRole('radio', { name: 'Shadow' }).click();
+  await page.waitForSelector('[data-delegation-kind="question"][data-mode="shadow"]');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  assert.deepEqual(errors, []);
+  await page.close();
+});
