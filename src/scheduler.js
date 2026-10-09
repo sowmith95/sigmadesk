@@ -1685,7 +1685,7 @@ export async function deskAction(run, cmd, body = {}) {
       const ws = runner.workspaceDir(run.ticket_key);
       need(store.getRun(run.id)?.cwd === ws, 'desk test runs in the ticket\'s workspace');
       const sha = await runner.headSha(ws).catch(() => null);
-      if (body.action === 'result') return packages.testResult(run, { id: body.id, status: body.status }, { ws, sha });
+      if (body.action === 'result') return packages.testResult(run, { id: body.id, status: body.status, output: String(body.output || '').slice(-65_536) }, { ws, sha });
       return { test: packages.testPlan(run, body.args, { ws, sha }) };
     }
     case 'fetch':

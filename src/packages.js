@@ -34,6 +34,7 @@ import { agentById } from './team.js';
 import { notify } from './notify.js';
 import * as net from './netfetch.js';
 import { wheelInventory } from './wheel.js';
+import { startProxy, RESOLVER_HOSTS } from './pkgproxy.js';
 
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
 const nowIso = () => new Date().toISOString();
@@ -303,10 +304,16 @@ export async function resolveRequest(id, signal = null) {
     // -I -S: no PYTHON* variables, no user site, and no site import at all, so no .pth file or sitecustomize of the
     // shared venv runs; pip is started from its own directory. --dry-run with --target: pip resolves the whole closure
     // and installs nothing (even a non-dry run could only reach the throwaway target, never the shared venv).
+    // Every connection pip makes goes through a desk proxy for this resolution only: CONNECT to pypi.org:443 and
+    // files.pythonhosted.org:443 and nothing else, with its own token, byte and time caps (closed on revoke).
+    const timeoutMs = (Number(P().resolveTimeoutSeconds) || 180) * 1000;
+    const proxy = await startProxy({ hosts: RESOLVER_HOSTS, maxBytes: Math.max(50e6, maxTotal), maxMs: timeoutMs + 5000, signal });
     const argv = [env.python, '-I', '-S', path.join(env.site, 'pip'), 'install', '--dry-run', '--target', path.join(work, 'target'), '--only-binary=:all:', '--no-cache-dir',
-      '--disable-pip-version-check', '--no-input', '--timeout', '30', '--retries', '1', '--index-url', PYPI_INDEX, '--report', report, '-c', constraints,
+      '--disable-pip-version-check', '--no-input', '--timeout', '30', '--retries', '1', '--proxy', proxy.url, '--index-url', PYPI_INDEX, '--report', report, '-c', constraints,
       ...specs.map((s) => `${s.name}==${s.version}`), `pip==${pipVersion}`];
-    const res = await runResolver(argv, { env: scrubbedEnv(work), cwd: work, timeoutMs: (Number(P().resolveTimeoutSeconds) || 180) * 1000, watchDir: work, maxBytes: Math.max(50e6, maxTotal), signal });
+    let res;
+    try { res = await runResolver(argv, { env: scrubbedEnv(work), cwd: work, timeoutMs, watchDir: work, maxBytes: Math.max(50e6, maxTotal), signal }); } finally { proxy.close(); }
+    if (proxy.stats.refused.length && res.code !== 0) res.err = `${res.err}\nERROR: the desk proxy refused: ${proxy.stats.refused.slice(0, 3).join('; ')}`;
     cancelled();
     if (res.code !== 0) {
       const tail = (res.err || '').trim().split('\n').filter((l) => /ERROR|conflict|requested|No matching|Could not find/i.test(l)).slice(-6).join(' · ');
@@ -328,7 +335,7 @@ export async function resolveRequest(id, signal = null) {
       total += got.bytes;
       if (w.role === 'add') {
         let inv;
-        try { inv = wheelInventory(file, { maxUnpacked: (Number(P().maxUnpackedMB) || 1000) * 1e6 }); } catch (e) { throw err(`${w.filename}: ${e.message}`); }
+        try { inv = wheelInventory(file, { maxUnpacked: (Number(P().maxUnpackedMB) || 1000) * 1e6, xy: env.xy }); } catch (e) { throw err(`${w.filename}: ${e.message}`); }
         const want = `${w.name.replace(/-/g, '_')}-${w.version}.dist-info`.toLowerCase();
         if (canonicalName(inv.distInfo.replace(/\.dist-info$/, '').replace(/-[^-]+$/, '')) !== w.name) throw err(`${w.filename} contains ${inv.distInfo}, not ${want}`);
         inventory[w.name] = { distInfo: inv.distInfo, files: inv.files, outside: inv.outside };
@@ -630,7 +637,7 @@ const STARTUP = (f) => !f.includes('/') && (f.endsWith('.pth') || f === 'sitecus
  *    sitecustomize, usercustomize or bytecode.
  * Throws with the first reason it is not what was approved.
  */
-export function fingerprint(ticketKey, ws, { including = [] } = {}) {
+export function fingerprint(ticketKey, ws, { including = [], requireAll = true } = {}) {
   const venv = path.join(ws, '.venv');
   if (!realDir(venv)) throw err('there is no .venv directory in this workspace (or it is a link)', 409);
   const env = sharedEnv();
@@ -648,7 +655,10 @@ export function fingerprint(ticketKey, ws, { including = [] } = {}) {
   if (libs.length !== 1) throw err(`.venv/lib holds ${libs.join(', ')}: only python${env.xy} is expected`, 409);
   if (readSmall(path.join(site, PTH_NAME), 4096) !== pthText(env.site)) throw err(`.venv does not layer the shared venv as the desk wrote it (${PTH_NAME})`, 409);
   // Which approvals the venv must hold: installed ones and the ones being recorded now.
-  const reqs = approvedFor(ticketKey).filter((r) => r.installed_at || including.includes(r.id));
+  const all = approvedFor(ticketKey);
+  const pendingInstall = all.filter((r) => !r.installed_at && !including.includes(r.id) && r.status === 'approved');
+  if (requireAll && pendingInstall.length) throw err(`request ${pendingInstall.map((r) => `#${r.id}`).join(', ')} is approved but not installed in this .venv: run desk pkg install`, 409);
+  const reqs = all.filter((r) => r.installed_at || including.includes(r.id));
   const sharedNow = staticDistributions(env.site);
   const nowLock = lockLines(sharedNow);
   for (const r of reqs) {
@@ -656,6 +666,7 @@ export function fingerprint(ticketKey, ws, { including = [] } = {}) {
     if (lockHash(Object.entries(base).map(([n, v]) => `${n}==${v}`).sort()) !== lockHash(nowLock)) throw err(`the shared venv changed since request #${r.id} was approved: ask again`, 409);
   }
   const expected = new Map(); // relative path -> sha256
+  const outside = []; // files a wheel installs outside site-packages (scripts, headers, data)
   const distInfos = new Set();
   const added = [];
   for (const r of reqs) {
@@ -664,6 +675,7 @@ export function fingerprint(ticketKey, ws, { including = [] } = {}) {
       const i = inv[w.name];
       if (!i) throw err(`request #${r.id} has no verified inventory for ${w.name}`, 409);
       for (const f of i.files) expected.set(f.path, f.sha256);
+      for (const o of i.outside || []) if (typeof o === 'object') outside.push({ ...o, wheel: w.name });
       distInfos.add(i.distInfo);
       added.push({ name: w.name, version: w.version, sha256: w.sha256, dev: !!r.dev, request: r.id, files: i.files.length });
     }
@@ -685,6 +697,20 @@ export function fingerprint(ticketKey, ws, { including = [] } = {}) {
     if (STARTUP(f)) throw err(`.venv has a startup hook nobody approved: ${f}`, 409);
     throw err(`.venv holds a file no approved wheel installs: ${f}`, 409);
   }
+  // Outside site-packages: each scheme's files under the venv root, hashed the same way (a `#!python` script's first line
+  // is rewritten by pip to this venv's interpreter, so it is compared from the second line on).
+  for (const o of outside) {
+    const dest = path.join(venv, o.dest);
+    if (!inside(path.resolve(dest), venv)) throw err(`${o.dest} would install outside the venv`, 409);
+    let st; try { st = fs.lstatSync(dest); } catch { throw err(`.venv is missing ${o.dest} (installed by ${o.wheel}): run desk pkg install`, 409); }
+    if (!st.isFile()) throw err(`${o.dest} in .venv is not a regular file`, 409);
+    const body = fs.readFileSync(dest);
+    let ok;
+    if (o.shebang) { const nl = body.indexOf(10); ok = nl > 0 && /^#!.*python[\d.]*\s*$/.test(body.subarray(0, nl).toString()) && crypto.createHash('sha256').update(body.subarray(nl + 1)).digest('hex') === o.rest_sha256; }
+    else ok = crypto.createHash('sha256').update(body).digest('hex') === o.sha256;
+    if (!ok) throw err(`${o.dest} in .venv was changed after the install`, 409);
+    lines.push(`${o.dest}\t${o.sha256}`);
+  }
   const missing = [...expected.keys()].filter((f) => !seen.has(f));
   if (missing.length) throw err(`.venv is missing ${missing.length} file(s) of the approved packages (${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''}): run desk pkg install`, 409);
   const lock = [...nowLock, ...added.map((a) => `${a.name}==${a.version}`)].sort();
@@ -700,7 +726,9 @@ export function recordInstall(run, { ok, step = '', output = '' } = {}) {
     store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: `offline package install failed at "${String(step).slice(0, 120)}": ${String(output).slice(-300)}` });
     return 'Recorded the failure. Fix what the output shows (or ask the owner), then run desk pkg install again.';
   }
-  const fp = fingerprint(run.ticket_key, store.getRun(run.id)?.cwd, { including: ids });
+  // Requests approved after this run started cannot be in this venv yet; the venv is complete (and QA can pass) only
+  // once every approved request is installed.
+  const fp = fingerprint(run.ticket_key, store.getRun(run.id)?.cwd, { including: ids, requireAll: false });
   for (const id of ids) store.updatePkgRequest(id, { installed_at: nowIso(), install_run: run.id, fingerprint: fp });
   store.kvSet(`venv:${run.ticket_key}`, JSON.stringify(fp));
   const text = `installed ${fp.added.map((a) => `${a.name}==${a.version}`).join(', ')} offline into .venv (Python ${fp.python}, ${fp.platform}; ${fp.installed_files} files verified; lock ${fp.lock_sha256.slice(0, 12)})`;
@@ -719,7 +747,27 @@ export function qaEnvironment(ticketKey, ws) {
 }
 
 // ---------------- desk test: the canonical interpreter, the real exit status ----------------
-const MODULE_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+// Test runners only, and only ways of running them that actually run tests and report them.
+export const TEST_RUNNERS = ['pytest', 'unittest'];
+const PYTEST_REFUSED = /^(--junit-?xml|--co$|--collect-only|--setup-plan|--setup-only|--fixtures|--markers|--version$|-V$|-h$|--help$|-p|-o$|--override-ini|-c$|--config-file|--rootdir|--confcutdir|--noconftest|--pyargs|--import-mode|--basetemp)/;
+const junitPath = (ws, id) => path.join(ws, '.git', `sigmadesk-test-${id}.xml`);
+/** Count what a junit XML says ran: { tests, failures, errors, skipped } summed over its <testsuite> elements. */
+export function junitCounts(xml) {
+  const out = { tests: 0, failures: 0, errors: 0, skipped: 0, suites: 0 };
+  const re = /<testsuite\b([^>]*)>/g;
+  let m;
+  while ((m = re.exec(xml))) {
+    out.suites++;
+    for (const k of ['tests', 'failures', 'errors', 'skipped']) out[k] += Number(m[1].match(new RegExp(`\\b${k}="(\\d+)"`))?.[1] || 0);
+  }
+  return out;
+}
+/** unittest's own summary: "Ran N tests" and "OK". */
+export function unittestCounts(output) {
+  const ran = String(output).match(/^Ran (\d+) tests? in /m);
+  const failed = /^FAILED \(/m.test(output);
+  return { tests: ran ? Number(ran[1]) : 0, failures: failed ? 1 : 0, errors: 0, skipped: Number(String(output).match(/skipped=(\d+)/)?.[1] || 0), ok: /^OK\b/m.test(output) };
+}
 const testPlans = new Map(); // runId -> { id, args, sha, fp }
 /**
  * `desk test <module> [args…]`: what to run, inside the seat's sandbox, in its workspace: the workspace venv's python
@@ -728,7 +776,9 @@ const testPlans = new Map(); // runId -> { id, args, sha, fp }
 export function testPlan(run, args, { ws, sha }) {
   if (!Array.isArray(args) || !args.length) throw err('desk test <module> [args…], e.g. desk test pytest tests/test_x.py -q');
   if (args.length > 64 || args.some((a) => typeof a !== 'string' || a.length > 1000 || a.includes('\0'))) throw err('too many or invalid arguments');
-  if (!MODULE_RE.test(args[0])) throw err(`"${args[0]}" is not a Python module name (desk test runs python -m <module>)`);
+  if (!TEST_RUNNERS.includes(args[0])) throw err(`desk test runs a test runner: ${TEST_RUNNERS.join(' or ')} (got "${String(args[0]).slice(0, 60)}")`);
+  const bad = args[0] === 'pytest' ? args.slice(1).find((a) => PYTEST_REFUSED.test(a)) : args.slice(1).find((a) => /^(-h|--help)$/.test(a));
+  if (bad) throw err(`desk test refuses ${bad}: it must run the whole selection and report it (narrow with paths, ::node ids, -k or -m instead)`);
   let py, fp = null;
   if (hasVenv(ws)) {
     const env = qaEnvironment(run.ticket_key, ws);
@@ -736,12 +786,15 @@ export function testPlan(run, args, { ws, sha }) {
     fp = env.fingerprint;
     py = path.join(ws, '.venv', 'bin', 'python');
   } else py = sharedEnv().python;
+  if (args[0] === 'pytest' && !realDir(path.join(ws, '.git'))) throw err('desk test pytest needs the workspace clone (.git) for its report');
   const plan = { id: crypto.randomBytes(6).toString('hex'), args, sha, fp, at: nowIso() };
   testPlans.set(run.id, plan);
-  return { id: plan.id, cwd: ws, argv: [py, '-B', '-s', '-m', ...args], env: { PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1' }, interpreter: py };
+  // pytest writes a junit report the desk reads afterwards: what ran, what failed (exit 0 with nothing collected is not a pass).
+  const extra = args[0] === 'pytest' ? [`--junitxml=${junitPath(ws, plan.id)}`] : [];
+  return { id: plan.id, cwd: ws, argv: [py, '-B', '-s', '-m', ...args, ...extra], env: { PYTHONDONTWRITEBYTECODE: '1', PYTHONNOUSERSITE: '1' }, interpreter: py };
 }
 /** The seat's `desk test` finished: re-verify the venv and commit, then record the exit status for the QA gate. */
-export function testResult(run, { id, status }, { ws, sha }) {
+export function testResult(run, { id, status, output = '' }, { ws, sha }) {
   const plan = testPlans.get(run.id);
   if (!plan || plan.id !== id) throw err('no desk test plan with that id in this run', 409);
   testPlans.delete(run.id);
@@ -750,12 +803,29 @@ export function testResult(run, { id, status }, { ws, sha }) {
   if (plan.fp) { try { fp = fingerprint(run.ticket_key, ws); if (fp.installed_sha256 !== plan.fp.installed_sha256 || fp.lock_sha256 !== plan.fp.lock_sha256) problem = 'the workspace venv changed while the tests ran'; } catch (e) { problem = e.message; } }
   else if (hasVenv(ws)) problem = 'a .venv appeared while the tests ran';
   if (sha !== plan.sha) problem = problem || 'HEAD moved while the tests ran';
-  const rec = { args: plan.args, status: code, sha, fp: fp ? { lock_sha256: fp.lock_sha256, installed_sha256: fp.installed_sha256, text: fpText(fp) } : null, venv: !!plan.fp, problem, at: nowIso() };
+  // What actually ran: pytest's junit report, or unittest's own summary.
+  let counts;
+  if (plan.args[0] === 'pytest') {
+    const f = junitPath(ws, plan.id);
+    const xml = readSmall(f, 50_000_000);
+    try { if (fs.lstatSync(f).isFile()) fs.rmSync(f); } catch { /* none */ }
+    counts = xml == null ? null : junitCounts(xml);
+    if (!counts || !counts.suites) problem = problem || 'pytest wrote no test report';
+  } else {
+    counts = unittestCounts(output);
+    if (code === 0 && !counts.ok) problem = problem || 'unittest did not report OK';
+  }
+  if (counts && code === 0 && !problem) {
+    if (counts.tests - counts.skipped < 1) problem = 'no test ran (nothing collected, or everything skipped)';
+    else if (counts.failures || counts.errors) problem = `the report shows ${counts.failures} failure(s) and ${counts.errors} error(s)`;
+  }
+  const rec = { args: plan.args, status: code, sha, tests: counts, fp: fp ? { lock_sha256: fp.lock_sha256, installed_sha256: fp.installed_sha256, text: fpText(fp) } : null, venv: !!plan.fp, problem, at: nowIso() };
   const list = json(store.kvGet(`desk-test:${run.id}`), []);
   list.push(rec);
   store.kvSet(`desk-test:${run.id}`, JSON.stringify(list.slice(-20)));
   store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'action', text: `desk test ${plan.args.join(' ').slice(0, 120)} → exit ${code}${problem ? ` (not counted: ${problem})` : ''}` });
-  return problem ? `Exit ${code}, NOT counted: ${problem}.` : `Exit ${code}${code === 0 ? '' : ' (failed)'}${fp ? ` · ${fpText(fp)}` : ''} · at ${String(sha).slice(0, 10)}.`;
+  const ran = counts ? ` · ${counts.tests} tests (${counts.failures} failed, ${counts.errors} errors, ${counts.skipped} skipped)` : '';
+  return problem ? `Exit ${code}, NOT counted: ${problem}.` : `Exit ${code}${code === 0 ? '' : ' (failed)'}${ran}${fp ? ` · ${fpText(fp)}` : ''} · at ${String(sha).slice(0, 10)}.`;
 }
 export const testRecords = (runId) => json(store.kvGet(`desk-test:${runId}`), []);
 

@@ -50,7 +50,7 @@ const SAFE_PATH = (p) => p && !p.startsWith('/') && !p.includes('\\') && !p.spli
  * outside: [paths installed elsewhere: scripts, headers, data], startup: [site-packages-level .pth / *customize.py] }.
  * Every archive member must be in RECORD with a matching sha256 and size (and vice versa).
  */
-export function wheelInventory(file, { maxEntries = 50_000, maxUnpacked = 1_000_000_000 } = {}) {
+export function wheelInventory(file, { maxEntries = 50_000, maxUnpacked = 1_000_000_000, xy = '3' } = {}) {
   const buf = fs.readFileSync(file);
   const list = entries(buf);
   if (list.length > maxEntries) throw err(`more than ${maxEntries} files in the wheel`);
@@ -84,7 +84,18 @@ export function wheelInventory(file, { maxEntries = 50_000, maxUnpacked = 1_000_
     if (e.name.startsWith(dataDir)) {
       const [, scheme, ...rest] = e.name.slice(dataDir.length - 1).split('/');
       if (scheme === 'purelib' || scheme === 'platlib') dest = rest.join('/');
-      else { outside.push(e.name); continue; }
+      else {
+        // Where pip puts the other schemes, relative to the venv root (verified there after the install).
+        const rel = rest.join('/');
+        const distName = distInfo.slice(0, -'.dist-info'.length).replace(/-[^-]+$/, '');
+        const where = scheme === 'scripts' ? `bin/${rel}` : scheme === 'headers' ? `include/site/python${xy}/${distName}/${rel}` : scheme === 'data' ? rel : null;
+        if (!where || !rel || !SAFE_PATH(where)) throw err(`unsafe or unknown install location in the wheel: ${e.name.slice(0, 120)}`);
+        const nl = body.indexOf(10);
+        const shebang = scheme === 'scripts' && /^#!pythonw?\b/.test(body.subarray(0, Math.max(0, nl)).toString('latin1'));
+        outside.push({ path: e.name, scheme, dest: where, sha256: sha, size: body.length, shebang,
+          rest_sha256: shebang ? crypto.createHash('sha256').update(body.subarray(nl + 1)).digest('hex') : null });
+        continue;
+      }
     }
     files.push({ path: dest, sha256: sha, size: body.length });
     if (!dest.includes('/') && (dest.endsWith('.pth') || dest === 'sitecustomize.py' || dest === 'usercustomize.py')) startup.push(dest);

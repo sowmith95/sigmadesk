@@ -41,12 +41,21 @@ const a = process.argv.slice(2);
 const ctl = JSON.parse(fs.readFileSync(${JSON.stringify(pipCtl)}, 'utf8'));
 const c = a.indexOf('-c');
 fs.appendFileSync(${JSON.stringify(pipLog)}, JSON.stringify({ argv: a, env: process.env, cwd: process.cwd(), constraints: c >= 0 ? fs.readFileSync(a[c + 1], 'utf8') : null }) + '\\n');
-if (a.includes('install') && a.includes('--dry-run')) {
+const finish = () => {
   if (ctl.stderr) process.stderr.write(ctl.stderr);
   if (ctl.code) process.exit(ctl.code);
   if (ctl.hang) setInterval(() => {}, 1000);
   else { fs.writeFileSync(a[a.indexOf('--report') + 1], JSON.stringify(ctl.report)); process.exit(0); }
-} else process.exit(9);
+};
+if (!(a.includes('install') && a.includes('--dry-run'))) process.exit(9);
+if (ctl.connect) {
+  // Pretend pip (or a malicious index) reaches for another host through the proxy it was given.
+  const u = new URL(a[a.indexOf('--proxy') + 1]);
+  const req = require('http').request({ host: u.hostname, port: u.port, method: 'CONNECT', path: ctl.connect, headers: { 'Proxy-Authorization': 'Basic ' + Buffer.from(u.username + ':' + u.password).toString('base64') } });
+  req.on('connect', (res, sock) => { fs.appendFileSync(${JSON.stringify(pipLog)}, JSON.stringify({ connect: ctl.connect, status: res.statusCode }) + '\\n'); sock.destroy(); finish(); });
+  req.on('error', (e) => { fs.appendFileSync(${JSON.stringify(pipLog)}, JSON.stringify({ connect: ctl.connect, error: e.message }) + '\\n'); finish(); });
+  req.end();
+} else finish();
 `);
 fs.chmodSync(fakePy, 0o755);
 
@@ -128,7 +137,7 @@ function wheel(name, version, { host = 'files.pythonhosted.org', file = null, bo
   return { download_info: { url, archive_info: { hash: `sha256=${badHash ? 'f'.repeat(64) : sha(content)}`, hashes: { sha256: badHash ? 'f'.repeat(64) : sha(content) } } },
     is_direct: direct, requested, metadata: { name, version } };
 }
-function setPip({ report = null, code = 0, stderr = '', hang = false }) { fs.writeFileSync(pipCtl, JSON.stringify({ report, code, stderr, hang })); fs.rmSync(pipLog, { force: true }); }
+function setPip({ report = null, code = 0, stderr = '', hang = false, connect = null }) { fs.writeFileSync(pipCtl, JSON.stringify({ report, code, stderr, hang, connect })); fs.rmSync(pipLog, { force: true }); }
 const pipCalls = () => fs.readFileSync(pipLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
 function fakeNet({ addresses = {}, hold = null } = {}) {
   netfetch._setLookup((host, _o, cb) => cb(null, [{ address: addresses[host] || '151.101.0.223', family: 4 }]));
@@ -160,6 +169,13 @@ function simulateInstall(wsDir, pins) {
   if (!fs.existsSync(path.join(dv, 'bin', 'python'))) fs.symlinkSync(fakePy, path.join(dv, 'bin', 'python'));
   fs.writeFileSync(path.join(vsite, '_sigmadesk_shared.pth'), packages.pthText(site));
   for (const pin of pins) for (const [rel, data] of Object.entries(contents[pin])) {
+    const dm = rel.match(/^[^/]+\.data\/(scripts|data)\/(.+)$/);
+    if (dm) { // what pip does with the other schemes: scripts to bin (a #!python line rewritten), data to the venv root
+      const dest = path.join(dv, dm[1] === 'scripts' ? 'bin' : '', dm[2]);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, dm[1] === 'scripts' && data.toString().startsWith('#!python') ? Buffer.concat([Buffer.from(`#!${path.join(dv, 'bin', 'python')}\n`), data.subarray(data.indexOf(10) + 1)]) : data);
+      continue;
+    }
     fs.mkdirSync(path.dirname(path.join(vsite, rel)), { recursive: true }); fs.writeFileSync(path.join(vsite, rel), data);
     const di = rel.split('/')[0];
     if (di.endsWith('.dist-info')) for (const f of ['INSTALLER', 'RECORD', 'REQUESTED']) fs.writeFileSync(path.join(vsite, di, f), 'pip\n');
@@ -206,6 +222,8 @@ test('resolution: -I -S pip from its directory, static constraints, scrubbed env
   assert.ok(!dry.argv.includes('--isolated'), '--isolated would re-enable global/site pip config files');
   assert.equal(dry.argv[dry.argv.indexOf('--index-url') + 1], 'https://pypi.org/simple');
   assert.ok(!dry.argv.some((a) => /extra-index|find-links|trusted-host/.test(a)));
+  assert.match(dry.argv[dry.argv.indexOf('--proxy') + 1], /^http:\/\/sigmadesk:[0-9a-f]{36}@127\.0\.0\.1:\d+$/, 'all of pip\'s traffic goes through the desk proxy');
+  assert.ok(!Object.keys(dry.env).some((k) => /proxy/i.test(k)), 'no other proxy settings');
   assert.equal(dry.argv[dry.argv.indexOf('--timeout') + 1], '30');
   assert.ok(dry.argv[dry.argv.indexOf('--target') + 1].includes(path.join('data', 'pkg')), 'a throwaway target, never the shared venv');
   assert.ok(dry.cwd.includes(path.join('data', 'pkg')), 'a temp working directory');
@@ -589,7 +607,8 @@ test('desk test: bin/desk passes arguments through, runs the canonical interpret
   const { code, stdout, seen } = await deskCli(['test', 'pytest', '-q', '--maxfail', '1'], (req) => (req.body.action === 'plan' ? { test: plan } : `Exit ${req.body.status} (failed)`));
   assert.equal(code, 3, stdout);
   assert.deepEqual(seen[0].body, { action: 'plan', args: ['pytest', '-q', '--maxfail', '1'] }, 'flags are the test\'s, not the desk\'s');
-  assert.deepEqual(seen[1].body, { action: 'result', id: 'abc', status: 3 });
+  assert.deepEqual({ ...seen[1].body, output: undefined }, { action: 'result', id: 'abc', status: 3, output: undefined });
+  assert.match(seen[1].body.output, /-q --maxfail 1/, 'the output tail goes back too (unittest reports only there)');
   assert.match(stdout, new RegExp(`${cwd} -q --maxfail 1`));
 });
 
@@ -626,20 +645,46 @@ test('QA never fails open: an invalid .venv blocks QA; with a valid one QA passe
   await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest'] }), /not what the owner approved/);
   fs.rmSync(path.join(vsite, 'evil.pth'));
   // desk test: the canonical interpreter, in the workspace; the exit status is what counts.
-  await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['os; import x'] }), /not a Python module name/);
+  await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['json.tool', '--help'] }), /runs a test runner: pytest or unittest/);
+  await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['os; import x'] }), /runs a test runner/);
+  for (const flag of ['--co', '--collect-only', '--junitxml=/tmp/x.xml', '-p', 'no:junitxml', '--setup-plan', '--version', '-o'].filter((f) => f.startsWith('-')))
+    await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', flag] }), /desk test refuses/);
+  const junit = (id, attrs) => fs.writeFileSync(path.join(wsDir, '.git', `sigmadesk-test-${id}.xml`), `<?xml version="1.0"?><testsuites><testsuite name="pytest" ${attrs} time="0.1"></testsuite></testsuites>`);
   let p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
-  assert.deepEqual(p.argv, [path.join(wsDir, '.venv', 'bin', 'python'), '-B', '-s', '-m', 'pytest', '-q']);
+  assert.deepEqual(p.argv.slice(0, -1), [path.join(wsDir, '.venv', 'bin', 'python'), '-B', '-s', '-m', 'pytest', '-q']);
   assert.equal(p.cwd, wsDir);
-  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 1 }), /Exit 1 \(failed\)/);
+  assert.ok(p.argv.at(-1) === `--junitxml=${path.join(wsDir, '.git', `sigmadesk-test-${p.id}.xml`)}`, 'the desk asks pytest for a report it reads afterwards');
+  junit(p.id, 'errors="0" failures="2" skipped="0" tests="5"');
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 1 }), /Exit 1 \(failed\) · 5 tests \(2 failed/);
+  // Exit 0 with nothing collected (e.g. a selection that matches no test) is not a pass.
+  p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q', '-k', 'nomatch'] })).test;
+  junit(p.id, 'errors="0" failures="0" skipped="0" tests="0"');
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0 }), /NOT counted: no test ran/);
+  p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
+  junit(p.id, 'errors="0" failures="0" skipped="4" tests="4"');
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0 }), /NOT counted: no test ran \(nothing collected, or everything skipped\)/);
+  p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0 }), /NOT counted: pytest wrote no test report/);
+  p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
+  junit(p.id, 'errors="1" failures="0" skipped="0" tests="3"');
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0 }), /NOT counted: the report shows 0 failure\(s\) and 1 error/);
+  // unittest: its own summary is the evidence.
+  p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['unittest', 'discover'] })).test;
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0, output: '\n----\nRan 0 tests in 0.000s\n\nOK\n' }), /NOT counted: no test ran/);
   runner.applyEvents([{ type: 'cmd-start', id: 'b', cmd: 'desk test pytest -q || true' }, { type: 'cmd-end', id: 'b', ok: true }], ctx);
   await rejects(pass(), /QA passes only through desk test/);
   // The venv changing while tests run voids the result.
   p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
+  junit(p.id, 'errors="0" failures="0" skipped="0" tests="3"');
   fs.writeFileSync(path.join(vsite, 'humanize', '__init__.py'), 'changed\n');
   assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0 }), /NOT counted: .*changed after the install/);
   simulateInstall(wsDir, ['humanize==4.9.0']);
+  p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['unittest', 'discover'] })).test;
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0, output: 'Ran 2 tests in 0.010s\n\nOK\n' }), /^Exit 0 · 2 tests \(0 failed, 0 errors, 0 skipped\) · Python 3\.12\.4/);
   p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
-  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0 }), /^Exit 0 · Python 3\.12\.4/);
+  junit(p.id, 'errors="0" failures="0" skipped="1" tests="3"');
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0 }), /^Exit 0 · 3 tests \(0 failed, 0 errors, 1 skipped\) · Python 3\.12\.4/);
+  assert.ok(!fs.existsSync(path.join(wsDir, '.git', `sigmadesk-test-${p.id}.xml`)), 'the report is removed once read');
   await rejects(pass(), /QA passes only through desk test/); // the engine never saw a clean `desk test` command yet
   runner.applyEvents([{ type: 'cmd-start', id: 'c', cmd: 'desk test pytest -q' }, { type: 'cmd-end', id: 'c', ok: true }], ctx);
   // Past the evidence gate: the next refusal is the submitted-commit check.
@@ -745,4 +790,100 @@ test('HTML → text is linear (no backtracking) and runs in a worker with a time
   assert.equal(htmlText.htmlToText('<h2>T</h2><p>a &lt;b&gt; &#x41;&amp;</p><SCRIPT>x</script><li>i'), '## T\na <b> A&\n\n- i');
   assert.equal(await htmlText.htmlToTextBounded('<p>hi</p>'), 'hi');
   await rejects(htmlText.htmlToTextBounded('<p>x</p>'.repeat(200_000), { timeoutMs: 1 }), /longer than 1 ms/);
+});
+
+// ---------------- the resolver's proxy ----------------
+test('resolver proxy: CONNECT to pypi.org:443 / files.pythonhosted.org:443 only, with its token; byte and time caps; closes on abort', async () => {
+  const proxyMod = await import('../src/pkgproxy.js');
+  const netMod = await import('node:net');
+  const http = await import('node:http');
+  // Upstream "PyPI": a local echo server the injected connector reaches whatever address was checked.
+  const echo = netMod.createServer((s) => s.pipe(s));
+  await new Promise((r) => echo.listen(0, '127.0.0.1', r));
+  const dials = [];
+  proxyMod._setConnector((host, port, cb) => { dials.push(`${host}:${port}`); return netMod.connect({ host: '127.0.0.1', port: echo.address().port }, cb); });
+  proxyMod._setLookup((host, _o, cb) => cb(null, [{ address: host === 'files.pythonhosted.org' ? '10.0.0.7' : '151.101.0.223', family: 4 }]));
+  const ac = new AbortController();
+  const p = await proxyMod.startProxy({ maxBytes: 4000, maxMs: 60_000, signal: ac.signal });
+  const tunnel = (target, token = p.token) => new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: p.port, method: 'CONNECT', path: target, headers: token ? { 'Proxy-Authorization': `Basic ${Buffer.from(`sigmadesk:${token}`).toString('base64')}` } : {} });
+    req.on('connect', (res, sock) => resolve({ status: res.statusCode, sock }));
+    req.on('error', (e) => resolve({ error: e.message }));
+    req.end();
+  });
+  for (const [target, token, code] of [['evil.example:443', p.token, 403], ['pypi.org:80', p.token, 403], ['151.101.0.223:443', p.token, 403], ['pypi.org.evil.example:443', p.token, 403],
+    ['pypi.org:443', null, 407], ['pypi.org:443', 'f'.repeat(36), 407], ['files.pythonhosted.org:443', p.token, 403]]) {
+    const r = await tunnel(target, token);
+    assert.equal(r.status, code, `${target}`); r.sock?.destroy();
+  }
+  assert.deepEqual(dials, [], 'nothing refused was ever dialled');
+  const plain = await new Promise((resolve) => http.get({ host: '127.0.0.1', port: p.port, path: 'http://pypi.org/simple/' }, (res) => { res.resume(); resolve(res.statusCode); }));
+  assert.equal(plain, 405, 'no plain HTTP proxying');
+  // An allowed tunnel relays bytes (TLS would run end to end inside it)…
+  const ok = await tunnel('pypi.org:443');
+  assert.equal(ok.status, 200);
+  assert.deepEqual(dials, ['151.101.0.223:443'], 'the checked address is the one dialled');
+  const got = await new Promise((resolve) => { ok.sock.once('data', (d) => resolve(d.toString())); ok.sock.write('hello'); });
+  assert.equal(got, 'hello');
+  // …until the byte cap over all tunnels.
+  const closed = new Promise((resolve) => ok.sock.on('close', resolve));
+  ok.sock.write(Buffer.alloc(5000));
+  await closed;
+  assert.ok(p.stats.refused.some((x) => /byte cap/.test(x)));
+  // Abort (a revoked request) closes the proxy.
+  ac.abort();
+  const after = await tunnel('pypi.org:443');
+  assert.ok(after.error, 'closed');
+  // The lifetime cap.
+  const short = await proxyMod.startProxy({ maxMs: 50 });
+  await new Promise((r) => setTimeout(r, 120));
+  assert.ok(short.stats.refused.some((x) => /lifetime cap/.test(x)));
+  proxyMod._setConnector(null); proxyMod._setLookup(null);
+  echo.close();
+});
+
+test('resolver proxy in a resolution: pip (or an index it is pointed at) reaching another host is refused', async () => {
+  const t = store.createTicket({ title: 'proxy', status: 'in_progress' });
+  setPip({ connect: 'evil.example:443', code: 1, stderr: 'ERROR: Could not install: connection refused by proxy\n' });
+  fakeNet();
+  packages.request(mkRun('junior', 'implement', t.key), { specs: ['x==1.0'], why: 'w' });
+  await packages.settled();
+  const log = fs.readFileSync(pipLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(log.find((x) => x.connect), { connect: 'evil.example:443', status: 403 });
+  const r = store.pkgRequestsForTicket(t.key).at(-1);
+  assert.equal(r.status, 'failed');
+  assert.match(r.error, /the desk proxy refused: evil\.example:443: Forbidden/);
+});
+
+// ---------------- fingerprint completeness ----------------
+test('fingerprint completeness: every approved request must be installed; files outside site-packages are hashed too', async () => {
+  const t = store.createTicket({ title: 'complete', status: 'in_progress' });
+  const r = await resolved(mkRun('junior', 'implement', t.key), ['toolpkg==1.0'], { install: [wheel('toolpkg', '1.0', { requested: true, files: {
+    'toolpkg/__init__.py': 'X = 1\n', 'toolpkg-1.0.data/scripts/toolpkg-run': '#!python\nimport toolpkg\nprint(toolpkg.X)\n', 'toolpkg-1.0.data/data/share/toolpkg/notes.txt': 'notes\n' } }), wheel('pip', '24.0')] });
+  assert.equal(r.status, 'owner', r.error);
+  const inv = JSON.parse(store.getPkgRequest(r.id).inventory).toolpkg;
+  assert.deepEqual(inv.outside.map((o) => [o.dest, o.shebang]), [['bin/toolpkg-run', true], ['share/toolpkg/notes.txt', false]]);
+  packages.decide(r.id, 'approve', { by: 'owner' });
+  const w = ws(t.key);
+  // Approved but not yet installed: the venv is not complete, so QA cannot pass on it.
+  simulateInstall(w, []);
+  assert.match(packages.qaEnvironment(t.key, w).error, new RegExp(`request #${r.id} is approved but not installed in this \\.venv: run desk pkg install`));
+  const run = mkRun('junior', 'implement', t.key);
+  packages.recordLaunch(run.id, packages.readPathsFor('junior', t.key, 'implement').ids);
+  packages.installPlan(run);
+  simulateInstall(w, ['toolpkg==1.0']);
+  assert.match(packages.recordInstall(run, { ok: true }), /Installed and verified/);
+  assert.ok(packages.qaEnvironment(t.key, w).fingerprint);
+  const script = path.join(w, '.venv', 'bin', 'toolpkg-run'), notes = path.join(w, '.venv', 'share', 'toolpkg', 'notes.txt');
+  fs.writeFileSync(script, `#!${path.join(w, '.venv', 'bin', 'python')}\nimport os; os.system("evil")\n`);
+  assert.match(packages.qaEnvironment(t.key, w).error, /bin\/toolpkg-run in \.venv was changed after the install/);
+  simulateInstall(w, ['toolpkg==1.0']);
+  fs.rmSync(notes);
+  assert.match(packages.qaEnvironment(t.key, w).error, /\.venv is missing share\/toolpkg\/notes\.txt/);
+  simulateInstall(w, ['toolpkg==1.0']);
+  assert.ok(packages.qaEnvironment(t.key, w).fingerprint);
+  // A second approval arrives: until it is installed, the venv is incomplete again.
+  const r2 = await resolved(mkRun('junior', 'implement', t.key), ['other==1.0'], { install: [wheel('other', '1.0', { requested: true }), wheel('pip', '24.0')] });
+  packages.decide(r2.id, 'approve', { by: 'owner' });
+  assert.match(packages.qaEnvironment(t.key, w).error, new RegExp(`#${r2.id} is approved but not installed`));
 });

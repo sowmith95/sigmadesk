@@ -5,7 +5,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawnSync, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 
 const USAGE = `usage:
   desk show [KEY] | desk list [status]
@@ -42,7 +42,7 @@ const USAGE = `usage:
   desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>"
   desk pkg request name==version [...] --why "<what needs it>" [--dev]   (build runs: the desk resolves every wheel; the owner approves)
   desk pkg status | desk pkg install   (install: offline, into this workspace's .venv, from the approved wheels)
-  desk test <module> [args…]   (runs python -m <module> with the canonical interpreter — this workspace's .venv if any — and records the exit status; QA uses it)
+  desk test pytest|unittest [args…]   (runs the tests with the canonical interpreter — this workspace's .venv if any — and records the exit status and what ran; QA uses it)
   desk fetch <https-url>   (the desk fetches one page from its allowed documentation hosts; the text is untrusted)
   desk ops list | desk ops <probe> [--param value]   (seats holding a production read access grant)
   desk ops request <probe…|all> --why "<what you must check>" [--for 1h | --ticket]
@@ -198,10 +198,17 @@ if (cmd === 'test' && first.status < 400 && !first.j.error && first.j.output?.te
   // Run the desk's canonical interpreter here, in this run's sandbox and workspace; the exit status goes back as-is.
   const t = first.j.output.test;
   console.log(`$ ${t.argv.join(' ').slice(0, 400)}`);
-  const r = spawnSync(t.argv[0], t.argv.slice(1), { cwd: t.cwd, env: { ...scrubbed(), ...(t.env || {}) }, stdio: 'inherit' });
-  const status = r.error ? -1 : r.status ?? -1;
-  if (r.error) console.error(`desk test: ${r.error.message}`);
-  const done = await send('test', { action: 'result', id: t.id, status });
+  // Streamed through (and its tail kept: unittest reports what ran only in its output).
+  let tail = '';
+  const keep = (c) => { tail = (tail + c).slice(-65_536); };
+  const status = await new Promise((resolve) => {
+    const child = spawn(t.argv[0], t.argv.slice(1), { cwd: t.cwd, env: { ...scrubbed(), ...(t.env || {}) }, stdio: ['inherit', 'pipe', 'pipe'] });
+    child.stdout.on('data', (c) => { process.stdout.write(c); keep(c); });
+    child.stderr.on('data', (c) => { process.stderr.write(c); keep(c); });
+    child.on('error', (e) => { console.error(`desk test: ${e.message}`); resolve(-1); });
+    child.on('close', (code) => resolve(code ?? -1));
+  });
+  const done = await send('test', { action: 'result', id: t.id, status, output: tail });
   if (done.status >= 400 || done.j.error) { console.error(`desk test: ${done.j.error || done.status}`); process.exit(1); }
   console.log(done.j.output);
   process.exit(status === 0 && !/NOT counted/.test(String(done.j.output)) ? 0 : status > 0 ? status : 1);
