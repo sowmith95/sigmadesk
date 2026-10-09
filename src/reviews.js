@@ -146,7 +146,7 @@ export function advance(key) {
     if (a.error) {
       const text = `⏸ **Code review cannot start**: ${a.error}. Switch a reviewer seat on (or reassign the work), then reply here to resume.`;
       store.addComment(key, 'system', text);
-      setStatus(key, 'needs_human', { resume_status: 'review', progress_msg: 'no eligible code reviewer' });
+      setStatus(key, 'needs_human', { resume_status: 'review', progress_msg: 'no eligible code reviewer', hold_kind: 'no_reviewer' });
       return null;
     }
     const ctx = store.latestReview(key, 'context', t.head_sha);
@@ -175,7 +175,7 @@ function escalateIfStuck(t, job) {
   const limit = Number(config.review.escalateAfterMinutes ?? 240) * 60_000;
   if (!(Date.now() - since > limit)) return;
   store.addComment(t.key, 'system', `⏸ ${nameOf(job.seat)} (${roleOf(job.seat)}) is assigned to ${job.kind === 'respond' ? 'answer the review' : 'review this PR'} but has been switched off for over ${Math.round(limit / 60_000)} minutes. Switch the seat back on, then reply here to resume.`);
-  setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: `${nameOf(job.seat)} is switched off` });
+  setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: `${nameOf(job.seat)} is switched off`, hold_kind: 'seat_off', hold_seat: job.seat });
 }
 
 /** QA passed commit `sha`: classify risk, void earlier reviews, and start the two-reviewer flow. */
@@ -300,7 +300,8 @@ export function reviewVerdict(run, t, body) {
     store.transaction(() => {
       store.addComment(t.key, 'system', summaryText);
       store.enqueueOutbox(t.key, `${t.key}:cap:${row.id}`, `${summaryText}${footer(t, row.sha)}`);
-      setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: `Reviewers and ${nameOf(author)} disagree — your call` });
+      // hold_seat: the reviewer who still asks for changes (a party to the disagreement, so never the one to settle it).
+      setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: `Reviewers and ${nameOf(author)} disagree — your call`, hold_kind: 'review_disagree', hold_seat: row.seat });
     });
   } else {
     store.updateTicket(t.key, { progress_msg: `${nameOf(row.seat)} requested ${blocking} change${blocking === 1 ? '' : 's'} — ${nameOf(author)} is responding` });

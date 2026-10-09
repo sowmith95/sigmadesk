@@ -20,7 +20,9 @@ const SELF_CODES = new Set(['paused', 'dependency', 'seat_busy', 'tick', 'setup_
 const SELF_RESOLVING = /desk paused|seat busy|waiting for \S+ to (merge|finish)|capacity|concurrent|busy window|queued behind|next (scheduler )?tick|setup retry/i;
 const selfResolving = (w) => (w.code ? SELF_CODES.has(w.code) : SELF_RESOLVING.test(w.reason || ''));
 
-const isGuard = (t) => /publish guard/i.test(t.progress_msg || '');
+// Structured hold reasons (#9): the code that holds a ticket records why (ticket.hold_kind). Holds written before that
+// existed have none and fall back to the progress-message patterns.
+const isGuard = (t) => (t.hold_kind ? t.hold_kind === 'guard' : /publish guard/i.test(t.progress_msg || ''));
 // The desk merges these by itself (mergetrain.mergeState): not the owner's step.
 const AUTO_MERGE = { queued: 'Approved; the desk merges it when CI and the deploy allow', scheduled: 'Approved; the desk merges it after the busy hours',
   merging: 'Merging now', conflict: 'Resolving a conflict with the latest code' };
@@ -41,7 +43,10 @@ const HOLDS = [
 ];
 // A branch refresh the owner started: the desk holds the ticket while it rebases (no step for anyone).
 const REFRESHING = (t) => t.active_run === -1 && /desk refreshing remote base/i.test(t.progress_msg || '');
-const holdOf = (t) => HOLDS.find(([re]) => re.test(t.progress_msg || ''));
+// hold_kind → its HOLDS row. A structured kind not listed here (a question, a stall, a route to the owner) is a question.
+const HOLD_ROW = { conflict: 0, no_reviewer: 1, seat_off: 2, workspace: 3, base_changed: 4, remote_changed: 5, refresh_interrupted: 5, orphaned: 6,
+  review_disagree: 7, qa_loops: 8, review_loops: 8, ci_loops: 8, github_loops: 8 };
+const holdOf = (t) => (t.hold_kind ? (t.hold_kind in HOLD_ROW ? HOLDS[HOLD_ROW[t.hold_kind]] : null) : HOLDS.find(([re]) => re.test(t.progress_msg || '')));
 function guardWhy(g) {
   if (!g?.reasons?.length) return 'The change touches protected paths or is unusually large. Review the diff before it is pushed.';
   return `Held before pushing: ${g.reasons.join('; ')}. Approving pushes it; the reviewers then check this exact commit.`;

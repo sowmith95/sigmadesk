@@ -234,11 +234,13 @@ Then exactly one outcome:
   desk groom <KEY> --complexity <S|M|L|XL> --area <backend|frontend|db|fullstack|infra> --priority <P0-P3> --risk <high|low> [--assign <seat>] <<'EOF'
   <refined spec: scope, files likely touched, acceptance criteria, test plan>
   EOF
-  desk create-task --parent <KEY> --title "..." --complexity .. --area .. [--after <earlier task KEY>] [--owner "<why>" | --verify] <<'EOF' ... EOF
+  desk create-task --parent <KEY> --title "..." --complexity .. --area .. [--after <earlier task KEY>] [--owner "<why>" --owner-kind <kind> | --verify] <<'EOF' ... EOF
   desk split <KEY> "<one-line summary>"   (after creating the tasks: the parent stays open and closes when its tasks are done)
   Use --after whenever a task must wait for another to merge first; describing the order in text does not enforce it.
   Use --owner "<why>" for a step only the owner can do (a production write or restart, credentials, a business decision):
-  it goes straight to the owner instead of an engineer, and the tasks after it wait for it.
+  it goes straight to the owner instead of an engineer, and the tasks after it wait for it. Always say what kind of step it is
+  with --owner-kind check|package|write|restart|credential|business|other: a check or a missing package can be routed back to
+  the team for the owner; the others stay the owner's (an owner step without a kind is never routed).
   Use --verify instead for a READ-ONLY production check (establish a cause, confirm a fix landed, check freshness, jobs,
   logs, container or app health): it goes to the SRE, who answers with the desk's read-only probes; it reaches the owner
   only if no probe can answer it.
@@ -445,13 +447,14 @@ If unavailable, continue using the repository evidence; do not retry. Synthesize
    ## Risks and how each slice guards them
    EOF
 3. Slice it into at most 4 tasks, each S or M, each independently testable and reviewable:
-   desk create-task --parent ${t?.key} --title "..." --complexity S|M --area <backend|frontend|db|fullstack> [--assign senior-be|senior-fe|junior|dba] [--after <TASK-KEY>] [--owner "<why>" | --verify] <<'EOF'
+   desk create-task --parent ${t?.key} --title "..." --complexity S|M --area <backend|frontend|db|fullstack> [--assign senior-be|senior-fe|junior|dba] [--after <TASK-KEY>] [--owner "<why>" --owner-kind <kind> | --verify] <<'EOF'
    ## Goal  ## Files / functions to change  ## Exact acceptance criteria  ## Tests to add or run
    EOF
    Give S slices to junior and M slices to seniors (DB work to dba). Use --after when a slice needs an earlier task
    merged first (any task of this feature, not only your slices): writing "gated on X" in the text does not stop it
    from starting. A step only the owner can do (a production write or restart, credentials, a business decision) is a
-   slice with --owner "<why>"; it goes to the owner and the slices after it wait. A read-only production check is a
+   slice with --owner "<why>" --owner-kind check|package|write|restart|credential|business|other; it goes to the owner and
+   the slices after it wait. A read-only production check is a
    slice with --verify instead: the SRE answers it with the desk's read-only probes.
 4. Finish with: desk delegate "<one-paragraph summary of the plan and slice order>".`;
     case 'review':

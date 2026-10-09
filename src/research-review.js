@@ -90,7 +90,7 @@ function pass(t) {
 }
 function hold(t, reason) {
   store.updateTicket(t.key, { research_review: 'held' });
-  hooks.setStatus(t.key, 'needs_human', { resume_status: 'proposed', active_run: null, progress_msg: `Research review: ${reason}` });
+  hooks.setStatus(t.key, 'needs_human', { resume_status: 'proposed', active_run: null, progress_msg: `Research review: ${reason}`, hold_kind: 'research' });
 }
 const comment = (t, author, report) => store.addComment(t.key, author, `**Research review · ${report.verdict}** (second reviewer: ${agentById[author]?.name || author})\n\n${report.summary}\n\nEvidence checked: ${report.evidence_checked.join('; ') || 'none stated'}\nFindings: ${report.findings.join('; ') || 'none'}\nConditions: ${report.conditions.join('; ') || 'none'}`);
 

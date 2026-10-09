@@ -418,7 +418,7 @@ export async function resolveCommand(run, t, body) {
   if (body.action === 'stuck') {
     store.updateConflictJob(job.id, { status: 'needs_owner', note: text });
     say(t, `conflict-stuck:${job.id}`, `🧭 **${nameOf(job.seat)} could not resolve the conflict alone**: ${text}\n\nThe owner decides; reply on the desk to let ${nameOf(job.seat)} try again with your guidance.`, job.head_sha);
-    setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: 'conflict needs your call' });
+    setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: 'conflict needs your call', hold_kind: 'conflict', hold_seat: job.seat });
     github.flushOutbox();
     return 'Parked for the owner. Stop now.';
   }
@@ -744,7 +744,7 @@ function askOwnerForChecks() {
   const hist = kvList('ci:history');
   const t = store.createTicket({ title: 'Confirm which CI checks auto-merge must wait for', type: 'task', status: 'needs_human', priority: 'P1', reporter: 'system', source: 'agent',
     description: `SigmaDesk only auto-merges when every required CI check has reported SUCCESS on the exact commit. It does not know yet which checks are required in this repository, so auto-merge is off.\n\n${hist.length ? `Checks seen on recent merges: ${[...new Set(hist.flat())].join(', ')}.` : 'No merges have been observed yet; merging one PR yourself lets the desk propose the list.'}\n\nSet them with POST /api/ci/required-checks {"names": [...]} or in sigmadesk.config.json → review.requiredChecks.` });
-  store.updateTicket(t.key, { resume_status: 'done' });
+  store.updateTicket(t.key, { resume_status: 'done', hold_kind: 'ci_checks' });
 }
 
 /**

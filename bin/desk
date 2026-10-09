@@ -16,7 +16,7 @@ const USAGE = `usage:
   desk revise KEY [--title T]   (revised proposal body on stdin; the author's research revision run only)
   desk connector-propose --name N   (connector case on stdin; thinking seats; owner approval required)
   desk groom KEY --complexity S|M|L|XL --area A [--priority P] [--risk high] [--assign SEAT] [--title T]   (spec on stdin)
-  desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT] [--after KEY|none] [--owner "<why only the owner can do it>"]   (body on stdin)
+  desk create-task --parent KEY --title T --complexity C --area A [--assign SEAT] [--after KEY|none] [--owner "<why only the owner can do it>" --owner-kind check|package|write|restart|credential|business|other]   (body on stdin)
   desk lesson "<one sentence the team should remember>"   (builders, while fixing their own work; the owner approves it)
   desk split KEY "<summary>"   (manager, after create-task: the parent stays open until its tasks are done)
   desk design   (design doc on stdin; principals)
