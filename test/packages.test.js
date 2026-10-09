@@ -165,11 +165,13 @@ async function resolved(run, specs, report, extra = {}) {
   return store.pkgRequestsForTicket(run.ticket_key).at(-1);
 }
 const goodReport = (v = '4.9.0') => ({ version: '1', pip_version: '24.0', install: [wheel('humanize', v, { requested: true }), wheel('rich', '13.9.4'), wheel('pip', '24.0', { requested: true })] });
+/** The pyvenv.cfg `python -m venv --without-pip` writes for this fixture's shared interpreter. */
+const goodCfg = (dv) => `home = ${path.dirname(fakePy)}\ninclude-system-site-packages = false\nversion = 3.12.4\nexecutable = ${fakePy}\ncommand = ${fakePy} -m venv --without-pip ${dv}\n`;
 /** What `desk pkg install` leaves in a workspace (pip's own records included), built from the wheels' contents. */
 function simulateInstall(wsDir, pins) {
   const dv = path.join(wsDir, '.venv'), vsite = path.join(dv, 'lib', 'python3.12', 'site-packages');
   fs.mkdirSync(path.join(dv, 'bin'), { recursive: true }); fs.mkdirSync(vsite, { recursive: true });
-  fs.writeFileSync(path.join(dv, 'pyvenv.cfg'), `home = ${path.dirname(fakePy)}\ninclude-system-site-packages = false\nversion = 3.12.4\n`);
+  fs.writeFileSync(path.join(dv, 'pyvenv.cfg'), goodCfg(dv));
   if (!fs.existsSync(path.join(dv, 'bin', 'python'))) fs.symlinkSync(fakePy, path.join(dv, 'bin', 'python'));
   fs.writeFileSync(path.join(vsite, '_sigmadesk_shared.pth'), packages.pthText(site));
   for (const pin of pins) for (const [rel, data] of Object.entries(contents[pin])) {
@@ -478,7 +480,7 @@ test('offline install: exact steps (venv --without-pip, .pth layering, scrubbed 
   fs.writeFileSync(whl, good); fs.chmodSync(whl, 0o444); fs.chmodSync(stage, 0o555);
   packages.installPlan(run);
   simulateInstall(w, ['humanize==4.9.0']);
-  assert.match(packages.recordInstall(run, { ok: true }), /Installed and verified: Python 3\.12\.4 .*3 files verified/);
+  assert.match(packages.recordInstall(run, { ok: true }), /Installed and verified: Python 3\.12\.4 .*4 files verified/);
   const fp = packages.recordedFingerprint(t.key);
   assert.deepEqual(fp.added.map((a) => [a.name, a.version, a.dev, a.files]), [['humanize', '4.9.0', true, 3]]);
   assert.equal(fp.lock_size, SHARED_N + 1);
@@ -524,7 +526,22 @@ test('fingerprint comes from what is on disk: missing, modified, extra files, st
   throws(ok, /says Python 3\.13\.0, the shared venv is 3\.12\.4/);
   fs.writeFileSync(cfg, 'version = 3.12.4\ninclude-system-site-packages = true\n');
   throws(ok, /system site-packages/);
-  fs.writeFileSync(cfg, 'version = 3.12.4\ninclude-system-site-packages = false\n');
+  // pyvenv.cfg must point at the shared interpreter, key by key (round 4).
+  const dv = path.join(w, '.venv');
+  for (const [text, re] of [
+    [goodCfg(dv).replace(`home = ${path.dirname(fakePy)}`, 'home = /usr/bin'), /home is \/usr\/bin, not the shared interpreter's directory/],
+    [goodCfg(dv).replace(/^home = .*\n/m, ''), /home is missing/],
+    [goodCfg(dv).replace(`executable = ${fakePy}`, `executable = ${process.execPath}`), /executable is .*, not the shared interpreter/],
+    [goodCfg(dv).replace(`command = ${fakePy} -m venv`, 'command = /usr/bin/python3 -m venv'), /command is not how desk pkg install creates the venv/],
+    [`${goodCfg(dv)}prompt = x\n`, /keys nobody expects \(prompt\)/],
+  ]) { fs.writeFileSync(cfg, text); throws(ok, re); }
+  fs.writeFileSync(cfg, goodCfg(dv).replace(/^executable.*\n^command.*\n/m, '')); // executable/command are optional (older venv versions)
+  ok();
+  fs.writeFileSync(cfg, goodCfg(dv));
+  assert.equal(ok().installed_sha256, base.installed_sha256, 'pyvenv.cfg is part of the fingerprint');
+  fs.writeFileSync(cfg, goodCfg(dv).replace('version = 3.12.4', 'version  =  3.12.4'));
+  assert.notEqual(ok().installed_sha256, base.installed_sha256, 'any change to pyvenv.cfg changes the fingerprint');
+  fs.writeFileSync(cfg, goodCfg(dv));
   fs.writeFileSync(path.join(vsite, '_sigmadesk_shared.pth'), 'import site; site.addsitedir("/elsewhere")\n');
   throws(ok, /does not layer the shared venv as the desk wrote it/);
   restore();
@@ -638,6 +655,10 @@ test('QA never fails open: an invalid .venv blocks QA; with a valid one QA passe
   const { t, vsite } = await approvedInstalled('qa venv');
   const wsDir = ws(t.key);
   fs.writeFileSync(path.join(wsDir, 'README.md'), 'x\n');
+  fs.mkdirSync(path.join(wsDir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(wsDir, 'tests', 'test_x.py'), 'def test_a():\n    pass\n');
+  const outside = fs.mkdtempSync(path.join(tmp, 'outside-')); fs.writeFileSync(path.join(outside, 'test_y.py'), '');
+  fs.symlinkSync(outside, path.join(wsDir, 'outlink')); // a link out of the workspace
   execFileSync('git', ['init', '-q', '-b', 'main', wsDir]);
   git(wsDir, 'add', 'README.md'); git(wsDir, 'commit', '-qm', 'c');
   store.updateTicket(t.key, { status: 'qa', head_sha: 'f'.repeat(40) }); // a different submitted head: the gate's last step refuses, after the evidence gate
@@ -655,11 +676,12 @@ test('QA never fails open: an invalid .venv blocks QA; with a valid one QA passe
   await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['json.tool', '--help'] }), /runs a test runner: pytest or unittest/);
   await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['os; import x'] }), /runs a test runner/);
   for (const bad of [['--co'], ['--collect-only'], ['--junitxml=/tmp/x.xml'], ['-p', 'no:junitxml'], ['--setup-plan'], ['--version'], ['-o'], ['-c/tmp/skip.ini'], ['-oaddopts=--setup-only'],
-    ['-pno:x'], ['-qq'], ['--maxfail=1x'], ['-k'], ['-k', '--co'], ['/etc/passwd'], ['../other/tests'], ['tests', '--rootdir=/']])
+    ['-pno:x'], ['-qq'], ['--maxfail=1x'], ['-k'], ['-k', '--co'], ['/etc/passwd'], ['../other/tests'], ['tests', '--rootdir=/'],
+    ['@args.txt'], ['@/tmp/args'], ['tests/missing_test.py'], ['tests/test_x.py::../../x'], ['outlink'], ['outlink/test_y.py'], ['tests/test_x.py::']])
     await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', ...bad] }), /desk test refuses/);
   for (const bad of [['discover', '-s', '/tmp'], ['discover', '--locals'], ['-b'], ['os;x']])
     await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['unittest', ...bad] }), /desk test refuses/);
-  const okArgs = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', 'tests/test_x.py::test_a', '-k', 'not slow', '-m', 'unit', '-x', '-q', '-v', '--maxfail=2'] })).test;
+  const okArgs = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', 'tests/test_x.py::test_a', 'tests/test_x.py::TestA::test_b[a/b]', 'tests', '-k', 'not slow', '-m', 'unit', '-x', '-q', '-v', '--maxfail=2'] })).test;
   assert.deepEqual(okArgs.argv.slice(-3, -1), ['-p', 'no:cacheprovider']);
   assert.deepEqual(okArgs.scrub, ['PYTEST_ADDOPTS', 'PYTEST_PLUGINS', 'PYTEST_DISABLE_PLUGIN_AUTOLOAD']);
   const junit = (id, attrs) => fs.writeFileSync(path.join(wsDir, '.git', `sigmadesk-test-${id}.xml`), `<?xml version="1.0"?><testsuites><testsuite name="pytest" ${attrs} time="0.1"></testsuite></testsuites>`);
@@ -957,6 +979,16 @@ test('QA requires the workspace venv once anything is approved: no .venv plus or
   runner.applyEvents([{ type: 'cmd-start', id: 'a', cmd: 'python -m pytest tests -q' }, { type: 'cmd-end', id: 'a', ok: true }], { run: qaRun, cwd: wsDir, state: {} });
   await rejects(sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'qa87654321', body: 'ok' }), new RegExp(`QA cannot pass on this workspace: ${t.key} has approved package request #${r.id}, but this workspace has no \\.venv`));
   await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest'] }), /has no \.venv/);
+  // Revoking (or expiry) never brings shared-venv-only QA back: approval history decides.
+  packages.revoke(r.id, 'owner', 'changed my mind');
+  assert.equal(store.getPkgRequest(r.id).status, 'revoked');
+  await rejects(sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'qa87654321', body: 'ok' }), /has approved package request .*no \.venv/);
+  const tx = store.createTicket({ title: 'expired', status: 'in_progress' });
+  const rx = await resolved(mkRun('junior', 'implement', tx.key), ['humanize==4.9.0'], goodReport());
+  packages.decide(rx.id, 'approve', { by: 'owner' });
+  packages.sweep(new Date(Date.now() + 25 * 3600_000).toISOString());
+  assert.equal(store.getPkgRequest(rx.id).status, 'expired');
+  assert.match(packages.qaEnvironment(tx.key, ws(tx.key)).error, /has approved package request/);
   // Declined or never approved: the shared venv stays the environment.
   const t2 = store.createTicket({ title: 'declined', status: 'in_progress' });
   const r2 = await resolved(mkRun('junior', 'implement', t2.key), ['humanize==4.9.0'], goodReport());
@@ -1000,6 +1032,10 @@ test('venv root: only RECORD files, pip\'s exact console-script wrappers and exa
     throws(ok, re);
     fs.rmSync(path.join(w, '.venv', f));
   }
+  // Every declared console/gui script must be there (round 4).
+  fs.rmSync(path.join(bin, 'clip-gui'));
+  throws(ok, /missing the console script bin\/clip-gui its entry points declare/);
+  reset();
   fs.symlinkSync(process.execPath, path.join(bin, 'python3'));
   throws(ok, /a link nobody approved \(bin\/python3\)/);
   fs.rmSync(path.join(bin, 'python3')); fs.symlinkSync(fakePy, path.join(bin, 'python3'));

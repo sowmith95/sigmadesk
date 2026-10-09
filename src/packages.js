@@ -675,6 +675,21 @@ export function fingerprint(ticketKey, ws, { including = [], requireAll = true }
   const version = cfg.match(/^version(?:_info)?\s*=\s*(\S+)/m)?.[1];
   if (version !== env.version) throw err(`.venv says Python ${version || 'unknown'}, the shared venv is ${env.version}`, 409);
   const vpy = path.join(venv, 'bin', 'python');
+  // Every key of pyvenv.cfg is known and points at the shared venv's interpreter: `home` is its directory, `executable`
+  // the interpreter itself, `command` exactly how desk pkg install created this venv.
+  const keys = {};
+  for (const line of cfg.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const m = line.match(/^\s*([A-Za-z_-]+)\s*=\s*(.*?)\s*$/);
+    if (!m) throw err(`.venv/pyvenv.cfg has an unreadable line: ${line.slice(0, 80)}`, 409);
+    keys[m[1].toLowerCase()] = m[2];
+  }
+  const unknown = Object.keys(keys).filter((k) => !['home', 'include-system-site-packages', 'version', 'version_info', 'executable', 'command'].includes(k));
+  if (unknown.length) throw err(`.venv/pyvenv.cfg has keys nobody expects (${unknown.join(', ')})`, 409);
+  const interpReal = realpath(env.python);
+  if (!keys.home || realpath(keys.home) !== path.dirname(interpReal)) throw err(`.venv/pyvenv.cfg home is ${keys.home || 'missing'}, not the shared interpreter's directory`, 409);
+  if (keys.executable != null && realpath(keys.executable) !== interpReal) throw err(`.venv/pyvenv.cfg executable is ${keys.executable}, not the shared interpreter`, 409);
+  if (keys.command != null && keys.command !== `${env.python} -m venv --without-pip ${venv}`) throw err(`.venv/pyvenv.cfg command is not how desk pkg install creates the venv (${keys.command.slice(0, 120)})`, 409);
   let vreal; try { vreal = fs.realpathSync(vpy); } catch { throw err('.venv/bin/python is missing', 409); }
   if (vreal !== realpath(env.python)) throw err(`.venv/bin/python is ${vreal}, not the shared venv's interpreter`, 409);
   const site = path.join(venv, 'lib', `python${env.xy}`, 'site-packages');
@@ -743,6 +758,7 @@ export function fingerprint(ticketKey, ws, { including = [], requireAll = true }
   // Console-script wrappers pip generates from entry_points.txt (verified above as part of each wheel): their exact text
   // is deterministic, so it is regenerated here and compared byte for byte.
   const wrappers = new Map();
+  const wrappersSeen = new Set();
   for (const di of distInfos) {
     const ep = readSmall(path.join(site, di, 'entry_points.txt'), 1_000_000);
     for (const [name, spec] of entryPoints(ep || '')) wrappers.set(`bin/${name}`, consoleScript(vpy, spec));
@@ -764,11 +780,15 @@ export function fingerprint(ticketKey, ws, { including = [], requireAll = true }
       if (!e.isFile()) throw err(`.venv contains a special file (${r})`, 409);
       if (r === 'pyvenv.cfg' || r === '.tmp/.keep' || outsideDests.has(r)) continue;
       const want = wrappers.get(r);
-      if (want != null) { if (!fs.readFileSync(pth).equals(Buffer.from(want))) throw err(`${r} is not the console script pip generates for its entry point`, 409); lines.push(`${r}\t${sha256File(pth)}`); continue; }
+      if (want != null) { if (!fs.readFileSync(pth).equals(Buffer.from(want))) throw err(`${r} is not the console script pip generates for its entry point`, 409); wrappersSeen.add(r); lines.push(`${r}\t${sha256File(pth)}`); continue; }
       throw err(`.venv holds a file no approved wheel installs: ${r}`, 409);
     }
   };
   visit(venv, '');
+  // 3: every declared console/gui script must exist (the inventory is required, not just checked when present).
+  const absent = [...wrappers.keys()].filter((r) => !wrappersSeen.has(r));
+  if (absent.length) throw err(`.venv is missing the console script${absent.length === 1 ? '' : 's'} ${absent.join(', ')} its entry points declare: run desk pkg install`, 409);
+  lines.push(`pyvenv.cfg\t${crypto.createHash('sha256').update(cfg).digest('hex')}`);
   const missing = [...expected.keys()].filter((f) => !seen.has(f));
   if (missing.length) throw err(`.venv is missing ${missing.length} file(s) of the approved packages (${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', …' : ''}): run desk pkg install`, 409);
   const lock = [...nowLock, ...added.map((a) => `${a.name}==${a.version}`)].sort();
@@ -802,8 +822,10 @@ export const recordedFingerprint = (key) => json(store.kvGet(`venv:${key}`), nul
 export function qaEnvironment(ticketKey, ws) {
   if (!hasVenv(ws)) {
     // A ticket with approved packages is tested in its venv or not at all: the shared venv alone is not that environment.
-    const approved = store.pkgRequestsForTicket(ticketKey).filter((r) => r.decided_by === 'owner' && (r.status === 'approved' || r.installed_at));
-    return approved.length ? { venv: true, fingerprint: null, error: `${ticketKey} has approved package request ${approved.map((r) => `#${r.id}`).join(', ')}, but this workspace has no .venv: run desk pkg install (tests on the shared venv alone do not count)` } : { venv: false };
+    // Approval HISTORY decides: once the owner approved anything for this ticket, a revoke or expiry never brings the
+    // shared-venv-only QA back.
+    const approved = store.pkgRequestsForTicket(ticketKey).filter((r) => r.decided_by === 'owner' && r.status !== 'denied');
+    return approved.length ? { venv: true, fingerprint: null, error: `${ticketKey} has approved package request ${approved.map((r) => `#${r.id}`).join(', ')}, but this workspace has no .venv: run desk pkg install (tests on the shared venv alone do not count; if no approval is live any more, ask the owner)` } : { venv: false };
   }
   try { return { venv: true, fingerprint: fingerprint(ticketKey, ws), error: null }; } catch (e) { return { venv: true, fingerprint: null, error: e.message }; }
 }
@@ -818,7 +840,20 @@ export const TEST_RUNNERS = ['pytest', 'unittest'];
  */
 export function checkTestArgs(args, ws) {
   const [runner, ...rest] = args;
-  const insideWs = (p) => { const file = String(p).split('::')[0]; const abs = path.resolve(ws, file); return !!file && !file.includes('\0') && (abs === ws || abs.startsWith(`${ws}/`)); };
+  // A positional token is an EXISTING file or directory inside the workspace (links resolved), optionally followed by
+  // ::node segments; never an @argsfile, never a path that resolves elsewhere.
+  const wsReal = realpath(ws);
+  const insideWs = (p) => {
+    const tok = String(p);
+    if (!tok || tok.startsWith('@') || tok.includes('\0')) return false;
+    const [file, ...nodes] = tok.split('::');
+    if (!file || nodes.some((n) => !n || n.includes('..') || n.includes('/') && !/^[^[]*\[.*\]$/.test(n))) return false;
+    const abs = path.resolve(ws, file);
+    if (!(abs === ws || abs.startsWith(`${ws}/`))) return false;
+    if (!fs.existsSync(abs)) return false;
+    const real = realpath(abs);
+    return real === wsReal || real.startsWith(`${wsReal}/`);
+  };
   const refuse = (tok, why) => err(`desk test refuses ${String(tok).slice(0, 80)}: ${why}`);
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
@@ -827,7 +862,7 @@ export function checkTestArgs(args, ws) {
       if (a === '-k' || a === '-m') { const v = rest[++i]; if (v == null || v.startsWith('-')) throw refuse(a, 'needs an expression'); continue; }
       if (/^--maxfail=\d{1,5}$/.test(a)) continue;
       if (a.startsWith('-')) throw refuse(a, 'allowed: paths or node ids, -k EXPR, -m EXPR, -x, -q, -v, --maxfail=N');
-      if (!insideWs(a)) throw refuse(a, 'test paths must be inside the workspace');
+      if (!insideWs(a)) throw refuse(a, 'positional arguments must be existing test paths (or path::node ids) inside the workspace; no @files');
     } else {
       if (['-v', '-q', '-f'].includes(a) || (a === 'discover' && i === 0)) continue;
       if (a === '-s' || a === '-t') { const v = rest[++i]; if (v == null || !insideWs(v)) throw refuse(a, 'needs a directory inside the workspace'); continue; }
