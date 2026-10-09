@@ -687,7 +687,7 @@ test('QA never fails open: an invalid .venv blocks QA; with a valid one QA passe
   await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['os; import x'] }), /runs a test runner/);
   for (const bad of [['--co'], ['--collect-only'], ['--junitxml=/tmp/x.xml'], ['-p', 'no:junitxml'], ['--setup-plan'], ['--version'], ['-o'], ['-c/tmp/skip.ini'], ['-oaddopts=--setup-only'],
     ['-pno:x'], ['-qq'], ['--maxfail=1x'], ['-k'], ['-k', '--co'], ['/etc/passwd'], ['../other/tests'], ['tests', '--rootdir=/'],
-    ['@args.txt'], ['@/tmp/args'], ['-k', '@args.txt'], ['-m', '@x'], ['--maxfail=@1'], ['-k', 'a\nb'], ['-k', 'a\u0000b'], ['tests', '-k', 'x\rdel'], ['tests/missing_test.py'], ['tests/test_x.py::../../x'], ['outlink'], ['outlink/test_y.py'], ['tests/test_x.py::']])
+    ['@args.txt'], ['@/tmp/args'], ['-k', '@args.txt'], ['-m', '@x'], ['--maxfail=@1'], ['-k', 'a\nb'], ['-k', 'a\u0000b'], ['tests', '-k', 'x\rdel'], ['-k', 'a\tb'], ['-k', 'a\u001bb'], ['-k', 'a\u007fb'], ['tests/missing_test.py'], ['tests/test_x.py::../../x'], ['outlink'], ['outlink/test_y.py'], ['tests/test_x.py::']])
     await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', ...bad] }), /desk test refuses/);
   for (const bad of [['discover', '-s', '/tmp'], ['discover', '--locals'], ['-b'], ['os;x'], ['discover', '-p', '@x'], ['discover', '-s', '@tests']])
     await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['unittest', ...bad] }), /desk test refuses/);

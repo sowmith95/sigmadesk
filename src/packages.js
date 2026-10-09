@@ -859,7 +859,8 @@ export function checkTestArgs(args, ws) {
   // with @; no newlines or NUL anywhere.
   for (const a of rest.map(String)) {
     if (a.startsWith('@') || (a.startsWith('-') && a.includes('=') && a.slice(a.indexOf('=') + 1).startsWith('@'))) throw refuse(a, 'arguments may not start with @ (pytest reads them as argument files)');
-    if (/[\n\r\0]/.test(a)) throw refuse(JSON.stringify(a), 'arguments may not contain newlines or NUL');
+    // eslint-disable-next-line no-control-regex
+    if (/[\x00-\x1f\x7f]/.test(a)) throw refuse(JSON.stringify(a), 'arguments may not contain control characters');
   }
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
