@@ -181,10 +181,10 @@ export const codex = {
     const model = seat.model || userModel();
     const common = ['--json', '--skip-git-repo-check', ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : []),
       ...(['council_review','product_review','feature_groom'].includes(kind) ? ['-c', 'default_permissions="sigmadesk_review"'] : []),
-      ...(kind === 'mention' ? ['-c', 'default_permissions="sigmadesk_tagged"'] : []),
+      ...(kind === 'mention' || kind === 'decide' ? ['-c', 'default_permissions="sigmadesk_tagged"'] : []), // read-only + its own mailbox
       ...(kind === 'council_review' ? ['-c', 'features.shell_tool=false'] : []),
       // Package stages (#8) only ever extend the build profile (sigmadesk_seat), and only for the granted run.
-      ...(extraRead.length && !['council_review', 'product_review', 'feature_groom', 'mention'].includes(kind) ? ['-c', seatFilesystemOverride(extraRead)] : [])];
+      ...(extraRead.length && !['council_review', 'product_review', 'feature_groom', 'mention', 'decide'].includes(kind) ? ['-c', seatFilesystemOverride(extraRead)] : [])];
     const args = resume
       ? ['exec', 'resume', ...common, resume, '-']
       : ['exec', ...common, '-C', cwd, '-'];

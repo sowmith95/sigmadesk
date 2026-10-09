@@ -514,6 +514,49 @@ CREATE TABLE IF NOT EXISTS watch_checkpoints (
   UNIQUE(watch_id, name)
 );
 CREATE INDEX IF NOT EXISTS watch_checkpoints_status ON watch_checkpoints(status, due_at);
+-- Delegated decisions (#9): one row per owner decision (board decision id) and evidence version that the EM or the SRE
+-- decides for the owner (or, in shadow, would have decided). Server-owned: created from the board's structured state,
+-- decided by a bounded decide run (or by rule, for owner-task triage), applied in one transaction after the desk
+-- re-checks the evidence, the policy and the rules. Never written through an owner path: what was applied is the
+-- delegate's, "decided for the owner". status: queued | running | applied | shadow | escalated | superseded |
+-- invalidated | failed | overridden | reopened.
+CREATE TABLE IF NOT EXISTS delegated_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,             -- owner_task | question | research | loop_limit | design
+  decision_id TEXT NOT NULL,      -- the board decision it is for (e.g. SD-12:question)
+  ticket_key TEXT,
+  version TEXT NOT NULL,          -- hash of the evidence the decision rests on (a new hold or revision = a new decision)
+  policy_version TEXT,            -- the decision brief's policy version (src/decision.js)
+  delegation_version TEXT,        -- the delegation matrix in force when it was created (any change invalidates it)
+  mode TEXT NOT NULL,             -- shadow | em | sre
+  seat TEXT NOT NULL,             -- the delegate (manager | sre)
+  asker TEXT,                     -- who asked (a question's seat), when there is one
+  allowed TEXT NOT NULL,          -- JSON list of the actions the delegate may take
+  status TEXT NOT NULL DEFAULT 'queued',
+  action TEXT,                    -- answer | approve | changes | reject | route | escalate
+  text TEXT,                      -- the answer, direction or route, as the delegate gave it
+  why TEXT,                       -- the delegate's reason (cites the brief's evidence and the owner's standing rules)
+  recommendation TEXT,            -- an escalation's one-line recommendation (so the owner's tap is yes/no)
+  outcome TEXT,                   -- what happened, in plain words (applied, refused at apply and why, escalated …)
+  assign TEXT,                    -- a reassignment that came with a loop-limit decision
+  attempts INTEGER NOT NULL DEFAULT 0,
+  run_id INTEGER,
+  spent_usd REAL DEFAULT 0,
+  spent_ms INTEGER DEFAULT 0,
+  steps_used INTEGER DEFAULT 0,
+  brief TEXT,                     -- JSON: the decision brief it was based on (audit)
+  provenance TEXT,                -- JSON: decided for the owner by whom, under which mode, policy and run
+  comment_id INTEGER,             -- the ticket comment that announced an applied decision
+  override_note TEXT,
+  override_at TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  started_at TEXT,
+  decided_at TEXT,
+  ended_at TEXT,
+  UNIQUE(decision_id, version)
+);
+CREATE INDEX IF NOT EXISTS delegated_decisions_status ON delegated_decisions(status);
+CREATE INDEX IF NOT EXISTS delegated_decisions_ticket ON delegated_decisions(ticket_key, id);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -719,6 +762,12 @@ export function settingDefaults() {
     ops_enabled: 'false',
     // Owner's access policy (JSON, '' = config access.policy). Edited through the Access sheet (validated as a whole).
     access_policy: '',
+    // Delegation (#9): the owner's matrix (JSON {kinds, peerAccess}, '' = config delegation.*), the emergency "Escalate
+    // everything" switch, and an epoch that every policy change bumps (in-flight delegated decisions then lapse).
+    // All three are written through /api/delegation only (validated, and in-flight authority invalidated).
+    delegation: '',
+    delegation_escalate_all: 'false',
+    delegation_epoch: '0',
   };
 }
 
@@ -729,6 +778,7 @@ export function setSetting(key, value) {
   if (!(key in settingDefaults())) throw Object.assign(new Error(`unknown setting ${key}`), { status: 400 });
   if (key === 'access_policy') throw Object.assign(new Error('the access policy is edited through the Access sheet (validated as a whole)'), { status: 400 });
   if (key === 'research_programs') throw Object.assign(new Error('research programs are edited through Settings → Research (validated as a whole)'), { status: 400 });
+  if (['delegation', 'delegation_escalate_all', 'delegation_epoch'].includes(key)) throw Object.assign(new Error('delegation is changed through Settings → Autonomy (validated as a whole; in-flight decisions are invalidated)'), { status: 400 });
   const ranges = { max_concurrent: [1, 20], daily_budget_usd: [0, 100000], pm_interval_min: [1, 525600], max_open_proposals: [1, 100] };
   if (ranges[key]) {
     const n = Number(value), [min, max] = ranges[key];
@@ -1343,6 +1393,45 @@ export function updateMention(id, patch) {
   const cols = Object.keys(patch).filter((k) => MENTION_FIELDS.includes(k));
   if (cols.length) q(`UPDATE mention_deliveries SET ${cols.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), id);
   const m = getMention(id); announce({ type: 'mention', data: m }); return m;
+}
+
+// ---------- delegated decisions (#9) ----------
+const DD_INSERT = ['kind', 'decision_id', 'ticket_key', 'version', 'policy_version', 'delegation_version', 'mode', 'seat', 'asker', 'allowed', 'status', 'brief', 'provenance', 'outcome', 'action', 'text', 'why', 'decided_at', 'ended_at'];
+const DD_FIELDS = ['status', 'action', 'text', 'why', 'recommendation', 'outcome', 'assign', 'attempts', 'run_id', 'spent_usd', 'spent_ms', 'steps_used', 'brief', 'provenance',
+  'comment_id', 'override_note', 'override_at', 'started_at', 'decided_at', 'ended_at'];
+const ddVal = (v) => (v !== null && typeof v === 'object' ? JSON.stringify(v) : v ?? null);
+/** One record per (decision, evidence version): a repeat returns the existing row ({ row, created }). */
+export function createDelegation(d) {
+  const info = q(`INSERT OR IGNORE INTO delegated_decisions(${DD_INSERT.join(',')}) VALUES (${DD_INSERT.map(() => '?').join(',')})`).run(...DD_INSERT.map((c) => ddVal(c === 'status' ? d.status || 'queued' : d[c])));
+  const row = q('SELECT * FROM delegated_decisions WHERE decision_id=? AND version=?').get(d.decision_id, d.version);
+  if (info.changes) announce({ type: 'delegation', data: { id: row.id } });
+  return { row, created: info.changes > 0 };
+}
+export const getDelegation = (id) => q('SELECT * FROM delegated_decisions WHERE id=?').get(id) || null;
+export const delegationFor = (decisionId, version) => q('SELECT * FROM delegated_decisions WHERE decision_id=? AND version=?').get(decisionId, version) || null;
+export const delegationsByStatus = (...statuses) => q(`SELECT * FROM delegated_decisions WHERE status IN (${statuses.map(() => '?').join(',')}) ORDER BY id`).all(...statuses);
+export const delegationsSince = (iso) => q('SELECT * FROM delegated_decisions WHERE created_at >= ? ORDER BY id').all(iso);
+export const delegationsForTicket = (key) => q('SELECT * FROM delegated_decisions WHERE ticket_key=? ORDER BY id').all(key);
+export const recentDelegations = (limit = 50) => q('SELECT * FROM delegated_decisions ORDER BY id DESC LIMIT ?').all(limit);
+export const runsOfDelegation = (id) => q("SELECT * FROM runs WHERE kind='decide' AND json_extract(job, '$.delegation') = ? ORDER BY id").all(id);
+/** Decision runs per record since a time, in one pass: { [record id]: { runs, estimated } }. */
+export function delegationRunStats(sinceIso) {
+  const out = {};
+  for (const r of q("SELECT json_extract(job, '$.delegation') AS d, COUNT(*) AS n, SUM(cost_estimated) AS e FROM runs WHERE kind='decide' AND started_at >= ? GROUP BY d").all(sinceIso)) out[r.d] = { runs: r.n, estimated: r.e || 0 };
+  return out;
+}
+/** Move a record out of one of `from` (a later state is never overwritten by a late writer). Returns true if it moved. */
+export function transitionDelegation(id, from, patch) {
+  const keys = Object.keys(patch).filter((k) => DD_FIELDS.includes(k));
+  const n = q(`UPDATE delegated_decisions SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=? AND status IN (${from.map(() => '?').join(',')})`).run(...keys.map((k) => ddVal(patch[k])), id, ...from).changes;
+  if (n) announce({ type: 'delegation', data: { id } });
+  return n > 0;
+}
+export function updateDelegation(id, patch) {
+  const keys = Object.keys(patch).filter((k) => DD_FIELDS.includes(k));
+  if (keys.length) q(`UPDATE delegated_decisions SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=?`).run(...keys.map((k) => ddVal(patch[k])), id);
+  announce({ type: 'delegation', data: { id } });
+  return getDelegation(id);
 }
 
 // ---------- small durable key/value store (watch cursors etc.) ----------

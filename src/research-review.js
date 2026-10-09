@@ -229,6 +229,24 @@ export function ownerDecide(t, decision, note = '') {
   }
   fail('invalid decision');
 }
+/**
+ * A delegate (#9) sends a held proposal back to its author with corrections or a narrower scope, recorded as the
+ * delegate's decision for the owner (never the owner's). It never waives the review: the revision gets a fresh second
+ * review, and approving past a dissenting reviewer stays the owner's. The author gets one bounded revision, as after an
+ * owner correction; how often a delegate may do this over the proposal's life is limited by src/delegation.js.
+ */
+export function delegatedCorrection(t, seat, note, footer = '') {
+  if (!held(t)) fail('this proposal is not held by a research review');
+  const text = String(note || '').trim();
+  if (!text) fail('Describe the correction so the author can revise');
+  const name = String(agentById[seat]?.name || seat).split(/\s+/)[0];
+  return store.transaction(() => {
+    store.kvSet(`research-notes:${t.key}`, text.slice(0, 4000));
+    store.updateTicket(t.key, { research_review: 'changes', research_revisions: 0 });
+    hooks.setStatus(t.key, 'proposed', { resume_status: null, active_run: null, progress_msg: `${name} sent the proposal back for revision` });
+    return store.addComment(t.key, seat, `🔁 **${name} sent the proposal back to ${agentById[t.reporter]?.name || t.reporter}, deciding for the owner**\n\n${text}${footer}`);
+  });
+}
 export function reasonFor(t) {
   if (!blocks(t)) return null;
   if (t.research_review === 'changes') return `Author revising after the second review`;

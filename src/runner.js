@@ -43,14 +43,15 @@ export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
  * A tagged run (@mention) stops after its step allowance: every tool call and every command (desk calls too), each
  * counted once whatever the engine chooses to display. The desk-side bound when dollars cannot be capped.
  */
+const STEP_BOUNDED = new Set(['mention', 'decide']); // tagged replies and delegated decisions (#9)
 function stepLimit(ctx, id) {
-  if (ctx.run.kind !== 'mention') return;
+  if (!STEP_BOUNDED.has(ctx.run.kind)) return;
   if (id != null) { const seen = (ctx.state.stepIds ||= new Set()); if (seen.has(id)) return; seen.add(id); }
   ctx.state.steps = (ctx.state.steps || 0) + 1;
   store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the tag's steps from it
   const max = ctx.maxSteps ?? (Number(config.mentions?.maxSteps) || 60);
   if (ctx.state.steps === max + 1) {
-    store.logEvent({ run_id: ctx.run.id, agent_id: ctx.run.agent_id, ticket_key: ctx.run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for a tagged reply)` });
+    store.logEvent({ run_id: ctx.run.id, agent_id: ctx.run.agent_id, ticket_key: ctx.run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for ${ctx.run.kind === 'decide' ? 'a delegated decision' : 'a tagged reply'})` });
     killRun(ctx.run.id, `step limit (${max})`);
   }
 }
@@ -571,6 +572,7 @@ export function buildCommand(agent, kind, cwd, { resume = null, fork = false, ex
 export function kindCap(kind) {
   if (kind === 'resolve') return Number(config.resolve?.budgetUsd) || 1.5;
   if (kind === 'mention') return Number(config.mentions?.budgetUsd) || 2;
+  if (kind === 'decide') return Number(config.delegation?.budgetUsd) || 0.75;
   return null;
 }
 const capped = (kind, usd) => (kindCap(kind) ? Math.min(usd, kindCap(kind)) : usd);
@@ -681,7 +683,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   store.updateRun(run.id, { reserve_usd: Math.min(capped(kind, engineOf(agent).budgetUsd(agent)), limits?.usd ?? Infinity) });
   // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
   // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
-  if (kind !== 'mention') access.bindRun(agentId, ticketKey, run.id);
+  if (kind !== 'mention' && kind !== 'decide') access.bindRun(agentId, ticketKey, run.id); // a decision run (#9) is not the ticket's work either
   onStart?.(run);
   const ctx = { run, cwd, result: null, state: {}, presence: track };
   if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });

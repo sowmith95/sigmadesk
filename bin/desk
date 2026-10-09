@@ -50,7 +50,9 @@ const USAGE = `usage:
   desk verify done "<what production shows>" | desk verify owner "<why no read-only probe can answer>"   (SRE verify runs)
   desk watch verified|regression|inconclusive "<what production shows>"   (SRE post-deploy check runs)
   desk reply "<answer>"   (a run where the owner tagged you: your one answer in the thread)
-  desk handoff implement|design|verify "<what>" | desk handoff task --title T "<what>" | desk handoff merge|deploy "<what was asked>"   (tagged runs: route real work into the normal jobs)`;
+  desk handoff implement|design|verify "<what>" | desk handoff task --title T "<what>" | desk handoff merge|deploy "<what was asked>"   (tagged runs: route real work into the normal jobs)
+  desk decide answer|approve|changes|reject "<what you decided>" --why "<evidence and the owner's standing rule>" [--assign SEAT]
+  desk decide escalate "<one-line recommendation>" --why "<why the owner must decide>"   (EM/SRE decision runs: decide for the owner, or hand it back)`;
 
 const [cmd, ...rest] = process.argv.slice(2);
 // Help must exit before parsing flags, reading stdin or sending a mutating request.
@@ -95,7 +97,7 @@ switch (cmd) {
   case 'test': for (const k of Object.keys(body)) delete body[k]; body.action = 'plan'; body.args = rest.slice(); break;
   case 'ops': body.probe = pos.shift() || 'list'; if (body.probe === 'request') body.probes = pos.splice(0); break;
   case 'access': body.action = pos.shift() || 'list'; if (/^\d+$/.test(pos[0] || '')) body.id = pos.shift(); body.body = pos.join(' '); break;
-  case 'respond': case 'resolve': case 'verify': case 'watch': case 'handoff': body.action = pos.shift(); body.body = pos.join(' '); break;
+  case 'respond': case 'resolve': case 'verify': case 'watch': case 'handoff': case 'decide': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'incident': body.action = pos.shift(); body.body = pos.join(' '); break;
   case 'context-file': body.path = pos.join(' '); break;
   case 'lesson': body.body = pos.join(' '); break;

@@ -29,6 +29,7 @@ import * as packages from './packages.js';
 import * as netfetch from './netfetch.js';
 import * as mentions from './mentions.js';
 import * as deploywatch from './deploywatch.js';
+import * as delegation from './delegation.js';
 import * as flow from '../public/flow.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
@@ -188,7 +189,8 @@ export function setStatus(key, status, extra = {}) {
   const before = store.getTicket(key)?.status;
   const t = store.updateTicket(key, { status, ...extra });
   github.syncIssueState(key);
-  if (status !== before && status === 'needs_human') notify('needs_human', t, 'needs you');
+  // A hold whose kind is delegated (#9) is announced by the delegation only if it comes back to the owner.
+  if (status !== before && status === 'needs_human' && !delegation.takesNotice(t)) notify('needs_human', t, 'needs you');
   if (status !== before && status === 'ready_for_human') notify('ready_for_human', t, 'ready for your review');
   if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key); // clones are full copies now; free the disk
   if (['done', 'wontdo'].includes(status)) store.clearReservation(key);
@@ -941,6 +943,9 @@ export async function tick() {
   try {
     lastTick = store.now();
     const s = store.getSettings();
+    // Delegated decisions (#9): supersede what moved on, open records, triage owner tasks by rule, send late ones back.
+    // While halted it only expires and supersedes (nothing is applied or started).
+    try { delegation.sweep({ paused: s.paused === 'true' }); } catch (err) { store.logEvent({ kind: 'error', agent_id: 'system', text: `delegation: ${store.redact(err.message).slice(0, 240)}` }); }
     if (s.paused === 'true') return;
     let headroom = budgetHeadroom(s);
     // Seats are flipped to "working" synchronously when a job starts, so this counts jobs still in setup too.
@@ -1020,6 +1025,12 @@ export async function tick() {
     }
     const discussion = store.pendingDiscussions().find((d) => d.status === 'queued');
     if (discussion && slots > 0 && agentIdle('manager')) go('manager', (f) => launchDiscussion(discussion, f), null, 'owner_discussion');
+    // Delegated decisions (#9): one bounded decide run each, while a slot stays free for QA and incidents.
+    for (const r of delegation.nextJobs()) {
+      if (slots <= (capacity(s) > 1 ? 1 : 0)) break;
+      if (!agentIdle(r.seat)) continue;
+      go(r.seat, (f) => delegation.launch(r, f), null, 'decide');
+    }
     // Owner-requested feature grooming (Codex) runs before ordinary grooming: the owner is waiting on it.
     const plan = features.next();
     if (plan && slots > 0 && agentIdle('manager')) go('manager', (f) => features.launch(plan, f), features.ENGINE, 'feature_groom');
@@ -1192,6 +1203,7 @@ export function recoverOrphans() {
     else if ((m.attempts || 0) >= mentions.maxAttempts()) store.updateMention(m.id, { status: 'failed', run_id: null, reason: 'interrupted by desk restarts', ended_at: store.now() });
     else store.updateMention(m.id, { status: 'queued', run_id: null, reason: 'interrupted by a desk restart' });
   }
+  delegation.recover(); // an interrupted decision run is not retried: its decision goes to the owner, explained
   mergetrain.recover(); // interrupted conflict resolutions go back to pending (durable, keyed by PR/base/head)
   // Post-deploy checkpoints: spend is rebuilt from the run rows (never a fresh allowance after a crash), then an
   // interrupted desk check is due again and an interrupted SRE run is asked again (bounded by sreMaxAttempts).
@@ -1220,11 +1232,12 @@ const PERMS = {
   route: ['support'], submit: ENGINEERS, lesson: BUILDERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
   review: ['manager', ...ENGINEERS], respond: ENGINEERS, resolve: ENGINEERS,
-  'continue-rebase': BUILDERS, verify: ['sre'], watch: ['sre'], access: ['manager', 'sre'],
+  'continue-rebase': BUILDERS, verify: ['sre'], watch: ['sre'], access: ['manager', 'sre'], decide: ['manager', 'sre'],
 };
 const PRIORITY = /^P[0-3]$/;
 const consultsByRun = new Map();
 const mentionActions = new Map(); // desk actions per tagged run (server-side allowance)
+const decideActions = new Map(); // desk actions per decision run (#9)
 const consultTargets = new Map();
 const peerReviewsByRun = new Set();
 
@@ -1261,6 +1274,15 @@ export async function deskAction(run, cmd, body = {}) {
     need(used <= mentions.maxActions(), `this tagged run used its ${mentions.maxActions()} desk actions; reply with what you have and stop`);
   } else need(!['reply', 'handoff'].includes(cmd), `desk ${cmd} only works in a run where the owner tagged you`);
   if (run.kind === 'access_review') need(['show', 'list', 'access'].includes(cmd), 'an access review decides one request: desk access approve|deny|owner');
+  // A decision run (#9) reads the brief and the ticket and answers with exactly one desk decide, within an action
+  // allowance the desk counts itself.
+  if (run.kind === 'decide') {
+    need(['show', 'list', 'decide', 'context-file'].includes(cmd), 'a decision run reads the ticket and finishes with desk decide');
+    need(!body.key || body.key === run.ticket_key, 'decide on the decision you were given');
+    const used = (decideActions.get(run.id) || 0) + 1;
+    decideActions.set(run.id, used);
+    need(used <= delegation.limits().maxActions, `this decision run used its ${delegation.limits().maxActions} desk actions; decide with what you have or escalate`);
+  } else need(cmd !== 'decide', 'desk decide only works inside a decision run');
   if (run.kind === 'verify') need(['show', 'list', 'comment', 'progress', 'ops', 'verify', 'context-file'].includes(cmd), 'a verify run reads production through desk ops and finishes with desk verify done|owner');
   // A post-deploy checkpoint run reads and decides; it never comments, submits, publishes or changes a ticket.
   if (run.kind === 'watch') need(['show', 'list', 'ops', 'watch', 'context-file'].includes(cmd), 'a post-deploy check reads production through desk ops and finishes with desk watch verified|regression|inconclusive');
@@ -1743,6 +1765,8 @@ export async function deskAction(run, cmd, body = {}) {
     }
     case 'watch':
       return deploywatch.command(run, body);
+    case 'decide':
+      return delegation.command(run, body);
     case 'review':
       return reviews.reviewVerdict(run, ticket, body);
     case 'respond':
