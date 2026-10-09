@@ -229,6 +229,16 @@ const DEFAULTS = {
     resolveTimeoutSeconds: 180,
     downloadTimeoutSeconds: 120, // per wheel
     grantHours: 24, // an approved set may be installed for this long (and only while its ticket is open)
+    // Budgets for sets nobody approved yet: open requests per seat / per run / in total, all staged wheels together,
+    // and how long an unanswered request keeps its stage.
+    maxPendingPerSeat: 3,
+    maxPendingPerRun: 2,
+    maxPendingTotal: 10,
+    maxStagedMB: 1500,
+    pendingHours: 48,
+    maxUnpackedMB: 1000, // one wheel's contents, unpacked (zip-bomb guard when the desk reads its RECORD)
+    // The resolver's interpreter may not live under these (nor under the workspaces): places seats can write.
+    untrustedRoots: [os.tmpdir(), '/tmp', '/private/tmp'],
   },
   // Production read access ("desk ops"): named, read-only probes the DESK runs for SRE/DBA seats. Seats never get
   // credentials or a shell on the host. Off unless ops.enabled here AND the owner's Settings toggle (ops_enabled).

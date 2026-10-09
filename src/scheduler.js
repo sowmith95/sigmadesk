@@ -47,7 +47,9 @@ export function guardReasons(files, lines, complexity) {
   return reasons;
 }
 
-export const isDocPath = (f) => /\.(md|mdx|rst|txt|adoc)$/i.test(f) || /^docs\//.test(f);
+// Dependency manifests are never documentation (requirements.txt is a .txt): a change to one always needs tests.
+const DEP_MANIFEST = /(^|\/)(requirements[^/]*\.(txt|in)|constraints[^/]*\.txt|pyproject\.toml|setup\.(py|cfg)|Pipfile(\.lock)?|poetry\.lock|uv\.lock|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml)$/i;
+export const isDocPath = (f) => !DEP_MANIFEST.test(f) && (/\.(md|mdx|rst|txt|adoc)$/i.test(f) || /^docs\//.test(f));
 
 // A test command must START a shell segment (so `printf pytest` or `echo npm test` don't count).
 export function isTestCommand(cmd) {
@@ -66,11 +68,15 @@ const PY_TEST = /(^|\/)(pytest|py\.test|tox|nox)\b|(^|\/)python3?(\.\d+)?\s/;
  * Non-Python test commands (npm test, go test, …) are not affected.
  */
 export function testUsesVenv(cmd, ws = '') {
-  const segs = String(cmd).split(/&&|\|\||;|\n/).map((x) => x.trim().replace(/^\(+/, ''));
-  const venvBin = (p) => /(^|\/)\.venv\/bin\//.test(p) && (!p.startsWith('/') || !ws || p.startsWith(`${ws}/.venv/bin/`));
+  const segs = String(cmd).split(/&&|\|\||;|\n|\|/).map((x) => x.trim().replace(/^\(+/, ''));
+  // This workspace's venv only: relative (.venv/…, ./.venv/…) or absolute under this workspace — never another tree's.
+  const ours = (p, sub) => p === `.venv/${sub}` || p === `./.venv/${sub}` || (!!ws && p === `${ws}/.venv/${sub}`);
+  const ourBin = (p) => /^(\.\/)?\.venv\/bin\/[^/]+$/.test(p) || (!!ws && p.startsWith(`${ws}/.venv/bin/`) && !p.slice(`${ws}/.venv/bin/`.length).includes('/'));
   let activated = false, sawTest = false;
   for (const seg of segs) {
-    if (/^(source|\.)\s+(\S*\/)?\.venv\/bin\/activate\b/.test(seg)) { activated = true; continue; }
+    const act = seg.match(/^(?:source|\.)\s+(\S+)\s*$/);
+    if (act) { if (!ours(act[1], 'bin/activate')) return false; activated = true; continue; }
+    if (/^(?:export\s+)?(PATH|VIRTUAL_ENV|PYTHONPATH|PYTHONHOME)=\S*$/.test(seg) || /^(deactivate|cd)\b/.test(seg)) return false; // no re-pointing mid-command
     if (!isTestCommand(seg)) continue;
     sawTest = true;
     const words = seg.split(/\s+/);
@@ -78,8 +84,11 @@ export function testUsesVenv(cmd, ws = '') {
     while (i < words.length && /^[A-Z_]+=/.test(words[i])) envs.push(words[i++]);
     const exe = words[i] || '';
     if (!PY_TEST.test(`${exe} `)) continue; // not a Python test
-    const viaPath = envs.some((e) => /^PATH=[^:]*\.venv\/bin(:|$)/.test(e));
-    if (!(venvBin(exe) || viaPath || activated)) return false;
+    if (envs.some((e) => /^(PYTHONPATH|PYTHONHOME|VIRTUAL_ENV)=/.test(e))) return false;
+    const pathEnv = envs.find((e) => e.startsWith('PATH='));
+    const viaPath = !!pathEnv && ours(pathEnv.slice(5).split(':')[0], 'bin') && !exe.includes('/');
+    const viaActivate = activated && !exe.includes('/') && !pathEnv;
+    if (!(ourBin(exe) || viaPath || viaActivate)) return false;
   }
   return sawTest;
 }
@@ -1591,13 +1600,19 @@ export async function deskAction(run, cmd, body = {}) {
       const docsOnly = await runner.headSha(runner.workspaceDir(ticket.key))
         .then((sha) => runner.stageApproved(ticket.key, runner.workspaceDir(ticket.key), sha))
         .then(({ files }) => files.length > 0 && files.every(isDocPath), () => false); // any doubt → not docs-only
-      // A workspace with its own venv (approved package installs, #8): Python tests count only when run with it.
+      // A workspace with its own venv (approved package installs, #8) never fails open: the venv must verify against
+      // what the owner approved, and the tests must have run through desk test (the canonical interpreter, the real
+      // exit status, recorded with the fingerprint and the commit) — as a command of its own, not chained.
       const wsDir = runner.workspaceDir(ticket.key);
       const venv = packages.qaEnvironment(ticket.key, wsDir);
-      const counts = (e) => e.ok && isTestCommand(e.cmd) && (!venv.venv || testUsesVenv(e.cmd, wsDir));
-      need(docsOnly || ran.some(counts), venv.venv && ran.some((e) => e.ok && isTestCommand(e.cmd))
-        ? 'this workspace has its own venv (.venv, from approved package installs): run the tests with it — e.g. .venv/bin/python -m pytest … — and pass only if they succeed'
-        : `no passing test run in your session yet — run the relevant tests (e.g. ${ran.length ? 'the playbook test command' : 'pytest / npm test'}) and pass only if they succeed`);
+      need(!venv.venv || venv.fingerprint, `this workspace's .venv is not what the owner approved (${venv.error}): QA cannot pass on it — fail it (desk qa fail --reason tests "<what is wrong with the venv>")`);
+      const headNow = await runner.headSha(wsDir).catch(() => null);
+      const deskTested = packages.testRecords(run.id).filter((x) => x.status === 0 && !x.problem && x.sha === headNow && (!venv.venv || x.fp?.installed_sha256 === venv.fingerprint.installed_sha256));
+      const ranDeskTest = ran.some((e) => e.ok && /^\s*desk\s+test\s/.test(e.cmd) && !/&&|\|\||;|\||\n|`|\$\(/.test(e.cmd));
+      const viaDesk = deskTested.length > 0 && ranDeskTest;
+      if (venv.venv) need(viaDesk, 'this workspace has its own venv (.venv, from approved package installs): QA passes only through desk test — e.g. desk test pytest tests -q — which runs .venv/bin/python and records the real exit status (run it as its own command, and pass only if it succeeds)');
+      else need(docsOnly || viaDesk || ran.some((e) => e.ok && isTestCommand(e.cmd)), `no passing test run in your session yet — run the relevant tests (e.g. ${ran.length ? 'the playbook test command' : 'pytest / npm test'}) and pass only if they succeed`);
+      const testedNote = venv.venv ? `Tested with \`desk test ${deskTested.at(-1).args.join(' ').slice(0, 120)}\` (exit 0) at \`${String(headNow).slice(0, 10)}\` in ${wsDir}/.venv — ${packages.fpText(venv.fingerprint)}` : null;
       // The verdict only counts for the exact commit that was submitted.
       const sha = await runner.headSha(runner.workspaceDir(ticket.key));
       need(!ticket.head_sha || sha === ticket.head_sha, `HEAD moved since submission (${sha.slice(0, 7)} ≠ ${String(ticket.head_sha).slice(0, 7)}); QA must not commit`);
@@ -1605,7 +1620,7 @@ export async function deskAction(run, cmd, body = {}) {
         need(store.getTicket(ticket.key)?.status === 'qa', 'the ticket left QA while you were checking it'); // re-checked after the async checks
         refresh.recordQa(ticket.key, sha);
         store.recordQaVerdict({ ...fact, sha, verdict: 'pass' });
-        store.addComment(ticket.key, agentId, `✅ **QA passed** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}${venv.venv ? `\n\n_${venv.note}_` : ''}`);
+        store.addComment(ticket.key, agentId, `✅ **QA passed** at \`${sha.slice(0, 10)}\`\n\n${body.body || ''}${testedNote ? `\n\n_${testedNote}_` : ''}`);
         ev(`QA passed ${ticket.key}`);
       });
       teamStats.invalidate();
@@ -1661,6 +1676,17 @@ export async function deskAction(run, cmd, body = {}) {
       if (a === 'install') return { plan: packages.installPlan(run) };
       if (a === 'installed') return packages.recordInstall(run, { ok: body.ok === true, step: body.step, output: body.output });
       throw Object.assign(new Error('desk pkg request|status|install'), { status: 400 });
+    }
+    case 'test': {
+      // desk test <module> [args…] (#8): the desk names the canonical interpreter (the verified workspace venv, else the
+      // shared venv); bin/desk runs it in this run's sandbox and reports the real exit status, recorded with the
+      // venv fingerprint and the commit for the QA gate.
+      need(run.ticket_key, 'desk test runs on your ticket');
+      const ws = runner.workspaceDir(run.ticket_key);
+      need(store.getRun(run.id)?.cwd === ws, 'desk test runs in the ticket\'s workspace');
+      const sha = await runner.headSha(ws).catch(() => null);
+      if (body.action === 'result') return packages.testResult(run, { id: body.id, status: body.status }, { ws, sha });
+      return { test: packages.testPlan(run, body.args, { ws, sha }) };
     }
     case 'fetch':
       // The desk fetches one page from its documentation allowlist for the seat (seats have no network).

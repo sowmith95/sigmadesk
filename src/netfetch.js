@@ -12,6 +12,9 @@ import dns from 'node:dns';
 import fs from 'node:fs';
 import https from 'node:https';
 import net from 'node:net';
+import { Readable, Transform, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { htmlToTextBounded } from './html-text.js';
 import { config } from './config.js';
 import * as store from './db.js';
 
@@ -62,24 +65,34 @@ export function checkUrl(raw, hosts) {
 }
 
 /** Resolve a host and keep only an address that passed (every answer must be public, or the host is refused). */
-async function resolveSafe(host, lookup) {
-  const answers = await new Promise((resolve, reject) => lookup(host, { all: true, verbatim: true }, (e, a) => (e ? reject(e) : resolve(a))))
-    .catch((e) => { throw err(`cannot resolve ${host} (${e.code || e.message})`, 502); });
+async function resolveSafe(host, lookup, signal) {
+  const answers = await abortable(new Promise((resolve, reject) => lookup(host, { all: true, verbatim: true }, (e, a) => (e ? reject(e) : resolve(a)))), signal)
+    .catch((e) => { throw e.status ? e : err(`cannot resolve ${host} (${e.code || e.message})`, 502); });
   const list = (Array.isArray(answers) ? answers : [answers]).filter(Boolean);
   if (!list.length) throw err(`cannot resolve ${host}`, 502);
   const bad = list.find((a) => isPrivateAddress(a.address));
   if (bad) throw err(`${host} resolves to a private or reserved address (${bad.address}): refused`, 403);
   return list[0];
 }
-
-/** One HTTPS GET pinned to `addr` (no redirects followed here). Resolves { status, headers, stream }. */
-function httpsGet(u, addr, { timeoutMs, headers }) {
+/** Settle `p` or reject as soon as `signal` aborts (whatever `p` does). */
+function abortable(p, signal) {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
-    const req = https.request({ method: 'GET', host: u.hostname, servername: u.hostname, port: 443, path: `${u.pathname}${u.search}`, headers,
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then((v) => { signal.removeEventListener('abort', onAbort); resolve(v); }, (e) => { signal.removeEventListener('abort', onAbort); reject(e); });
+  });
+}
+
+/** One HTTPS GET pinned to `addr` (no redirects followed here). Resolves { status, headers, stream }. The signal ends
+ * DNS-free connect, TLS, headers and body alike. */
+function httpsGet(u, addr, { signal, headers }) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({ method: 'GET', host: u.hostname, servername: u.hostname, port: 443, path: `${u.pathname}${u.search}`, headers, signal,
       // Pinned: the socket connects to the address we checked, whatever DNS says a second time.
       lookup: (_h, opts, cb) => (opts?.all ? cb(null, [{ address: addr.address, family: addr.family }]) : cb(null, addr.address, addr.family)),
-      timeout: timeoutMs, agent: false }, (res) => resolve({ status: res.statusCode, headers: res.headers, stream: res }));
-    req.on('timeout', () => req.destroy(err('timed out', 504)));
+      agent: false }, (res) => resolve({ status: res.statusCode, headers: res.headers, stream: res }));
     req.on('error', reject);
     req.end();
   });
@@ -90,76 +103,71 @@ let resolver = dns.lookup;
 export function _setTransport(fn) { transport = fn || httpsGet; }
 export function _setLookup(fn) { resolver = fn || dns.lookup; }
 
+/** Counts bytes, hashes them and stops the stream past `maxBytes`. */
+function meter(maxBytes, hash, stats) {
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      stats.bytes += chunk.length;
+      if (stats.bytes > maxBytes) return cb(err(`too large (more than ${maxBytes} bytes)`, 413));
+      hash.update(chunk);
+      cb(null, chunk);
+    },
+  });
+}
+
 /**
- * GET a URL under the desk's rules. Options: hosts (exact allowlist), maxBytes, timeoutMs (total, all hops),
- * maxRedirects, file (stream to this path instead of memory; sha256 computed either way).
+ * GET a URL under the desk's rules. Options: hosts (exact allowlist), maxBytes, timeoutMs (ONE deadline across DNS,
+ * connect, TLS, headers, every redirect, the body and the file write), maxRedirects, file (stream to this path instead
+ * of memory; sha256 computed either way), signal (the caller's cancellation, e.g. a revoked package request).
  * Returns { status, url (final), headers, body (Buffer, unless file), bytes, sha256 }.
  */
-export async function safeFetch(raw, { hosts, maxBytes = 2_000_000, timeoutMs = 15_000, maxRedirects = 3, file = null, accept = '*/*' } = {}) {
-  const deadline = Date.now() + timeoutMs;
+export async function safeFetch(raw, { hosts, maxBytes = 2_000_000, timeoutMs = 15_000, maxRedirects = 3, file = null, accept = '*/*', signal = null } = {}) {
   let u = checkUrl(raw, hosts);
-  for (let hop = 0; ; hop++) {
-    const left = deadline - Date.now();
-    if (left <= 0) throw err('timed out', 504);
-    const addr = await resolveSafe(u.hostname, resolver);
-    const res = await transport(u, addr, { timeoutMs: left, headers: { 'User-Agent': 'SigmaDesk-fetch/1', Accept: accept, 'Accept-Encoding': 'identity' } });
-    if ([301, 302, 303, 307, 308].includes(res.status)) {
-      res.stream?.resume?.();
-      if (hop >= maxRedirects) throw err(`too many redirects (more than ${maxRedirects})`, 502);
-      const loc = res.headers?.location;
-      if (!loc) throw err('a redirect without a Location', 502);
-      u = checkUrl(new URL(loc, u).toString(), hosts); // every hop meets the same rules as the first URL
-      continue;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(err(`timed out after ${Math.round(timeoutMs / 1000)}s`, 504)), timeoutMs);
+  const onCaller = () => ac.abort(signal.reason || err('cancelled', 499));
+  if (signal) { if (signal.aborted) onCaller(); else signal.addEventListener('abort', onCaller, { once: true }); }
+  const live = [];
+  try {
+    for (let hop = 0; ; hop++) {
+      const addr = await resolveSafe(u.hostname, resolver, ac.signal);
+      const res = await abortable(Promise.resolve(transport(u, addr, { signal: ac.signal, headers: { 'User-Agent': 'SigmaDesk-fetch/1', Accept: accept, 'Accept-Encoding': 'identity' } })), ac.signal);
+      if (res.stream) { live.push(res.stream); res.stream.on?.('error', () => {}); } // errors surface through pipeline, never as uncaught events
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        res.stream?.destroy?.(); // a redirect's body is never read
+        if (hop >= maxRedirects) throw err(`too many redirects (more than ${maxRedirects})`, 502);
+        const loc = res.headers?.location;
+        if (!loc) throw err('a redirect without a Location', 502);
+        u = checkUrl(new URL(String(loc), u).toString(), hosts); // every hop meets the same rules as the first URL
+        continue;
+      }
+      const declared = Number(res.headers?.['content-length']);
+      if (Number.isFinite(declared) && declared > maxBytes) { res.stream?.destroy?.(); throw err(`too large (${declared} bytes; the limit is ${maxBytes})`, 413); }
+      const hash = crypto.createHash('sha256');
+      const stats = { bytes: 0 };
+      const chunks = [];
+      const sink = file ? fs.createWriteStream(file, { flags: 'wx', mode: 0o644 })
+        : new Writable({ write(c, _e, cb) { chunks.push(c); cb(); } });
+      try {
+        await pipeline(res.stream || Readable.from([]), meter(maxBytes, hash, stats), sink, { signal: ac.signal });
+      } catch (e) {
+        if (file) fs.rmSync(file, { force: true });
+        throw ac.signal.aborted && ac.signal.reason ? ac.signal.reason : e.status ? e : err(`download failed (${e.code || e.message})`, 502);
+      }
+      return { status: res.status, url: u.toString(), headers: res.headers || {}, body: file ? null : Buffer.concat(chunks), bytes: stats.bytes, sha256: hash.digest('hex') };
     }
-    const declared = Number(res.headers?.['content-length']);
-    if (Number.isFinite(declared) && declared > maxBytes) { res.stream?.destroy?.(); throw err(`too large (${declared} bytes; the limit is ${maxBytes})`, 413); }
-    const hash = crypto.createHash('sha256');
-    const chunks = [];
-    let bytes = 0;
-    const out = file ? fs.createWriteStream(file, { flags: 'wx', mode: 0o644 }) : null;
-    try {
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { res.stream.destroy(); reject(err('timed out', 504)); }, Math.max(1, deadline - Date.now()));
-        res.stream.on('data', (c) => {
-          bytes += c.length;
-          if (bytes > maxBytes) { clearTimeout(timer); res.stream.destroy(); reject(err(`too large (more than ${maxBytes} bytes)`, 413)); return; }
-          hash.update(c);
-          if (out) out.write(c); else chunks.push(c);
-        });
-        res.stream.on('end', () => { clearTimeout(timer); resolve(); });
-        res.stream.on('error', (e) => { clearTimeout(timer); reject(e); });
-      });
-    } catch (e) {
-      if (out) { out.destroy(); fs.rmSync(file, { force: true }); }
-      throw e;
-    }
-    if (out) await new Promise((resolve, reject) => out.end((e) => (e ? reject(e) : resolve())));
-    return { status: res.status, url: u.toString(), headers: res.headers || {}, body: file ? null : Buffer.concat(chunks), bytes, sha256: hash.digest('hex') };
+  } catch (e) {
+    for (const st of live) st.destroy?.();
+    throw ac.signal.aborted && ac.signal.reason && !e.status ? ac.signal.reason : e;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener?.('abort', onCaller);
   }
 }
 
 // ---------------- HTML → text ----------------
-const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', mdash: '—', ndash: '–', hellip: '…', copy: '©', reg: '®', rsquo: '’', lsquo: '‘', rdquo: '”', ldquo: '“' };
-/** Plain text from HTML: scripts, styles, forms and comments dropped, block elements become line breaks, tags removed. */
-export function htmlToText(html) {
-  let s = String(html || '');
-  s = s.replace(/<!--[\s\S]*?-->/g, ' ');
-  s = s.replace(/<(script|style|noscript|template|svg|iframe|object|embed|head|form|button|select|textarea)\b[\s\S]*?<\/\1\s*>/gi, ' ');
-  s = s.replace(/<(script|style|noscript|template|svg|iframe|object|embed)\b[^>]*\/?>/gi, ' ');
-  s = s.replace(/<(br|hr)\b[^>]*>/gi, '\n');
-  s = s.replace(/<li\b[^>]*>/gi, '\n- ');
-  s = s.replace(/<h([1-6])\b[^>]*>/gi, (_m, n) => `\n\n${'#'.repeat(Number(n))} `);
-  s = s.replace(/<\/(p|div|section|article|header|footer|li|ul|ol|table|tr|h[1-6]|pre|blockquote|dd|dt|dl)\s*>/gi, '\n');
-  s = s.replace(/<\/(td|th)\s*>/gi, '\t');
-  s = s.replace(/<[^>]*>/g, '');
-  s = s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) => {
-    if (e[0] === '#') { const n = e[1].toLowerCase() === 'x' ? parseInt(e.slice(2), 16) : Number(e.slice(1)); return n > 0 && n < 0x110000 && !(n >= 0xd800 && n < 0xe000) ? String.fromCodePoint(n) : ' '; }
-    return ENTITIES[e.toLowerCase()] ?? m;
-  });
-  // eslint-disable-next-line no-control-regex
-  s = s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f​-‏‪-‮⁦-⁩]/g, '');
-  return s.split('\n').map((l) => l.replace(/[ \t]+/g, ' ').trim()).join('\n').replace(/\n{3,}/g, '\n\n').trim();
-}
+// A linear single-pass parser, run in a worker with a time budget (src/html-text.js).
+export { htmlToText } from './html-text.js';
 
 // ---------------- desk fetch ----------------
 export const fetchHosts = () => (Array.isArray(config.fetch?.hosts) ? config.fetch.hosts : []);
@@ -178,7 +186,7 @@ export async function deskFetch(run, raw) {
     if (r.status < 200 || r.status >= 300) throw err(`the server answered HTTP ${r.status}`, 502);
     const type = String(r.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
     let text;
-    if (type === 'text/html' || type === 'application/xhtml+xml') text = htmlToText(r.body.toString('utf8'));
+    if (type === 'text/html' || type === 'application/xhtml+xml') text = await htmlToTextBounded(r.body.toString('utf8'), { timeoutMs: (Number(f.htmlSeconds) || 2) * 1000 });
     else if (['text/plain', 'text/markdown', 'text/x-rst', 'application/json', 'text/csv'].includes(type) || (!type && !r.body.includes(0))) text = r.body.toString('utf8');
     else throw err(`refused content type ${type || 'unknown'} (text, HTML and JSON only)`, 415);
     const max = Number(f.maxChars) || 60_000;

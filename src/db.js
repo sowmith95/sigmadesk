@@ -435,6 +435,7 @@ CREATE TABLE IF NOT EXISTS pkg_requests (
   installed_at TEXT,
   install_run INTEGER,
   fingerprint TEXT,               -- JSON: the workspace venv the desk verified after the seat's offline install
+  inventory TEXT,                 -- JSON: per added wheel, the files it installs (from its RECORD, each re-hashed)
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS pkg_requests_ticket ON pkg_requests(ticket_key, status);
@@ -871,7 +872,7 @@ export function updateAccessRequest(id, patch) {
 }
 export const openAccessRequests = () => q("SELECT * FROM ops_requests WHERE status IN ('pending','reviewing','owner') ORDER BY id").all();
 // ---------- package installs (#8) ----------
-const PKG_COLS = ['status', 'manifest', 'total_bytes', 'base_lock', 'error', 'decided_by', 'decided_at', 'note', 'expires_at', 'revoked_at', 'revoked_by', 'installed_at', 'install_run', 'fingerprint', 'run_id'];
+const PKG_COLS = ['inventory', 'status', 'manifest', 'total_bytes', 'base_lock', 'error', 'decided_by', 'decided_at', 'note', 'expires_at', 'revoked_at', 'revoked_by', 'installed_at', 'install_run', 'fingerprint', 'run_id'];
 export function insertPkgRequest(r) {
   const info = q('INSERT INTO pkg_requests(seat,ticket_key,run_id,why,specs,dev,status) VALUES (?,?,?,?,?,?,?)').run(
     r.seat, r.ticket_key, r.run_id ?? null, r.why ?? null, JSON.stringify(r.specs), r.dev ? 1 : 0, r.status || 'resolving');
@@ -880,6 +881,14 @@ export function insertPkgRequest(r) {
   return row;
 }
 export const getPkgRequest = (id) => q('SELECT * FROM pkg_requests WHERE id=?').get(id) || null;
+/** Move a request out of one of `from` (a terminal state set by a revoke is never overwritten by a late resolution). */
+export function transitionPkgRequest(id, from, patch) {
+  const keys = Object.keys(patch).filter((k) => PKG_COLS.includes(k));
+  const val = (v) => (v !== null && typeof v === 'object' ? JSON.stringify(v) : v ?? null);
+  const n = q(`UPDATE pkg_requests SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=? AND status IN (${from.map(() => '?').join(',')})`).run(...keys.map((k) => val(patch[k])), id, ...from).changes;
+  if (n) announce({ type: 'packages', data: { id } });
+  return n > 0;
+}
 export function updatePkgRequest(id, patch) {
   const keys = Object.keys(patch).filter((k) => PKG_COLS.includes(k));
   if (keys.length) q(`UPDATE pkg_requests SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=?`).run(...keys.map((k) => (patch[k] !== null && typeof patch[k] === 'object' ? JSON.stringify(patch[k]) : patch[k] ?? null)), id);

@@ -425,11 +425,14 @@ every Codex permission profile keeps `network.enabled = false`). Two narrow desk
 
 - **Python packages, owner-approved, per ticket.** A build run asks with exact pins:
   `desk pkg request name==version [...] --why "…" [--dev]` (canonical names; extras, markers, URLs, ranges and pip
-  options are refused). The *desk* resolves the whole set with the shared venv's pip — wheels only, PyPI only, with
-  the shared venv's current distributions as constraints, so nothing that exists changes version (a request that
-  would replace one is refused) — in a scrubbed environment (no `PIP_*` from your shell, `PIP_CONFIG_FILE=/dev/null`),
-  then downloads every wheel itself from `files.pythonhosted.org` (redirects re-checked, size and time caps) and
-  verifies each sha256. The set is staged under `data/pkg/<id>/`. Your Inbox shows a **Package install** card with
+  options are refused), within budgets for unapproved sets (per run, per seat, in total, staged MB, a TTL). The *desk*
+  resolves the whole set with the shared venv's interpreter and pip started with no startup hooks (`-I -S`), wheels
+  only, `--index-url https://pypi.org/simple` only, in a scrubbed environment (no `PIP_*` from your shell,
+  `PIP_CONFIG_FILE=/dev/null`, temp cwd and HOME, hard time and disk limits). The constraints are the complete ticket
+  lock — the shared venv's distributions read statically from their METADATA, plus what was already approved for the
+  ticket — so nothing existing changes version. pip's answer is only a proposal: the desk downloads every wheel itself
+  from `files.pythonhosted.org` (one deadline across DNS/headers/body, redirects re-checked, size caps), binds it to the
+  sha256, and checks its RECORD file by file; that inventory is what the installed venv is later verified against. The set is staged under `data/pkg/<id>/`. Your Inbox shows a **Package install** card with
   the requester, ticket, reason and every wheel (transitive ones too) with its version, size and sha256; only you
   approve (Access sheet: approve, decline, revoke). No probe grant, owner tag or post-deploy grant covers packages.
 - **Offline install inside the sandbox.** Runs of that seat on that ticket started after the approval can read that
@@ -438,8 +441,10 @@ every Codex permission profile keeps `network.enabled = false`). Two narrow desk
   through a `.pth` file (not `--system-site-packages`), and installs with
   `pip install --no-index --no-deps --require-hashes --find-links <stage>` using pip from a wheel in the stage, with
   `PYTHONDONTWRITEBYTECODE=1` and a desk-owned CA bundle copy (`data/pkg/ca.pem`). The desk then reads the venv back
-  (never executing it) and records its fingerprint (Python, platform, full lock, hashes) on the ticket. QA counts
-  Python tests only when run with `.venv/bin/python` and names the fingerprint; the merge brief says "adds N
+  (never executing it): interpreter identity, every installed file hashed against the approved inventories, no
+  unexpected file, `.pth`, `sitecustomize` or bytecode, the shared venv unchanged; that fingerprint is recorded on the
+  ticket. With a `.venv`, QA passes only through `desk test <module> …` (the canonical interpreter, the real exit
+  status, recorded with the fingerprint and the commit); an unverifiable venv blocks QA; the merge brief says "adds N
   dependencies (runtime/dev)", and reviewers are asked to check the requirements file change. Revoking, expiry
   (`packages.grantHours`) or the ticket closing deletes the stage and refuses further installs; the workspace venv dies
   with the workspace. The shared venv is never written.

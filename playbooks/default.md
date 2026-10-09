@@ -6,8 +6,8 @@ Every seat reads it on every run. Keep it short and concrete.
 ## How to test
 - Find the project's test runner (package.json scripts, pytest.ini, Makefile, go.mod, Cargo.toml).
 - Run only the tests related to your change. Never start long-running services.
-- If this workspace has its own `.venv` (packages the owner approved for this ticket), run Python and the tests with it:
-  `.venv/bin/python -m pytest …`. QA only counts Python tests run through it.
+- If this workspace has its own `.venv` (packages the owner approved for this ticket), run the tests through
+  `desk test pytest …` (it uses `.venv/bin/python` and records the real exit status). QA passes only that way.
 
 ## Dependencies
 - Your shell has no network. Need a Python package the shared environment lacks? Ask with exact pins:

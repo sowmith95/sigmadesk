@@ -225,7 +225,7 @@ export function board(state, extra = {}) {
     const transitive = adds.length - (r.specs || []).length;
     out.needs_you.push({ key: `packages-${r.id}`, id: `packages:${r.id}`, kind: 'packages', bucket: 'needs_you', name: who, packages: r, ticket_key: r.ticket_key || null, ticket: null, ticket_name: lt ? nameOf(lt) : r.ticket_key,
       action: 'Review packages', verb: `Let ${who} install ${adds.length} package${adds.length === 1 ? '' : 's'} for ${r.ticket_key}?`,
-      reason: `${r.why || ''} — ${adds.map((x) => `${x.name}==${x.version}`).join(', ')}${transitive > 0 ? ` (${transitive} pulled in as dependencies)` : ''}${size}${r.dev ? ' · dev/test only' : ''}`.trim(), since: r.created_at });
+      reason: `${r.why || ''} — ${adds.map((x) => `${x.name}==${x.version}`).join(', ')}${transitive > 0 ? ` (${transitive} pulled in as dependencies)` : ''}${size}${r.dev ? ' · dev/test only' : ''}${(r.startup || []).length ? ` · ⚠ startup code: ${r.startup.map((x) => x.name).join(', ')}` : ''}`.trim(), since: r.created_at });
   }
   // An epic review's one question (and its proposed closes) is the owner's single decision for that epic.
   const byKey = new Map(tickets.map((t) => [t.key, t]));

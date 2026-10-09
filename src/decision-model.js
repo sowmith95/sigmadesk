@@ -254,6 +254,8 @@ export function brief(facts) {
     out.you_decide = d.verb;
     out.consequence = { summary: `Lets ${d.name} install ${plural(adds.length, 'package')}${mbs} offline into ${r.ticket_key || 'the ticket'}'s workspace venv.`,
       steps: [{ text: `Installs exactly these wheels from the desk's stage, hash-checked: ${list(adds.map((x) => `${x.name}==${x.version}`))}.`, tone: 'ok' },
+        { text: 'pip\'s resolution was only a proposal: the desk downloaded each wheel itself, bound it to its sha256 and read its file list; the installed venv is verified against it file by file.', tone: 'ok' },
+        ...((r.startup || []).length ? [{ text: `Startup code: ${list(r.startup.map((x) => `${x.name} (${x.files.join(', ')})`))} runs at every Python start in that venv.`, tone: 'deploy' }] : []),
         { text: 'The shared venv does not change: the workspace venv layers on it read-only, and nothing already there changes version.', tone: 'ok' },
         { text: 'Wheels run their code when imported inside the seat\'s sandbox (no network, writes only in its workspace).', tone: 'unknown' },
         { text: `The ticket must add the dependency to the right requirements file${r.dev ? ' (development/test only)' : ''}; reviewers check that change.`, tone: 'deploy' }] };

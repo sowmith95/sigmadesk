@@ -6,9 +6,9 @@ import { api, loadSnapshot } from '@/store.js';
 import { AsyncButton } from '@/components/desk/AsyncButton';
 import { Tag, type Tone } from '@/components/desk/Bits';
 
-export type Wheel = { name: string; version: string; filename: string; sha256: string; size: number | null; requested: boolean; role: string };
+export type Wheel = { name: string; version: string; filename: string; sha256: string; size: number | null; requested: boolean; role: string; files?: number; startup?: string[] };
 export type PkgRequest = { id: number; seat: string; seat_name: string; ticket_key: string; why: string | null; specs: { name: string; version: string }[]; dev: number; status: string;
-  manifest: Wheel[]; additions: Wheel[]; shared_count: number; total_bytes: number | null; error: string | null; note: string | null; expires_at: string | null; installed_at: string | null; created_at: string };
+  manifest: Wheel[]; additions: Wheel[]; shared_count: number; startup?: { name: string; files: string[] }[]; total_bytes: number | null; error: string | null; note: string | null; expires_at: string | null; installed_at: string | null; created_at: string };
 export type Fingerprint = { python: string; platform: string; shared_venv: string; added: { name: string; version: string; sha256: string; dev: boolean }[]; lock_size: number; lock_sha256: string; verified_at: string };
 
 const STATUS: Record<string, { label: string; tone: Tone }> = {
@@ -33,12 +33,14 @@ export function PackageRequestRow({ r, onDone }: { r: PkgRequest; onDone?: () =>
         {r.total_bytes ? <span className="text-muted-foreground"> · {mbText(r.total_bytes)}</span> : null}</p>
       {r.why && <p className="text-sm text-muted-foreground">{r.why}</p>}
       {(r.error || (r.note && r.status !== 'approved')) && <p className="text-sm text-blocked">{r.error || r.note}</p>}
+      {!!r.startup?.length && <p className="text-sm text-blocked" data-startup>⚠ Runs code at every Python start in that venv: {r.startup.map((x) => `${x.name} (${x.files.join(', ')})`).join('; ')}</p>}
+      {!!wheels.length && <p className="text-[13px] text-muted-foreground">pip's resolution is only a proposal: the desk downloaded every wheel itself from PyPI, bound it to its sha256 and read its file list; after the install the venv is checked file by file.</p>}
       {r.status === 'approved' && r.expires_at && <p className="text-[13px] text-muted-foreground">Installable until {r.expires_at.slice(5, 16).replace('T', ' ')} UTC, while {r.ticket_key} is open.</p>}
       {!!wheels.length && <details open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
         <summary className="cursor-pointer text-sm text-primary">{wheels.length} wheel{wheels.length === 1 ? '' : 's'} from PyPI{r.shared_count ? ` · ${r.shared_count} already in the shared venv (unchanged)` : ''}</summary>
         <ul className="mt-1 grid gap-1 text-[13px]">
           {wheels.map((w) => <li key={w.filename} className="grid min-w-0">
-            <span><span className="font-mono">{w.name}=={w.version}</span>{w.requested ? <span className="text-muted-foreground"> · asked for</span> : w.role === 'installer' ? <span className="text-muted-foreground"> · installer only (not installed)</span> : <span className="text-muted-foreground"> · dependency</span>} · {mbText(w.size)}</span>
+            <span><span className="font-mono">{w.name}=={w.version}</span>{w.files ? <span className="text-muted-foreground"> · {w.files} files</span> : null}{w.requested ? <span className="text-muted-foreground"> · asked for</span> : w.role === 'installer' ? <span className="text-muted-foreground"> · installer only (not installed)</span> : <span className="text-muted-foreground"> · dependency</span>} · {mbText(w.size)}</span>
             <span className="truncate font-mono text-[11px] text-muted-foreground" title={w.sha256}>sha256 {w.sha256}</span></li>)}
         </ul>
       </details>}

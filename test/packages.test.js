@@ -1,12 +1,13 @@
-// Package installs (#8) and desk fetch. Stubs only: a fake shared-venv interpreter (a node script that answers
-// `pip list` and `pip install --dry-run --report`), a fake HTTPS transport and DNS for wheel downloads and fetches, and
-// a fixture workspace venv. Nothing reaches PyPI, the network or the real shared venv.
+// Package installs (#8) and desk fetch. Stubs only: a fake shared venv (static dist-info METADATA and a "python" node
+// script that answers `pip install --dry-run --report`), real wheel zips built here, a fake HTTPS transport and DNS for
+// wheel downloads and fetches, and fixture workspace venvs. Nothing reaches PyPI, the network or the real shared venv.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { Readable } from 'node:stream';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -14,18 +15,24 @@ import { fileURLToPath } from 'node:url';
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'sigmadesk-pkg-')));
 const repo = path.join(tmp, 'repo');
 fs.mkdirSync(repo);
+const git = (dir, ...a) => execFileSync('git', ['-C', dir, '-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { stdio: 'pipe' }).toString().trim();
 execFileSync('git', ['init', '-q', '-b', 'main', repo]);
 fs.writeFileSync(path.join(repo, 'README.md'), 'hi\n');
-execFileSync('git', ['-C', repo, 'add', '.']);
-execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { stdio: 'ignore' });
+git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'init');
 
-// ---- a fake shared venv: pyvenv.cfg, site-packages with certifi's bundle, and a "python" that fakes pip ----
+// ---- a fake shared venv: pyvenv.cfg, site-packages read statically, and a "python" that fakes pip's resolver ----
 const venv = path.join(tmp, 'shared-venv');
 const site = path.join(venv, 'lib', 'python3.12', 'site-packages');
 fs.mkdirSync(path.join(site, 'certifi'), { recursive: true });
+fs.mkdirSync(path.join(site, 'pip'));
 fs.mkdirSync(path.join(venv, 'bin'));
 fs.writeFileSync(path.join(venv, 'pyvenv.cfg'), 'home = /opt/python/bin\ninclude-system-site-packages = false\nversion = 3.12.4\n');
 fs.writeFileSync(path.join(site, 'certifi', 'cacert.pem'), '-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n');
+const distInfo = (dir, name, version, extra = {}) => { fs.mkdirSync(path.join(dir, `${name.replace(/-/g, '_')}-${version}.dist-info`), { recursive: true }); fs.writeFileSync(path.join(dir, `${name.replace(/-/g, '_')}-${version}.dist-info`, 'METADATA'), `Metadata-Version: 2.1\nName: ${name}\nVersion: ${version}\n`); for (const [f, t] of Object.entries(extra)) fs.writeFileSync(path.join(dir, `${name.replace(/-/g, '_')}-${version}.dist-info`, f), t); };
+distInfo(site, 'pip', '24.0'); distInfo(site, 'requests', '2.32.3'); distInfo(site, 'rich', '13.9.4');
+distInfo(site, 'agent-swarm', '0.1.0', { 'direct_url.json': '{"url": "file:///x", "dir_info": {"editable": true}}' });
+fs.writeFileSync(path.join(site, 'evil-startup.pth'), 'import os; os.system("touch /tmp/pwned")\n'); // never runs: the resolver starts with -I -S
+const SHARED_N = 4;
 const pipCtl = path.join(tmp, 'pip.json'), pipLog = path.join(tmp, 'pip.log');
 const fakePy = path.join(venv, 'bin', 'python');
 fs.writeFileSync(fakePy, `#!${process.execPath}
@@ -33,15 +40,13 @@ const fs = require('fs');
 const a = process.argv.slice(2);
 const ctl = JSON.parse(fs.readFileSync(${JSON.stringify(pipCtl)}, 'utf8'));
 const c = a.indexOf('-c');
-fs.appendFileSync(${JSON.stringify(pipLog)}, JSON.stringify({ argv: a, env: process.env, constraints: c >= 0 ? fs.readFileSync(a[c + 1], 'utf8') : null }) + '\\n');
-if (a.includes('list')) { process.stdout.write(JSON.stringify(ctl.list)); process.exit(0); }
+fs.appendFileSync(${JSON.stringify(pipLog)}, JSON.stringify({ argv: a, env: process.env, cwd: process.cwd(), constraints: c >= 0 ? fs.readFileSync(a[c + 1], 'utf8') : null }) + '\\n');
 if (a.includes('install') && a.includes('--dry-run')) {
   if (ctl.stderr) process.stderr.write(ctl.stderr);
   if (ctl.code) process.exit(ctl.code);
-  fs.writeFileSync(a[a.indexOf('--report') + 1], JSON.stringify(ctl.report));
-  process.exit(0);
-}
-process.exit(9);
+  if (ctl.hang) setInterval(() => {}, 1000);
+  else { fs.writeFileSync(a[a.indexOf('--report') + 1], JSON.stringify(ctl.report)); process.exit(0); }
+} else process.exit(9);
 `);
 fs.chmodSync(fakePy, 0o755);
 
@@ -54,11 +59,12 @@ process.env.SIGMADESK_DB = ':memory:';
 process.env.PIP_INDEX_URL = 'http://evil.example/simple';
 process.env.PIP_TRUSTED_HOST = 'evil.example';
 
-let config, store, packages, netfetch, runner, sched, access, attention, codex, decisionModel;
+let config, store, packages, netfetch, runner, sched, access, attention, codex, decisionModel, wheelMod, htmlText;
 before(async () => {
   ({ config } = await import('../src/config.js'));
   config.dataDir = path.join(tmp, 'data'); // keep stages and the CA copy out of the checkout
   config.workspaceRoot = path.join(tmp, 'workspaces');
+  config.packages.untrustedRoots = []; // the fixture venv lives under the temp dir (a dedicated test covers the rule)
   store = await import('../src/db.js');
   store.openDb(':memory:');
   packages = await import('../src/packages.js');
@@ -69,26 +75,65 @@ before(async () => {
   attention = await import('../public/attention.js');
   ({ codex } = await import('../src/engines/codex.js'));
   decisionModel = await import('../src/decision-model.js');
+  wheelMod = await import('../src/wheel.js');
+  htmlText = await import('../src/html-text.js');
 });
-after(() => { netfetch._setTransport(null); netfetch._setLookup(null); fs.rmSync(tmp, { recursive: true, force: true }); });
+after(() => {
+  netfetch._setTransport(null); netfetch._setLookup(null);
+  // Stages are read-only (0555): open them up before removing the fixture tree.
+  const open = (d) => { try { fs.chmodSync(d, 0o755); } catch { return; } for (const e of fs.readdirSync(d, { withFileTypes: true })) if (e.isDirectory() && !e.isSymbolicLink()) open(path.join(d, e.name)); };
+  open(tmp);
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+// ---- wheels: real zip archives with a RECORD ----
+function zip(entries) {
+  const locals = [], centrals = [];
+  let off = 0;
+  for (const e of entries) {
+    const name = Buffer.from(e.name), crc = zlib.crc32(e.data) >>> 0;
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(e.data.length, 18); lh.writeUInt32LE(e.data.length, 22); lh.writeUInt16LE(name.length, 26);
+    locals.push(lh, name, e.data);
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt32LE(crc, 16); ch.writeUInt32LE(e.data.length, 20); ch.writeUInt32LE(e.data.length, 24); ch.writeUInt16LE(name.length, 28); ch.writeUInt32LE(off, 42);
+    centrals.push(ch, name);
+    off += 30 + name.length + e.data.length;
+  }
+  const cd = Buffer.concat(centrals), eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); eocd.writeUInt16LE(entries.length, 8); eocd.writeUInt16LE(entries.length, 10); eocd.writeUInt32LE(cd.length, 12); eocd.writeUInt32LE(off, 16);
+  return Buffer.concat([...locals, cd, eocd]);
+}
+const b64sha = (b) => crypto.createHash('sha256').update(b).digest('base64url');
+const contents = {}; // "name==version" -> { relative path: Buffer } (what pip would install)
+function wheelZip(name, version, { files = null, badRecord = false } = {}) {
+  const mod = name.replace(/-/g, '_');
+  const di = `${mod}-${version}.dist-info`;
+  const fl = files || { [`${mod}/__init__.py`]: `VERSION = "${version}"\n` };
+  const all = { ...fl, [`${di}/METADATA`]: `Metadata-Version: 2.1\nName: ${name}\nVersion: ${version}\n`, [`${di}/WHEEL`]: 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n' };
+  const entries = Object.entries(all).map(([n, t]) => ({ name: n, data: Buffer.from(t) }));
+  const record = `${entries.map((e) => `${e.name},sha256=${badRecord && e.name.endsWith('.py') ? 'AAAA' : b64sha(e.data)},${e.data.length}`).join('\n')}\n${di}/RECORD,,\n`;
+  contents[`${name}==${version}`] = Object.fromEntries(entries.map((e) => [e.name, e.data]));
+  return zip([...entries, { name: `${di}/RECORD`, data: Buffer.from(record) }]);
+}
 
 // ---- fixtures ----
 const wheels = {}; // url -> Buffer served by the fake transport
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
-function wheel(name, version, { host = 'files.pythonhosted.org', file = null, body = null, requested = false, direct = false, badHash = false } = {}) {
+function wheel(name, version, { host = 'files.pythonhosted.org', file = null, body = null, requested = false, direct = false, badHash = false, files = null, badRecord = false } = {}) {
   const filename = file || `${name.replace(/-/g, '_')}-${version}-py3-none-any.whl`;
   const url = `https://${host}/packages/ab/cd/${filename}`;
-  const content = body || Buffer.from(`wheel ${name} ${version}`);
+  const content = body || wheelZip(name, version, { files, badRecord });
   wheels[url] = content;
   return { download_info: { url, archive_info: { hash: `sha256=${badHash ? 'f'.repeat(64) : sha(content)}`, hashes: { sha256: badHash ? 'f'.repeat(64) : sha(content) } } },
     is_direct: direct, requested, metadata: { name, version } };
 }
-const SHARED = [{ name: 'pip', version: '24.0' }, { name: 'requests', version: '2.32.3' }, { name: 'rich', version: '13.9.4' }, { name: 'agent-swarm', version: '0.1.0', editable_project_location: '/x' }];
-function setPip({ report, list = SHARED, code = 0, stderr = '' }) { fs.writeFileSync(pipCtl, JSON.stringify({ report, list, code, stderr })); fs.rmSync(pipLog, { force: true }); }
+function setPip({ report = null, code = 0, stderr = '', hang = false }) { fs.writeFileSync(pipCtl, JSON.stringify({ report, code, stderr, hang })); fs.rmSync(pipLog, { force: true }); }
 const pipCalls = () => fs.readFileSync(pipLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-function fakeNet({ addresses = {} } = {}) {
+function fakeNet({ addresses = {}, hold = null } = {}) {
   netfetch._setLookup((host, _o, cb) => cb(null, [{ address: addresses[host] || '151.101.0.223', family: 4 }]));
-  netfetch._setTransport(async (u) => {
+  netfetch._setTransport(async (u, _addr, { signal }) => {
+    if (hold && u.toString().includes(hold)) return new Promise((_r, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
     const body = wheels[u.toString()];
     if (!body) return { status: 404, headers: {}, stream: Readable.from([]) };
     return { status: 200, headers: { 'content-length': String(body.length) }, stream: Readable.from([body]) };
@@ -106,7 +151,33 @@ async function resolved(run, specs, report, extra = {}) {
   await packages.settled();
   return store.pkgRequestsForTicket(run.ticket_key).at(-1);
 }
-const goodReport = () => ({ version: '1', pip_version: '24.0', install: [wheel('humanize', '4.9.0', { requested: true }), wheel('rich', '13.9.4'), wheel('pip', '24.0', { requested: true })] });
+const goodReport = (v = '4.9.0') => ({ version: '1', pip_version: '24.0', install: [wheel('humanize', v, { requested: true }), wheel('rich', '13.9.4'), wheel('pip', '24.0', { requested: true })] });
+/** What `desk pkg install` leaves in a workspace (pip's own records included), built from the wheels' contents. */
+function simulateInstall(wsDir, pins) {
+  const dv = path.join(wsDir, '.venv'), vsite = path.join(dv, 'lib', 'python3.12', 'site-packages');
+  fs.mkdirSync(path.join(dv, 'bin'), { recursive: true }); fs.mkdirSync(vsite, { recursive: true });
+  fs.writeFileSync(path.join(dv, 'pyvenv.cfg'), `home = ${path.dirname(fakePy)}\ninclude-system-site-packages = false\nversion = 3.12.4\n`);
+  if (!fs.existsSync(path.join(dv, 'bin', 'python'))) fs.symlinkSync(fakePy, path.join(dv, 'bin', 'python'));
+  fs.writeFileSync(path.join(vsite, '_sigmadesk_shared.pth'), packages.pthText(site));
+  for (const pin of pins) for (const [rel, data] of Object.entries(contents[pin])) {
+    fs.mkdirSync(path.dirname(path.join(vsite, rel)), { recursive: true }); fs.writeFileSync(path.join(vsite, rel), data);
+    const di = rel.split('/')[0];
+    if (di.endsWith('.dist-info')) for (const f of ['INSTALLER', 'RECORD', 'REQUESTED']) fs.writeFileSync(path.join(vsite, di, f), 'pip\n');
+  }
+  return vsite;
+}
+async function approvedInstalled(title, { dev = false } = {}) {
+  const t = store.createTicket({ title, status: 'in_progress' });
+  const r = await resolved(mkRun('junior', 'implement', t.key), ['humanize==4.9.0'], goodReport(), { dev });
+  assert.equal(r.status, 'owner', r.error);
+  packages.decide(r.id, 'approve', { by: 'owner' });
+  const run = mkRun('junior', 'implement', t.key);
+  packages.recordLaunch(run.id, packages.readPathsFor('junior', t.key, 'implement').ids);
+  packages.installPlan(run);
+  const vsite = simulateInstall(ws(t.key), ['humanize==4.9.0']);
+  packages.recordInstall(run, { ok: true });
+  return { t, r, run, vsite, w: ws(t.key) };
+}
 
 // ---------------- parsing ----------------
 test('pins: exact name==version only; canonical names; extras, markers, URLs, ranges and options refused', () => {
@@ -122,54 +193,90 @@ test('pins: exact name==version only; canonical names; extras, markers, URLs, ra
 });
 
 // ---------------- resolution ----------------
-test('resolution: the desk resolves with the shared venv\'s pip — wheels only, PyPI only, constrained, scrubbed — and stages hash-verified wheels', async () => {
+test('resolution: -I -S pip from its directory, static constraints, scrubbed env, PyPI only; every wheel re-fetched, hash-bound and inventoried', async () => {
   const t = store.createTicket({ title: 'parse dates', status: 'in_progress' });
   const run = mkRun('junior', 'implement', t.key);
   const r = await resolved(run, ['humanize==4.9.0'], goodReport());
   assert.equal(r.status, 'owner', r.error);
-  const [list, dry] = pipCalls();
-  assert.deepEqual(list.argv.slice(0, 4), ['-I', '-m', 'pip', 'list']);
-  for (const f of ['--dry-run', '--isolated', '--only-binary=:all:', '--no-cache-dir', '--no-input']) assert.ok(dry.argv.includes(f), f);
+  const calls = pipCalls();
+  assert.equal(calls.length, 1, 'the shared venv is listed statically: the only execution is the resolver');
+  const [dry] = calls;
+  assert.deepEqual(dry.argv.slice(0, 4), ['-I', '-S', path.join(site, 'pip'), 'install'], 'no site import: the shared venv\'s .pth files never run');
+  for (const f of ['--dry-run', '--only-binary=:all:', '--no-cache-dir', '--no-input']) assert.ok(dry.argv.includes(f), f);
+  assert.ok(!dry.argv.includes('--isolated'), '--isolated would re-enable global/site pip config files');
   assert.equal(dry.argv[dry.argv.indexOf('--index-url') + 1], 'https://pypi.org/simple');
+  assert.ok(!dry.argv.some((a) => /extra-index|find-links|trusted-host/.test(a)));
+  assert.equal(dry.argv[dry.argv.indexOf('--timeout') + 1], '30');
   assert.ok(dry.argv[dry.argv.indexOf('--target') + 1].includes(path.join('data', 'pkg')), 'a throwaway target, never the shared venv');
+  assert.ok(dry.cwd.includes(path.join('data', 'pkg')), 'a temp working directory');
   assert.ok(dry.argv.includes('humanize==4.9.0') && dry.argv.includes('pip==24.0'));
-  const constraints = dry.constraints;
-  assert.match(constraints, /^requests==2\.32\.3$/m);
-  assert.match(constraints, /^rich==13\.9\.4$/m);
-  assert.ok(!/agent-swarm/.test(constraints), 'editable installs are not PyPI constraints');
-  // Scrubbed: the owner's PIP_* never reach pip; config files are off; HOME is a throwaway.
+  assert.match(dry.constraints, /^requests==2\.32\.3$/m);
+  assert.match(dry.constraints, /^rich==13\.9\.4$/m);
+  assert.ok(!/agent-swarm/.test(dry.constraints), 'editable installs are not PyPI constraints');
   assert.equal(dry.env.PIP_INDEX_URL, undefined);
   assert.equal(dry.env.PIP_TRUSTED_HOST, undefined);
   assert.equal(dry.env.PIP_CONFIG_FILE, '/dev/null');
+  assert.equal(dry.env.PYTHONNOUSERSITE, '1');
   assert.ok(dry.env.HOME.startsWith(path.join(tmp, 'data', 'pkg')));
   assert.ok(!Object.keys(dry.env).some((k) => /PROXY/i.test(k)));
-  // Manifest: the addition, the shared (unchanged) distribution, and pip as installer only.
   const m = JSON.parse(r.manifest);
   assert.deepEqual(m.map((x) => [x.name, x.role]), [['humanize', 'add'], ['rich', 'shared'], ['pip', 'installer']]);
+  assert.equal(m[0].files, 3);
+  const inv = JSON.parse(r.inventory).humanize;
+  assert.equal(inv.distInfo, 'humanize-4.9.0.dist-info');
+  assert.deepEqual(inv.files.map((f) => f.path).sort(), ['humanize-4.9.0.dist-info/METADATA', 'humanize-4.9.0.dist-info/WHEEL', 'humanize/__init__.py']);
   const stage = packages.stageDir(r.id);
   assert.deepEqual(fs.readdirSync(stage).sort(), ['humanize-4.9.0-py3-none-any.whl', 'manifest.txt', 'pip-24.0-py3-none-any.whl']);
-  assert.equal(fs.readFileSync(path.join(stage, 'manifest.txt'), 'utf8'), `humanize==4.9.0 --hash=sha256:${sha(Buffer.from('wheel humanize 4.9.0'))}\n`);
+  assert.equal(fs.readFileSync(path.join(stage, 'manifest.txt'), 'utf8'), `humanize==4.9.0 --hash=sha256:${m[0].sha256}\n`);
   assert.equal(fs.statSync(stage).mode & 0o777, 0o555);
   assert.ok(fs.existsSync(packages.caPath()), 'a desk-owned CA bundle copy');
-  assert.equal(r.total_bytes, Buffer.from('wheel humanize 4.9.0').length + Buffer.from('wheel pip 24.0').length);
-  // The owner's Inbox card shows requester, ticket, every addition and the size.
+  // The owner's Inbox card: requester, ticket, every addition, size; the brief says the report was only a proposal.
   const B = attention.board({ tickets: store.listTickets(), agents: [{ id: 'junior', name: 'Jamie' }], meta: { packages: packages.summary() } });
-  const card = B.decisions.find((d) => d.kind === 'packages');
+  const card = B.decisions.find((d) => d.kind === 'packages' && d.packages.id === r.id);
   assert.equal(card.verb, `Let Jamie install 1 package for ${t.key}?`);
   assert.match(card.reason, /humanize==4\.9\.0/);
-  assert.equal(card.packages.additions[0].sha256, m[0].sha256);
   const brief = decisionModel.brief({ decision: card });
   assert.match(brief.consequence.summary, /install 1 package .* offline/);
+  assert.ok(brief.consequence.steps.some((x) => /only a proposal/.test(x.text)));
   assert.equal(brief.gate.items[0].state, 'yours');
+  packages.decide(r.id, 'deny', { note: 'cleanup' });
 });
 
-test('resolution refuses anything that would change the shared venv, leave PyPI, or skip a wheel', async () => {
+test('resolver trust: the interpreter must be the configured shared venv and outside anything seats write', () => {
+  const save = { ...config.packages };
+  try {
+    config.packages.untrustedRoots = [tmp];
+    throws(() => packages.sharedEnv(), /where seats can write: refused/);
+    config.packages.untrustedRoots = [];
+    const wsVenv = path.join(config.workspaceRoot, 'P-999', 'venv');
+    fs.mkdirSync(path.join(wsVenv, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(wsVenv, 'pyvenv.cfg'), 'version = 3.12.4\n');
+    fs.symlinkSync(fakePy, path.join(wsVenv, 'bin', 'python'));
+    config.packages.python = path.join(wsVenv, 'bin', 'python');
+    throws(() => packages.sharedEnv(), /under .*workspaces, where seats can write/);
+    // A link from outside into a workspace is judged by where it resolves.
+    const link = path.join(tmp, 'linked-venv');
+    fs.symlinkSync(wsVenv, link);
+    config.packages.python = path.join(link, 'bin', 'python');
+    throws(() => packages.sharedEnv(), /where seats can write/);
+    config.packages.python = '';
+    const ro = config.project.readOnlyPaths;
+    config.project.readOnlyPaths = [];
+    throws(() => packages.sharedEnv(), /no shared Python environment/);
+    config.project.readOnlyPaths = ro;
+  } finally { Object.assign(config.packages, save); }
+  // Distributions are read from METADATA files, never by running anything.
+  const d = packages.staticDistributions(site);
+  assert.deepEqual(Object.keys(d).sort(), ['agent-swarm', 'pip', 'requests', 'rich']);
+  assert.equal(d['agent-swarm'].editable, true);
+});
+
+test('resolution refuses anything that would change the shared venv or the ticket lock, leave PyPI, skip a wheel, or lie in its RECORD', async () => {
   const t = store.createTicket({ title: 'refusals', status: 'in_progress' });
   const run = mkRun('junior', 'implement', t.key);
   const cases = [
     [['rich==14.0.0'], goodReport(), /would replace rich 13\.9\.4 with 14\.0\.0/],
     [['requests==2.32.3'], goodReport(), /already in the shared environment/],
-    // A transitive dependency that would replace an existing distribution (the stub resolver ignores constraints).
     [['textual==0.47.1'], { install: [wheel('textual', '0.47.1', { requested: true }), wheel('rich', '14.1.0'), wheel('pip', '24.0')] }, /would replace rich 13\.9\.4 with 14\.1\.0 in the shared environment/],
     [['textual==0.47.1'], { install: [wheel('textual', '0.47.1', { requested: true, host: 'evil.example' }), wheel('pip', '24.0')] }, /only files\.pythonhosted\.org/],
     [['textual==0.47.1'], { install: [wheel('textual', '0.47.1', { requested: true, file: 'textual-0.47.1.tar.gz' }), wheel('pip', '24.0')] }, /not a wheel/],
@@ -177,6 +284,9 @@ test('resolution refuses anything that would change the shared venv, leave PyPI,
     [['textual==0.47.1'], { install: [wheel('textual', '0.47.1', { requested: true, badHash: true }), wheel('pip', '24.0')] }, /does not match the sha256/],
     [['textual==0.47.2'], { install: [wheel('textual', '0.47.2', { requested: true, body: Buffer.alloc(1_200_000) }), wheel('pip', '24.0')] }, /too large|larger than/],
     [['textual==0.47.1'], { install: [wheel('textual', '0.47.1', { requested: true })] }, /pip's own wheel is missing/],
+    [['textual==0.47.3'], { install: [wheel('textual', '0.47.3', { requested: true, badRecord: true }), wheel('pip', '24.0')] }, /does not match the wheel's RECORD/],
+    [['textual==0.47.4'], { install: [wheel('textual', '0.47.4', { requested: true, files: { '../escape.py': 'x' } }), wheel('pip', '24.0')] }, /unsafe path/],
+    [['textual==0.47.5'], { install: [wheel('textual', '0.47.5', { requested: true, body: Buffer.from('not a zip at all') }), wheel('pip', '24.0')] }, /not a zip/],
   ];
   for (const [specs, report, re] of cases) {
     const r = await resolved(run, specs, report);
@@ -184,14 +294,91 @@ test('resolution refuses anything that would change the shared venv, leave PyPI,
     assert.match(r.error, re);
     assert.ok(!fs.existsSync(packages.stageDir(r.id)), 'a refused set leaves no stage');
   }
-  // pip's own refusal (constraints conflict) is reported in plain words.
-  setPip({ report: null, code: 1, stderr: 'ERROR: Cannot install x==1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit …\n' });
+  setPip({ code: 1, stderr: 'ERROR: Cannot install x==1 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit …\n' });
   packages.request(run, { specs: ['x==1.0'], why: 'w' });
   await packages.settled();
-  assert.match(store.pkgRequestsForTicket(t.key).at(-1).error, /without changing a distribution the shared environment already has/);
-  // Only build runs on their own open ticket may ask.
+  assert.match(store.pkgRequestsForTicket(t.key).at(-1).error, /without changing a distribution the shared environment or this ticket already has/);
   throws(() => packages.request(mkRun('qa', 'qa', t.key), { specs: ['a==1.0'], why: 'w' }), /build run/);
   throws(() => packages.request(run, { specs: ['a==1.0'], why: '' }), /say why/);
+  // A wheel that adds startup code is flagged for the owner.
+  const r = await resolved(mkRun('junior', 'implement', t.key), ['hooky==1.0'], { install: [wheel('hooky', '1.0', { requested: true, files: { 'hooky/__init__.py': '', 'hooky.pth': 'import hooky' } }), wheel('pip', '24.0')] });
+  assert.equal(r.status, 'owner', r.error);
+  assert.deepEqual(packages.summary().owner_requests.find((x) => x.id === r.id).startup, [{ name: 'hooky', files: ['hooky.pth'] }]);
+  packages.decide(r.id, 'deny', { note: 'no' });
+});
+
+test('ticket lock: later requests resolve against earlier approvals; conflicting approvals are refused', async () => {
+  const t = store.createTicket({ title: 'lock', status: 'in_progress' });
+  const a = await resolved(mkRun('junior', 'implement', t.key), ['alpha==1.0'], { install: [wheel('alpha', '1.0', { requested: true }), wheel('shared-dep', '1.0'), wheel('pip', '24.0')] });
+  // A second request, resolved while the first still waits, that wants another version of the same new dependency.
+  const b = await resolved(mkRun('junior', 'implement', t.key), ['beta==1.0'], { install: [wheel('beta', '1.0', { requested: true }), wheel('shared-dep', '2.0'), wheel('pip', '24.0')] });
+  assert.equal(b.status, 'owner', b.error);
+  packages.decide(a.id, 'approve', { by: 'owner' });
+  throws(() => packages.decide(b.id, 'approve', { by: 'owner' }), /conflicts with what is already approved .*shared-dep 2\.0 vs 1\.0/);
+  packages.decide(b.id, 'deny', { note: 'conflict' });
+  // From now on the approved additions are constraints, and a resolution that would replace one is refused.
+  const c = await resolved(mkRun('junior', 'implement', t.key), ['gamma==1.0'], { install: [wheel('gamma', '1.0', { requested: true }), wheel('shared-dep', '2.0'), wheel('pip', '24.0')] });
+  assert.match(pipCalls()[0].constraints, /^shared-dep==1\.0$/m);
+  assert.match(pipCalls()[0].constraints, /^alpha==1\.0$/m);
+  assert.equal(c.status, 'failed');
+  assert.match(c.error, /would replace shared-dep 1\.0 \(approved for this ticket in #\d+\) with 2\.0/);
+  const d = await resolved(mkRun('junior', 'implement', t.key), ['delta==1.0'], { install: [wheel('delta', '1.0', { requested: true }), wheel('shared-dep', '1.0'), wheel('pip', '24.0')] });
+  assert.deepEqual(JSON.parse(d.manifest).map((x) => [x.name, x.role]), [['delta', 'add'], ['shared-dep', 'ticket'], ['pip', 'installer']]);
+  throws(() => packages.request(mkRun('junior', 'implement', t.key), { specs: ['alpha==2.0'], why: 'w' }), /already approved for this ticket .*a second version is refused/);
+  packages.decide(d.id, 'deny', {});
+  packages.revoke(a.id);
+});
+
+test('budgets: pending requests per run, per seat and in total; unanswered requests expire and free their stage', async () => {
+  const t = store.createTicket({ title: 'quota', status: 'in_progress' });
+  const run = mkRun('senior-be', 'implement', t.key);
+  const r1 = await resolved(run, ['q1==1.0'], { install: [wheel('q1', '1.0', { requested: true }), wheel('pip', '24.0')] });
+  await resolved(run, ['q2==1.0'], { install: [wheel('q2', '1.0', { requested: true }), wheel('pip', '24.0')] });
+  throws(() => packages.request(run, { specs: ['q3==1.0'], why: 'w' }), /this run already has 2 package requests waiting/);
+  const run2 = mkRun('senior-be', 'implement', t.key);
+  await resolved(run2, ['q3==1.0'], { install: [wheel('q3', '1.0', { requested: true }), wheel('pip', '24.0')] });
+  throws(() => packages.request(mkRun('senior-be', 'implement', t.key), { specs: ['q4==1.0'], why: 'w' }), /already has 3 package requests waiting/);
+  const save = config.packages.maxPendingTotal;
+  config.packages.maxPendingTotal = 3;
+  throws(() => packages.request(mkRun('junior', 'implement', t.key), { specs: ['q5==1.0'], why: 'w' }), /3 package requests are already waiting/);
+  config.packages.maxPendingTotal = save;
+  // Global staging quota: the bytes already staged count against a new set.
+  const saveMB = config.packages.maxStagedMB;
+  config.packages.maxStagedMB = 0.0001;
+  const full = await resolved(mkRun('junior', 'implement', t.key), ['q6==1.0'], { install: [wheel('q6', '1.0', { requested: true }), wheel('pip', '24.0')] });
+  assert.match(full.error, /staging area is full/);
+  config.packages.maxStagedMB = saveMB;
+  // TTL: nobody answered within packages.pendingHours.
+  packages.sweep(new Date(Date.now() + 49 * 3600_000).toISOString());
+  assert.equal(store.getPkgRequest(r1.id).status, 'expired');
+  assert.ok(!fs.existsSync(packages.stageDir(r1.id)));
+  assert.ok(!store.openPkgRequests().some((r) => r.ticket_key === t.key));
+});
+
+test('cancellation: revoking during resolution or download stops it, deletes the stage, and the terminal state stands', async () => {
+  const t = store.createTicket({ title: 'cancel', status: 'in_progress' });
+  // Revoked while a wheel download hangs.
+  setPip({ report: { install: [wheel('slow', '1.0', { requested: true }), wheel('pip', '24.0')] } });
+  fakeNet({ hold: 'slow-1.0' });
+  packages.request(mkRun('junior', 'implement', t.key), { specs: ['slow==1.0'], why: 'w' });
+  const id = store.pkgRequestsForTicket(t.key).at(-1).id;
+  for (let i = 0; i < 100 && !fs.existsSync(packages.stageDir(id)); i++) await new Promise((r) => setTimeout(r, 10));
+  await new Promise((r) => setTimeout(r, 100));
+  packages.revoke(id, 'owner', 'changed my mind');
+  await packages.settled();
+  assert.equal(store.getPkgRequest(id).status, 'revoked');
+  assert.ok(!fs.existsSync(packages.stageDir(id)));
+  // Revoked while pip itself is still resolving: the resolver process is killed.
+  setPip({ hang: true });
+  packages.request(mkRun('junior', 'implement', t.key), { specs: ['hang==1.0'], why: 'w' });
+  const id2 = store.pkgRequestsForTicket(t.key).at(-1).id;
+  await new Promise((r) => setTimeout(r, 300));
+  const t0 = Date.now();
+  packages.revoke(id2, 'owner');
+  await packages.settled();
+  assert.ok(Date.now() - t0 < 3000, 'the resolver was stopped, not waited for');
+  assert.equal(store.getPkgRequest(id2).status, 'revoked');
+  assert.equal(store.getPkgRequest(id2).error, null, 'a late failure never overwrites the revoke');
 });
 
 // ---------------- approval, scoping, install ----------------
@@ -202,7 +389,6 @@ test('approval is the owner\'s alone; the stage is readable only in that seat\'s
   const r = await resolved(run, ['humanize==4.9.0'], goodReport());
   throws(() => packages.decide(r.id, 'approve', { by: 'manager' }), /only the owner/);
   throws(() => packages.decide(r.id, 'approve', { by: 'sre' }), /only the owner/);
-  // A probe grant for everything ("*"), even standing, never covers packages.
   access.ownerGrant({ seat: 'junior', probes: ['*'], standing: true, reason: 'test' });
   assert.deepEqual(packages.readPathsFor('junior', t.key, 'implement'), { paths: [], ids: [] });
   throws(() => packages.installPlan(mkRun('junior', 'implement', t.key)), /waiting for the owner/);
@@ -212,17 +398,15 @@ test('approval is the owner\'s alone; the stage is readable only in that seat\'s
   assert.deepEqual(mine, { paths: [stage, packages.caPath()], ids: [r.id] });
   for (const [seat, key, kind] of [['senior-be', t.key, 'implement'], ['junior', other.key, 'implement'], ['junior', t.key, 'qa'], ['junior', t.key, 'mention'], ['junior', t.key, 'review'], ['junior', null, 'implement']])
     assert.deepEqual(packages.readPathsFor(seat, key, kind).paths, [], `${seat} ${key} ${kind}`);
-  // Claude: the stage joins that run's allowRead (the data dir stays denied); the network stays closed.
   const s = runner.sandboxSettings(ws(t.key), [], 'implement', '/tmp/sock', mine.paths);
   assert.ok(s.sandbox.filesystem.allowRead.includes(stage));
   assert.ok(s.sandbox.filesystem.denyRead.includes(config.dataDir));
   assert.deepEqual(s.sandbox.network.allowedDomains, []);
   assert.ok(!runner.sandboxSettings(ws(t.key), [], 'implement', '/tmp/sock').sandbox.filesystem.allowRead.includes(stage));
-  // Codex: a per-run override of the seat profile's filesystem table; the shared profile never changes; network off.
   const seat = { id: 'junior', engine: 'codex', model: '' };
   const withPkg = codex.command({ seat, charter: 'c', cwd: ws(t.key), kind: 'implement', extraRead: mine.paths }).args;
-  const ov = withPkg[withPkg.indexOf('-c', withPkg.findIndex((a) => a.startsWith('permissions.')) - 1) + 1];
-  assert.ok(ov.startsWith('permissions.sigmadesk_seat.filesystem={'), ov.slice(0, 60));
+  const ov = withPkg.find((a) => a.startsWith('permissions.sigmadesk_seat.filesystem={'));
+  assert.ok(ov, 'a per-run filesystem override');
   assert.ok(ov.includes(`${JSON.stringify(stage)} = "read"`));
   assert.ok(!/network/.test(ov));
   assert.ok(!codex.command({ seat, charter: 'c', cwd: ws(t.key), kind: 'implement' }).args.some((a) => a.includes(stage)));
@@ -232,17 +416,17 @@ test('approval is the owner\'s alone; the stage is readable only in that seat\'s
   const nets = [...toml.matchAll(/\[permissions\.(\w+)\.network\]\s*\n\s*enabled = (\w+)/g)].map((x) => [x[1], x[2]]);
   assert.deepEqual(nets, [['sigmadesk_seat', 'false'], ['sigmadesk_review', 'false'], ['sigmadesk_tagged', 'false']]);
   assert.notEqual(codex.profileHash(mine.paths), codex.profileHash(), 'a session from before the grant is not resumed');
+  packages.revoke(r.id);
 });
 
-test('offline install: exact steps (venv --without-pip, .pth layering, scrubbed pip, hash-checked), then the desk verifies the venv', async () => {
+test('offline install: exact steps (venv --without-pip, .pth layering, scrubbed pip, hash-checked, requirement check)', async () => {
   const t = store.createTicket({ title: 'install', status: 'in_progress' });
   const asking = mkRun('junior', 'implement', t.key);
   const r = await resolved(asking, ['humanize==4.9.0'], goodReport(), { dev: true });
   packages.decide(r.id, 'approve', { by: 'owner' });
-  // The asking run started before the approval: its sandbox cannot read the stage.
   throws(() => packages.installPlan(asking), /approved after this run started/);
   const run = mkRun('junior', 'implement', t.key);
-  packages.recordLaunch(run.id, packages.readPathsFor('junior', t.key, 'implement').ids); // what runner.startRun does
+  packages.recordLaunch(run.id, packages.readPathsFor('junior', t.key, 'implement').ids);
   const plan = packages.installPlan(run);
   const w = ws(t.key), stage = packages.stageDir(r.id), dotvenv = path.join(w, '.venv');
   const [mk, pth, scratch, exclude, install, verify] = plan.steps;
@@ -250,7 +434,7 @@ test('offline install: exact steps (venv --without-pip, .pth layering, scrubbed 
   assert.deepEqual(mk.argv, [fakePy, '-I', '-m', 'venv', '--without-pip', dotvenv]);
   assert.ok(!mk.argv.includes('--system-site-packages'));
   assert.equal(pth.write.path, path.join(dotvenv, 'lib', 'python3.12', 'site-packages', '_sigmadesk_shared.pth'));
-  assert.equal(pth.write.text, `import site; site.addsitedir(${JSON.stringify(site)})\n`);
+  assert.equal(pth.write.text, `import site, sys; sys.dont_write_bytecode = True; site.addsitedir(${JSON.stringify(site)})\n`);
   assert.deepEqual(exclude.exclude, { ws: w, line: '/.venv/' });
   assert.deepEqual(install.argv, [path.join(dotvenv, 'bin', 'python'), '-B', '-s', path.join(stage, 'pip-24.0-py3-none-any.whl', 'pip'), 'install', '--no-index', '--no-deps', '--require-hashes',
     '--no-compile', '--no-cache-dir', '--disable-pip-version-check', '--no-input', '--find-links', stage, '-r', path.join(stage, 'manifest.txt')]);
@@ -259,41 +443,77 @@ test('offline install: exact steps (venv --without-pip, .pth layering, scrubbed 
   assert.equal(install.env.PIP_CERT, path.join(config.dataDir, 'pkg', 'ca.pem'));
   assert.equal(install.env.PIP_NO_INDEX, '1');
   assert.equal(install.env.TMPDIR, path.join(dotvenv, '.tmp'));
-  assert.deepEqual(verify.argv.slice(-1), ['humanize']);
-  // A tampered stage is refused before any step runs.
+  // The in-seat check: imports plus the added distributions' own requirements, with pip's vendored packaging.
+  assert.deepEqual(verify.argv.slice(-2), [path.join(stage, 'pip-24.0-py3-none-any.whl'), 'humanize']);
+  assert.match(verify.argv[4], /from pip\._vendor\.packaging\.requirements import Requirement/);
+  assert.match(verify.argv[4], /req\.specifier\.contains/);
   const whl = path.join(stage, 'humanize-4.9.0-py3-none-any.whl');
+  const good = fs.readFileSync(whl);
   fs.chmodSync(stage, 0o755); fs.chmodSync(whl, 0o644); fs.writeFileSync(whl, 'tampered');
   throws(() => packages.installPlan(run), /changed .*does not match its sha256/);
-  fs.writeFileSync(whl, 'wheel humanize 4.9.0'); fs.chmodSync(whl, 0o444); fs.chmodSync(stage, 0o555);
+  fs.writeFileSync(whl, good); fs.chmodSync(whl, 0o444); fs.chmodSync(stage, 0o555);
   packages.installPlan(run);
-  // The seat ran the steps (here: the venv they leave behind); the desk reads it back without executing anything.
-  const vsite = path.join(dotvenv, 'lib', 'python3.12', 'site-packages');
-  fs.mkdirSync(path.join(vsite, 'humanize-4.9.0.dist-info'), { recursive: true });
-  fs.writeFileSync(path.join(dotvenv, 'pyvenv.cfg'), 'home = /opt/python/bin\ninclude-system-site-packages = false\nversion = 3.12.4\n');
-  fs.writeFileSync(path.join(vsite, 'humanize-4.9.0.dist-info', 'METADATA'), 'Metadata-Version: 2.1\nName: humanize\nVersion: 4.9.0\n');
-  fs.writeFileSync(pth.write.path, pth.write.text);
-  const out = packages.recordInstall(run, { ok: true });
-  assert.match(out, /Installed and verified: Python 3\.12\.4/);
+  simulateInstall(w, ['humanize==4.9.0']);
+  assert.match(packages.recordInstall(run, { ok: true }), /Installed and verified: Python 3\.12\.4 .*3 files verified/);
   const fp = packages.recordedFingerprint(t.key);
-  assert.deepEqual(fp.added, [{ name: 'humanize', version: '4.9.0', sha256: sha(Buffer.from('wheel humanize 4.9.0')), dev: true, request: r.id }]);
-  assert.equal(fp.lock_size, SHARED.length + 1);
-  assert.match(fp.lock_sha256, /^[0-9a-f]{64}$/);
-  assert.equal(fp.platform, `${process.platform}-${process.arch}`);
-  assert.ok(store.listComments(t.key).some((c) => /installed humanize==4\.9\.0 offline into \.venv/.test(c.body)));
-  // A distribution nobody approved makes the venv unverifiable.
-  fs.mkdirSync(path.join(vsite, 'evil-1.0.dist-info'));
-  fs.writeFileSync(path.join(vsite, 'evil-1.0.dist-info', 'METADATA'), 'Name: evil\nVersion: 1.0\n');
-  throws(() => packages.fingerprint(t.key, w), /nobody approved: evil==1\.0/);
-  assert.match(packages.qaEnvironment(t.key, w).note, /NOT verified/);
-  fs.rmSync(path.join(vsite, 'evil-1.0.dist-info'), { recursive: true });
-  assert.match(packages.qaEnvironment(t.key, w).note, /Environment: .*\.venv — Python 3\.12\.4/);
-  // The merge brief and the reviewers see the dependency change.
+  assert.deepEqual(fp.added.map((a) => [a.name, a.version, a.dev, a.files]), [['humanize', '4.9.0', true, 3]]);
+  assert.equal(fp.lock_size, SHARED_N + 1);
+  assert.equal(fp.interpreter, fs.realpathSync(fakePy));
   const deps = packages.ticketDependencies(t.key);
   assert.deepEqual(deps, { runtime: [], dev: ['humanize==4.9.0'], total: 1, transitive: 0 });
   const brief = decisionModel.brief({ decision: { kind: 'merge', id: 'm', key: t.key, name: 'x' }, ticket: store.getTicket(t.key), dependencies: deps });
   assert.match(brief.consequence.summary, /adds 1 dependency \(0 runtime, 1 dev\)/);
   assert.ok(brief.consequence.steps.some((s) => /requirements file/.test(s.text)));
-  assert.match(packages.dependencyText(deps), /adds 1 dependency \(0 runtime, 1 dev\): humanize==4\.9\.0 \(dev\)/);
+});
+
+test('fingerprint comes from what is on disk: missing, modified, extra files, startup hooks, bytecode, wrong interpreter, drifted shared venv', async () => {
+  const { t, vsite, w } = await approvedInstalled('reality');
+  const ok = () => packages.fingerprint(t.key, w);
+  const base = ok();
+  const restore = () => { simulateInstall(w, ['humanize==4.9.0']); assert.equal(ok().installed_sha256, base.installed_sha256); };
+  // An approved addition that is not there (the old check accepted a METADATA-only venv).
+  fs.rmSync(path.join(vsite, 'humanize', '__init__.py'));
+  throws(ok, /missing 1 file\(s\) of the approved packages \(humanize\/__init__\.py\)/);
+  restore();
+  // Modified code with untouched METADATA.
+  fs.writeFileSync(path.join(vsite, 'humanize', '__init__.py'), 'import os; os.system("evil")\n');
+  throws(ok, /humanize\/__init__\.py in \.venv was changed after the install/);
+  restore();
+  for (const [f, re] of [['evil.pth', /startup hook nobody approved: evil\.pth/], ['sitecustomize.py', /startup hook nobody approved: sitecustomize\.py/], ['usercustomize.py', /startup hook/],
+    ['humanize/__pycache__/__init__.cpython-312.pyc', /no approved wheel installs: humanize\/__pycache__/], ['other/__init__.py', /no approved wheel installs: other\/__init__\.py/],
+    ['evil-1.0.dist-info/METADATA', /no approved wheel installs: evil-1\.0\.dist-info\/METADATA/]]) {
+    fs.mkdirSync(path.dirname(path.join(vsite, f)), { recursive: true }); fs.writeFileSync(path.join(vsite, f), 'x');
+    throws(ok, re);
+    fs.rmSync(path.join(vsite, f));
+  }
+  fs.rmSync(path.join(vsite, 'other'), { recursive: true }); fs.rmSync(path.join(vsite, 'evil-1.0.dist-info'), { recursive: true });
+  fs.symlinkSync('/etc/hosts', path.join(vsite, 'link.py'));
+  throws(ok, /contains a link \(link\.py\)/);
+  fs.rmSync(path.join(vsite, 'link.py'));
+  // Interpreter identity and version.
+  const vpy = path.join(w, '.venv', 'bin', 'python');
+  fs.rmSync(vpy); fs.symlinkSync(process.execPath, vpy);
+  throws(ok, /\.venv\/bin\/python is .*, not the shared venv's interpreter/);
+  fs.rmSync(vpy); fs.symlinkSync(fakePy, vpy);
+  const cfg = path.join(w, '.venv', 'pyvenv.cfg');
+  fs.writeFileSync(cfg, 'version = 3.13.0\ninclude-system-site-packages = false\n');
+  throws(ok, /says Python 3\.13\.0, the shared venv is 3\.12\.4/);
+  fs.writeFileSync(cfg, 'version = 3.12.4\ninclude-system-site-packages = true\n');
+  throws(ok, /system site-packages/);
+  fs.writeFileSync(cfg, 'version = 3.12.4\ninclude-system-site-packages = false\n');
+  fs.writeFileSync(path.join(vsite, '_sigmadesk_shared.pth'), 'import site; site.addsitedir("/elsewhere")\n');
+  throws(ok, /does not layer the shared venv as the desk wrote it/);
+  restore();
+  // The shared venv changed since approval (its lock is current, not historical).
+  distInfo(site, 'newcomer', '1.0');
+  throws(ok, /the shared venv changed since request #\d+ was approved/);
+  fs.rmSync(path.join(site, 'newcomer-1.0.dist-info'), { recursive: true });
+  assert.equal(ok().lock_sha256, base.lock_sha256);
+  // The QA view never fails open.
+  fs.writeFileSync(path.join(vsite, 'evil.pth'), 'x');
+  const q = packages.qaEnvironment(t.key, w);
+  assert.equal(q.venv, true); assert.equal(q.fingerprint, null); assert.match(q.error, /startup hook/);
+  fs.rmSync(path.join(vsite, 'evil.pth'));
 });
 
 test('revoke and expiry refuse further installs and delete the stage; the ticket closing ends it too; revoke-all covers packages', async () => {
@@ -309,36 +529,28 @@ test('revoke and expiry refuse further installs and delete the stage; the ticket
   assert.ok(!fs.existsSync(packages.stageDir(r.id)));
   throws(() => packages.installPlan(run), /is revoked/);
   assert.deepEqual(packages.readPathsFor('junior', t.key, 'implement').paths, []);
-  // Expiry.
   const r2 = await resolved(mkRun('junior', 'implement', t.key), ['humanize==4.9.0'], goodReport());
   packages.decide(r2.id, 'approve', { by: 'owner' });
   packages.sweep(new Date(Date.now() + 25 * 3600_000).toISOString());
   assert.equal(store.getPkgRequest(r2.id).status, 'expired');
   throws(() => packages.installPlan(mkRun('junior', 'implement', t.key)), /is expired/);
-  // The ticket closing.
   const r3 = await resolved(mkRun('junior', 'implement', t.key), ['humanize==4.9.0'], goodReport());
   packages.decide(r3.id, 'approve', { by: 'owner' });
   store.updateTicket(t.key, { status: 'done' });
   packages.sweep();
   assert.equal(store.getPkgRequest(r3.id).status, 'closed');
-  // Revoke all (the Access sheet's emergency stop) ends package grants too.
   const t2 = store.createTicket({ title: 'all', status: 'in_progress' });
   const r4 = await resolved(mkRun('junior', 'implement', t2.key), ['humanize==4.9.0'], goodReport());
   access.revokeAll('owner');
   assert.equal(store.getPkgRequest(r4.id).status, 'revoked');
 });
 
-test('desk pkg install: bin/desk runs the plan inside the run (scrubbed pip env) and reports back', async () => {
+// ---------------- bin/desk ----------------
+async function deskCli(args, answer, extraEnv = {}) {
   const mailbox = fs.mkdtempSync(path.join(tmp, 'mb-'));
-  const envOut = path.join(tmp, 'step-env.json'), wrote = path.join(tmp, 'wrote', 'x.pth');
-  const plan = { steps: [
-    { label: 'write', write: { path: wrote, text: 'layer\n' } },
-    { label: 'run', argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(envOut)}, JSON.stringify(process.env))`], env: { PIP_CONFIG_FILE: '/dev/null', PYTHONDONTWRITEBYTECODE: '1' } },
-    { label: 'skipped', argv: ['/nonexistent'], unless: tmp },
-  ] };
   const seen = [];
-  const child = spawn(process.execPath, [fileURLToPath(new URL('../bin/desk', import.meta.url)), 'pkg', 'install'], {
-    env: { ...process.env, DESK_RUN_TOKEN: 't', DESK_MAILBOX: mailbox, PIP_INDEX_URL: 'http://evil/simple', PYTHONPATH: '/evil' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../bin/desk', import.meta.url)), ...args], {
+    env: { ...process.env, DESK_RUN_TOKEN: 't', DESK_MAILBOX: mailbox, ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   child.stdout.on('data', (c) => { stdout += c; });
   const poll = setInterval(() => {
@@ -346,12 +558,21 @@ test('desk pkg install: bin/desk runs the plan inside the run (scrubbed pip env)
       const req = JSON.parse(fs.readFileSync(path.join(mailbox, f), 'utf8'));
       fs.unlinkSync(path.join(mailbox, f));
       seen.push(req);
-      const output = req.body.action === 'install' ? { plan } : `recorded ${req.body.ok}`;
-      fs.writeFileSync(path.join(mailbox, f.replace('req-', 'res-')), JSON.stringify({ ok: true, output }));
+      fs.writeFileSync(path.join(mailbox, f.replace('req-', 'res-')), JSON.stringify({ ok: true, output: answer(req) }));
     }
   }, 20);
   const code = await new Promise((resolve) => child.on('close', resolve));
   clearInterval(poll);
+  return { code, stdout, seen };
+}
+test('desk pkg install: bin/desk runs the plan inside the run (scrubbed pip env) and reports back', async () => {
+  const envOut = path.join(tmp, 'step-env.json'), wrote = path.join(tmp, 'wrote', 'x.pth');
+  const plan = { steps: [
+    { label: 'write', write: { path: wrote, text: 'layer\n' } },
+    { label: 'run', argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(envOut)}, JSON.stringify(process.env))`], env: { PIP_CONFIG_FILE: '/dev/null', PYTHONDONTWRITEBYTECODE: '1' } },
+    { label: 'skipped', argv: ['/nonexistent'], unless: tmp },
+  ] };
+  const { code, stdout, seen } = await deskCli(['pkg', 'install'], (req) => (req.body.action === 'install' ? { plan } : `recorded ${req.body.ok}`), { PIP_INDEX_URL: 'http://evil/simple', PYTHONPATH: '/evil' });
   assert.equal(code, 0, stdout);
   assert.deepEqual(seen.map((r) => [r.cmd, r.body.action]), [['pkg', 'install'], ['pkg', 'installed']]);
   assert.equal(seen[1].body.ok, true);
@@ -361,35 +582,70 @@ test('desk pkg install: bin/desk runs the plan inside the run (scrubbed pip env)
   assert.equal(env.PYTHONPATH, undefined);
   assert.equal(env.PIP_CONFIG_FILE, '/dev/null');
   assert.match(stdout, /skipped: already there/);
-  assert.match(stdout, /recorded true/);
+});
+test('desk test: bin/desk passes arguments through, runs the canonical interpreter in the workspace and reports the real exit status', async () => {
+  const cwd = fs.mkdtempSync(path.join(tmp, 'dt-'));
+  const plan = { id: 'abc', cwd, argv: [process.execPath, '-e', 'console.log(process.cwd(), process.argv.slice(1).join(" ")); process.exit(3)', '--', '-q', '--maxfail', '1'], env: { PYTHONDONTWRITEBYTECODE: '1' } };
+  const { code, stdout, seen } = await deskCli(['test', 'pytest', '-q', '--maxfail', '1'], (req) => (req.body.action === 'plan' ? { test: plan } : `Exit ${req.body.status} (failed)`));
+  assert.equal(code, 3, stdout);
+  assert.deepEqual(seen[0].body, { action: 'plan', args: ['pytest', '-q', '--maxfail', '1'] }, 'flags are the test\'s, not the desk\'s');
+  assert.deepEqual(seen[1].body, { action: 'result', id: 'abc', status: 3 });
+  assert.match(stdout, new RegExp(`${cwd} -q --maxfail 1`));
 });
 
 // ---------------- QA evidence gate ----------------
-test('evidence gate: with a workspace venv, Python tests count only when run through it; the verdict names the fingerprint', async () => {
+test('QA never fails open: an invalid .venv blocks QA; with a valid one QA passes only through desk test, bound to the fingerprint and commit', async () => {
   const w = '/ws/P-1';
   assert.ok(sched.testUsesVenv('.venv/bin/python -m pytest -q', w));
-  assert.ok(sched.testUsesVenv('./.venv/bin/pytest tests', w));
   assert.ok(sched.testUsesVenv(`${w}/.venv/bin/python -m pytest`, w));
   assert.ok(sched.testUsesVenv('source .venv/bin/activate && pytest -q', w));
   assert.ok(sched.testUsesVenv('PATH=.venv/bin:$PATH pytest -q', w));
-  assert.ok(sched.testUsesVenv('cd ui && npm test', w), 'non-Python tests are unaffected');
-  assert.ok(!sched.testUsesVenv('python -m pytest -q', w));
-  assert.ok(!sched.testUsesVenv('pytest -q', w));
-  assert.ok(!sched.testUsesVenv('/Users/x/ml_quant_env/bin/python -m pytest', w));
-  assert.ok(!sched.testUsesVenv('/other/.venv/bin/python -m pytest', w), 'another tree\'s venv does not count');
-  assert.ok(!sched.testUsesVenv('npm test && python -m pytest', w));
-  // Through the real QA gate.
-  const t = store.createTicket({ title: 'qa venv', status: 'qa' });
+  assert.ok(!sched.testUsesVenv('source /other/P-2/.venv/bin/activate && pytest -q', w), 'another workspace\'s activation');
+  assert.ok(!sched.testUsesVenv('PATH=/other/P-2/.venv/bin:$PATH pytest -q', w), 'another workspace\'s PATH');
+  assert.ok(!sched.testUsesVenv('source .venv/bin/activate && /shared/venv/bin/python -m pytest', w), 'activation then the shared interpreter');
+  assert.ok(!sched.testUsesVenv('source .venv/bin/activate && PATH=/x:$PATH pytest', w));
+  assert.ok(!sched.testUsesVenv('/other/.venv/bin/python -m pytest', w));
+  assert.ok(!sched.testUsesVenv(`${w}/.venv/bin/../../../x/bin/python -m pytest`, w));
+  assert.ok(!sched.isDocPath('requirements.txt') && !sched.isDocPath('docs/requirements-docs.txt') && !sched.isDocPath('pyproject.toml'), 'dependency manifests are never docs-only');
+  assert.ok(sched.isDocPath('README.md') && sched.isDocPath('notes.txt'));
+  // A real workspace with an approved, installed venv.
+  const { t, vsite } = await approvedInstalled('qa venv');
   const wsDir = ws(t.key);
-  fs.mkdirSync(path.join(wsDir, '.venv', 'lib', 'python3.12', 'site-packages'), { recursive: true });
-  fs.writeFileSync(path.join(wsDir, '.venv', 'pyvenv.cfg'), 'version = 3.12.4\n');
+  fs.writeFileSync(path.join(wsDir, 'README.md'), 'x\n');
+  execFileSync('git', ['init', '-q', '-b', 'main', wsDir]);
+  git(wsDir, 'add', 'README.md'); git(wsDir, 'commit', '-qm', 'c');
+  store.updateTicket(t.key, { status: 'qa', head_sha: 'f'.repeat(40) }); // a different submitted head: the gate's last step refuses, after the evidence gate
   const qaRun = store.createRun({ agent_id: 'qa', kind: 'qa', ticket_key: t.key, token: `tok-qa-${++tokenN}`, model: 'x', nonce: 'qa12345678', cwd: wsDir });
   const ctx = { run: qaRun, cwd: wsDir, state: {} };
-  runner.applyEvents([{ type: 'cmd-start', id: 'a', cmd: 'python -m pytest tests -q' }, { type: 'cmd-end', id: 'a', ok: true }], ctx);
-  await rejects(sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'qa12345678', body: 'ok' }), /has its own venv .*\.venv\/bin\/python -m pytest/);
-  runner.applyEvents([{ type: 'cmd-start', id: 'b', cmd: '.venv/bin/python -m pytest tests -q' }, { type: 'cmd-end', id: 'b', ok: true }], ctx);
-  // Past the evidence gate (this fixture has no git clone, so the commit check is the next refusal).
-  await assert.rejects(sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'qa12345678', body: 'ok' }), (e) => !/venv|no passing test run/.test(e.message));
+  const pass = () => sched.deskAction(qaRun, 'qa', { verdict: 'pass', code: 'qa12345678', body: 'ok' });
+  runner.applyEvents([{ type: 'cmd-start', id: 'a', cmd: '.venv/bin/python -m pytest tests -q' }, { type: 'cmd-end', id: 'a', ok: true }], ctx);
+  await rejects(pass(), /QA passes only through desk test/);
+  // An invalid venv: QA cannot pass at all, and desk test refuses to run on it.
+  fs.writeFileSync(path.join(vsite, 'evil.pth'), 'x');
+  await rejects(pass(), /\.venv is not what the owner approved \(.*startup hook/);
+  await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest'] }), /not what the owner approved/);
+  fs.rmSync(path.join(vsite, 'evil.pth'));
+  // desk test: the canonical interpreter, in the workspace; the exit status is what counts.
+  await rejects(sched.deskAction(qaRun, 'test', { action: 'plan', args: ['os; import x'] }), /not a Python module name/);
+  let p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
+  assert.deepEqual(p.argv, [path.join(wsDir, '.venv', 'bin', 'python'), '-B', '-s', '-m', 'pytest', '-q']);
+  assert.equal(p.cwd, wsDir);
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 1 }), /Exit 1 \(failed\)/);
+  runner.applyEvents([{ type: 'cmd-start', id: 'b', cmd: 'desk test pytest -q || true' }, { type: 'cmd-end', id: 'b', ok: true }], ctx);
+  await rejects(pass(), /QA passes only through desk test/);
+  // The venv changing while tests run voids the result.
+  p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
+  fs.writeFileSync(path.join(vsite, 'humanize', '__init__.py'), 'changed\n');
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0 }), /NOT counted: .*changed after the install/);
+  simulateInstall(wsDir, ['humanize==4.9.0']);
+  p = (await sched.deskAction(qaRun, 'test', { action: 'plan', args: ['pytest', '-q'] })).test;
+  assert.match(await sched.deskAction(qaRun, 'test', { action: 'result', id: p.id, status: 0 }), /^Exit 0 · Python 3\.12\.4/);
+  await rejects(pass(), /QA passes only through desk test/); // the engine never saw a clean `desk test` command yet
+  runner.applyEvents([{ type: 'cmd-start', id: 'c', cmd: 'desk test pytest -q' }, { type: 'cmd-end', id: 'c', ok: true }], ctx);
+  // Past the evidence gate: the next refusal is the submitted-commit check.
+  await rejects(pass(), /HEAD moved since submission/);
+  // Another run cannot use this run's plan, and a run outside the workspace cannot desk test.
+  await rejects(sched.deskAction(mkRun('qa', 'qa', t.key, '/elsewhere'), 'test', { action: 'plan', args: ['pytest'] }), /in the ticket's workspace/);
 });
 
 // ---------------- desk fetch ----------------
@@ -442,4 +698,51 @@ test('desk fetch: https only, exact allowed hosts before DNS, private addresses 
   for (const ip of ['151.101.0.223', '8.8.8.8', '2a04:4e42::223']) assert.ok(!netfetch.isPrivateAddress(ip), ip);
   // Read-only and research kinds cannot use it; the per-run cap holds.
   await rejects(sched.deskAction(mkRun('principal-be', 'product_review', t.key), 'fetch', { url: 'https://docs.python.org/3/library/venv.html' }), /read-only/);
+});
+
+test('netfetch robustness: one deadline over DNS, headers and body; stream and file errors are rejections, never crashes', async () => {
+  const opts = { hosts: ['docs.python.org'], timeoutMs: 300 };
+  // DNS that never answers.
+  netfetch._setLookup(() => {});
+  let t0 = Date.now();
+  await rejects(netfetch.safeFetch('https://docs.python.org/', opts), /timed out/);
+  assert.ok(Date.now() - t0 < 1500);
+  netfetch._setLookup((h, _o, cb) => cb(null, [{ address: '151.101.0.223', family: 4 }]));
+  // Headers that never come (a transport that ignores the signal entirely).
+  netfetch._setTransport(() => new Promise(() => {}));
+  t0 = Date.now();
+  await rejects(netfetch.safeFetch('https://docs.python.org/', opts), /timed out/);
+  assert.ok(Date.now() - t0 < 1500);
+  // A trickled body.
+  netfetch._setTransport(async () => ({ status: 200, headers: {}, stream: new Readable({ read() { setTimeout(() => this.push('.'), 100); } }) }));
+  await rejects(netfetch.safeFetch('https://docs.python.org/', opts), /timed out/);
+  // A body stream that errors.
+  netfetch._setTransport(async () => ({ status: 200, headers: {}, stream: new Readable({ read() { this.destroy(new Error('ECONNRESET boom')); } }) }));
+  await rejects(netfetch.safeFetch('https://docs.python.org/', { ...opts, timeoutMs: 2000 }), /download failed|boom/);
+  // The destination directory vanished (e.g. a revoked stage): a rejection, the desk keeps running.
+  netfetch._setTransport(async () => ({ status: 200, headers: {}, stream: Readable.from([Buffer.from('x')]) }));
+  await rejects(netfetch.safeFetch('https://docs.python.org/', { ...opts, file: path.join(tmp, 'gone', 'x.whl') }), /ENOENT|download failed/);
+  // A redirect whose body errors is destroyed, never read.
+  let n = 0;
+  netfetch._setTransport(async (u) => (n++ === 0
+    ? { status: 302, headers: { location: '/b' }, stream: new Readable({ read() { this.destroy(new Error('redirect body boom')); } }) }
+    : { status: 200, headers: {}, stream: Readable.from([Buffer.from('ok')]) }));
+  const r = await netfetch.safeFetch('https://docs.python.org/a', { ...opts, timeoutMs: 2000 });
+  assert.equal(r.body.toString(), 'ok');
+  // A caller's cancellation.
+  const ac = new AbortController();
+  netfetch._setTransport((_u, _a, { signal }) => new Promise((_r, reject) => signal.addEventListener('abort', () => reject(signal.reason))));
+  setTimeout(() => ac.abort(new Error('revoked')), 50);
+  await rejects(netfetch.safeFetch('https://docs.python.org/', { ...opts, timeoutMs: 5000, signal: ac.signal }), /revoked/);
+});
+
+test('HTML → text is linear (no backtracking) and runs in a worker with a time budget', async () => {
+  for (const evil of ['<'.repeat(2_000_000), '<a '.repeat(600_000), '<script>'.repeat(250_000), '&'.repeat(2_000_000), '<!--'.repeat(500_000)]) {
+    const t0 = Date.now();
+    htmlText.htmlToText(evil);
+    assert.ok(Date.now() - t0 < 1500, `${evil.slice(0, 8)}… took ${Date.now() - t0} ms`);
+  }
+  assert.equal(htmlText.htmlToText('<h2>T</h2><p>a &lt;b&gt; &#x41;&amp;</p><SCRIPT>x</script><li>i'), '## T\na <b> A&\n\n- i');
+  assert.equal(await htmlText.htmlToTextBounded('<p>hi</p>'), 'hi');
+  await rejects(htmlText.htmlToTextBounded('<p>x</p>'.repeat(200_000), { timeoutMs: 1 }), /longer than 1 ms/);
 });

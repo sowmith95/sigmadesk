@@ -42,6 +42,7 @@ const USAGE = `usage:
   desk incident mute "<why it is noise>" | desk incident page "<why the owner must act>"
   desk pkg request name==version [...] --why "<what needs it>" [--dev]   (build runs: the desk resolves every wheel; the owner approves)
   desk pkg status | desk pkg install   (install: offline, into this workspace's .venv, from the approved wheels)
+  desk test <module> [args…]   (runs python -m <module> with the canonical interpreter — this workspace's .venv if any — and records the exit status; QA uses it)
   desk fetch <https-url>   (the desk fetches one page from its allowed documentation hosts; the text is untrusted)
   desk ops list | desk ops <probe> [--param value]   (seats holding a production read access grant)
   desk ops request <probe…|all> --why "<what you must check>" [--for 1h | --ticket]
@@ -53,7 +54,9 @@ const USAGE = `usage:
 
 const [cmd, ...rest] = process.argv.slice(2);
 // Help must exit before parsing flags, reading stdin or sending a mutating request.
-if (!cmd || [cmd, ...rest].some((arg) => arg === '-h' || arg === '--help')) {
+// desk test passes its arguments through untouched (pytest has its own -h): only `desk test` alone or `desk test -h` is help.
+const wantsHelp = cmd === 'test' ? !rest.length || ['-h', '--help'].includes(rest[0]) : [cmd, ...rest].some((arg) => arg === '-h' || arg === '--help');
+if (!cmd || wantsHelp) {
   console.log(USAGE); process.exit(cmd ? 0 : 2);
 }
 
@@ -89,6 +92,7 @@ switch (cmd) {
   case 'qa': case 'accept': case 'review': body.verdict = pos.shift(); body.body = pos.join(' '); break;
   case 'pkg': body.action = pos.shift() || 'status'; if (body.action === 'request') body.specs = pos.splice(0); break;
   case 'fetch': body.url = pos.shift(); break;
+  case 'test': for (const k of Object.keys(body)) delete body[k]; body.action = 'plan'; body.args = rest.slice(); break;
   case 'ops': body.probe = pos.shift() || 'list'; if (body.probe === 'request') body.probes = pos.splice(0); break;
   case 'access': body.action = pos.shift() || 'list'; if (/^\d+$/.test(pos[0] || '')) body.id = pos.shift(); body.body = pos.join(' '); break;
   case 'respond': case 'resolve': case 'verify': case 'watch': case 'handoff': body.action = pos.shift(); body.body = pos.join(' '); break;
@@ -102,7 +106,7 @@ switch (cmd) {
 if (typeof body.findings === 'string' && body.findings.startsWith('@')) {
   try { body.findings = fs.readFileSync(path.resolve(body.findings.slice(1)), 'utf8'); } catch (e) { console.error(`desk: cannot read ${body.findings.slice(1)} (${e.message})`); process.exit(2); }
 }
-if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file', 'ops', 'access', 'pkg', 'fetch'].includes(cmd)) body.body = await stdinText();
+if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file', 'ops', 'access', 'pkg', 'fetch', 'test'].includes(cmd)) body.body = await stdinText();
 else if (['groom', 'propose', 'create-task', 'incident', 'design', 'revise', 'connector-propose'].includes(cmd) && !body.body) body.body = await stdinText();
 
 const token = process.env.DESK_RUN_TOKEN;
@@ -163,7 +167,7 @@ function send(command, payloadBody) {
  * Then the desk reads the venv back and records its fingerprint.
  */
 function runSteps(plan) {
-  const base = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(PIP_|PYTHON|VIRTUAL_ENV$|CONDA)/.test(k)));
+  const base = scrubbed();
   for (const st of plan.steps) {
     if (st.unless && fs.existsSync(st.unless)) { console.log(`- ${st.label}: already there`); continue; }
     console.log(`- ${st.label}`);
@@ -188,7 +192,20 @@ function runSteps(plan) {
   return { ok: true };
 }
 
+const scrubbed = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(PIP_|PYTHON|VIRTUAL_ENV$|CONDA)/.test(k)));
 const first = await send(cmd, body);
+if (cmd === 'test' && first.status < 400 && !first.j.error && first.j.output?.test) {
+  // Run the desk's canonical interpreter here, in this run's sandbox and workspace; the exit status goes back as-is.
+  const t = first.j.output.test;
+  console.log(`$ ${t.argv.join(' ').slice(0, 400)}`);
+  const r = spawnSync(t.argv[0], t.argv.slice(1), { cwd: t.cwd, env: { ...scrubbed(), ...(t.env || {}) }, stdio: 'inherit' });
+  const status = r.error ? -1 : r.status ?? -1;
+  if (r.error) console.error(`desk test: ${r.error.message}`);
+  const done = await send('test', { action: 'result', id: t.id, status });
+  if (done.status >= 400 || done.j.error) { console.error(`desk test: ${done.j.error || done.status}`); process.exit(1); }
+  console.log(done.j.output);
+  process.exit(status === 0 && !/NOT counted/.test(String(done.j.output)) ? 0 : status > 0 ? status : 1);
+}
 if (cmd === 'pkg' && body.action === 'install' && first.status < 400 && !first.j.error && first.j.output?.plan) {
   const plan = first.j.output.plan;
   if (plan.skipped?.length) console.log(`(request ${plan.skipped.map((x) => `#${x}`).join(', ')} was approved after this run started: not readable here)`);
