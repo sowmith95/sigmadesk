@@ -205,8 +205,8 @@ publish-guard holds; standing and renewal production access; package installs.
   reviewer), built, is assigned, designed or worked on the ticket, reviews the change, wrote or reviewed the proposal,
   wrote the recommendation or chaired the council, or filed the owner task. Questions and designs only on positively
   low-risk tickets; lifetime limits that survive revisions. A decision is applied in one transaction after re-checking
-  its evidence fingerprint, the delegation settings and the desk's general policy (production access, merge and sync
-  settings); if any of them changed, nothing is applied.
+  its evidence fingerprint, the delegation settings, the desk's general policy (production access, merge and sync
+  settings) and the standing rules its run was given (your playbook); if any of them changed, nothing is applied.
 - **Notices.** While a delegate holds a decision for you, the hold's push notice waits. It is owed on the hold itself,
   not on a version of the decision: when the decision comes back to you for any reason (an escalation, a failed run,
   a halted desk, a policy change, the kind switched to shadow or back to you, a hold no delegate may decide) you are

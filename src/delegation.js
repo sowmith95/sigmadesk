@@ -508,10 +508,15 @@ function citablesFor(r, c) {
   }
   return { rules, evidence };
 }
-/** Fix what a record's run is given to cite (stored on the record for the check and the audit), and return it in full. */
+/** The owner's standing rules as a decision run is given them: a change to the playbook is a change of policy. */
+const rulesHash = () => hash(model.playbookRules(playbook()));
+/**
+ * Fix what a record's run is given to cite (stored on the record for the check and the audit, with the fingerprint of
+ * the standing rules it was given), and return it in full.
+ */
 export function seal(r, c = currentOf(r)) {
   const given = c ? citablesFor(r, c) : { rules: [], evidence: [] };
-  store.updateDelegation(r.id, { citables: { rules: given.rules.map((x) => ({ id: x.id, text: x.text.slice(0, 200) })), evidence: given.evidence.map((x) => ({ id: x.id, label: x.label })) } });
+  store.updateDelegation(r.id, { citables: { rules: given.rules.map((x) => ({ id: x.id, text: x.text.slice(0, 200) })), evidence: given.evidence.map((x) => ({ id: x.id, label: x.label })), playbook: rulesHash() } });
   return given;
 }
 /** Why the ids a delegate cited do not support its decision, or null (every id given to its run, or a file in the base). */
@@ -647,6 +652,13 @@ export function decide(r, choice, { run = null, deterministic = false } = {}) {
     if (l) {
       endLapsed(rec, l);
       message = l.status === 'superseded' ? 'The decision changed or was settled meanwhile: nothing was applied. Stop now.' : `${l.why.replace(/ The decision is yours\.$/, '')}: nothing was applied. Stop now.`;
+      return;
+    }
+    // A model's decision rests on the standing rules its run was given: rules the owner edited since are not those.
+    const sealed = json(rec.citables, null);
+    if (!deterministic && sealed?.playbook && sealed.playbook !== rulesHash()) {
+      endLapsed(rec, { status: 'invalidated', why: 'Your playbook (the standing rules it was given) changed before it was applied. The decision is yours.' });
+      message = 'The owner changed the standing rules while you decided: nothing was applied. Stop now.';
       return;
     }
     const rule = ownerReasonFor(c, rec.seat);

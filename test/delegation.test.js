@@ -275,10 +275,15 @@ test('evidence and policy at apply (property): any one substantive change after 
     ['GitHub sync', () => store.setSetting('github_sync', store.getSettings().github_sync === 'true' ? 'false' : 'true')],
     ['opening PRs', () => store.setSetting('open_draft_prs', store.getSettings().open_draft_prs === 'true' ? 'false' : 'true')],
     ['the access policy', () => store.writeSetting('access_policy', JSON.stringify({ approvers: ['manager'], seats: ['sre'], probes: ['*'], maxMinutes: 30 }))],
+    ['the owner\'s standing rules (the playbook)', () => fs.appendFileSync(config.project.playbook, '\n- Never answer for the owner on Fridays.\n')],
   ];
+  // The playbook a run is given is the owner's: this test edits a private copy of it.
+  const playbookWas = config.project.playbook;
+  config.project.playbook = path.join(tmp, 'playbook.md');
   const sync = store.getSettings().github_sync, prs = store.getSettings().open_draft_prs;
   try {
     for (const [what, mutate] of mutations) {
+      fs.copyFileSync(playbookWas, config.project.playbook);
       const t = await ask(ticket({ description: 'Fix the retry helper in utils/net.py.' }));
       delegation.sweep({ paused: false });
       const r = recFor(`${t.key}:question`);
@@ -295,7 +300,10 @@ test('evidence and policy at apply (property): any one substantive change after 
       store.setSetting('ops_enabled', 'false'); store.setSetting('github_sync', sync); store.setSetting('open_draft_prs', prs);
       store.writeSetting('access_policy', savedPolicy ?? '');
     }
-  } finally { store.setSetting('ops_enabled', 'false'); store.setSetting('github_sync', sync); store.setSetting('open_draft_prs', prs); store.writeSetting('access_policy', savedPolicy ?? ''); }
+  } finally {
+    store.setSetting('ops_enabled', 'false'); store.setSetting('github_sync', sync); store.setSetting('open_draft_prs', prs); store.writeSetting('access_policy', savedPolicy ?? '');
+    config.project.playbook = playbookWas;
+  }
 });
 
 test('a failed final write rolls the whole decision back: no answer on the thread, the ticket still waits for the owner', async () => {
