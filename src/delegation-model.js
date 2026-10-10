@@ -206,6 +206,7 @@ const strip = (s) => s.replace(/^[ \t]+|[ \t]+$/g, ''); // what Markdown strips 
 // the playbook has no standing rules at all, and Settings says why.
 const MARKED = /[&<[\]\\`]|[^\x00-\x7F]/;
 export const MARKED_HEADING = 'a heading uses markup or non-ASCII characters; headings must be plain text';
+export const UNSURE_BLOCK = 'the playbook has raw HTML, or a code block or comment that a less indented line interrupts; the desk cannot tell what Markdown shows after it';
 export const EARLIER_HEADING = 'an earlier heading has the same words; the owner\'s section is the first, and it must be a plain "##" heading';
 const loose = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ''); // letters and digits only
 // What a rule's text may not hold, because Markdown would show it differently or not at all: `<` (HTML, comments,
@@ -245,25 +246,25 @@ function interrupts(s) {
  *    it may be missing a condition.
  */
 export function standingRuleLines(text = '', heading = RULES_SECTION) { return standingRulesRead(text, heading).rules; }
-/** standingRuleLines, and why there are none when a heading stands in the way (MARKED_HEADING, EARLIER_HEADING). */
+/** standingRuleLines, and why there are none when something in the playbook stands in the way (MARKED_HEADING, EARLIER_HEADING, UNSURE_BLOCK). */
 export function standingRulesRead(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
   const lines = String(text || '').split(/\r\n|\r|\n/), none = { rules: [], problem: null };
   const target = loose(heading), container = (b) => /^(?:[-*+](?: |$)|\d{1,9}[.)](?: |$)|>)/.test(b);
   // 1. Every heading candidate in the whole playbook, outside fences and comments: each ATX line (any level) and each
   // paragraph with an underline. Any with markup or non-ASCII: no rules. The first one with the owner's words (letters
-  // and digits compared) must be the exact column-0 `## <heading>` line; a later one never opens a section. Before
-  // the heading, nothing may be read differently by Markdown (raw HTML, a fence or comment a less indented line
-  // interrupts); after it, the scan just stops there.
+  // and digits compared) must be the exact column-0 `## <heading>` line; a later one never opens a section. The scan
+  // runs to the end of the file, and anything Markdown may read differently (raw HTML, a fence or comment a less
+  // indented line interrupts), wherever it is, leaves no rules.
   let at = -1, fence = null, comment = null, run = [];
   for (let i = 0; i < lines.length; i++) {
     const src = lines[i].replace(/\t/g, '    '), indent = src.match(/^ */)[0].length, body = src.slice(indent);
-    if ((fence || comment) && /[^ ]/.test(src) && indent < (fence || comment).indent) { if (at < 0) return none; break; }
+    if ((fence || comment) && /[^ ]/.test(src) && indent < (fence || comment).indent) return { rules: [], problem: UNSURE_BLOCK };
     if (fence) { if (indent <= 3 && fence.close.test(src)) fence = null; continue; }
     if (comment) { if (src.includes('-->')) comment = null; continue; } // Markdown: the closing line is all comment
     if (/^ *$/.test(src)) { run = []; continue; }
     if (indent <= 3 && body.startsWith('<!--')) { comment = body.slice(2).includes('-->') ? null : { indent }; run = []; continue; } // a comment block
-    if (indent <= 3 && HTML_BLOCK.test(body)) { if (at < 0) return none; break; } // a raw HTML block may run on past the heading
+    if (indent <= 3 && HTML_BLOCK.test(body)) return { rules: [], problem: UNSURE_BLOCK }; // a raw HTML block: where it ends is Markdown's call
     if (indent <= 3 && fenceOpens(body)) { const f = body.match(FENCE)[1]; fence = { indent, close: new RegExp(`^ {0,3}${f[0] === '`' ? '`' : '~'}{${f.length},} *$`) }; run = []; continue; }
     const atx = indent <= 3 && body.match(/^(#{1,6})(?:[ ]+(.*?))?[ ]*$/s); // the whole line, separators included
     if (atx) {

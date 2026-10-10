@@ -123,6 +123,6 @@ test('owner rules match what Markdown shows, line for line, over generated playb
     }
     if (process.env.SIGMADESK_CM_ORACLE_REPORT) console.log(`${mode}: ${N} documents, ${count} read wrongly; rules found ${found} of the ${shown} bullets Markdown shows`);
     assert.equal(count, 0, `${mode}: ${count} of ${N} documents read wrongly, first:\n${JSON.stringify(first, null, 1)}`);
-    assert.ok(found > (mode === 'clean' ? 0.99 * shown : N / 40), `${mode}: the generator gave the grammar too little to read (${found} of ${shown})`);
+    assert.ok(found > (mode === 'clean' ? 0.99 * shown : N / 100), `${mode}: the generator gave the grammar too little to read (${found} of ${shown})`);
   }
 });
