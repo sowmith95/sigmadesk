@@ -207,6 +207,10 @@ publish-guard holds; standing and renewal production access; package installs.
   whatever the section says. Write narrow rules. The desk checks that a decision cites one of your rules and evidence
   from its brief; whether the rule fits the decision is the delegate's judgment, which you review in the Inbox.
   Override and Reopen let you decide again, but they cannot undo what the team already did after a decision.
+- **Upgrading a playbook from an earlier version.** Earlier shipped playbooks and project templates put a note (an
+  HTML comment) right under `## Standing rules the EM may apply alone`. A comment now ends the section, so with that
+  note in place no rule after it counts and the desk finds none. Move the note above the heading (or delete it) and
+  put your rules directly under the heading; Settings says so when it sees the old note there.
 - **Decisions cite what they rest on.** A decision run is given your rules from that section, numbered (R1…), and
   numbered evidence (E1…: the ticket description, the kind's own record and the thread's messages), and answers with
   `desk decide answer|approve|changes|reject "<text>" --cite "R2,E1[,file:<path>:<line>]" --why "<how they settle

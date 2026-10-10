@@ -309,6 +309,18 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
   return { rules: rules.slice(0, 60).map((r) => ({ text: r.text.join('\n'), lines: r.lines })), problem: null };
 }
 export const standingRules = (text = '', heading = RULES_SECTION) => standingRuleLines(text, heading).map((r) => r.text);
+/**
+ * The shape playbooks shipped with before the strict reading: a comment right under the owner's heading. It ends the
+ * section, so no rule after it counts; Settings tells the owner to move it above the heading.
+ */
+export function noteUnderHeading(text = '', heading = RULES_SECTION) {
+  const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
+  const lines = String(text || '').split(/\r\n|\r|\n/);
+  const at = lines.findIndex((l) => { const h = l.match(/^##(?:[ \t]+(.*?))?[ \t]*$/); return !!h && norm((h[1] || '').replace(/(?:^|[ \t]+)#+$/, '')) === norm(heading); });
+  if (at < 0) return false;
+  const next = lines.slice(at + 1).find((l) => /\S/.test(l));
+  return !!next && /^ {0,3}<!--/.test(next);
+}
 /** desk decide --cite "R2, E1, file:src/x.py:40": the ids, in order, each once. */
 export function parseCites(raw) {
   if (raw == null || raw === true) return [];

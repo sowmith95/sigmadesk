@@ -410,6 +410,12 @@ test('delegation (#9): Settings follows the playbook as the owner edits it, with
     assert.match(text, /only under the standing rule the desk found in your playbook under “Standing rules the EM may apply alone”/);
     assert.match(text, /The desk checks that what they cite is your rule and was in the brief; whether the rule fits the decision is their judgment/);
     assert.match(text, /cannot undo what the team already did after a decision/);
+    // A playbook from an earlier version: the note sits right under the heading, so the rule after it does not count.
+    fs.writeFileSync(PLAYBOOK, '# P\n## Standing rules the EM may apply alone\n<!-- Yours alone: the desk and its seats never write here. -->\n- Answer which-file questions.\n');
+    const again = await api('POST', '/api/inbox/snooze', { id: `${asked.key}:question`, until: null });
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    await page.waitForSelector('[data-standing-rules="0"] [data-note-under-heading]', { timeout: 20_000 });
+    assert.match(await page.locator('[data-note-under-heading]').textContent(), /The note under the heading must move above it/);
   } finally { fs.writeFileSync(PLAYBOOK, shipped); }
   assert.deepEqual(errors, []);
   await page.close();
