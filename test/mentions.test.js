@@ -440,14 +440,40 @@ process.stdin.resume(); process.stdin.on('end', () => {
     assert.deepEqual([killed.kind, killed.status, store.getRun(killed.id).result_text], ['mention', 'killed', 'timeout']);
     assert.equal(m2.status, 'failed', 'the time allowance is per tag: a run that used all of it is not retried');
     assert.match(m2.reason, /used this tag's whole allowance/);
-    // Steps: the run is stopped once it exceeds mentions.maxSteps tool calls.
+    // Steps: a plan-billed tagged run is stopped once it exceeds mentions.maxSteps (its admission's steps).
     const live = store.createRun({ agent_id: 'principal-be', ticket_key: t.key, kind: 'mention', token: 'step-tok', model: 'codex:' });
-    const ctx = { run: live, state: {}, presence: false };
+    const ctx = { run: live, state: {}, presence: false, maxSteps: 60 };
     runner.applyEvents(Array.from({ length: 60 }, (_, i) => ({ type: 'tool', text: `Reading f${i}` })), ctx);
     assert.equal(store.getRun(live.id).status, 'running');
     runner.applyEvents([{ type: 'tool', text: 'one more' }], ctx);
     assert.deepEqual([store.getRun(live.id).status, store.getRun(live.id).result_text], ['killed', 'step limit (60)']);
   } finally { config.engines.codex.bin = oldBin; config.mentions.maxMinutes = oldMin; fs.rmSync(path.join(tmp, 'codex-wait'), { force: true }); team.applyTeamOverrides({}); }
+});
+
+test('a tagged run admitted on dollars is bounded by its dollar cap, not by steps; a plan-billed one still stops at its steps', async () => {
+  fresh();
+  const { codex } = await import('../src/engines/codex.js');
+  const show = (ctx, i) => runner.applyEvents(codex.parse(JSON.stringify({ type: 'item.started', item: { id: `s${i}`, type: 'command_execution', command: "/bin/zsh -lc 'desk show'", status: 'in_progress' } }), tmp, ctx.state), ctx);
+  // $2 on Claude: no steps in its admission. Twenty-nine reads (each a reported command and a desk request), then the reply.
+  const t = ticket(); const r = tag(t, ['principal-be'], 'Does the retry cover the broker?');
+  const m = store.getMention(r.mentions[0].id);
+  const run = taggedRun(m);
+  runner.boundSteps(run, null); // what admission on dollars gives it
+  const ctx = { run, state: {}, presence: false };
+  for (let i = 0; i < 29; i++) { show(ctx, i); await sched.deskAction(run, 'show', {}); }
+  assert.match(await sched.deskAction(run, 'reply', { body: 'Yes: the retry wraps the broker client (broker/client.py).' }), /./);
+  assert.equal(store.getRun(run.id).status, 'running', 'its 30th action, the reply, is carried out');
+  assert.equal(store.getRun(run.id).steps, 59, 'its steps are still recorded');
+  runner.applyEvents(Array.from({ length: 100 }, (_, i) => ({ type: 'tool', text: `Reading f${i}` })), ctx);
+  assert.equal(store.getRun(run.id).status, 'running', 'steps never stop a run bounded in dollars');
+  // Plan-billed: its admission gives it 60 steps, and they are enforced.
+  const t2 = ticket(); const r2 = tag(t2, ['principal-be']);
+  const run2 = taggedRun(store.getMention(r2.mentions[0].id));
+  runner.boundSteps(run2, 60);
+  const ctx2 = { run: run2, state: {}, presence: false, maxSteps: 60 };
+  for (let i = 0; i < 20; i++) { show(ctx2, i); await sched.deskAction(run2, 'show', {}); } // 20 + 2 × 20 = 60: the last that fits
+  await assert.rejects(sched.deskAction(run2, 'reply', { body: 'x' }), /could take the run past its 60 steps/);
+  assert.deepEqual([store.getRun(run2.id).status, store.getRun(run2.id).result_text], ['killed', 'step limit (60)']);
 });
 
 test('review fixes: tagged runs are read-only in both engines, and scratch clones are replaced, never reused', async () => {
@@ -544,7 +570,7 @@ test('review fixes: every command counts toward the step cap (desk calls Codex h
   fresh();
   const { codex } = await import('../src/engines/codex.js');
   const t = ticket(); const r = tag(t, ['principal-be']); const run = taggedRun(store.getMention(r.mentions[0].id));
-  const ctx = { run, state: {}, presence: false };
+  const ctx = { run, state: {}, presence: false, maxSteps: 60 }; // a plan-billed tag's steps
   for (let i = 0; i < 61; i++) {
     const item = { id: `c${i}`, type: 'command_execution', command: `bash -lc 'desk show'`, exit_code: 0, aggregated_output: '' };
     runner.applyEvents(codex.parse(JSON.stringify({ type: 'item.started', item }), tmp, ctx.state), ctx);

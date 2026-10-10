@@ -1189,11 +1189,14 @@ test('watch steps are enforced across attempts: a plan-billed check stops past w
   dw.chargeJob(cp.id, store.getRun(run2.id), 16);
   const a3 = dw.admit(store.getCheckpoint(cp.id), plan);
   assert.equal(a3.exhausted, true, 'nothing is left for a third attempt');
-  // A dollar-capped engine's allowance is dollars: its steps are counted, never stopped.
+  // A dollar-capped engine's allowance is dollars: its steps are counted, never stopped, and its requests still pass.
   const run3 = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t.key, token: `w${++seq}`, model: 'claude:opus', job: { checkpoint: cp.id } });
+  runner.boundSteps(run3, null); // what admission on dollars gives it
   const ctx3 = { run: run3, state: {}, presence: false };
   tools(ctx3, 100);
   assert.deepEqual([store.getRun(run3.id).status, ctx3.state.steps], ['running', 100]);
+  assert.match(await sched.deskAction(store.getRun(run3.id), 'show', { key: t.key }), new RegExp(t.key));
+  assert.equal(store.getRun(run3.id).status, 'running');
   store.updateRun(run3.id, { status: 'success', token: null, ended_at: store.now() });
 });
 

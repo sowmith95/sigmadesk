@@ -49,9 +49,9 @@ export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
  * one included, fit in the allowance; otherwise it is refused, and the run stopped, before anything it asked for
  * happens. So no order of late reports can take a run past its allowance after a request was carried out.
  */
-// Post-deploy checks (watch) are bounded too, by what is left of their checkpoint's steps when the engine cannot cap
-// dollars; with a dollar cap their allowance is dollars, so their steps are counted (the checkpoint keeps the total)
-// but never stop them.
+// Post-deploy checks (watch) and tagged replies are bounded by what is left of their steps when the engine cannot cap
+// dollars; admitted on dollars, their allowance is dollars, so their steps are counted (the checkpoint or tag keeps
+// the total) but never stop them. A decision run carries its own steps whatever its bound.
 const STEP_BOUNDED = new Set(['mention', 'decide', 'watch']);
 export const isStepBounded = (kind) => STEP_BOUNDED.has(kind);
 // run id → { max, tools: tool calls, ids: reported command ids, requests: desk requests, stopped }
@@ -63,7 +63,9 @@ function ledgerOf(run, max = null) {
   return l;
 }
 const ledgerSteps = (l) => l.tools + l.ids.size + l.requests;
-const ledgerMax = (run, l) => l.max ?? (run.kind === 'decide' ? Number(config.delegation?.maxSteps) || 60 : run.kind === 'mention' ? Number(config.mentions?.maxSteps) || 60 : Infinity);
+// Only the steps a run's admission gave it bound it (a plan-billed engine's time-and-steps bound, or a decision's own
+// steps). A run admitted on dollars is bounded by its dollar cap: its steps are still counted and recorded, never enforced.
+const ledgerMax = (run, l) => l.max ?? Infinity;
 const LIMIT_OF = { decide: 'a delegated decision', mention: 'a tagged reply', watch: 'a post-deploy check' };
 /** Give a step-bounded run its allowance before anything is counted (its admission's steps; none: unlimited). */
 export function boundSteps(run, max = null) { if (STEP_BOUNDED.has(run.kind)) ledgerOf(run, max); }

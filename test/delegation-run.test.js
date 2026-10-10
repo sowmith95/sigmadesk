@@ -103,6 +103,7 @@ test('a decide run reads the owner\'s brief, answers once through the socket und
   const run = store.getRun(after.run_id);
   assert.deepEqual([run.kind, run.agent_id, run.reserve_usd], ['decide', 'manager', 0.75], 'the reservation is the decision cap');
   assert.equal(lastArgv()[lastArgv().indexOf('--max-budget-usd') + 1], '0.75', 'hard spend cap on Claude');
+  assert.deepEqual(delegation.boundFor({ id: 'manager', engine: 'claude', model: 'opus' }), { kind: 'usd', usd: 0.75, minutes: 10, steps: 60 }, 'a decision keeps its own steps on dollars too');
   assert.ok(after.spent_usd > 0, 'its spend is on the record');
   const prompt = fs.readFileSync(path.join(tmp, 'prompt.txt'), 'utf8');
   assert.match(prompt, /<decision-brief>[\s\S]*You decide: Answer Riley[\s\S]*Gate:/, 'the same brief the owner sees');

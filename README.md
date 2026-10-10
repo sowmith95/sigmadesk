@@ -222,7 +222,9 @@ publish-guard holds; standing and renewal production access; package installs.
   request so far (this one included) fit, as if no command that sent a request had been reported yet. Otherwise it is
   refused and the run stopped before it can apply anything, and no report that arrives later can push a run past its
   allowance after a request was carried out. The same counting applies to tagged replies (`mentions.maxSteps`) and
-  post-deploy checks on a plan-billed engine (`watch.maxSteps`). The bound is reserved for the engine the run
+  post-deploy checks (`watch.maxSteps`) on a plan-billed engine; admitted on an engine with a dollar cap, those are
+  bounded by the dollars instead, and their steps are recorded but never stop them. A decision run keeps its own steps
+  on either kind of engine. The bound is reserved for the engine the run
   actually gets (a fallback included). A research proposal's delegated runs share a $1.50 lifetime allowance: each run
   is capped at what is left of it, and an engine that cannot cap dollars only starts when its whole reservation fits.
   Every dollar is reserved or charged, never neither: a run's reservation stands, whatever its decision did, until the
