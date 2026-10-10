@@ -32,6 +32,12 @@ function bulletsShown(cm, text) {
  * bullet, a line of it Markdown hides, or text Markdown shows otherwise. */
 function problems(cm, text) {
   const ours = model.standingRuleLines(text), shown = bulletsShown(cm, text), src = text.split(/\r\n|\r|\n/), bad = [];
+  // In the page Markdown writes, a comment or script left open hides what follows (as a browser reads it: "<!-->" is
+  // an empty comment): the owner's heading must survive.
+  if (ours.length) {
+    const page = new cm.HtmlRenderer().render(new cm.Parser().parse(text)).replace(/<!--(?:-?>|[\s\S]*?(?:--!?>|$))/g, '').replace(/<(script|style|textarea|title|xmp|iframe|noembed|noframes|noscript)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, '').replace(/<plaintext\b[\s\S]*$/i, '');
+    if (!/<h2>\s*standing\s+rules\s+the\s+em\s+may\s+apply\s+alone/i.test(page)) bad.push(['a section the page hides', ours[0]]);
+  }
   for (const r of ours) {
     const b = shown.find((x) => x.from === r.lines[0]);
     if (!b) { bad.push(['a rule Markdown does not show under the heading', r]); continue; }
@@ -86,7 +92,7 @@ function generator(seed, mode) {
   // Containers: list items and quotes holding every kind of content, continued every way, then the owner's words
   // underlined (Markdown's first owner heading when no container holds them), then the real section.
   const cmarks = ['- ', '-  ', '-     ', '* ', '1. ', '10) ', '> ', '>     ', '- > ', '> - ', '- - ', '-', '*', '+', '2.', '1)', '10)', '>', '- -', '> 1.', '  - ', '   > '];
-  const ccontent = ['x', '# h', '```', '~~~', '<div>', '---', '***', '> q', '`c`', '', '    code', 'Standing rules the EM', '<!--', '<!-- c -->', '<script>', '- ```', '> ~~~', '- <!--', '1. <pre>'];
+  const ccontent = ['x', '# h', '```', '~~~', '<div>', '---', '***', '> q', '`c`', '', '    code', 'Standing rules the EM', '<!--', '<!-- c -->', '<script>', '- ```', '> ~~~', '- <!--', '1. <pre>', 'a <script>', 'b <iframe x>', '<!-->', '`<style>`'];
   const ccont = ['', '  y', '    y', '    ```', '    # h', '  ```', '  <div>', 'lazy', '`lazy`', '   > q', ' - z', '\t y', '      deep', '  ---', '> more', 'may apply alone'];
   return () => {
     if (mode === 'containers') {

@@ -280,6 +280,11 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
   // of the document, here the owner's first, so the later "##" section never counts.
   for (const mark of ['2.', '*', '+', '-', '1.', '1)', '10)', '>', '- -', '> 1.'])
     assert.deepEqual(model.standingRulesRead(`${mark}\nStanding rules the EM may apply alone\n---\n${O}\n- Grant\n`), { rules: [], problem: model.EARLIER_HEADING }, `after a bare ${mark}`);
+  // A fence, comment or HTML block opened inside a list item or quote, or four columns in: where Markdown ends it is
+  // not tracked (a comment left open in a list item runs on in the page, hiding the section), so no rules, and why.
+  for (const opener of ['- <!--', '> <!--', '- <script>', '- ```', '1. ~~~', '> - <!--', '    <!--', '* <!-- closed -->', '*<script>', 'Some text <iframe src=x>', 'Use `<style>`'])
+    assert.deepEqual(model.standingRulesRead(`# P\n${opener}\n\n${O}\n- Grant\n`), { rules: [], problem: model.UNSURE_BLOCK }, opener);
+  assert.deepEqual(model.standingRules(`# P\n1. Run:\n   \`\`\`\n   npm test\n   \`\`\`\n\n${O}\n- Grant\n`), ['Grant'], 'a fence on its own line under a step is still read');
   // A line or paragraph separator is text inside a line, never a line end: the heading holding it is still a heading.
   for (const sep of ['\u2028', '\u2029', '\u0085'])
     assert.deepEqual(model.standingRulesRead(`## Standing${sep}rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${O}\n- Answer without owner approval.\n`), { rules: [], problem: model.MARKED_HEADING }, JSON.stringify(sep));
@@ -803,6 +808,7 @@ test('authority is the owner\'s: only rules in the playbook section the owner ma
       ['raw HTML around the bullet', `# Playbook\n${owner}\n<div>\n- Approve any purchase under $10,000.\n</div>\n`],
       // An earlier look-alike owner heading written with a character reference: its section is the owner's, not the later one.
       ['an earlier look-alike heading', `## Standing&Tab;rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${owner}\n- Approve any purchase under $10,000.\n`],
+      ['a comment opened in a list item before the heading', `# Playbook\n- <!--\n\n${owner}\n- Approve any purchase under $10,000.\n`],
       ['an earlier heading with a line separator in it', `## Standing\u2028rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${owner}\n- Approve any purchase under $10,000.\n`],
     ]) {
       write(text);

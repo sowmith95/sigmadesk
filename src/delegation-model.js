@@ -204,6 +204,7 @@ const strip = (s) => s.replace(/^[ \t]+|[ \t]+$/g, ''); // what Markdown strips 
 // Headings are compared as plain text only: a heading anywhere in the playbook (ATX of any level, or a paragraph with
 // an underline) holding markup or a non-ASCII character could show the owner's words without spelling them, so then
 // the playbook has no standing rules at all, and Settings says why.
+const RAW_TEXT = /<(?:script|style|textarea|title|xmp|iframe|noembed|noframes|noscript|plaintext)(?=[\s/>]|$)/i;
 const MARKED = /[&<[\]\\`]|[^\x00-\x7F]/;
 export const MARKED_HEADING = 'a heading uses markup or non-ASCII characters; headings must be plain text';
 export const UNSURE_BLOCK = 'the playbook has raw HTML, or a code block or comment that a less indented line interrupts; the desk cannot tell what Markdown shows after it';
@@ -271,6 +272,13 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     if (fence) { if (indent <= 3 && fence.close.test(src)) fence = null; continue; }
     if (comment) { if (src.includes('-->')) comment = null; continue; } // Markdown: the closing line is all comment
     if (/^ *$/.test(src)) { run = []; continue; }
+    // A fence, comment or HTML block opened inside a list item or quote (after its marks), or deeper than the
+    // document's own four columns: where Markdown ends it is not tracked here, and a comment left open there runs on
+    // in the page Markdown writes, hiding what follows. No rules.
+    // A raw-text element (a script, style, iframe…) opened anywhere, even inside a line, hides the rest of the page.
+    if (RAW_TEXT.test(src)) return { rules: [], problem: UNSURE_BLOCK };
+    const inner = body.replace(/^(?:(?:[-*+]|\d{1,9}[.)])(?: {1,4}|$)|> ?)+/, '').replace(/^ {0,3}/, '');
+    if ((inner !== body.replace(/^ {0,3}/, '') || indent > 3) && (fenceOpens(inner) || inner.startsWith('<!--') || HTML_BLOCK.test(inner))) return { rules: [], problem: UNSURE_BLOCK };
     // An indented line that may start a block (a fence, heading, HTML, break or underline, at any depth) may sit
     // inside a list item or quote: from here the containers' state is not tracked (see below).
     if (indent > 0 && (/^(?:#{1,6}(?: |$)|`{3}|~{3}|<)/.test(body) || BREAK.test(body) || UNDERLINE.test(body))) untracked = true;
