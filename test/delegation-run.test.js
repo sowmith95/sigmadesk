@@ -215,8 +215,8 @@ process.stdin.resume(); process.stdin.on('end', () => { setTimeout(() => {
     assert.ok(Date.now() - started < 7000, 'the desk stopped it at the time bound');
     const after = store.getDelegation(r.id);
     assert.equal(after.status, 'escalated'); assert.match(after.why, /stopped \(timeout\)/);
-    assert.ok(store.recentEvents({ ticket_key: t.key, limit: 50 }).some((e) => /Morgan has 0\.02 minutes \(at most 40 steps\) for this decision/.test(e.text)));
-    assert.deepEqual(delegation.boundFor({ id: 'manager', engine: 'codex' }), { kind: 'time', minutes: 0.02, steps: 40 });
+    assert.ok(store.recentEvents({ ticket_key: t.key, limit: 50 }).some((e) => /Morgan has 0\.02 minutes \(at most 60 steps\) for this decision/.test(e.text)));
+    assert.deepEqual(delegation.boundFor({ id: 'manager', engine: 'codex' }), { kind: 'time', minutes: 0.02, steps: 60 });
     // A metered engine without a hard cap: nothing starts.
     config.engines.codex.billing = 'api';
     assert.equal(delegation.boundFor({ id: 'manager', engine: 'codex' }), null);
@@ -360,7 +360,7 @@ process.stdin.resume(); process.stdin.on('end', () => {
     const after = store.getDelegation(r.id);
     const run = store.getRun(after.run_id);
     assert.equal(run.model.split(':')[0], 'codex', 'Claude was unavailable, so the fallback engine ran it');
-    assert.ok(store.recentEvents({ ticket_key: t.key, limit: 50 }).some((e) => /Morgan has 6 minutes \(at most 40 steps\) for this decision/.test(e.text)), 'bounded by time and steps, not by the Claude cap');
+    assert.ok(store.recentEvents({ ticket_key: t.key, limit: 50 }).some((e) => /Morgan has 6 minutes \(at most 60 steps\) for this decision/.test(e.text)), 'bounded by time and steps, not by the Claude cap');
     assert.equal(after.status, 'escalated', 'it ended without a decision');
     config.engines.codex.billing = 'api';
     const t2 = await held();
@@ -407,7 +407,7 @@ async function stepFixture() {
   const answer = { action: 'answer', body: 'utils/net.py:40.', cite: 'R1,E1', why: 'utils/net.py:40 defines retry(); the marked rule says answer from the code.' };
   // Refused before anything applies: the decision stays open and the ticket waits; the run is stopped.
   const refused = async (d, what) => {
-    await assert.rejects(sched.deskAction(d.run, 'decide', answer), /would take the run past its 30 steps \(a desk command counts twice: as a command and as a request\)/, what);
+    await assert.rejects(sched.deskAction(d.run, 'decide', answer), /could take the run past its 30 steps \(a desk command counts twice: as a command and as a request\)/, what);
     assert.deepEqual([store.getRun(d.run.id).status, store.getRun(d.run.id).result_text], ['killed', 'step limit (30)'], what);
     assert.notEqual(store.getDelegation(d.r.id).status, 'applied', what); assert.equal(store.getTicket(d.t.key).status, 'needs_human', what);
   };
@@ -433,7 +433,7 @@ test('steps in Codex\'s real order: every reported command is a step and every d
   const b = await decision(); ran(b.ctx, 30);
   start(b.ctx, 'x31', "/bin/zsh -lc 'desk decide answer x'");
   assert.equal(store.getRun(b.run.id).status, 'killed', 'counted when it started, not when it completed');
-  await assert.rejects(sched.deskAction(b.run, 'decide', answer), /would take the run past its 30 steps|no longer open/);
+  await assert.rejects(sched.deskAction(b.run, 'decide', answer), /could take the run past its 30 steps|no longer open/);
   assert.notEqual(store.getDelegation(b.r.id).status, 'applied');
   // Room for the request and for its own command, reported late: applied, and the late report still fits.
   const c = await decision(); ran(c.ctx, 28);
@@ -469,9 +469,8 @@ test('steps are never paired: interleaved help and decision commands, delayed st
   await applied(e, 'quoted text leaves the usual room', () => start(e.ctx, 'D', "/bin/zsh -lc 'desk decide answer x'"));
   // Concurrent requests each keep room for their own commands' reports until they are carried out.
   const f = await decision(); ran(f.ctx, 26);
-  const first = runner.admitDeskCall(f.run), second = runner.admitDeskCall(f.run); // 27, 28: room kept for 2 reports
-  assert.throws(() => runner.admitDeskCall(f.run), /would take the run past its 30 steps/, 'a third does not fit beside them');
-  first(); second();
+  runner.admitDeskCall(f.run); runner.admitDeskCall(f.run); // 26 + 2 + 2: room kept for both carriers' reports
+  assert.throws(() => runner.admitDeskCall(f.run), /could take the run past its 30 steps/, 'a third does not fit beside them');
   assert.equal(store.getRun(f.run.id).status, 'killed');
   // And the late-reported 31st: refused before it applied, never stopped after.
   const g = await decision(); ran(g.ctx, 30);
@@ -481,7 +480,63 @@ test('steps are never paired: interleaved help and decision commands, delayed st
   assert.equal(steps(g) > 30, true);
 });
 
-test('steps end to end on a Codex stand-in that writes events in the real order: a 41st command that is desk decide is never applied', async () => {
+test('steps (property): under any order of late reports, nothing a carried-out request started can take the run past its allowance', () => {
+  fresh();
+  let seed = 20261009;
+  const rand = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const report = (ctx, id) => runner.applyEvents([{ type: 'cmd-start', id, cmd: 'ls' }], ctx);
+  const made = []; // these runs are taken out again: they are not today's decision runs
+  // A desk request carried out to completion (an admission that handed anything back would get it back here).
+  const request = (run) => { const done = runner.admitDeskCall(run); if (typeof done === 'function') done(); };
+  // The reported reproduction: 36 reports, then show, list and decide with all three carrying reports withheld.
+  {
+    const run = store.createRun({ agent_id: 'manager', kind: 'decide', token: `steps-prop-0-${Math.random()}`, model: 'codex:' });
+    made.push(run.id);
+    const ctx = { run, state: {}, presence: false, maxSteps: 40 };
+    runner.boundSteps?.(run, 40); // as its admission does
+    for (let i = 0; i < 36; i++) report(ctx, `c${i}`);
+    request(run); request(run); // show and list, both completed: 36 + 2 + 2
+    assert.throws(() => request(run), /could take the run past its 40 steps/, 'the decide is refused before it applies');
+    assert.equal(store.getRun(run.id).status, 'killed');
+    for (const id of ['d3', 'd2', 'd1']) report(ctx, id); // the withheld reports, reversed
+  }
+  let issuedFirst = 0;
+  for (let k = 0; k < 400; k++) {
+    const max = 8 + rand(33);
+    const run = store.createRun({ agent_id: 'manager', kind: 'decide', token: `steps-prop-${k}-${Math.random()}`, model: 'codex:' });
+    made.push(run.id);
+    const ctx = { run, state: {}, presence: false, maxSteps: max };
+    runner.boundSteps?.(run, max); // as its admission does: the allowance is known before the first step
+    report(ctx, 'first'); issuedFirst = 1;
+    // A plan in issue order: a plain command is reported at once; a desk command's request arrives at once and the
+    // report of the command that carried it is withheld, to come back at any later point in any order.
+    const plan = Array.from({ length: 1 + rand(45) }, () => (rand(4) ? 'plain' : 'desk'));
+    const plainFirst = rand(2) === 1; // then no new work follows any request: only withheld reports come later
+    if (plainFirst) plan.sort((a, b) => (a === b ? 0 : a === 'plain' ? -1 : 1));
+    const withheld = [];
+    let issued = issuedFirst, requests = 0, applied = 0, stopped = null;
+    const note = (cause) => { if (!stopped && store.getRun(run.id).status === 'killed') stopped = { cause, applied }; };
+    for (const [i, what] of plan.entries()) {
+      while (withheld.length && rand(3) === 0) { report(ctx, withheld.splice(rand(withheld.length), 1)[0]); note('report'); }
+      issued++;
+      if (what === 'plain') { report(ctx, `p${i}`); note('report'); continue; }
+      requests++; withheld.push(`d${i}`);
+      try {
+        request(run); applied++;
+        // Everything this request and the commands before it can ever add up to fits the allowance.
+        assert.ok(issued + requests <= max, `plan ${k}: carried out at ${issued} commands and ${requests} requests, over ${max}`);
+      } catch { note('refusal'); }
+    }
+    while (withheld.length) { report(ctx, withheld.splice(rand(withheld.length), 1)[0]); note('report'); }
+    if (plainFirst && applied) {
+      assert.notEqual(stopped?.cause === 'report' && stopped.applied > 0, true, `plan ${k}: a late report stopped the run after a request was carried out`);
+      if (!stopped) assert.ok(store.getRun(run.id).steps <= max, `plan ${k}: final ${store.getRun(run.id).steps} over ${max}`);
+    }
+  }
+  for (const id of made) store.handle().prepare('DELETE FROM runs WHERE id = ?').run(id);
+});
+
+test('steps end to end on a Codex stand-in that writes events in the real order: a 61st command that is desk decide is never applied', async () => {
   fresh();
   const cli = path.join(tmp, 'codex-steps.mjs'), args = path.join(tmp, 'codex-steps-args.json');
   // Like Codex: each event line is written (synchronously) before the command runs, then the completion after it.
@@ -490,12 +545,12 @@ import fs from 'node:fs'; import { spawnSync } from 'node:child_process';
 const out = (o) => fs.writeSync(1, JSON.stringify(o) + '\\n');
 process.stdin.on('data', () => {}); process.stdin.on('end', () => {
   out({ type: 'thread.started', thread_id: 'steps' });
-  for (let i = 1; i <= 40; i++) {
+  for (let i = 1; i <= 60; i++) {
     const item = { id: 'item_' + i, type: 'command_execution', command: "/bin/zsh -lc 'ls'", aggregated_output: '', exit_code: null, status: 'in_progress' };
     out({ type: 'item.started', item }); out({ type: 'item.completed', item: { ...item, exit_code: 0, status: 'completed' } });
   }
   const argv = JSON.parse(fs.readFileSync(${JSON.stringify(args)}, 'utf8'));
-  const item = { id: 'item_41', type: 'command_execution', command: "/bin/zsh -lc 'desk decide answer'", aggregated_output: '', exit_code: null, status: 'in_progress' };
+  const item = { id: 'item_61', type: 'command_execution', command: "/bin/zsh -lc 'desk decide answer'", aggregated_output: '', exit_code: null, status: 'in_progress' };
   out({ type: 'item.started', item });
   const r = spawnSync('desk', argv, { encoding: 'utf8', env: process.env });
   out({ type: 'item.completed', item: { ...item, exit_code: r.status, aggregated_output: String(r.stdout) + String(r.stderr), status: 'completed' } });
@@ -513,8 +568,8 @@ process.stdin.on('data', () => {}); process.stdin.on('end', () => {
     fs.writeFileSync(args, JSON.stringify(['decide', 'answer', 'It is utils/net.py:40.', '--cite', 'R1,E1', '--why', 'utils/net.py:40 defines retry(); the playbook says reuse.']));
     await delegation.launch(r);
     const after = store.getDelegation(r.id);
-    assert.equal(after.status, 'escalated', after.outcome); assert.match(after.why, /stopped \(step limit \(40\)\)/);
-    assert.equal(store.getRun(after.run_id).result_text, 'step limit (40)', 'the default allowance: 40 steps');
+    assert.equal(after.status, 'escalated', after.outcome); assert.match(after.why, /stopped \(step limit \(60\)\)/);
+    assert.equal(store.getRun(after.run_id).result_text, 'step limit (60)', 'the default allowance: 60 steps');
     assert.equal(store.getTicket(t.key).status, 'needs_human', 'nothing resumed');
     assert.ok(!store.listComments(t.key).some((c) => c.author === 'manager'), 'no answer was posted');
   } finally { clearInterval(poll); config.engines.codex.bin = oldBin; team.applyTeamOverrides({}); }

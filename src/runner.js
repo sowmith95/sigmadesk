@@ -44,27 +44,29 @@ export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
  * desk-side bound when dollars cannot be capped. Two kinds of step, counted apart and never matched to each other (the
  * desk cannot know which command sent a request, so it does not guess): every command or tool call the engine reports
  * (a command once, by its id, when it starts) and every desk request that reaches the desk. A desk command therefore
- * costs two steps. A request is admitted only while it, the stream step of the command that sent it (which the engine
- * may not have reported yet) and one such step for every request still being carried out all fit in the allowance;
- * otherwise it is refused, and the run stopped, before anything it asked for happens. So a late-reported step can
- * never take a run past its allowance after a request was carried out.
+ * costs two steps. Admission assumes the worst order of reports: that the command carrying every request so far is
+ * still unreported. A request is carried out only while the reported steps plus two for every request so far, this
+ * one included, fit in the allowance; otherwise it is refused, and the run stopped, before anything it asked for
+ * happens. So no order of late reports can take a run past its allowance after a request was carried out.
  */
 // Post-deploy checks (watch) are bounded too, by what is left of their checkpoint's steps when the engine cannot cap
 // dollars; with a dollar cap their allowance is dollars, so their steps are counted (the checkpoint keeps the total)
 // but never stop them.
 const STEP_BOUNDED = new Set(['mention', 'decide', 'watch']);
 export const isStepBounded = (kind) => STEP_BOUNDED.has(kind);
-// run id → { max, tools: tool calls, ids: reported command ids, requests: desk requests, open: requests being carried out, stopped }
+// run id → { max, tools: tool calls, ids: reported command ids, requests: desk requests, stopped }
 const ledgers = new Map();
 function ledgerOf(run, max = null) {
   let l = ledgers.get(run.id);
-  if (!l) { l = { max: null, tools: 0, ids: new Set(), requests: 0, open: 0, stopped: false }; ledgers.set(run.id, l); }
+  if (!l) { l = { max: null, tools: 0, ids: new Set(), requests: 0, stopped: false }; ledgers.set(run.id, l); }
   if (max != null) l.max = max;
   return l;
 }
 const ledgerSteps = (l) => l.tools + l.ids.size + l.requests;
-const ledgerMax = (run, l) => l.max ?? (run.kind === 'decide' ? Number(config.delegation?.maxSteps) || 40 : run.kind === 'mention' ? Number(config.mentions?.maxSteps) || 60 : Infinity);
+const ledgerMax = (run, l) => l.max ?? (run.kind === 'decide' ? Number(config.delegation?.maxSteps) || 60 : run.kind === 'mention' ? Number(config.mentions?.maxSteps) || 60 : Infinity);
 const LIMIT_OF = { decide: 'a delegated decision', mention: 'a tagged reply', watch: 'a post-deploy check' };
+/** Give a step-bounded run its allowance before anything is counted (its admission's steps; none: unlimited). */
+export function boundSteps(run, max = null) { if (STEP_BOUNDED.has(run.kind)) ledgerOf(run, max); }
 /** The steps a run has taken so far (its ledger when it is step-bounded). */
 const stepsTaken = (ctx) => { const l = ledgers.get(ctx.run.id); return l ? ledgerSteps(l) : ctx.state.steps || 0; };
 function stopRun(run, l, max) {
@@ -84,25 +86,22 @@ function stepLimit(ctx, id = null) {
   store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the run's steps from it
   if (ctx.state.steps > ledgerMax(ctx.run, l)) stopRun(ctx.run, l, ledgerMax(ctx.run, l));
 }
-const refusedFor = (max) => Object.assign(new Error(`this desk command would take the run past its ${max} steps (a desk command counts twice: as a command and as a request), so the run was stopped and nothing it asked for was carried out`), { status: 409 });
+const refusedFor = (max) => Object.assign(new Error(`this desk command could take the run past its ${max} steps (a desk command counts twice: as a command and as a request), so the run was stopped and nothing it asked for was carried out`), { status: 409 });
 /**
- * A desk request from a step-bounded run, BEFORE the desk carries it out: a step of its own, admitted only with room
- * left for the stream step of the command that sent it and for those of every request still being carried out. →
- * a function to call once the request has been carried out. A refused request stops the run.
+ * A desk request from a step-bounded run, BEFORE the desk carries it out: admitted only while the reported steps plus
+ * two for every request so far, this one included, fit in the allowance (the worst case: every request's carrying
+ * command still unreported). Nothing is ever given back. A refused request stops the run.
  */
 export function admitDeskCall(run) {
-  if (!STEP_BOUNDED.has(run.kind)) return () => {};
+  if (!STEP_BOUNDED.has(run.kind)) return;
   const l = ledgerOf(run);
   const max = ledgerMax(run, l);
   if (l.stopped) throw refusedFor(max);
   if (store.getRun(run.id)?.status !== 'running') throw Object.assign(new Error('this run is no longer open (it was stopped), so this desk command was not carried out; stop now'), { status: 409 });
-  const fits = ledgerSteps(l) + 1 + 1 + l.open <= max;
+  const fits = l.tools + l.ids.size + 2 * (l.requests + 1) <= max;
   l.requests++;
   store.setRunSteps(run.id, ledgerSteps(l));
   if (!fits) { stopRun(run, l, max); throw refusedFor(max); }
-  l.open++;
-  let done = false;
-  return () => { if (!done) { done = true; l.open = Math.max(0, l.open - 1); } };
 }
 
 // Apply an engine's normalized events to the desk (activity log, presence, progress, result).
@@ -787,7 +786,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0));
   const deadlineAt = Date.now() + timeoutMin * 60_000;
   if (limits?.steps != null) ctx.maxSteps = limits.steps;
-  if (STEP_BOUNDED.has(kind)) ledgerOf(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
+  boundSteps(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
   // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
   if (store.getRun(run.id)?.status !== 'running') return Promise.resolve(endBeforeSpawn('killed', store.getRun(run.id)?.result_text || 'refused before start'));
   if (!pplx) return spawnChild();

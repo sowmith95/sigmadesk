@@ -1289,9 +1289,8 @@ export async function deskAction(run, cmd, body = {}) {
   else need(cmd !== 'watch', 'desk watch only works inside a post-deploy check run');
   // A step-bounded run's desk request (a tagged reply, a decision run, a post-deploy check) is a step of its own,
   // admitted BEFORE it is carried out: past the allowance the run is stopped and nothing it asked for happens.
-  if (!runner.isStepBounded(run.kind)) return carryOut(run, cmd, body);
-  const done = runner.admitDeskCall(run);
-  try { return await carryOut(run, cmd, body); } finally { done(); }
+  if (runner.isStepBounded(run.kind)) runner.admitDeskCall(run);
+  return carryOut(run, cmd, body);
 }
 /** What a desk command does, once the gates above let its run send it. */
 async function carryOut(run, cmd, body) {

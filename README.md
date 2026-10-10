@@ -215,12 +215,14 @@ publish-guard holds; standing and renewal production access; package installs.
   timed out, over its steps) never applies anything, even if its decision was already sent.
 - **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and ends with one
   `desk decide` (or `desk decide escalate "<recommendation>" --why "<why it is yours>"`): up to $0.75 on an engine with a
-  spending cap, or 6 minutes and 40 steps on a plan-billed one (`delegation.maxSteps`); an engine with neither is
+  spending cap, or 6 minutes and 60 steps on a plan-billed one (`delegation.maxSteps`); an engine with neither is
   refused. A step is every command or tool call the engine reports, counted as it starts, and every desk request,
-  counted apart: the desk never guesses which command sent a request, so **a desk command costs two steps**. A request
-  is carried out only if it still leaves room for the late report of the command that sent it; otherwise it is refused
-  and the run stopped before it can apply anything. The same counting applies to tagged replies (`mentions.maxSteps`)
-  and post-deploy checks on a plan-billed engine (`watch.maxSteps`). The bound is reserved for the engine the run
+  counted apart: the desk never guesses which command sent a request, so **a desk command costs two steps**. Admission
+  assumes the worst order of reports: a request is carried out only if the steps reported so far plus two for every
+  request so far (this one included) fit, as if no command that sent a request had been reported yet. Otherwise it is
+  refused and the run stopped before it can apply anything, and no report that arrives later can push a run past its
+  allowance after a request was carried out. The same counting applies to tagged replies (`mentions.maxSteps`) and
+  post-deploy checks on a plan-billed engine (`watch.maxSteps`). The bound is reserved for the engine the run
   actually gets (a fallback included). A research proposal's delegated runs share a $1.50 lifetime allowance: each run
   is capped at what is left of it, and an engine that cannot cap dollars only starts when its whole reservation fits.
   Every dollar is reserved or charged, never neither: a run's reservation stands, whatever its decision did, until the
