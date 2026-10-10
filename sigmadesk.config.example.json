@@ -56,7 +56,8 @@
       "loop_limit": "shadow",
       "design": "shadow"
     },
-    "peerAccess": false
+    "peerAccess": false,
+    "rulesSection": "Standing rules the EM may apply alone"
   },
   "github": {
     "sync": true,

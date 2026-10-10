@@ -62,8 +62,11 @@ export function settingsFrom(cfg = {}) {
     maxActions: num(cfg.maxActions, 12, 2, 60), maxWaitMinutes: num(cfg.maxWaitMinutes, 30, 1, 1440), maxPerDay: num(cfg.maxPerDay, 40, 0, 1000),
     research: { maxCorrections: num(cfg.research?.maxCorrections, 1, 0, 5), maxSpendUsd: num(cfg.research?.maxSpendUsd, 1.5, 0, 50) },
     loopLimit: { maxRescopes: num(cfg.loopLimit?.maxRescopes, 1, 0, 5) },
+    rulesSection: typeof cfg.rulesSection === 'string' && cfg.rulesSection.trim() && !/[\n#]/.test(cfg.rulesSection) ? cfg.rulesSection.trim().slice(0, 120) : RULES_SECTION,
   };
 }
+/** The playbook heading the owner lists a delegate's standing rules under (delegation.rulesSection). */
+export const RULES_SECTION = 'Standing rules the EM may apply alone';
 export const validMode = (kind, mode) => mode === 'owner' || mode === 'shadow' || (KINDS[kind]?.delegates || []).includes(mode);
 
 /** Validate the owner's matrix as a whole (Settings → Autonomy). → { kinds, peerAccess } or throws. */
@@ -139,6 +142,7 @@ export const positivelyLow = (t) => !!t && t.risk === 'low' && t.diff_risk !== '
 /**
  * The deterministic rules, checked before any model call and again when a decision is applied. facts:
  *   { kind, delegate, ticket, interest: why the delegate is a party (src/delegation.js interestedSeats) or null,
+ *     rules: how many standing rules the owner marked for a delegate (null: not checked), rulesSection,
  *     lifetime: { count, spend }, limits: settingsFrom(), designStatus, stale, verifyReady, packagesEnabled, ownerTaskKind }
  * → null (the delegate may decide) or a plain-language reason it is the owner's.
  */
@@ -150,6 +154,9 @@ export function ownerReason(f, nameOf = (s) => s) {
   if (t && ['done', 'wontdo'].includes(t.status)) return 'the ticket is closed';
   // Never decide one's own matter: one's own question, request, work, review, proposal or plan.
   if (f.interest) return `${who} ${f.interest}, so ${who} cannot decide it for you`;
+  // Authority is the owner's: a model decides only under standing rules the owner marked for it, so with none the run
+  // could only escalate (it never starts).
+  if (!KINDS[f.kind]?.deterministic && f.rules === 0) return `your playbook marks no standing rules a delegate may apply alone (a "${f.rulesSection || RULES_SECTION}" section), so it stays yours`;
   switch (f.kind) {
     case 'owner_task': {
       const k = f.ownerTaskKind;
@@ -183,9 +190,34 @@ export function ownerReason(f, nameOf = (s) => s) {
 }
 
 // ---------------- what a decision may cite ----------------
-/** The owner's standing rules: each rule line (a bullet or a numbered item) of the project playbook, in order (R1, R2 …). */
-export function playbookRules(text = '') {
-  return String(text || '').split('\n').map((l) => l.match(/^\s*(?:[-*+]|\d+[.)])\s+(.*\S)\s*$/)?.[1]).filter(Boolean).slice(0, 80);
+/**
+ * The standing rules a delegate may apply alone: the list items under the playbook heading the OWNER marks for them
+ * (delegation.rulesSection, any heading level), in order (R1, R2 …), each with its continuation lines and sub-items,
+ * until the next heading of the same or a higher level. Text outside list items and HTML comments are not rules. No
+ * such heading, or no item under it → [] (then nothing can be decided for the owner).
+ */
+export function standingRules(text = '', heading = RULES_SECTION) {
+  const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
+  const lines = String(text || '').replace(/<!--[\s\S]*?(-->|$)/g, '').split('\n');
+  let i = 0, level = 0;
+  for (; i < lines.length && !level; i++) { const h = lines[i].match(/^(#{1,6})\s+(.*?)\s*#*\s*$/); if (h && norm(h[2]) === norm(heading)) level = h[1].length; }
+  if (!level) return [];
+  const rules = [];
+  let cur = null, base = null, blank = false;
+  for (; i < lines.length; i++) {
+    const line = lines[i];
+    const h = line.match(/^(#{1,6})\s/);
+    if (h && h[1].length <= level) break; // the owner's section ends at the next heading of its level or higher
+    if (h) { cur = null; continue; }
+    if (!line.trim()) { blank = true; continue; }
+    const item = line.match(/^(\s*)(?:[-*+]|\d+[.)])\s+(.*\S)\s*$/);
+    const indent = line.match(/^\s*/)[0].length;
+    if (item && (base == null || indent <= base)) { base = base ?? indent; cur = [item[2]]; rules.push(cur); blank = false; continue; }
+    // A continuation (or a sub-item) belongs to the rule above it; after a blank line only an indented one does.
+    if (cur && (!blank || indent > (base ?? 0))) { cur.push(line.trim()); blank = false; continue; }
+    cur = null; blank = false; // a paragraph between rules is not a rule
+  }
+  return rules.map((r) => r.join('\n').trim()).filter(Boolean).slice(0, 60);
 }
 /** desk decide --cite "R2, E1, file:src/x.py:40": the ids, in order, each once. */
 export function parseCites(raw) {
@@ -204,16 +236,17 @@ export function parseFileCite(id) {
 }
 /**
  * Why a decision's citations do not support it, or null. A decision that changes anything must cite at least one of
- * the owner's standing rules (R) and at least one piece of evidence: from its brief (E) or a repository file (file:).
- * Every id must be one its run was given, or a file that exists (badFiles: the cited files that do not).
+ * the standing rules the owner marked for a delegate to apply alone (R) and at least one numbered piece of evidence
+ * from its brief (E). A repository file (file:) may be cited as well, never instead of an E. Every id must be one its
+ * run was given, or a file that exists at the pinned base (badFiles: the cited files that do not).
  */
 export function citationProblem(ids = [], { rules = new Set(), evidence = new Set(), badFiles = new Set() } = {}) {
   if (!ids.length) return 'cites nothing from its brief';
   const isFile = (id) => !!parseFileCite(id) && !badFiles.has(id);
   const unknown = ids.filter((id) => !rules.has(id) && !evidence.has(id) && !isFile(id));
   if (unknown.length) return `cites ${unknown.join(', ')}, which ${unknown.length === 1 ? 'is' : 'are'} not in its brief or the repository`;
-  if (!ids.some((id) => rules.has(id))) return 'cites none of your standing rules';
-  if (!ids.some((id) => evidence.has(id) || isFile(id))) return 'cites no evidence from its brief';
+  if (!ids.some((id) => rules.has(id))) return 'cites none of the standing rules you marked for a delegate to apply alone';
+  if (!ids.some((id) => evidence.has(id))) return 'cites no numbered evidence from its brief (a file citation does not replace one)';
   return null;
 }
 

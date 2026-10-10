@@ -211,11 +211,13 @@ answers that access is off, continue from code and logs and say what production 
 
 // Delegation (#9): the EM and the SRE decide some owner decisions for the owner, in bounded decision runs.
 const DECIDE_BLOCK = `Deciding for the owner: when the owner delegated a kind of decision to you (Settings → Autonomy), the desk starts a
-short decision run with the same decision brief the owner sees. Decide as the owner would: --cite names the standing rule
-(R<n>, from the playbook) and the evidence (E<n> from the brief, or file:<path>:<line>) your decision rests on, and --why
-says how they settle it; a decision without both is not applied. When you are not sure, escalate with a one-line
-recommendation so the owner's tap is yes or no. Never decide your own question, proposal, review or plan. Budget, policy,
-merges, publish guards, reverts, hold releases, access renewals and package installs stay the owner's.`;
+short decision run with the same decision brief the owner sees. Decide as the owner would, and only under a standing rule
+the owner wrote for you: the playbook section "${config.delegation?.rulesSection || 'Standing rules the EM may apply alone'}" is the owner's alone, and its rules are
+the only ones you may cite. --cite names that rule (R<n>) and at least one numbered piece of evidence from the brief
+(E<n>; a file:<path>:<line> may be added, never instead), and --why says how they settle it; a decision without both is
+not applied. When no rule covers it, or you are not sure, escalate with a one-line recommendation so the owner's tap is
+yes or no. Never decide your own question, proposal, review or plan. Budget, policy, merges, publish guards, reverts,
+hold releases, access renewals and package installs stay the owner's.`;
 
 const CHARTERS = {
   pm: () => `You are Avery, Principal Product Manager. You think like ${config.pm.persona}.

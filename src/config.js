@@ -311,6 +311,9 @@ const DEFAULTS = {
     maxPerDay: 40, // decision runs per day across every kind
     research: { maxCorrections: 1, maxSpendUsd: 1.5 }, // per proposal over its whole life (survives revisions)
     loopLimit: { maxRescopes: 1 }, // per ticket
+    // The playbook heading under which the OWNER lists the standing rules a delegate may apply alone. Only those rules
+    // can be cited; with no such section (or an empty one) every delegated decision stays the owner's.
+    rulesSection: 'Standing rules the EM may apply alone',
   },
   // Per-agent overrides keyed by agent id, e.g. {"junior": {"model": "haiku"}, "pm": {"enabled": false}}
   team: {},
@@ -532,6 +535,8 @@ export function validateConfig(c = config) {
   }
   if (dlg.enabled !== undefined && typeof dlg.enabled !== 'boolean') problems.push('delegation.enabled must be true or false');
   if (dlg.peerAccess !== undefined && typeof dlg.peerAccess !== 'boolean') problems.push('delegation.peerAccess must be true or false');
+  if (dlg.rulesSection !== undefined && !(typeof dlg.rulesSection === 'string' && dlg.rulesSection.trim() && dlg.rulesSection.length <= 120 && !/[\n#]/.test(dlg.rulesSection)))
+    problems.push('delegation.rulesSection must be a playbook heading (text without #, at most 120 characters)');
   const modelList = (v) => Array.isArray(v) && v.every((id) => typeof id === 'string' && /^[\w.:-]{1,80}$/.test(id));
   for (const id of ['claude', 'codex', 'perplexity']) if (!modelList(c.engines[id]?.models)) problems.push(`engines.${id}.models must be a list of model ids`);
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');

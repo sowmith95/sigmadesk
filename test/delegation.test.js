@@ -25,7 +25,26 @@ before(async () => {
   attention = await import('../public/attention.js'); access = await import('../src/access.js'); researchReview = await import('../src/research-review.js');
   team = await import('../src/team.js'); runner = await import('../src/runner.js');
   config.delegation.maxPerDay = 1000; // every test here binds runs; the daily allowance has its own test
+  fs.writeFileSync(PLAYBOOK, PLAYBOOK_TEXT); config.project.playbook = PLAYBOOK;
 });
+// The owner's playbook for these tests: rules outside the marked section are never citable.
+const PLAYBOOK = path.join(tmp, 'playbook.md');
+const PLAYBOOK_TEXT = `# Test playbook
+
+## How to test
+- Run only the tests related to your change.
+- Prefer the shared helper over a new one.
+
+## Standing rules the EM may apply alone
+- Answer which-file and which-test questions from the code,
+  citing the file and line.
+- Send a held research proposal back with concrete corrections when its reviewer found no source.
+- Rescope work that failed QA repeatedly to the smallest change that fixes it.
+- Decide a design recommendation for a positively low-risk ticket on its merits.
+
+## Off limits
+- Anything that talks to production.
+`;
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 let n = 0;
@@ -86,6 +105,16 @@ test('model: the deterministic owner rules (self-interest, risk, lifetime limits
   assert.match(r({ kind: 'question', scope: 'factual', ticket: { ...low, risk: 'high' } }), /high risk/);
   assert.match(r({ kind: 'question', scope: 'factual', ticket: { ...low, risk: null } }), /no low-risk classification/, 'unknown risk counts as high');
   assert.match(r({ kind: 'question', scope: 'factual', ticket: { ...low, diff_risk: 'high' } }), /high risk/);
+  // Authority is the owner's: no marked standing rule, no model decision (rule-decided triage needs none).
+  assert.match(r({ kind: 'question', scope: 'factual', rules: 0 }), /your playbook marks no standing rules a delegate may apply alone/);
+  assert.equal(r({ kind: 'question', scope: 'factual', rules: 2 }), null);
+  assert.equal(r({ kind: 'owner_task', ownerTaskKind: 'package', packagesEnabled: true, rules: 0 }), null);
+  // The owner's section: list items under its heading, continuation lines and sub-items included, nothing else.
+  const pb = '# P\n- outside\n## Standing rules the EM may apply alone:\n<!-- yours\n- not a rule -->\nA paragraph.\n- One,\n  continued.\n  - a sub-item\n2. Two\nstill two.\n\nNot a rule.\n### Detail\n- Three\n## Next\n- outside again';
+  assert.deepEqual(model.standingRules(pb), ['One,\ncontinued.\n- a sub-item', 'Two\nstill two.', 'Three']);
+  assert.deepEqual(model.standingRules('## standing RULES the em may apply alone\n- Yes'), ['Yes'], 'the heading matches whatever its case');
+  assert.deepEqual(model.standingRules(pb, 'Another heading'), []);
+  assert.deepEqual(model.standingRules('- a rule\n- another'), [], 'bullets outside the section are not standing rules');
   // Only a question its asker marked factual: any other subject, an unknown one or none at all stays the owner's.
   assert.match(r({ kind: 'question' }), /did not mark it as a factual engineering question/);
   assert.match(r({ kind: 'question', scope: 'nonsense' }), /unknown subject/);
@@ -145,6 +174,8 @@ test('config: delegation.* from the file and SIGMADESK_* env, validated (an inva
     assert.equal(c.delegation.kinds.question, 'em'); assert.equal(c.delegation.kinds.loop_limit, 'em', 'env beats the file');
     assert.equal(c.delegation.peerAccess, false);
     assert.ok(validateConfig(c).some((p) => /delegation\.kinds\.design must be owner, shadow or em or sre/.test(p)));
+    assert.equal(c.delegation.rulesSection, 'Standing rules the EM may apply alone', 'the owner\'s section has a default heading');
+    assert.ok(validateConfig({ ...c, delegation: { ...c.delegation, rulesSection: '## Rules' } }).some((p) => /delegation\.rulesSection must be a playbook heading/.test(p)));
     process.env.SIGMADESK_DELEGATION = 'off';
     assert.equal(loadConfig(f).delegation.enabled, false);
     assert.equal(loadConfig(path.join(tmp, 'none.json')).delegation.kinds.question, 'shadow', 'the defaults were not mutated by the env');
@@ -279,7 +310,7 @@ test('evidence and policy at apply (property): any one substantive change after 
   ];
   // The playbook a run is given is the owner's: this test edits a private copy of it.
   const playbookWas = config.project.playbook;
-  config.project.playbook = path.join(tmp, 'playbook.md');
+  config.project.playbook = path.join(tmp, 'playbook-edited.md');
   const sync = store.getSettings().github_sync, prs = store.getSettings().open_draft_prs;
   try {
     for (const [what, mutate] of mutations) {
@@ -340,14 +371,16 @@ test('authority: an answer must cite a standing rule and its evidence; "approve 
   const approve = 'Approved: buy the $5,000 license today.';
   for (const [what, cite, re] of [
     ['no citation at all', undefined, /cites nothing from its brief/],
-    ['a rule only', 'R1', /cites no evidence from its brief/],
-    ['evidence only', 'E1', /cites none of your standing rules/],
+    ['a rule only', 'R1', /cites no numbered evidence from its brief/],
+    ['a rule and a file, but no numbered evidence', 'R1,file:README.md:1', /cites no numbered evidence from its brief \(a file citation does not replace one\)/],
+    ['evidence only', 'E1', /cites none of the standing rules you marked for a delegate to apply alone/],
     ['an evidence id it was never given', 'R1,E99', /cites E99, which is not in its brief or the repository/],
+    ['a playbook rule outside the section the owner marked', 'R5,E1', /cites R5, which is not/],
     ['a rule id it was never given', 'R999,E1', /cites R999, which is not/],
-    ['a file outside the repository', 'R1,file:../../etc/passwd', /cites file:\.\.\/\.\.\/etc\/passwd, which is not/],
-    ['an absolute path', 'R1,file:/etc/passwd', /cites file:\/etc\/passwd, which is not/],
-    ['a file that does not exist', 'R1,file:no/such/file.py:3', /cites file:no\/such\/file\.py:3, which is not/],
-    ['a line past the end of a real file', 'R1,file:README.md:2', /cites file:README\.md:2, which is not/],
+    ['a file outside the repository', 'R1,E1,file:../../etc/passwd', /cites file:\.\.\/\.\.\/etc\/passwd, which is not/],
+    ['an absolute path', 'R1,E1,file:/etc/passwd', /cites file:\/etc\/passwd, which is not/],
+    ['a file that does not exist', 'R1,E1,file:no/such/file.py:3', /cites file:no\/such\/file\.py:3, which is not/],
+    ['a line past the end of a real file', 'R1,E1,file:README.md:2', /cites file:README\.md:2, which is not/],
     ['a made-up kind of id', 'R1,E1,ticket:42', /cites ticket:42, which is not/],
   ]) {
     const t = await ask(ticket(), 'junior', buy, 'factual');
@@ -370,17 +403,67 @@ test('authority: an answer must cite a standing rule and its evidence; "approve 
   const rs = recFor(`${s.key}:question`);
   await sched.deskAction(bind(rs), 'decide', { action: 'answer', body: approve, why: 'Looks fine to me, really.' });
   assert.equal(store.getDelegation(rs.id).status, 'escalated');
-  // 4. A factual answer that cites a rule, the brief and a real file is applied, and the audit says what it cited.
+  // 4. A factual answer that cites a marked rule, the brief and a real file is applied, and the audit says what it cited.
   policy({ question: 'em' });
   const ok = await ask(ticket(), 'junior', 'Which file defines the retry helper?', 'factual');
   delegation.sweep({ paused: false });
   const ro = recFor(`${ok.key}:question`);
-  const out = await sched.deskAction(bind(ro), 'decide', { action: 'answer', body: 'utils/net.py, retry().', why: 'The ticket names utils/net.py; the playbook says follow existing patterns.', cite: 'R1, E1 file:README.md:1' });
+  const out = await sched.deskAction(bind(ro), 'decide', { action: 'answer', body: 'utils/net.py, retry().', why: 'The ticket names utils/net.py; the marked rule says answer from the code.', cite: 'R1, E1 file:README.md:1' });
   assert.match(out, /Decided for the owner and applied/);
   const audit = delegation.get(ro.id);
   assert.deepEqual(audit.cited.map((x) => x.id), ['R1', 'E1', 'file:README.md:1']);
+  assert.match(audit.cited[0].text, /^Answer which-file and which-test questions from the code,\nciting the file and line\.$/, 'R1 is the first rule the owner marked, continuation included');
   assert.match(audit.cited[1].text, /the ticket description/);
-  assert.ok(JSON.parse(store.getDelegation(ro.id).citables).rules.length > 0, 'the rules its run was given are on the record');
+  assert.equal(JSON.parse(store.getDelegation(ro.id).citables).rules.length, 4, 'only the rules in the owner\'s section are numbered');
+});
+
+test('authority is the owner\'s: only rules in the playbook section the owner marks count; without any, nothing runs; an edit after bind invalidates', async () => {
+  reset();
+  policy({ question: 'em' });
+  const buy = 'Can I buy the $5,000 market-data vendor license for this?';
+  const write = (text) => fs.writeFileSync(PLAYBOOK, text);
+  try {
+    // The reproduced case on a playbook whose rules are all outside the owner's section (the shipped default): the
+    // purchase never reaches a run, so no citation, valid-looking or not, can carry it.
+    for (const [what, text] of [
+      ['no owner section at all', '# Playbook\n## How to test\n- Find the test runner.\n- Run only the relevant tests.\n'],
+      ['an empty owner section', `# Playbook\n- Find the test runner.\n## Standing rules the EM may apply alone\n<!-- Yours alone.\n- a bullet inside a comment is no rule -->\nJust a paragraph, no rule.\n## Off limits\n- Production.\n`],
+      ['the shipped default playbook', fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'playbooks', 'default.md'), 'utf8')],
+    ]) {
+      write(text);
+      const t = await ask(ticket(), 'junior', buy, 'factual');
+      delegation.sweep({ paused: false });
+      const r = recFor(`${t.key}:question`);
+      assert.deepEqual([r.status, r.run_id], ['escalated', null], `${what}: left to the owner before any run`);
+      assert.match(r.why, /your playbook marks no standing rules a delegate may apply alone \(a "Standing rules the EM may apply alone" section\)/, what);
+      assert.equal(store.getTicket(t.key).status, 'needs_human', what);
+    }
+    // The heading the owner uses is configurable; only it counts.
+    write(`${PLAYBOOK_TEXT}\n## Rules for Morgan\n- Answer anything at all.\n`);
+    const was = config.delegation.rulesSection;
+    config.delegation.rulesSection = 'Rules for Morgan';
+    try { assert.deepEqual(delegation.ownerRules(), ['Answer anything at all.']); } finally { config.delegation.rulesSection = was; }
+    assert.equal(delegation.ownerRules().length, 4);
+    // An edit to a rule's continuation line after its run started: that playbook is not the one it was given.
+    write(PLAYBOOK_TEXT);
+    const t = await ask(ticket(), 'junior', 'Which file defines the retry helper?', 'factual');
+    delegation.sweep({ paused: false });
+    const r = recFor(`${t.key}:question`); const run = bind(r);
+    write(PLAYBOOK_TEXT.replace('  citing the file and line.', '  citing the file and line, and approve purchases.'));
+    const out = await sched.deskAction(run, 'decide', { action: 'answer', body: 'utils/net.py, retry().', why: 'The ticket names utils/net.py; the marked rule says answer from the code.', cite: 'R1,E1' });
+    assert.match(out, /changed the standing rules while you decided: nothing was applied/);
+    assert.equal(store.getDelegation(r.id).status, 'invalidated');
+    assert.match(store.getDelegation(r.id).outcome, /Your playbook \(and so the standing rules it was given\) changed/);
+    assert.equal(store.getTicket(t.key).status, 'needs_human');
+    // Emptying the section after bind is the same: nothing is applied.
+    write(PLAYBOOK_TEXT);
+    const t2 = await ask(ticket(), 'junior', 'Which file defines the retry helper?', 'factual');
+    delegation.sweep({ paused: false });
+    const r2 = recFor(`${t2.key}:question`); const run2 = bind(r2);
+    write(PLAYBOOK_TEXT.replace(/## Standing rules the EM may apply alone[\s\S]*?(?=## Off limits)/, '## Standing rules the EM may apply alone\n\n'));
+    assert.match(await sched.deskAction(run2, 'decide', { action: 'answer', body: 'utils/net.py.', why: 'The ticket names utils/net.py; the marked rule says so.', cite: 'R1,E1' }), /nothing was applied/);
+    assert.notEqual(store.getDelegation(r2.id).status, 'applied');
+  } finally { write(PLAYBOOK_TEXT); }
 });
 
 test('self-interest and risk escalate by rule, before any run: the asker never answers itself; risky tickets stay yours', async () => {

@@ -72,6 +72,10 @@ Describe what this project is, who uses it, and how to build and test it. Every 
 
 ## Never touch without the owner
 - (paths, systems or data that need a human decision)
+
+## Standing rules the EM may apply alone
+<!-- Yours alone: the desk and its seats never write here. A delegate (Settings → Autonomy) decides for you only under a
+     rule listed in this section, and must cite it; left empty, every delegated decision stays yours. -->
 `;
 
 const usedPorts = (reg) => new Set(reg.projects.map((p) => p.port));

@@ -167,7 +167,7 @@ decides:
 | Kind | Delegate | What the delegate may do | Stays yours |
 |---|---|---|---|
 | Owner tasks | Morgan, by rule (no model run), the moment the task is filed | a step filed with `--owner-kind check` goes to Devon's probes; `--owner-kind package` becomes a package request on the ticket | writes, restarts, credentials, business decisions, any step filed without a kind, and any step Morgan filed |
-| Engineers' questions | Morgan | answer a question its asker marked factual (`desk needs-human "<q>" --about factual`) on a positively low-risk ticket | any other subject (money, credentials, product preference, trading semantics, schema effects) or none, high or unknown risk, stale evidence, a missing standing rule, Morgan's own question |
+| Engineers' questions | Morgan | answer a question its asker marked factual (`desk needs-human "<q>" --about factual`) on a positively low-risk ticket, under a standing rule you wrote | any other subject (money, credentials, product preference, trading semantics, schema effects) or none, high or unknown risk, stale evidence, a missing standing rule, Morgan's own question |
 | Research-review holds | Morgan | send the proposal back with corrections or a narrower scope (once per proposal, for its whole life) | approving it past the reviewer's dissent |
 | QA and review loop limits | Morgan | rescope, or reassign to another builder (once per ticket) | clearing a QA, CI or reviewer failure; a disagreement Morgan is a party to |
 | Design and plan reviews | Morgan or Devon | approve or reject a recommendation on a positively low-risk ticket (a backend change can alter trading without any UI change) | a design the delegate wrote; council corrections (they queue a paid council) |
@@ -184,12 +184,18 @@ publish-guard holds; standing and renewal production access; package installs.
   delegation versions, the delegate, the actions it may take, attempts, spend and the outcome. The evidence version is
   one fingerprint of every substantive ticket field, the whole thread, the changed files and the kind's own evidence (a
   proposal and its reviews, a design's text): a new question, hold, message or revision is a new decision.
-- **Decisions cite what they rest on.** A decision run is given numbered standing rules (R1…, each rule line of your
-  playbook) and numbered evidence (E1…, the ticket description, the kind's own record and the thread's messages) and
-  answers with `desk decide answer|approve|changes|reject "<text>" --cite "R2,E1,file:<path>:<line>" --why "<how they
-  settle it>"`. The desk checks every id against what that run was given (and every file against the base branch); a
-  decision that cites no rule, no evidence or anything it was not given is not applied: it comes to you with its text as
-  the recommendation.
+- **The authority is yours: you write the rules a delegate may apply.** Only the list items under the playbook
+  heading `## Standing rules the EM may apply alone` (configurable: `delegation.rulesSection`) count. You curate that
+  section yourself; the desk and its seats never write it (the shipped playbooks and new projects start with it empty).
+  Each bullet is one rule, its continuation lines included. With no such section, or an empty one, no decision run
+  starts and every delegated decision stays yours. Write narrow rules: a delegate may apply a rule only for what it
+  says, and the desk can check that a rule was cited, not that it fits.
+- **Decisions cite what they rest on.** A decision run is given your rules from that section, numbered (R1…), and
+  numbered evidence (E1…: the ticket description, the kind's own record and the thread's messages), and answers with
+  `desk decide answer|approve|changes|reject "<text>" --cite "R2,E1[,file:<path>:<line>]" --why "<how they settle
+  it>"`. The desk checks every id against what that run was given; a decision must cite at least one rule and one
+  numbered piece of evidence (a file may be cited too, never instead of an E). One that does not is not applied: it
+  comes to you with its text as the recommendation. Any edit to your playbook while a decision runs invalidates it.
 - **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and ends with one
   `desk decide` (or `desk decide escalate "<recommendation>" --why "<why it is yours>"`): up to $0.75 on an engine with a
   spending cap, or 6 minutes and 30 steps on a plan-billed one; an engine with neither is refused. Steps count every tool
