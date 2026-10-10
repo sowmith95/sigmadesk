@@ -917,7 +917,9 @@ export function summary(now = Date.now(), settings = store.getSettings()) {
       recommendation: r.recommendation, line: model.lineFor(r, first), assign: r.assign };
   }
   const day = now - 86400_000;
+  const rules = ownerRules();
   return { enabled: pol.enabled, escalate_all: pol.escalateAll, kinds: pol.kinds, configured: pol.configured, peer_access: pol.peerAccess, version: version(settings), paused: settings.paused === 'true',
+    rules: { section: limits().rulesSection, count: rules.length, hash: hash(rules) }, // fresh with every snapshot: a playbook edit shows at once
     metrics: model.metrics(recs, { now, days: 7 }), open,
     decided: recs.filter((r) => ['applied', 'overridden', 'reopened'].includes(r.status) && Date.parse(r.decided_at || r.created_at) >= day).reverse() };
 }
@@ -930,7 +932,7 @@ export function details(settings = store.getSettings()) {
       modes: ['owner', 'shadow', ...model.KINDS[k].delegates], deterministic: !!model.KINDS[k].deterministic, delegate: model.delegateFor(k, pol.configured[k] === 'owner' ? 'shadow' : pol.configured[k]) })),
     limits: { budget_usd: L.budgetUsd, max_minutes: L.maxMinutes, max_steps: L.maxSteps, max_wait_minutes: L.maxWaitMinutes, max_per_day: L.maxPerDay, research: L.research, loop_limit: L.loopLimit },
     // The owner's standing rules (the playbook section): with none, a delegate never decides anything by model.
-    rules: { section: L.rulesSection, count: ownerRules().length },
+    rules: { section: L.rulesSection, count: ownerRules().length, hash: hash(ownerRules()) },
     never: ['Budget, policies and this matrix', 'Merges of high-risk work, revert merges and releasing holds', 'Publish-guard holds', 'Standing grants and renewals of production access', 'Package installs'],
     recent: store.recentDelegations(30).map(view) };
 }

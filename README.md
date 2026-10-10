@@ -190,9 +190,13 @@ publish-guard holds; standing and renewal production access; package installs.
   heading `## Standing rules the EM may apply alone` (configurable: `delegation.rulesSection`) count. You curate that
   section yourself; the desk and its seats never write it (the shipped playbooks and new projects start with it empty).
   Each top-level bullet is one rule, its continuation lines and nested items included; code blocks (fenced or
-  indented), HTML comments and plain paragraphs are never rules, so an example in your playbook grants nothing. With no such section, or an empty one, no decision run
-  starts and every delegated decision stays yours. Write narrow rules: a delegate may apply a rule only for what it
-  says, and the desk can check that a rule was cited, not that it fits.
+  indented), HTML comments and plain paragraphs are never rules, so an example in your playbook grants nothing. With
+  no such section, or an empty one, no decision run starts: nothing is decided for you by judgment. Owner-task triage
+  is the one exception, because it is decided by rule, not judgment: a step filed as a check or a package is routed
+  back to the team (when that kind is delegated) whatever the section says. Write narrow rules. The desk checks that a
+  decision cites one of your rules and evidence from its brief; whether the rule fits the decision is the delegate's
+  judgment, which you review in the Inbox. Override and Reopen let you decide again, but they cannot undo what the team
+  already did after a decision.
 - **Decisions cite what they rest on.** A decision run is given your rules from that section, numbered (R1…), and
   numbered evidence (E1…: the ticket description, the kind's own record and the thread's messages), and answers with
   `desk decide answer|approve|changes|reject "<text>" --cite "R2,E1[,file:<path>:<line>]" --why "<how they settle
@@ -200,8 +204,12 @@ publish-guard holds; standing and renewal production access; package installs.
   numbered piece of evidence (a file may be cited too, never instead of an E). One that does not is not applied: it
   comes to you with its text as the recommendation. Any edit to your playbook while a decision runs invalidates it.
   File evidence is pinned: a run's read-only workspace is a copy of one trusted base commit, its file citations are
-  checked at that commit, and if the desk's base has moved on by the time it decides, nothing is applied. A run that
-  was stopped (cancelled, timed out, over its steps) never applies anything, even if its decision was already sent.
+  checked at that commit, and if the desk's base has moved on by the time it decides, nothing is applied (the base is
+  read, and the decision applied, under the lock the base's writers hold). That base is the desk's cached copy of your
+  base branch, not a live read: it is refreshed when a read-only workspace is prepared, at most every 10 minutes from
+  your remote (a checkout with no remote is read every time); when the remote cannot be reached it is your checkout's
+  last fetched copy of the base branch, or your local base branch. Nothing is fetched when a decision is applied. A run that was stopped (cancelled,
+  timed out, over its steps) never applies anything, even if its decision was already sent.
 - **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and ends with one
   `desk decide` (or `desk decide escalate "<recommendation>" --why "<why it is yours>"`): up to $0.75 on an engine with a
   spending cap, or 6 minutes and 40 steps on a plan-billed one (`delegation.maxSteps`); an engine with neither is

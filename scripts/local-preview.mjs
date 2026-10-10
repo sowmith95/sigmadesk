@@ -24,8 +24,11 @@ else {process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringi
 `); fs.chmodSync(cli, 0o755);
 const log = path.join(tmp, 'application.log'); fs.writeFileSync(log, 'INFO preview ready\n');
 const cfg = path.join(tmp, 'config.json');
+// The preview's own copy of the default playbook (a browser test may pass its own file to edit).
+const playbook = process.env.SIGMADESK_PREVIEW_PLAYBOOK || path.join(tmp, 'playbook.md');
+if (!process.env.SIGMADESK_PREVIEW_PLAYBOOK) fs.copyFileSync(path.join(root, 'playbooks/default.md'), playbook);
 fs.writeFileSync(cfg, JSON.stringify({ server: { port: Number(process.env.SIGMADESK_PORT || 8791), hosts: ['127.0.0.1'], preventIdleSleep: false, preview: true, ...(process.env.SIGMADESK_PREVIEW_TOKEN ? { ownerToken: process.env.SIGMADESK_PREVIEW_TOKEN } : {}) /* tests of the sign-in link */ },
-  project: { name: 'SigmaDesk · local preview', repoPath: repo, githubRepo: 'test/fixture', playbook: path.join(root, 'playbooks/default.md') },
+  project: { name: 'SigmaDesk · local preview', repoPath: repo, githubRepo: 'test/fixture', playbook },
   bins: { claude: cli }, engines: { codex: { bin: cli } }, github: { sync: false, openDraftPrs: false }, pm: { enabled: false },
   watch: { enabled: true, intervalSeconds: 5, sources: [{ type: 'file', path: log, label: 'Preview service' }] }, notify: { webhookUrl: '' },
   // Decision demo: one workflow mapped to a service (the brief names a target only from this), read-only probes configured.

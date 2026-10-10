@@ -4,12 +4,20 @@
 // saves, connector proposals, and no horizontal overflow on phones.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { startPreview, launch, openPage, findChromium } from '../scripts/ui-browser.mjs';
 
 const skip = !findChromium() && 'no Chromium available';
 let preview, browser;
-before(async () => { if (skip) return; preview = await startPreview(); browser = await launch(); });
-after(async () => { await browser?.close(); await preview?.stop(); });
+// The preview desk's playbook: a copy of the shipped default this file may edit (the owner's standing rules).
+const pbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sigmadesk-e2e-playbook-'));
+const PLAYBOOK = path.join(pbDir, 'playbook.md');
+fs.copyFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'playbooks', 'default.md'), PLAYBOOK);
+before(async () => { if (skip) return; preview = await startPreview({ SIGMADESK_PREVIEW_PLAYBOOK: PLAYBOOK }); browser = await launch(); });
+after(async () => { await browser?.close(); await preview?.stop(); fs.rmSync(pbDir, { recursive: true, force: true }); });
 const api = (method, p, b) => fetch(preview.url + p, { method, headers: { 'Content-Type': 'application/json' }, body: b === undefined ? undefined : JSON.stringify(b) }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) }));
 const go = (page, hash) => page.evaluate((h) => { location.hash = h; }, hash);
 
@@ -341,7 +349,10 @@ test('delegation (#9): Decided for you with Override, the delegate\'s take on an
   assert.equal(await q.getAttribute('data-mode'), 'shadow', 'every kind starts in shadow');
   // The preview's playbook marks no standing rules: Settings says plainly that every decision still comes to the owner.
   assert.equal(await page.locator('[data-standing-rules]').getAttribute('data-standing-rules'), '0');
-  assert.match(await page.locator('[data-standing-rules]').textContent(), /You have not written any standing rules yet \(a “Standing rules the EM may apply alone” section in your playbook\)/);
+  const rules = await page.locator('[data-standing-rules]').textContent();
+  assert.match(rules, /You have not written any standing rules yet \(a “Standing rules the EM may apply alone” section in your playbook\), so nothing below is decided for you by judgment/);
+  assert.match(rules, /Owner tasks are the exception: a step filed as a check or a package is routed by rule/, 'the rule-decided exception is stated');
+  assert.match(rules, /cannot undo what the team already did after a decision/, 'override is not a rollback');
   await q.getByRole('radio', { name: 'Morgan decides' }).click();
   await page.waitForSelector('[data-delegation-kind="question"][data-mode="em"]');
   assert.equal((await api('GET', '/api/delegation')).body.kinds.find((k) => k.id === 'question').mode, 'em');
@@ -377,6 +388,28 @@ test('delegation (#9) on a phone: a decided row folds into two lines however lon
   assert.match(await row.locator('[data-decided-detail]').textContent(), /the audit export should call to_utc\(\) too/, 'the whole decision once expanded');
   await row.locator('[data-based-on]').waitFor();
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'expanded: still no sideways scrolling');
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('delegation (#9): Settings follows the playbook as the owner edits it, without a reload, and says what the desk checks', { skip, timeout: 90_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/settings`, { width: 1280, height: 900 });
+  const line = page.locator('[data-standing-rules]');
+  await line.waitFor();
+  assert.equal(await line.getAttribute('data-standing-rules'), '0');
+  const shipped = fs.readFileSync(PLAYBOOK, 'utf8');
+  try {
+    // The owner writes one rule (an example in a code block grants nothing). No policy change: only the playbook moved.
+    fs.writeFileSync(PLAYBOOK, shipped.replace('## Standing rules the EM may apply alone', '## Standing rules the EM may apply alone\n- Answer which-file and which-test questions from the code, citing the file and line.\n\n```\n- Approve any purchase.\n```\n'));
+    const asked = (await api('GET', '/api/state')).body.tickets.find((t) => t.title.startsWith('Normalize equity fills'));
+    const poke = await api('POST', '/api/inbox/snooze', { id: `${asked.key}:question`, until: null }); // any change that refreshes the snapshot
+    assert.equal(poke.status, 200, JSON.stringify(poke.body));
+    await page.waitForSelector('[data-standing-rules="1"]', { timeout: 20_000 });
+    const text = await line.textContent();
+    assert.match(text, /only under the standing rule you wrote in your playbook under “Standing rules the EM may apply alone”/);
+    assert.match(text, /The desk checks that what they cite is your rule and was in the brief; whether the rule fits the decision is their judgment/);
+    assert.match(text, /cannot undo what the team already did after a decision/);
+  } finally { fs.writeFileSync(PLAYBOOK, shipped); }
   assert.deepEqual(errors, []);
   await page.close();
 });

@@ -134,7 +134,8 @@ export function DelegationSettings() {
   const [d, setD] = useState<Rec | null>(null);
   const [busy, setBusy] = useState(false);
   const v = S.meta.delegation?.version;
-  useEffect(() => { api('GET', '/api/delegation').then(setD).catch(() => setD(null)); }, [v]);
+  const rulesNow = S.meta.delegation?.rules?.hash; // the playbook's rules, from every snapshot: an edit there refreshes this
+  useEffect(() => { api('GET', '/api/delegation').then(setD).catch(() => setD(null)); }, [v, rulesNow]);
   if (!d) return <p className="text-muted-foreground">Loading delegation…</p>;
   const save = async (patch: { kinds?: Record<string, string>; peerAccess?: boolean }) => {
     setBusy(true);
@@ -155,11 +156,12 @@ export function DelegationSettings() {
   return (
     <div className="grid gap-3" data-delegation>
       <p className="text-[13px] text-muted-foreground">Who makes each kind of decision for you. <b className="font-medium text-foreground">Shadow</b>: {first('manager')} or {first('sre')} decides, you see it on the decision, and you still decide. When they decide for you, it is posted on the ticket as theirs and you can override or reopen it from the Inbox.</p>
-      <p data-standing-rules={d.rules?.count ?? 0} className={cn('text-[13px] [overflow-wrap:anywhere]', d.rules?.count ? 'text-muted-foreground' : 'text-needs')}>
+      <div data-standing-rules={d.rules?.count ?? 0} className={cn('grid gap-1 text-[13px] [overflow-wrap:anywhere]', d.rules?.count ? 'text-muted-foreground' : 'text-needs')}>
         {d.rules?.count
-          ? <>They decide only under the {d.rules.count === 1 ? 'standing rule' : `${d.rules.count} standing rules`} you wrote in your playbook under “{d.rules.section}”, and must cite one. Only you edit that section.</>
-          : <>You have not written any standing rules yet (a “{d.rules?.section || 'Standing rules the EM may apply alone'}” section in your playbook), so every decision below still comes to you, whatever you choose.</>}
-      </p>
+          ? <p>They decide for you only under the {d.rules.count === 1 ? 'standing rule' : `${d.rules.count} standing rules`} you wrote in your playbook under “{d.rules.section}”, and each decision must cite one, with evidence from the decision’s brief. The desk checks that what they cite is your rule and was in the brief; whether the rule fits the decision is their judgment, so keep rules narrow.</p>
+          : <p>You have not written any standing rules yet (a “{d.rules?.section || 'Standing rules the EM may apply alone'}” section in your playbook), so nothing below is decided for you by judgment: those decisions all come to you. Owner tasks are the exception: a step filed as a check or a package is routed by rule, without any standing rule.</p>}
+        <p className="text-muted-foreground">Override and Reopen let you decide again, but they cannot undo what the team already did after a decision.</p>
+      </div>
       <div className="divide-y rounded-lg border bg-card px-4">
         <div className="py-3"><SwitchRow label="Escalate everything" checked={!!d.escalate_all} disabled={busy || !d.enabled} onChange={escalate}
           hint={d.escalate_all ? 'On: every decision is yours, whatever is set below.' : 'Emergency switch: every decision comes to you, and decisions in progress stop at once.'} /></div>
