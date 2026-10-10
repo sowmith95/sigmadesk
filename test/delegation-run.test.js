@@ -310,6 +310,10 @@ test('lifetime spend: every dollar is reserved or charged, never neither, throug
     assert.deepEqual([store.getRun(run.id).status, store.getRun(run.id).cost_usd], ['killed', 0.75]);
     sched.recoverOrphans(); // a second restart charges nothing twice
     assert.equal(store.getDelegation(r.id).spent_usd, 0.75);
+    // A reservation with no run behind it (the desk died between admitting a run and creating it) is released.
+    store.updateDelegation(r2.id, { reserved_usd: 0.5 });
+    sched.recoverOrphans();
+    assert.equal(store.getDelegation(r2.id).reserved_usd, 0);
   } finally { config.delegation.research = old; }
 });
 

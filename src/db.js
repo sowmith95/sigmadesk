@@ -1422,6 +1422,8 @@ export const delegationsByStatusSince = (iso, ...statuses) => q(`SELECT * FROM d
 export const delegationsForTicket = (key) => q('SELECT * FROM delegated_decisions WHERE ticket_key=? ORDER BY id').all(key);
 export const recentDelegations = (limit = 50) => q('SELECT * FROM delegated_decisions ORDER BY id DESC LIMIT ?').all(limit);
 export const runsOfDelegation = (id) => q("SELECT * FROM runs WHERE kind='decide' AND json_extract(job, '$.delegation') = ? ORDER BY id").all(id);
+/** Records still holding a reservation for their run's spend. */
+export const reservedDelegations = () => q('SELECT * FROM delegated_decisions WHERE reserved_usd > 0 ORDER BY id').all();
 /** Decision runs that have ended (each is charged to its record exactly once: src/delegation.js recover). */
 export const endedDecisionRuns = () => q("SELECT * FROM runs WHERE kind='decide' AND status <> 'running' ORDER BY id").all();
 /** Decision runs per record since a time, in one pass: { [record id]: { runs, estimated } }. */

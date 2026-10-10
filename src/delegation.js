@@ -869,6 +869,8 @@ export function recover() {
     if (store.getDelegation(id)) charge(id, run, run.steps || 0);
   }
   for (const r of store.delegationsByStatus('running')) escalate(r, 'the desk restarted while the decision run was working. One attempt per decision, so it is yours now.', { from: ['running'] });
+  // A reservation with no run behind it (the desk stopped between admitting the run and creating it) can spend nothing.
+  for (const r of store.reservedDelegations()) if (!store.runsOfDelegation(r.id).length) store.updateDelegation(r.id, { reserved_usd: 0 });
 }
 
 // ---------------- views ----------------
