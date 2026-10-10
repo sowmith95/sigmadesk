@@ -305,7 +305,10 @@ export function ensureReadonlyWorkspace(seatId = 'scratch') {
 const workspaceBases = new Map(); // read-only workspace → the trusted base commit it was copied from
 /** The trusted base commit a read-only workspace was copied from (a decision run's evidence is pinned to it), or null. */
 export const workspaceBase = (dir) => workspaceBases.get(dir) || null;
-/** The trusted base as the desk last fetched it (the commit read-only workspaces are copied from), or null. */
+/**
+ * The trusted base as the desk last fetched it (the commit read-only workspaces are copied from), or null. Only a
+ * workspace refresh, under withGitLock, moves it: read it under that lock to rely on it staying put.
+ */
 export async function trustedBase() {
   const pub = await publisher();
   const sha = await git([...SAFE, '-C', pub, 'rev-parse', '-q', '--verify', 'refs/sigmadesk/scratch-base^{commit}']).then((r) => r.stdout.trim(), () => '');

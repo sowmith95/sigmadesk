@@ -661,9 +661,10 @@ export async function command(run, body = {}) {
   // never taken on trust. An unsupported decision is not applied: it goes to the owner as a recommendation.
   const cites = action === 'escalate' ? [] : model.parseCites(body.cite);
   const problem = action === 'escalate' ? null : await unsupported(r, cites);
-  const sealedBase = json(r.citables, null)?.base || null;
-  const baseNow = sealedBase ? await runner.trustedBase() : null; // compared with the pinned commit inside the transaction
-  const msg = decide(r, { action, text, why, assign, cites, unsupported: problem, baseNow }, { run });
+  // A run pinned to a base commit: the trusted base is read and the decision applied under the Git lock the base's
+  // writers hold (a workspace refresh), so the base cannot move between that read and the applying transaction.
+  const apply = (baseNow) => decide(r, { action, text, why, assign, cites, unsupported: problem, baseNow }, { run });
+  const msg = json(r.citables, null)?.base ? await runner.withGitLock(async () => apply(await runner.trustedBase())) : apply(null);
   store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: r.ticket_key, kind: 'action', text: `desk decide ${action}: ${text.slice(0, 140)}` });
   return msg;
 }

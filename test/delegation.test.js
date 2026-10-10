@@ -497,6 +497,32 @@ test('file evidence is pinned: a citation is checked at the commit its run read,
   assert.match(await cite(r4, bind(r4), 'R1,E1,file:README.md:1'), /cites file:README\.md:1, which is not/);
 });
 
+test('the base is read and the decision applied under the Git lock its writers hold: a competing refresh is waited for, then invalidates', async () => {
+  reset();
+  policy({ question: 'em' });
+  await runner.scratchTemplate({ force: true });
+  const A = await runner.trustedBase();
+  const t = await ask(ticket()); delegation.sweep({ paused: false });
+  const r = recFor(`${t.key}:question`); const run = bind(r, { base: A });
+  // A refresh holds the lock (as a workspace refresh does) and moves the base on while the decision is being made.
+  let go; const gate = new Promise((res) => { go = res; });
+  const refreshing = runner.withGitLock(async () => {
+    await gate;
+    fs.writeFileSync(path.join(repo, 'race.md'), 'moved\n');
+    execFileSync('git', ['-C', repo, 'add', '.']); execFileSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'race']);
+    await runner.scratchTemplate({ force: true });
+  });
+  const deciding = delegation.command(run, { action: 'answer', body: 'utils/net.py:40.', cite: 'R1,E1', why: 'utils/net.py:40 defines retry(); the marked rule says answer from the code.' });
+  await new Promise((res) => setTimeout(res, 300));
+  assert.equal(store.getDelegation(r.id).status, 'running', 'nothing is applied while a refresh of the base holds the lock');
+  go();
+  await refreshing;
+  assert.notEqual(await runner.trustedBase(), A, 'the base moved');
+  assert.match(await deciding, /The repository changed while you decided: nothing was applied/);
+  assert.equal(store.getDelegation(r.id).status, 'invalidated');
+  assert.equal(store.getTicket(t.key).status, 'needs_human');
+});
+
 test('a failed final write rolls the whole decision back: no answer on the thread, the ticket still waits for the owner', async () => {
   reset();
   policy({ question: 'em' });
