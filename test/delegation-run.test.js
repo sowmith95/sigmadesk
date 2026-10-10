@@ -366,6 +366,59 @@ test('steps in Codex\'s real order: a command counts when it starts, and the des
   assert.equal(store.getRun(c.run.id).steps, 30);
 });
 
+test('steps pair each desk request with the command that carries it: local desk calls, compound shells, either order', async () => {
+  fresh();
+  delegation.setPolicy({ kinds: { question: 'em' } });
+  const { codex } = await import('../src/engines/codex.js');
+  const item = (id, command, done) => ({ id, type: 'command_execution', command, aggregated_output: '', exit_code: done ? 0 : null, status: done ? 'completed' : 'in_progress' });
+  const start = (ctx, id, command) => runner.applyEvents(codex.parse(JSON.stringify({ type: 'item.started', item: item(id, command) }), tmp, ctx.state), ctx);
+  const end = (ctx, id, command) => runner.applyEvents(codex.parse(JSON.stringify({ type: 'item.completed', item: item(id, command, true) }), tmp, ctx.state), ctx);
+  const ran = (ctx, id, command) => { start(ctx, id, command); end(ctx, id, command); };
+  const answer = { action: 'answer', body: 'utils/net.py:40.', cite: 'R1,E1', why: 'utils/net.py:40 defines retry(); the marked rule says answer from the code.' };
+  const decision = async () => {
+    const t = await held();
+    delegation.sweep({ paused: false });
+    const r = open(t);
+    delegation.seal(r);
+    const run = store.createRun({ agent_id: 'manager', ticket_key: t.key, kind: 'decide', token: `cx-${Math.random()}`, model: 'codex:', job: { delegation: r.id } });
+    store.updateDelegation(r.id, { status: 'running', run_id: run.id, attempts: 1 });
+    return { t, r, run, ctx: { run, state: {}, presence: false, maxSteps: 30 } };
+  };
+  const steps = (d) => store.getRun(d.run.id).steps;
+  // 1. Thirty desk --help calls answered locally (no request reaches the desk), then a 31st, desk decide, whose
+  //    request arrives before its stream event: it is a step of its own, the 31st, and is refused.
+  const a = await decision();
+  for (let i = 1; i <= 30; i++) ran(a.ctx, `h${i}`, "/bin/zsh -lc 'desk --help'");
+  assert.equal(steps(a), 30);
+  await assert.rejects(sched.deskAction(a.run, 'decide', answer), /used its 30 steps/);
+  assert.equal(store.getRun(a.run.id).status, 'killed');
+  assert.notEqual(store.getDelegation(a.r.id).status, 'applied'); assert.equal(store.getTicket(a.t.key).status, 'needs_human');
+  start(a.ctx, 'h31', "/bin/zsh -lc 'desk decide answer x'");
+  assert.equal(steps(a), 31, 'its late stream event is the same step, not another');
+  // 2. A compound shell and the request it sends are one step, so the 30th command may still decide.
+  const b = await decision();
+  for (let i = 1; i <= 28; i++) ran(b.ctx, `c${i}`, "/bin/zsh -lc 'rg -n retry utils'");
+  start(b.ctx, 'c29', "/bin/zsh -lc 'cd utils && desk show'");
+  await sched.deskAction(b.run, 'show', {});
+  end(b.ctx, 'c29', "/bin/zsh -lc 'cd utils && desk show'");
+  assert.equal(steps(b), 29, 'cd … && desk show is one step');
+  start(b.ctx, 'c30', "/bin/zsh -lc 'cd utils && desk decide answer x'");
+  assert.match(await sched.deskAction(b.run, 'decide', answer), /Decided for the owner and applied/);
+  assert.equal(steps(b), 30);
+  // 3. The other order: the request first (a step of its own), then the late start of the command that sent it.
+  const c = await decision();
+  for (let i = 1; i <= 29; i++) ran(c.ctx, `x${i}`, "/bin/zsh -lc 'ls utils'");
+  assert.match(await sched.deskAction(c.run, 'decide', answer), /Decided for the owner and applied/);
+  start(c.ctx, 'x30', "/bin/zsh -lc 'cd utils && desk decide answer x'");
+  assert.deepEqual([steps(c), store.getRun(c.run.id).status], [30, 'running'], 'claimed by its command: still 30 steps');
+  // 4. A request no command accounts for, past the allowance: refused before it is carried out.
+  const d = await decision();
+  for (let i = 1; i <= 30; i++) ran(d.ctx, `y${i}`, "/bin/zsh -lc 'ls'");
+  await assert.rejects(sched.deskAction(d.run, 'show', {}), /used its 30 steps/);
+  await assert.rejects(sched.deskAction(d.run, 'decide', answer), /no longer open|used its 30 steps/);
+  assert.notEqual(store.getDelegation(d.r.id).status, 'applied');
+});
+
 test('steps end to end on a Codex stand-in that writes events in the real order: a 31st command that is desk decide is never applied', async () => {
   fresh();
   const cli = path.join(tmp, 'codex-steps.mjs'), args = path.join(tmp, 'codex-steps-args.json');
