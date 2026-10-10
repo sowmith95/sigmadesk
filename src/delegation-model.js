@@ -293,8 +293,13 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     // in the page Markdown writes, hiding what follows. No rules.
     // A raw-text element (a script, style, iframe…) opened anywhere, even inside a line, hides the rest of the page.
     if (RAW_TEXT.test(src)) return { rules: [], problem: UNSURE_BLOCK };
-    const km = marksOf(body), inner = km.rest.replace(/^ +/, '');
-    if ((km.marks || indent > 3) && (fenceOpens(inner) || inner.startsWith('<!--') || HTML_BLOCK.test(inner))) return { rules: [], problem: UNSURE_BLOCK };
+    // Marks are peeled here with any spacing at all: how far in a nested block starts depends on list items this
+    // scanner does not follow (">     - <!--" is still a comment, inside the quote's numbered item), so any opener
+    // after marks, however indented, counts.
+    let inner = body, peeled = 0;
+    for (let m; (m = inner.match(/^ *(?:>|(?:[-*+]|\d{1,9}[.)])(?= |$))/)); peeled++) inner = inner.slice(m[0].length);
+    inner = inner.replace(/^ +/, '');
+    if ((peeled || indent > 3) && (fenceOpens(inner) || inner.startsWith('<!--') || HTML_BLOCK.test(inner))) return { rules: [], problem: UNSURE_BLOCK };
     // An indented line that may start a block (a fence, heading, HTML, break or underline, at any depth) may sit
     // inside a list item or quote: from here the containers' state is not tracked (see below).
     if (indent > 0 && (/^(?:#{1,6}(?: |$)|`{3}|~{3}|<)/.test(body) || BREAK.test(body) || UNDERLINE.test(body))) untracked = true;

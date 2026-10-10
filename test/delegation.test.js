@@ -282,7 +282,7 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
     assert.deepEqual(model.standingRulesRead(`${mark}\nStanding rules the EM may apply alone\n---\n${O}\n- Grant\n`), { rules: [], problem: model.EARLIER_HEADING }, `after a bare ${mark}`);
   // A fence, comment or HTML block opened inside a list item or quote, or four columns in: where Markdown ends it is
   // not tracked (a comment left open in a list item runs on in the page, hiding the section), so no rules, and why.
-  for (const opener of ['- <!--', '> <!--', '- <script>', '- ```', '1. ~~~', '> - <!--', '    <!--', '* <!-- closed -->', '*<script>', 'Some text <iframe src=x>', 'Use `<style>`', '>  - <!--', '>\t- <!--', '-  > ```', '1.  - <div>', '> \t> <!--'])
+  for (const opener of ['- <!--', '> <!--', '- <script>', '- ```', '1. ~~~', '> - <!--', '    <!--', '* <!-- closed -->', '*<script>', 'Some text <iframe src=x>', 'Use `<style>`', '>  - <!--', '>\t- <!--', '-  > ```', '1.  - <div>', '> \t> <!--', '>  1. > q\n>     - <!--'])
     assert.deepEqual(model.standingRulesRead(`# P\n${opener}\n\n${O}\n- Grant\n`), { rules: [], problem: model.UNSURE_BLOCK }, opener);
   assert.deepEqual(model.standingRules(`# P\n1. Run:\n   \`\`\`\n   npm test\n   \`\`\`\n\n${O}\n- Grant\n`), ['Grant'], 'a fence on its own line under a step is still read');
   // A line or paragraph separator is text inside a line, never a line end: the heading holding it is still a heading.
