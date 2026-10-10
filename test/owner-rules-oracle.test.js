@@ -79,7 +79,18 @@ function generator(seed, mode) {
   const w = { bullet0: 6, bulletIn: 3, text0: 3, textIn: 4, blank: 5, atx: 1, under: 1, brk: 1, fence: 1, comment: 1, hash: 1, html: 1, setextOwner: mode === 'prefix' ? 2 : 0, ownerAtx: mode === 'prefix' ? 2 : 1, cr: 1, unicode: 2, lookalike: mode === 'prefix' ? 2 : 1, inlines: 2, closers: mode === 'prefix' ? 2 : 1, indentedFence: mode === 'prefix' ? 2 : 1 };
   const bag = Object.keys(kinds).flatMap((k) => Array(w[k]).fill(k));
   const clean = () => pick(['Answer which-file questions from the code', 'Use `desk show` first', '*only* after QA passed', 'Docs & tests only', 'See `docs/run.md` first']) + ` (${++id})`;
+  // Soup: lines put together from pieces of every construct, at any indent, before and after the heading.
+  const marks = ['', '- ', '* ', '+ ', '1. ', '2) ', '> ', '# ', '## ', '### ', '```', '~~~', '````', '<!--', '-->', '<div>', '<x>', '</p>', '<?', '<!X', '---', '===', '***', '_ _ _', '-', '=', '[a]: /u', '[a]', '    ', '\t', '\u00A0', '\\', '&amp;', '&#35;'];
+  const bits = ['rule', 'Rule', 'cond', '`x`', '*e*', '_u_', '[l](u)', 'a  ', 'b\t', O, 'Standing rules', 'the EM may apply alone', '#', ':', '|', '<b>', '](x)', '!'];
+  const soup = () => `${sp(pick([0, 0, 0, 1, 2, 3, 4, 5, 6]))}${pick(['', '', '\t', ' \t'])}${pick(marks)}${pick(marks)}${Array.from({ length: rand(3) }, () => pick(bits)).join(' ')}`;
   return () => {
+    if (mode === 'soup') {
+      const lines = [];
+      for (let j = 0, n = rand(6); j < n; j++) lines.push(rand(4) ? soup() : '');
+      lines.push(pick([`## ${O}`, `## ${O}`, `## ${O} ##`, `## ${O}:`]));
+      for (let j = 0, n = 1 + rand(10); j < n; j++) lines.push(rand(3) ? pick([`- ${pick(bits)} ${++id}`, `  ${pick(bits)} ${++id}`, `${pick(bits)} ${++id}`, soup()]) : (rand(2) ? '' : soup()));
+      return lines.join(pick(['\n', '\r\n', '\r']));
+    }
     if (mode === 'clean') {
       const lines = ['# Playbook', '', '## How to test', '- Run the relevant tests.', '```', 'npm test', '```', '', `## ${O}`];
       for (let r = 0, n = 1 + rand(6); r < n; r++) {
@@ -101,7 +112,7 @@ function generator(seed, mode) {
 
 test('owner rules match what Markdown shows, line for line, over generated playbooks (with SIGMADESK_CM_ORACLE)', { skip: ORACLE ? false : 'set SIGMADESK_CM_ORACLE to a commonmark.js module to run it', timeout: 600_000 }, () => {
   const cm = createRequire(import.meta.url)(ORACLE);
-  for (const [mode, seed] of [['section', 7], ['prefix', 99], ['clean', 5]]) {
+  for (const [mode, seed] of [['section', 7], ['prefix', 99], ['soup', 3], ['clean', 5]]) {
     const next = generator(seed, mode);
     let found = 0, shown = 0, first = null, count = 0;
     for (let k = 0; k < N; k++) {
