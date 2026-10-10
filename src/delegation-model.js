@@ -55,13 +55,16 @@ const bool = (v, name) => { if (typeof v !== 'boolean') throw err(`${name} must 
 /** The config block with every value in range (sigmadesk.config.json → delegation, after the env overrides). */
 export function settingsFrom(cfg = {}) {
   const num = (v, d, lo, hi) => { const n = Number(v); return Number.isFinite(n) && n >= lo && n <= hi ? n : d; };
+  // Counts are whole numbers: a fractional allowance is rounded DOWN, so the runs actually started never exceed it
+  // (maxPerDay 1.5 admits one run, 0.5 admits none).
+  const count = (v, d, lo, hi) => Math.floor(num(v, d, lo, hi));
   const kinds = Object.fromEntries(KIND_IDS.map((k) => [k, validMode(k, cfg.kinds?.[k]) ? cfg.kinds[k] : 'shadow']));
   return {
     enabled: cfg.enabled !== false, kinds, peerAccess: cfg.peerAccess === true,
-    budgetUsd: num(cfg.budgetUsd, 0.75, 0.05, 20), maxMinutes: num(cfg.maxMinutes, 6, 0.01, 60), maxSteps: num(cfg.maxSteps, 60, 3, 200),
-    maxActions: num(cfg.maxActions, 12, 2, 60), maxWaitMinutes: num(cfg.maxWaitMinutes, 30, 1, 1440), maxPerDay: num(cfg.maxPerDay, 40, 0, 1000),
-    research: { maxCorrections: num(cfg.research?.maxCorrections, 1, 0, 5), maxSpendUsd: num(cfg.research?.maxSpendUsd, 1.5, 0, 50) },
-    loopLimit: { maxRescopes: num(cfg.loopLimit?.maxRescopes, 1, 0, 5) },
+    budgetUsd: num(cfg.budgetUsd, 0.75, 0.05, 20), maxMinutes: num(cfg.maxMinutes, 6, 0.01, 60), maxSteps: count(cfg.maxSteps, 60, 3, 200),
+    maxActions: count(cfg.maxActions, 12, 2, 60), maxWaitMinutes: num(cfg.maxWaitMinutes, 30, 1, 1440), maxPerDay: count(cfg.maxPerDay, 40, 0, 1000),
+    research: { maxCorrections: count(cfg.research?.maxCorrections, 1, 0, 5), maxSpendUsd: num(cfg.research?.maxSpendUsd, 1.5, 0, 50) },
+    loopLimit: { maxRescopes: count(cfg.loopLimit?.maxRescopes, 1, 0, 5) },
     rulesSection: typeof cfg.rulesSection === 'string' && cfg.rulesSection.trim() && !/[\n#]/.test(cfg.rulesSection) ? cfg.rulesSection.trim().slice(0, 120) : RULES_SECTION,
   };
 }

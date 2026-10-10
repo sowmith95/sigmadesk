@@ -81,6 +81,13 @@ test('model: every delegable kind defaults to shadow; the matrix validates as a 
   assert.deepEqual(Object.values(s.kinds), ['shadow', 'shadow', 'shadow', 'shadow', 'shadow']);
   assert.equal(s.peerAccess, false, 'peer access is off by default');
   assert.equal(s.budgetUsd, 0.75); assert.equal(s.maxMinutes, 6);
+  // Counts round down: a fractional allowance can never admit more runs than it names.
+  assert.equal(model.settingsFrom({ maxPerDay: 1.5 }).maxPerDay, 1);
+  assert.equal(model.settingsFrom({ maxPerDay: 0.5 }).maxPerDay, 0);
+  assert.equal(model.settingsFrom({ maxSteps: 3.9, maxActions: 2.5, research: { maxCorrections: 1.9 }, loopLimit: { maxRescopes: 0.9 } }).maxSteps, 3);
+  assert.deepEqual([model.settingsFrom({ maxActions: 2.5 }).maxActions, model.settingsFrom({ research: { maxCorrections: 1.9 } }).research.maxCorrections,
+    model.settingsFrom({ loopLimit: { maxRescopes: 0.9 } }).loopLimit.maxRescopes], [2, 1, 0]);
+  assert.equal(model.settingsFrom({ maxMinutes: 0.5 }).maxMinutes, 0.5, 'minutes may be fractional');
   assert.throws(() => model.validatePolicy({ kinds: { question: 'sre' } }), /Engineers' questions: mode must be one of owner, shadow, em/);
   assert.throws(() => model.validatePolicy({ kinds: { merge: 'em' } }), /unknown decision kind "merge"/, 'merges are not a delegable kind at all');
   assert.throws(() => model.validatePolicy({ kinds: {}, peerAccess: 'yes' }), /peerAccess must be true or false/);
