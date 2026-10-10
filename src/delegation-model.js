@@ -193,7 +193,7 @@ export function ownerReason(f, nameOf = (s) => s) {
 // The owner section is read as a strict subset of Markdown: every rule the desk finds is a bullet Markdown shows under
 // the owner's heading, made of exactly that bullet's lines (test/owner-rules-oracle.test.js checks this against a
 // reference CommonMark parser when one is given). Line ends are LF, CRLF or a lone CR, nothing else (U+2028, U+2029 and
-// U+0085 are text in a line, as in Markdown, and every pattern takes them in); a tab counts as four spaces, and
+// U+0085 are text in a line, as in Markdown, and every pattern takes them in); a tab runs to the next fourth column, and
 // only spaces and tabs are blank or indentation, as in Markdown (a no-break space is text).
 const HTML_BLOCK = /^<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|\/[A-Za-z]|\?|![A-Za-z[])/; // a tag, <? or <! (not an autolink)
 const BREAK = /^([-*_])[ ]*(?:\1[ ]*){2,}$/; // a thematic break (it wins over a bullet: "- - -")
@@ -201,6 +201,8 @@ const UNDERLINE = /^(?:=+|-+) *$/;
 const FENCE = /^(`{3,}|~{3,})(.*)$/s; // s: a line or paragraph separator (U+2028/9) is text, as in Markdown
 const fenceOpens = (s) => { const f = s.match(FENCE); return !!f && !(f[1][0] === '`' && f[2].includes('`')); };
 const strip = (s) => s.replace(/^[ \t]+|[ \t]+$/g, ''); // what Markdown strips from a line: spaces and tabs only
+/** Tabs to spaces as Markdown counts them: to the next column that is a multiple of four (">\t-" is "> " and two). */
+function tabs(line) { let out = ''; for (const ch of line) out += ch === '\t' ? ' '.repeat(4 - (out.length % 4)) : ch; return out; }
 // Headings are compared as plain text only: a heading anywhere in the playbook (ATX of any level, or a paragraph with
 // an underline) holding markup or a non-ASCII character could show the owner's words without spelling them, so then
 // the playbook has no standing rules at all, and Settings says why.
@@ -251,14 +253,28 @@ export function standingRuleLines(text = '', heading = RULES_SECTION) { return s
 export function standingRulesRead(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
   const lines = String(text || '').split(/\r\n|\r|\n/), none = { rules: [], problem: null };
-  const target = loose(heading), MARKS = /^(?:(?:[-*+]|\d{1,9}[.)])(?: +|$)|> ?)+/; // list item and quote marks
+  const target = loose(heading);
+  // A line's list item and quote marks, read as Markdown nests them: after each mark up to three spaces (a tab counts
+  // four) may come before the next one. → { marks, rest: what follows them, code: the rest is indented code, empty }
+  const marksOf = (b) => {
+    let t = b, marks = 0, m;
+    for (;;) {
+      const r = marks ? t.replace(/^ {0,3}/, '') : t;
+      if ((m = r.match(/^> ?/))) { t = r.slice(m[0].length); marks++; continue; }
+      if ((m = r.match(/^(?:[-*+]|\d{1,9}[.)])( +|$)/))) {
+        marks++;
+        if (m[1].length > 4) return { marks, rest: r.slice(m[0].length), code: true, empty: false }; // five or more spaces: code
+        t = r.slice(m[0].length); continue;
+      }
+      return { marks, rest: r, code: marks > 0 && /^ {4}/.test(t), empty: marks > 0 && !r };
+    }
+  };
   // A list item or quote line, and whether it leaves a paragraph open (its text after the marks is paragraph text):
   // then the lines under it continue that paragraph, inside the container, and are never a heading of the document.
+  // A mark alone on its line is an empty item: no paragraph open.
   const opens = (b) => {
-    let t = b, m;
-    // A mark alone on its line is an empty item: no paragraph open. Five or more spaces after it: code.
-    while ((m = t.match(/^(?:(?:[-*+]|\d{1,9}[.)])( +|$)|> ?)/))) { if (m[1] && m[1].length > 4) return false; t = t.slice(m[0].length); if (!t) return false; }
-    return !!t && !/^ {4}/.test(t) && !/^(?:#{1,6}(?: |$)|`{3}|~{3}|<)/.test(t) && !BREAK.test(t) && !UNDERLINE.test(t);
+    const k = marksOf(b), t = k.rest;
+    return !k.code && !k.empty && !!t && !/^(?:#{1,6}(?: |$)|`{3}|~{3}|<)/.test(t) && !BREAK.test(t) && !UNDERLINE.test(t);
   };
   // 1. Every heading candidate in the whole playbook, outside fences and comments: each ATX line (any level) and each
   // paragraph with an underline. Any with markup or non-ASCII: no rules. The first one with the owner's words (letters
@@ -267,7 +283,7 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
   // indented line interrupts), wherever it is, leaves no rules.
   let at = -1, fence = null, comment = null, run = [], untracked = false;
   for (let i = 0; i < lines.length; i++) {
-    const src = lines[i].replace(/\t/g, '    '), indent = src.match(/^ */)[0].length, body = src.slice(indent);
+    const src = tabs(lines[i]), indent = src.match(/^ */)[0].length, body = src.slice(indent);
     if ((fence || comment) && /[^ ]/.test(src) && indent < (fence || comment).indent) return { rules: [], problem: UNSURE_BLOCK };
     if (fence) { if (indent <= 3 && fence.close.test(src)) fence = null; continue; }
     if (comment) { if (src.includes('-->')) comment = null; continue; } // Markdown: the closing line is all comment
@@ -277,8 +293,8 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     // in the page Markdown writes, hiding what follows. No rules.
     // A raw-text element (a script, style, iframe…) opened anywhere, even inside a line, hides the rest of the page.
     if (RAW_TEXT.test(src)) return { rules: [], problem: UNSURE_BLOCK };
-    const inner = body.replace(/^(?:(?:[-*+]|\d{1,9}[.)])(?: {1,4}|$)|> ?)+/, '').replace(/^ {0,3}/, '');
-    if ((inner !== body.replace(/^ {0,3}/, '') || indent > 3) && (fenceOpens(inner) || inner.startsWith('<!--') || HTML_BLOCK.test(inner))) return { rules: [], problem: UNSURE_BLOCK };
+    const km = marksOf(body), inner = km.rest.replace(/^ +/, '');
+    if ((km.marks || indent > 3) && (fenceOpens(inner) || inner.startsWith('<!--') || HTML_BLOCK.test(inner))) return { rules: [], problem: UNSURE_BLOCK };
     // An indented line that may start a block (a fence, heading, HTML, break or underline, at any depth) may sit
     // inside a list item or quote: from here the containers' state is not tracked (see below).
     if (indent > 0 && (/^(?:#{1,6}(?: |$)|`{3}|~{3}|<)/.test(body) || BREAK.test(body) || UNDERLINE.test(body))) untracked = true;
@@ -302,7 +318,7 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     }
     if (indent <= 3 && BREAK.test(body)) { run = []; continue; }
     if (indent > 3 && !run.length) continue; // four or more in only continues a paragraph (else code)
-    const marked = MARKS.test(body) && indent <= 3, last = run.at(-1);
+    const marked = indent <= 3 && marksOf(body).marks > 0, last = run.at(-1);
     // It continues a list item's or quote's open paragraph only as plain continuation text: a line that may start a
     // block inside the container (a heading, fence, quote, list or HTML at any depth) closes that paragraph.
     const starts = /^(?:#{1,6}(?: |$)|`{3}|~{3}|<|>|[-*+](?: |$)|\d{1,9}[.)](?: |$))/.test(body) || BREAK.test(body);
@@ -320,7 +336,7 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
   let cur = null, gap = false; // gap: a blank line since the rule's last line
   const take = (r, i, t) => { r.text.push(t); r.lines.push(i); };
   for (let i = at + 1; i < lines.length; i++) {
-    const raw = lines[i], src = raw.replace(/\t/g, '    ');
+    const raw = lines[i], src = tabs(raw);
     if (/^ *$/.test(src)) { gap = true; continue; }
     const indent = src.match(/^ */)[0].length, body = src.slice(indent), own = !!cur && !gap;
     const after = raw.slice(raw.match(/^ */)[0].length), spaced = /^[-*+] /.test(after) && !/^[-*+] *\t/.test(after); // no tab after the mark
