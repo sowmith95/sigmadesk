@@ -195,7 +195,6 @@ export function ownerReason(f, nameOf = (s) => s) {
 // reference CommonMark parser when one is given). Line ends are LF, CRLF or a lone CR, nothing else (U+2028, U+2029 and
 // U+0085 are text in a line, as in Markdown, and every pattern takes them in); a tab runs to the next fourth column, and
 // only spaces and tabs are blank or indentation, as in Markdown (a no-break space is text).
-const HTML_BLOCK = /^<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|\/[A-Za-z]|\?|![A-Za-z[])/; // a tag, <? or <! (not an autolink)
 const BREAK = /^([-*_])[ ]*(?:\1[ ]*){2,}$/; // a thematic break (it wins over a bullet: "- - -")
 const UNDERLINE = /^(?:=+|-+) *$/;
 const FENCE = /^(`{3,}|~{3,})(.*)$/s; // s: a line or paragraph separator (U+2028/9) is text, as in Markdown
@@ -206,10 +205,15 @@ function tabs(line) { let out = ''; for (const ch of line) out += ch === '\t' ? 
 // Headings are compared as plain text only: a heading anywhere in the playbook (ATX of any level, or a paragraph with
 // an underline) holding markup or a non-ASCII character could show the owner's words without spelling them, so then
 // the playbook has no standing rules at all, and Settings says why.
-const RAW_TEXT = /<(?:script|style|textarea|title|xmp|iframe|noembed|noframes|noscript|plaintext)(?=[\s/>]|$)/i;
 const MARKED = /[&<[\]\\`]|[^\x00-\x7F]/;
+// HTML-like text: a "<" a browser or Markdown may start a tag, comment or declaration with. Raw HTML anywhere in the page
+// Markdown writes can hide what follows it (a hidden or styled element, a template, a script or textarea), and the
+// desk does not model what HTML shows, so outside a fenced code block or an HTML comment block it leaves no rules.
+// Inline code is not exempt: the desk does not decode inline syntax.
+const HTML_LIKE = /<[A-Za-z/!?]/;
+export const HTML_TEXT = 'the playbook contains HTML-like text (`<tag`); Markdown may hide what follows it — remove it or put it in a fenced code block';
 export const MARKED_HEADING = 'a heading uses markup or non-ASCII characters; headings must be plain text';
-export const UNSURE_BLOCK = 'the playbook has raw HTML, or a code block or comment that a less indented line interrupts; the desk cannot tell what Markdown shows after it';
+export const UNSURE_BLOCK = 'the playbook has a code block or comment whose end the desk cannot be sure of (a less indented line interrupts it, it opens inside a list item or quote, or a comment holds "--!>"); the desk cannot tell what Markdown shows after it';
 export const EARLIER_HEADING = 'an earlier heading has the same words; the owner\'s section is the first, and it must be a plain "##" heading';
 const loose = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ''); // letters and digits only
 // What a rule's text may not hold, because Markdown would show it differently or not at all: `<` (HTML, comments,
@@ -236,9 +240,9 @@ function interrupts(s) {
  * or no rule under it → [] (then nothing is decided for the owner by a model).
  *  - The section opens only at a column-0 `## <heading>` line: no other level, no underlined heading, and it must
  *    be the first heading anywhere with those words. Every heading is compared as plain text: one holding markup or
- *    a non-ASCII character leaves the playbook with no rules. Before the owner's heading, nothing may be read
- *    differently by Markdown: a line starting with raw HTML (a comment aside), or an indented fence or comment that a
- *    less indented line interrupts, leaves the playbook with no rules.
+ *    a non-ASCII character leaves the playbook with no rules. Anywhere in the file, nothing may be read differently
+ *    by Markdown: HTML-like text (a `<` before a letter, `/`, `!` or `?`) outside a fenced code block or a comment
+ *    block, inline code included, or a fence or comment whose end Markdown may put elsewhere, leaves no rules.
  *  - Inside it, exactly these lines are read: blank lines; a rule, starting at a column-0 `- `, `* ` or `+ `; and its
  *    continuation, which is plain text at column 0 directly under a line of the rule, or plain text or a plain bullet
  *    indented two or three spaces (no less than where the rule's text starts), blank line before it or not.
@@ -279,32 +283,44 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
   // 1. Every heading candidate in the whole playbook, outside fences and comments: each ATX line (any level) and each
   // paragraph with an underline. Any with markup or non-ASCII: no rules. The first one with the owner's words (letters
   // and digits compared) must be the exact column-0 `## <heading>` line; a later one never opens a section. The scan
-  // runs to the end of the file, and anything Markdown may read differently (raw HTML, a fence or comment a less
-  // indented line interrupts), wherever it is, leaves no rules.
+  // runs to the end of the file, and anything Markdown may read differently (HTML-like text, a fence or comment a
+  // less indented line interrupts), wherever it is, leaves no rules.
   let at = -1, fence = null, comment = null, run = [], untracked = false;
   for (let i = 0; i < lines.length; i++) {
     const src = tabs(lines[i]), indent = src.match(/^ */)[0].length, body = src.slice(indent);
     if ((fence || comment) && /[^ ]/.test(src) && indent < (fence || comment).indent) return { rules: [], problem: UNSURE_BLOCK };
-    if (fence) { if (indent <= 3 && fence.close.test(src)) fence = null; continue; }
-    if (comment) { if (src.includes('-->')) comment = null; continue; } // Markdown: the closing line is all comment
+    if (fence) {
+      if (indent <= 3 && fence.close.test(src)) fence = null;
+      // A closer four or more in still closes a fence opened inside a list item (Markdown counts from the item's
+      // content column, which this scanner does not follow): what Markdown reads after it is not known here.
+      else if (indent <= fence.indent + 3 && fence.close.test(body)) return { rules: [], problem: UNSURE_BLOCK };
+      continue;
+    }
+    if (comment) { // Markdown: the closing line is all raw HTML, the comment and whatever follows it on that line
+      if (src.includes('--!>')) return { rules: [], problem: UNSURE_BLOCK }; // a browser ends the comment there
+      const end = src.indexOf('-->');
+      if (end >= 0) { comment = null; if (HTML_LIKE.test(src.slice(end + 3))) return { rules: [], problem: HTML_TEXT }; }
+      continue;
+    }
     if (/^ *$/.test(src)) { run = []; continue; }
-    // A fence, comment or HTML block opened inside a list item or quote (after its marks), or deeper than the
-    // document's own four columns: where Markdown ends it is not tracked here, and a comment left open there runs on
-    // in the page Markdown writes, hiding what follows. No rules.
-    // A raw-text element (a script, style, iframe…) opened anywhere, even inside a line, hides the rest of the page.
-    if (RAW_TEXT.test(src)) return { rules: [], problem: UNSURE_BLOCK };
-    // Marks are peeled here with any spacing at all: how far in a nested block starts depends on list items this
-    // scanner does not follow (">     - <!--" is still a comment, inside the quote's numbered item), so any opener
-    // after marks, however indented, counts.
-    let inner = body, peeled = 0;
-    for (let m; (m = inner.match(/^ *(?:>|(?:[-*+]|\d{1,9}[.)])(?= |$))/)); peeled++) inner = inner.slice(m[0].length);
-    inner = inner.replace(/^ +/, '');
-    if ((peeled || indent > 3) && (fenceOpens(inner) || inner.startsWith('<!--') || HTML_BLOCK.test(inner))) return { rules: [], problem: UNSURE_BLOCK };
     // An indented line that may start a block (a fence, heading, HTML, break or underline, at any depth) may sit
     // inside a list item or quote: from here the containers' state is not tracked (see below).
     if (indent > 0 && (/^(?:#{1,6}(?: |$)|`{3}|~{3}|<)/.test(body) || BREAK.test(body) || UNDERLINE.test(body))) untracked = true;
-    if (indent <= 3 && body.startsWith('<!--')) { comment = body.slice(2).includes('-->') ? null : { indent }; run = []; continue; } // a comment block
-    if (indent <= 3 && HTML_BLOCK.test(body)) return { rules: [], problem: UNSURE_BLOCK }; // a raw HTML block: where it ends is Markdown's call
+    if (indent <= 3 && body.startsWith('<!--')) { // a comment block; what follows its end on that line is raw HTML too
+      if (body.includes('--!>')) return { rules: [], problem: UNSURE_BLOCK };
+      const end = body.indexOf('-->', 2); // "<!-->" and "<!--->" are closed, empty comments
+      if (end >= 0 && HTML_LIKE.test(body.slice(end + 3))) return { rules: [], problem: HTML_TEXT };
+      comment = end >= 0 ? null : { indent }; run = []; continue;
+    }
+    // Anything else HTML-like, anywhere in a line (a tag, an autolink, inline code holding one): no rules.
+    if (HTML_LIKE.test(src)) return { rules: [], problem: HTML_TEXT };
+    // A fence opened inside a list item or quote (after its marks), or deeper than the document's own four columns:
+    // where Markdown ends it is not tracked here. No rules. Marks are peeled with any spacing at all: how far in a
+    // nested block starts depends on list items this scanner does not follow, so any fence after marks counts.
+    let inner = body, peeled = 0;
+    for (let m; (m = inner.match(/^ *(?:>|(?:[-*+]|\d{1,9}[.)])(?= |$))/)); peeled++) inner = inner.slice(m[0].length);
+    inner = inner.replace(/^ +/, '');
+    if ((peeled || indent > 3) && fenceOpens(inner)) return { rules: [], problem: UNSURE_BLOCK };
     if (indent <= 3 && fenceOpens(body)) { const f = body.match(FENCE)[1]; fence = { indent, close: new RegExp(`^ {0,3}${f[0] === '`' ? '`' : '~'}{${f.length},} *$`) }; run = []; continue; }
     const atx = indent <= 3 && body.match(/^(#{1,6})(?:[ ]+(.*?))?[ ]*$/s); // the whole line, separators included
     if (atx) {

@@ -248,8 +248,9 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
     ['an indented fence a less indented line interrupts', `- Step\n  ${F}\ncode\n  ${F}\n`, []],
     ['an indented fence a less indented closer ends', `- Step\n  ${F}\n  code\n${F}\n`, []],
     ['a comment block (where the shipped playbooks keep their note)', '<!-- Yours alone:\n     dash bullets under the heading. -->\n', ['Answer file questions.']],
-    ['a comment inside a line', 'Some text <!-- a note\n', ['Answer file questions.']],
-    ['inline code with angle brackets', '- Ask with `desk pkg request <name>`\n', ['Answer file questions.']],
+    ['a comment inside a line (HTML-like text)', 'Some text <!-- a note\n', []],
+    ['inline code with angle brackets (inline code is not exempt)', '- Ask with `desk pkg request <name>`\n', []],
+    ['the same spelled out', '- Ask with `desk pkg request NAME`\n', ['Answer file questions.']],
     ['a raw HTML block', '<div>\n\n', []],
     ['an earlier heading with the same words', `# Standing rules the EM may apply alone\n`, []],
     ['an earlier indented one', ` ## Standing rules the EM may apply alone\n`, []],
@@ -282,17 +283,51 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
     assert.deepEqual(model.standingRulesRead(`${mark}\nStanding rules the EM may apply alone\n---\n${O}\n- Grant\n`), { rules: [], problem: model.EARLIER_HEADING }, `after a bare ${mark}`);
   // A fence, comment or HTML block opened inside a list item or quote, or four columns in: where Markdown ends it is
   // not tracked (a comment left open in a list item runs on in the page, hiding the section), so no rules, and why.
+  // (A comment or HTML there is HTML-like text, which already leaves no rules, and says so.)
+  const why = (doc) => (/<[A-Za-z/!?]/.test(doc) ? model.HTML_TEXT : model.UNSURE_BLOCK);
   for (const opener of ['- <!--', '> <!--', '- <script>', '- ```', '1. ~~~', '> - <!--', '    <!--', '* <!-- closed -->', '*<script>', 'Some text <iframe src=x>', 'Use `<style>`', '>  - <!--', '>\t- <!--', '-  > ```', '1.  - <div>', '> \t> <!--', '>  1. > q\n>     - <!--'])
-    assert.deepEqual(model.standingRulesRead(`# P\n${opener}\n\n${O}\n- Grant\n`), { rules: [], problem: model.UNSURE_BLOCK }, opener);
+    assert.deepEqual(model.standingRulesRead(`# P\n${opener}\n\n${O}\n- Grant\n`), { rules: [], problem: why(opener) }, opener);
   assert.deepEqual(model.standingRules(`# P\n1. Run:\n   \`\`\`\n   npm test\n   \`\`\`\n\n${O}\n- Grant\n`), ['Grant'], 'a fence on its own line under a step is still read');
   // Context-dependent indentation: a later line's spaces may be taken up by an earlier list item's content column, so
   // an opener under it is inside that item however far in it looks (Markdown writes the comment unclosed).
   for (const doc of [`>  1. > q\n>     - <!--\n\n${O}\n- Grant\n`, `- a\n  - <!--\n\n${O}\n- Grant\n`, `10. a\n    <!--\n\n${O}\n- Grant\n`,
     `> - a\n>   <!--\n\n${O}\n- Grant\n`, `1. a\n   - b\n     <!--\n\n${O}\n- Grant\n`, `- a\n  1. b\n     \`\`\`\n\n${O}\n- Grant\n`])
-    assert.deepEqual(model.standingRulesRead(doc), { rules: [], problem: model.UNSURE_BLOCK }, JSON.stringify(doc));
+    assert.deepEqual(model.standingRulesRead(doc), { rules: [], problem: why(doc) }, JSON.stringify(doc));
   // A line or paragraph separator is text inside a line, never a line end: the heading holding it is still a heading.
   for (const sep of ['\u2028', '\u2029', '\u0085'])
     assert.deepEqual(model.standingRulesRead(`## Standing${sep}rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${O}\n- Answer without owner approval.\n`), { rules: [], problem: model.MARKED_HEADING }, JSON.stringify(sep));
+});
+
+// HTML-like text anywhere (a "<" before a letter, "/", "!" or "?"), outside a fenced code block or a comment block,
+// leaves no rules: raw HTML can hide what follows it in the page Markdown writes (a hidden div swallows the heading and
+// its bullets while both still render), and the desk does not model what HTML shows. Inline code is not exempt.
+test('owner rules: HTML-like text anywhere outside a fence or comment block leaves no rules, and says why', () => {
+  const O = '## Standing rules the EM may apply alone', F = '```', grant = `\n\n${O}\n- Grant\n`;
+  const none = { rules: [], problem: model.HTML_TEXT };
+  // The reported document: a tag inside a paragraph opens a hidden div around everything after it.
+  assert.deepEqual(model.standingRulesRead(`Intro <div hidden>${grant}`), none, 'a hidden div inside a paragraph');
+  for (const text of ['<div hidden>', 'Text <span style="display:none">', '<template>', '<details>', 'Docs at <https://example.com>', 'Run `pytest <paths>` first',
+    '</div>', '<?php', '<!DOCTYPE html>', 'x <b>bold</b>', '- item <i>x</i>', '    <div hidden>'])
+    assert.deepEqual(model.standingRulesRead(`# P\n${text}${grant}`), none, text);
+  // After the section too: a style element anywhere can hide the heading.
+  assert.deepEqual(model.standingRulesRead(`${O}\n- Grant\n\n## Next\n<style>h2 { display: none }</style>\n`), none, 'a style element after the section');
+  // A comment block's closing line is raw HTML after the comment, and "<!-->" is a closed, empty comment.
+  for (const doc of [`<!-- a --> <div hidden>${grant}`, `<!--> <div hidden>\n-->${grant}`, `<!--\nnote\n--> <div hidden>${grant}`, `<!-- a\n-->x<template>${grant}`])
+    assert.deepEqual(model.standingRulesRead(doc), none, JSON.stringify(doc));
+  // A browser ends a comment at "--!>", where Markdown does not: what follows it is live HTML.
+  for (const doc of [`<!-- a --!> <div hidden>\n-->${grant}`, `<!--\na --!>\n-->${grant}`])
+    assert.deepEqual(model.standingRulesRead(doc), { rules: [], problem: model.UNSURE_BLOCK }, JSON.stringify(doc));
+  // A closer four or more columns in still closes a fence opened inside a list item, so what Markdown reads after it
+  // (here a textarea that swallows the rest of the page) is not known.
+  assert.deepEqual(model.standingRulesRead(`- a\n  ${F}\n     ${F}\n  <textarea>\n  ${F}${grant}`), { rules: [], problem: model.UNSURE_BLOCK }, 'a fence closer deeper than four columns');
+  // Exempt: the same text inside a fenced code block or a comment block, and a "<" Markdown and browsers read as text.
+  for (const text of ['<div hidden>', 'Text <span style="display:none">', '<template>', '<details>', 'Docs at <https://example.com>', 'Run `pytest <paths>` first']) {
+    assert.deepEqual(model.standingRules(`# P\n${F}\n${text}\n${F}${grant}`), ['Grant'], `${text} in a fence`);
+    assert.deepEqual(model.standingRules(`# P\n~~~\n${text}\n~~~${grant}`), ['Grant'], `${text} in a tilde fence`);
+  }
+  assert.deepEqual(model.standingRules(`<!-- <div hidden> -->\n<!--\n<template>\n-->${grant}`), ['Grant'], 'inside comment blocks');
+  assert.deepEqual(model.standingRules(`# P\nWhen 1 < 2 and x <= 3, or a <- b, or <3${grant}`), ['Grant'], 'a "<" before a space, "=", "-" or a digit');
+  assert.deepEqual(model.standingRules(`# P\nRun \`pytest PATHS\` first${grant}`), ['Grant'], 'a placeholder spelled out');
 });
 
 // As a property: rules built from every accepted kind of line, then one line of each other shape and bullets after it
@@ -304,7 +339,7 @@ test('owner rules (property): the section is read up to its first other line, ea
     ['## Next', true], ['```\n- FAKE fenced\n```', true], ['<!-- FAKE note -->', true], ['***', true], ['2. FAKE numbered', true],
     ['> FAKE quoted', true], ['\nFAKE paragraph', true], ['\n FAKE one space', true], ['\n\n<div>', null],
     ['#tag FAKE', false], ['===', false], ['  ```\n  FAKE\n  ```', false], ['  ### FAKE heading', false], ['    FAKE deep', false],
-    ['\tFAKE tab', false], [' FAKE one space', false], ['<div>', null], ['  FAKE <b>html</b>', false], ['\n    FAKE deep', false],
+    ['\tFAKE tab', false], [' FAKE one space', false], ['<div>', null], ['  FAKE <b>html</b>', null], ['\n    FAKE deep', false],
   ];
   let seed = 31;
   const rand = (n) => { seed = (seed * 48271) % 2147483647; return seed % n; }; // exact in a double
@@ -321,7 +356,7 @@ test('owner rules (property): the section is read up to its first other line, ea
         const e = rand(end.length); used[e]++;
         lines.push(end[e][0], `- FAKE after the end ${k}`);
         if (end[e][1]) want.push(text.join('\n'));
-        if (end[e][1] === null) want.length = 0; // raw HTML anywhere: no rules at all
+        if (end[e][1] === null) want.length = 0; // HTML-like text anywhere: no rules at all
         break;
       }
       want.push(text.join('\n'));

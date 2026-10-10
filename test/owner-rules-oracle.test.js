@@ -151,10 +151,10 @@ test('owner rules match what Markdown shows, line for line, over generated playb
   assert.deepEqual(problems(cm, hidden).bad, []);
   // Raw HTML cannot forge what the renderer wrote: a copy of the heading's and bullet's position attributes typed into
   // the playbook does not make the hidden first "Grant" count as shown. (The grammar keeps nothing here either: the
-  // comment opened inside the quote's list item leaves the playbook with no rules.)
+  // comment opened inside the quote's list item is HTML-like text outside a comment block, so no rules.)
   const forged = '>  1. > q\n>     - <!--\n\n## Standing rules the EM may apply alone\n- Grant\n\n## Next\nx <!-- closed -->\n\n## Standing rules the EM may apply alone\n- Grant\n\n## Other\nx <i data-sourcepos="4:">ok</i> <li data-sourcepos="5:">Grant</li>\n';
   assert.ok(problems(cm, forged, [{ text: 'Grant', lines: [4] }]).bad.length, 'the oracle flags the hidden rule despite forged attributes');
-  assert.deepEqual(model.standingRulesRead(forged), { rules: [], problem: model.UNSURE_BLOCK });
+  assert.deepEqual(model.standingRulesRead(forged), { rules: [], problem: model.HTML_TEXT });
   assert.deepEqual(problems(cm, forged).bad, []);
   for (const [mode, seed] of [['section', 7], ['prefix', 99], ['soup', 3], ['containers', 11], ['clean', 5]]) {
     const next = generator(seed, mode);
