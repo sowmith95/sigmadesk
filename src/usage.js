@@ -27,10 +27,14 @@ export function normalizeCodex(data, at = store.now()) {
     credits: selected?.credits ? { balance: selected.credits.balance, unlimited: selected.credits.unlimited, has_credits: selected.credits.hasCredits } : null };
 }
 
+// Account-usage RPCs still running. The Codex app-server writes into its CODEX_HOME (the desk's data directory), even after
+// its input closes, so the desk stops these and waits for them before it exits: nothing it started keeps writing there.
+const live = new Set();
 export function readCodexLimits() {
   return new Promise((resolve, reject) => {
     const cli = codexInvocation();
     const child = spawn(cli.bin, [...cli.prefix, 'app-server', '--stdio'], { env: { ...process.env, CODEX_HOME: codexHome() }, stdio: ['pipe', 'pipe', 'pipe'] });
+    live.add(child); child.on('exit', () => live.delete(child));
     let buffer = '', settled = false;
     const finish = (err, result) => {
       if (settled) return; settled = true; clearTimeout(timer); child.stdin.end(); child.kill('SIGTERM');
@@ -54,6 +58,18 @@ export function readCodexLimits() {
     });
     send({ method: 'initialize', id: 1, params: { clientInfo: { name: 'sigmadesk', title: 'SigmaDesk usage monitor', version: '0.1.0' } } });
   });
+}
+const exited = (c) => c.exitCode !== null || c.signalCode !== null;
+/** Stop every account-usage RPC still running and wait until each has exited: SIGTERM, then SIGKILL after `ms`. */
+export async function stopAll(ms = 3000) {
+  const kids = [...live].filter((c) => !exited(c));
+  const gone = Promise.all(kids.map((c) => new Promise((r) => { if (exited(c)) r(); else c.once('exit', r); })));
+  const within = (wait) => { let timer; return Promise.race([gone, new Promise((r) => { timer = setTimeout(r, wait); })]).finally(() => clearTimeout(timer)); };
+  for (const c of kids) { try { c.kill('SIGTERM'); } catch { /* exited */ } }
+  await within(ms);
+  for (const c of kids) if (!exited(c)) { try { c.kill('SIGKILL'); } catch { /* exited */ } }
+  await within(1000);
+  return kids.length;
 }
 let refreshing = null;
 export function refresh() {

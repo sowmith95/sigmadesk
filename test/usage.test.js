@@ -83,3 +83,22 @@ test('Perplexity desktop credits are a validated observed snapshot separate from
   assert.equal(q.source, 'Observed desktop snapshot'); assert.equal(q.reset_at, null);
   assert.equal(usage.status().perplexity_desktop.credits_remaining, 44985);
 });
+
+test('shutdown stops a Codex usage RPC still running and waits until it has exited, so it writes nothing into the desk afterwards', async () => {
+  const cli = path.join(tmp, 'slow.mjs'), pidFile = path.join(tmp, 'rpc.pid');
+  // An app-server that never answers and ignores SIGTERM (the real one keeps writing into CODEX_HOME while it shuts down).
+  fs.writeFileSync(cli, `#!/usr/bin/env node
+import fs from 'node:fs';
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+process.on('SIGTERM', () => {});
+process.stdin.resume(); setInterval(() => {}, 1000);`); fs.chmodSync(cli, 0o755);
+  config.engines.codex.bin = cli;
+  fs.rmSync(pidFile, { force: true });
+  const pending = usage.readCodexLimits().then(() => 'answered', (e) => e.message);
+  for (let i = 0; i < 100 && !fs.existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 30));
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  assert.equal(await usage.stopAll(200), 1, 'one RPC was running');
+  assert.throws(() => process.kill(pid, 0), /ESRCH/, 'it has exited by the time stopAll returns');
+  assert.match(await pending, /exited before reporting limits/);
+  assert.equal(await usage.stopAll(200), 0, 'nothing left to stop');
+});

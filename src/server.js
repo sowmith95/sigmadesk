@@ -719,7 +719,8 @@ export async function main() {
   // Post-deploy watch on its own timer: monitoring production never depends on the merge train or reviews being on.
   setInterval(() => deploywatch.sweep({ lock: mergetrain.deployState() }).catch((err) => console.error('post-deploy watch:', err.message)), 60_000);
   setInterval(() => sched.retryPublications(), 5 * 60_000);
-  const shutdown = () => { council.cancelAll(); advisors.cancelAll(); runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
+  // Seats' runs and the Codex usage RPC end before the desk does: nothing it started keeps writing into its data afterwards.
+  const shutdown = () => { council.cancelAll(); advisors.cancelAll(); Promise.allSettled([runner.shutdownAll('desk shutdown'), usage.stopAll()]).finally(() => process.exit(0)); };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
