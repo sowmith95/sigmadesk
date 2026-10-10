@@ -33,9 +33,9 @@ function problems(cm, text) {
   for (const r of ours) {
     const b = shown.find((x) => x.from === r.lines[0]);
     if (!b) { bad.push(['a rule Markdown does not show under the heading', r]); continue; }
-    const want = []; for (let k = b.from; k <= b.to; k++) if (src[k].trim()) want.push(k);
+    const want = []; for (let k = b.from; k <= b.to; k++) if (!/^[ \t]*$/.test(src[k])) want.push(k); // blank: spaces and tabs only
     if (!b.simple || JSON.stringify(want) !== JSON.stringify(r.lines)) bad.push(['not exactly the lines of its bullet', r, want]);
-    const text2 = r.lines.map((k, j) => (j ? src[k].trim() : src[k].replace(/^[-*+] +/, '').trim())).join('\n');
+    const strip = (x) => x.replace(/^[ \t]+|[ \t]+$/g, ''), text2 = r.lines.map((k, j) => strip(j ? src[k] : src[k].replace(/^[-*+] +/, ''))).join('\n');
     if (text2 !== r.text) bad.push(['text that is not its lines', r]);
   }
   return { bad, found: ours.length, shown: shown.length };
@@ -65,9 +65,10 @@ function generator(seed, mode) {
     setextOwner: () => pick([`${O}\n---`, `${O}\n===`, 'Standing rules the EM\nmay apply alone\n---', `  ${O}\n  ---`, 'Standing rules the EM\n    may apply alone\n-']),
     ownerAtx: () => pick([`## ${O}`, `# ${O}`, `### ${O}`, ` ## ${O}`, `## ${O} ##`, `##\t${O}`]),
     cr: () => `- Rule ${++id}\r- CR rule ${++id}`,
+    unicode: () => pick(['\u00A0', `\u00A0\u00A0text ${++id}`, `-\u00A0x ${++id}`, '\f', `\u00A0- x ${++id}`, `  \u00A0more ${++id}`, '---\u00A0', `- \u00A0text ${++id}`, `\u2028line ${++id}`, `#\u00A0x ${++id}`]),
     indentedFence: () => `- Step ${++id}\n${pick(['  ', '   '])}\`\`\`\n${pick(['  ', '   ', '', ' '])}code ${++id}\n${pick(['  ', '   ', ' ', ''])}\`\`\``,
   };
-  const w = { bullet0: 6, bulletIn: 3, text0: 3, textIn: 4, blank: 5, atx: 1, under: 1, brk: 1, fence: 1, comment: 1, hash: 1, html: 1, setextOwner: mode === 'prefix' ? 2 : 0, ownerAtx: mode === 'prefix' ? 2 : 1, cr: 1, indentedFence: mode === 'prefix' ? 2 : 1 };
+  const w = { bullet0: 6, bulletIn: 3, text0: 3, textIn: 4, blank: 5, atx: 1, under: 1, brk: 1, fence: 1, comment: 1, hash: 1, html: 1, setextOwner: mode === 'prefix' ? 2 : 0, ownerAtx: mode === 'prefix' ? 2 : 1, cr: 1, unicode: 2, indentedFence: mode === 'prefix' ? 2 : 1 };
   const bag = Object.keys(kinds).flatMap((k) => Array(w[k]).fill(k));
   const clean = () => pick(['Answer which-file questions from the code', 'Use `desk show` first', '*only* after QA passed', 'Docs & tests only', 'See [the runbook](docs/run.md)']) + ` (${++id})`;
   return () => {

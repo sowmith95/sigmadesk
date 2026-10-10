@@ -158,6 +158,10 @@ test('owner rules: bullets under the ## heading and their continuation; the firs
     ['One,\ncontinued\n- a sub-item\nand lazily continued.', 'Two\nits second paragraph', 'Three', 'Four']);
   assert.deepEqual(rules(`${O}\r\n- CRLF\r\n  continued\r- and a lone CR\n`), ['CRLF\ncontinued', 'and a lone CR'], 'every line end');
   assert.deepEqual(rules(`${O}\n- Use \`desk show\` and *only* docs & tests\n`), ['Use `desk show` and *only* docs & tests'], 'inline marks are text');
+  // Only spaces and tabs are blank or indentation, as in Markdown: a no-break space or a form feed is text.
+  assert.deepEqual(rules(`${O}\n- R\n\u00A0\nand its condition\n`), ['R\n\u00A0\nand its condition'], 'a line of no-break spaces is no blank line');
+  assert.deepEqual(rules(`${O}\n- R\n\f\nand its condition\n`), ['R\n\f\nand its condition'], 'nor is a form feed');
+  assert.deepEqual(rules(`${O}\n- R\n-\u00A0only on weekdays\n`), ['R\n-\u00A0only on weekdays'], 'a dash and a no-break space is no bullet');
   // Each other shape ends the section where it stands: the rule above is kept when Markdown ends its bullet there,
   // and dropped when Markdown still counts that line as part of it (it may be the rule's condition).
   for (const [what, tail, want] of [
