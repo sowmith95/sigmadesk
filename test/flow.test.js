@@ -117,14 +117,19 @@ test('owner tasks: never picked up, finished only with notes and never when code
   assert.equal(store.getTicket(b).owner_task, 0); assert.ok(store.getTicket(b).assignee);
 });
 
-test('handing back a read-only production check routes it to the SRE when production read access is on', async () => {
+test('handing back an owner task routes a read-only production check to the SRE by its kind or the owner\'s word, never by its text', async () => {
   const { config } = await import('../src/config.js');
   const prev = config.ops.enabled; config.ops.enabled = true; store.setSetting('ops_enabled', 'true');
   try {
     const e = epic(); const v = task(e, 'Establish Timescale incident cause from production logs');
-    sched.ownerTask(v, { owner_task: true });
+    // A check by its structured kind: filed with --owner-kind check, or parked by the desk while access was off.
+    store.updateTicket(v, { owner_task: 1, owner_task_kind: 'check', owner_task_by: 'desk', assignee: null });
     sched.ownerTask(v, { owner_task: false, why: 'the SRE can check it' });
     assert.equal(store.getTicket(v).assignee, 'sre'); assert.equal(store.kvGet(`verify:${v}`), '1');
+    // The same words on a task the owner took themselves carry no kind: the team's usual routing, not the SRE.
+    const u = task(e, 'Establish Timescale incident cause from production logs');
+    sched.ownerTask(u, { owner_task: true }); sched.ownerTask(u, { owner_task: false });
+    assert.notEqual(store.getTicket(u).assignee, 'sre', 'text is never classified');
     const w = task(e, 'Rotate the broker key'); sched.ownerTask(w, { owner_task: true }); sched.ownerTask(w, { owner_task: false });
     assert.notEqual(store.getTicket(w).assignee, 'sre', 'a write/credential task is never routed as a check');
     const x = task(e, 'Establish cause; no blind restart or deletion'); sched.ownerTask(x, { owner_task: true }); sched.ownerTask(x, { owner_task: false, verify: true });

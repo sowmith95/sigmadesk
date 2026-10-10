@@ -300,30 +300,52 @@ export function sweep({ now = Date.now(), paused = store.getSettings().paused ==
     }
   }
   if (paused || !delegated) { safetyNet(); return out; }
-  const L = limits();
-  for (const c of live.values()) {
-    const mode = pol.kinds[c.kind];
-    if (!mode || mode === 'owner') continue;
-    const seat = model.delegateFor(c.kind, mode);
-    if (!seat) continue;
-    let r = store.delegationFor(c.decision_id, c.version);
-    if (!r) {
-      // A day's allowance of decision runs bounds the cost; rule-decided triage costs nothing and is not counted.
-      if (!model.KINDS[c.kind].deterministic && L.maxPerDay >= 0 && runsToday() + store.delegationsByStatus('queued').filter((x) => !model.KINDS[x.kind].deterministic).length >= L.maxPerDay) {
-        if (mode === 'shadow') continue; // the owner decides anyway; no record, no noise
-        r = create(c, mode, seat); out.created++;
-        if (escalate(r, `today's allowance of ${L.maxPerDay} delegated decision runs is used up`)) out.escalated++;
-        continue;
-      }
-      r = create(c, mode, seat); out.created++;
-    }
-    if (r.status !== 'queued') continue;
-    const why = ownerReasonFor(c, seat);
-    if (why) { if (escalate(r, why)) out.escalated++; continue; }
-    if (model.KINDS[c.kind].deterministic) { const res = triage(r, c); if (res === 'applied' || res === 'shadow') out.applied++; }
-  }
+  for (const c of live.values()) consider(c, { pol, out });
   safetyNet();
   return out;
+}
+/**
+ * One open decision under the matrix: the one path every decision takes into delegation (the sweep, and an owner task
+ * the moment it is filed). Owner mode: nothing. Otherwise a record for this decision and evidence version (shadow
+ * included), the owner rules (escalated, with the reason, before any run) and, for owner-task triage, the rule's
+ * decision at once. Model-decided records wait for their run (nextJobs).
+ */
+function consider(c, { pol = policy(), out = { created: 0, applied: 0, escalated: 0 } } = {}) {
+  const mode = pol.kinds[c.kind];
+  if (!mode || mode === 'owner') return null;
+  const seat = model.delegateFor(c.kind, mode);
+  if (!seat) return null;
+  const L = limits();
+  let r = store.delegationFor(c.decision_id, c.version);
+  if (!r) {
+    // A day's allowance of decision runs bounds the cost; rule-decided triage costs nothing and is not counted.
+    if (!model.KINDS[c.kind].deterministic && L.maxPerDay >= 0 && runsToday() + store.delegationsByStatus('queued').filter((x) => !model.KINDS[x.kind].deterministic).length >= L.maxPerDay) {
+      if (mode === 'shadow') return null; // the owner decides anyway; no record, no noise
+      r = create(c, mode, seat); out.created++;
+      if (escalate(r, `today's allowance of ${L.maxPerDay} delegated decision runs is used up`)) out.escalated++;
+      return store.getDelegation(r.id);
+    }
+    r = create(c, mode, seat); out.created++;
+  }
+  if (r.status !== 'queued') return r;
+  const why = ownerReasonFor(c, seat);
+  if (why) { if (escalate(r, why)) out.escalated++; return store.getDelegation(r.id); }
+  if (model.KINDS[c.kind].deterministic) { const res = triage(r, c); if (res === 'applied' || res === 'shadow') out.applied++; }
+  return store.getDelegation(r.id);
+}
+/**
+ * An owner task the moment it is filed (desk create-task --owner, an epic review): the same mode-checked, structured
+ * triage the sweep runs, at once. Owner mode does nothing; shadow records what the rule would route while the owner
+ * keeps the task; em routes it or leaves it to the owner by rule. Only a stated kind is ever routed: an owner step
+ * without one stays the owner's. While the desk is halted nothing is triaged; the sweep does it once the desk runs.
+ * → the record, or null.
+ */
+export function triageOwnerTask(key, { paused = store.getSettings().paused === 'true' } = {}) {
+  if (paused) return null;
+  const t = store.getTicket(key);
+  const d = ticketDecision(t);
+  if (!d || d.kind !== 'owner_task') return null;
+  return consider({ ...d, ticket: t, version: evidenceFingerprint(d.kind, t) });
 }
 /**
  * Safety net, after records are opened: a hold whose notice was deferred must never sit silent. Unless its delegate still

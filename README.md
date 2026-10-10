@@ -166,7 +166,7 @@ decides:
 
 | Kind | Delegate | What the delegate may do | Stays yours |
 |---|---|---|---|
-| Owner tasks | Morgan, by rule (no model run) | a read-only production check goes to Devon's probes; a missing package becomes a package request on the ticket | writes, restarts, credentials, business decisions, and any step filed without a kind |
+| Owner tasks | Morgan, by rule (no model run), the moment the task is filed | a step filed with `--owner-kind check` goes to Devon's probes; `--owner-kind package` becomes a package request on the ticket | writes, restarts, credentials, business decisions, any step filed without a kind, and any step Morgan filed |
 | Engineers' questions | Morgan | answer a question its asker marked factual (`desk needs-human "<q>" --about factual`) on a positively low-risk ticket | any other subject (money, credentials, product preference, trading semantics, schema effects) or none, high or unknown risk, stale evidence, a missing standing rule, Morgan's own question |
 | Research-review holds | Morgan | send the proposal back with corrections or a narrower scope (once per proposal, for its whole life) | approving it past the reviewer's dissent |
 | QA and review loop limits | Morgan | rescope, or reassign to another builder (once per ticket) | clearing a QA, CI or reviewer failure; a disagreement Morgan is a party to |
@@ -441,8 +441,9 @@ as do the desk's state, credential stores and pgpass/service/verifier files. Sti
 home folder that the OS lets any user read (system files, `/opt/homebrew`, `/tmp`), the toolchain trees above, and the
 seat's own clone — keep secrets out of the repository and out of `readOnlyPaths`. `project.env` entries must be
 plain names and values: anything that looks like a credential (URL with a password, DSN, key, token) is withheld. A manager task that only needs a
-production *read* (`desk create-task --verify`, or an `--owner` step that is plainly a check) goes to the SRE, who
-answers it with probes under a ticket-scoped grant; it comes to you only if no probe can answer it.
+production *read* (`desk create-task --verify`) goes to the SRE, who answers it with probes under a ticket-scoped grant;
+it comes to you only if no probe can answer it. An `--owner` step is yours: the desk never reads its text to reroute it,
+and only delegation's owner-task triage can hand a stated `--owner-kind check` back to the SRE.
 
 **Setup (owner, once):**
 1. Provision the read-only role on each database — **dry run first** (does everything, self-checks the function as

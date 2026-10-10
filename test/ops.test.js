@@ -630,20 +630,22 @@ test('childEnv: an explicit allowlist, a project.env schema and an isolated tool
   fs.rmSync(th, { recursive: true, force: true });
 });
 
-test('routing: a read-only production check goes to the SRE (not the owner); writes stay with the owner', async () => {
+test('routing: --verify sends a read-only production check to the SRE; an --owner step stays the owner\'s, whatever its text says', async () => {
   freshDesk();
-  assert.ok(sched.isVerifyAsk('establish Timescale incident cause'));
-  assert.ok(sched.isVerifyAsk('Verify in production that ingest freshness recovered'));
-  assert.ok(!sched.isVerifyAsk('Restart the timescaledb container in production'));
-  assert.ok(!sched.isVerifyAsk('Rotate the Polygon API key in production'));
   const parent = store.createTicket({ title: 'Timescale incident', status: 'in_progress', risk: 'low' });
   const run = mkRun('manager', 'groom', parent.key);
-  const out = await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Establish Timescale incident cause', complexity: 'S', area: 'db', owner: 'needs production access to check the Timescale jobs', body: 'Check job errors.' });
+  const out = await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Establish Timescale incident cause', complexity: 'S', area: 'db', verify: true, body: 'Check job errors.' });
   assert.match(out, /assigned to sre \(read-only production check\)/);
   const k = out.match(/T-\d+/)[0];
   assert.equal(store.getTicket(k).assignee, 'sre');
   assert.equal(store.getTicket(k).owner_task, 0);
   assert.equal(store.kvGet(`verify:${k}`), '1');
+  // A request to the owner is the owner's, even when its words read like a check: the desk never classifies text.
+  const asked = await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Establish Timescale job errors', complexity: 'S', area: 'db', owner: 'needs production access to check the Timescale jobs', body: 'Check job errors.' });
+  assert.match(asked, /assigned to the owner/);
+  const ak = store.getTicket(asked.match(/T-\d+/)[0]);
+  assert.deepEqual([ak.owner_task, ak.owner_task_kind, ak.owner_task_by, ak.assignee], [1, null, 'manager', null], 'no kind was stated, so none is guessed');
+  await rejects(sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Both', complexity: 'S', area: 'db', verify: true, owner: 'needs access', body: 'x' }), /--verify .* or --owner .* not both/);
   const w = await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Restart ingestor', complexity: 'S', area: 'infra', owner: 'restart the stock-ingestor container', body: 'Restart it.' });
   assert.match(w, /assigned to the owner/);
   const v = await sched.deskAction(run, 'create-task', { parent: parent.key, title: 'Confirm caggs refresh', complexity: 'S', area: 'db', verify: true, body: 'Read jobs.' });

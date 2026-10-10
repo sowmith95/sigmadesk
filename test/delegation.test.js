@@ -416,6 +416,66 @@ test('owner-task triage by rule (em): a check goes to the SRE, a package becomes
   store.setSetting('ops_enabled', 'false');
 });
 
+test('owner requests: only structured, mode-checked triage routes them, at once and in shadow too; text is never read; --verify is its own route', async () => {
+  reset();
+  store.setSetting('ops_enabled', 'true'); store.setSetting('paused', 'false');
+  // A principal slicing a design (so the delegate did not file it) and the manager grooming (the delegate did).
+  const slice = async (title, extra) => {
+    const parent = ticket({ status: 'in_progress' });
+    const run = store.createRun({ agent_id: 'principal-be', ticket_key: parent.key, kind: 'design', token: `p-${Math.random()}`, model: 'claude:opus' });
+    const out = await sched.deskAction(run, 'create-task', { title, complexity: 'S', area: 'db', body: 'Count yesterday\'s fills.', ...extra });
+    return [out, out.match(/D-\d+/)[0]];
+  };
+  const groomed = async (title, extra) => {
+    const parent = ticket({ status: 'in_progress' });
+    const run = store.createRun({ agent_id: 'manager', ticket_key: parent.key, kind: 'groom', token: `g-${Math.random()}`, model: 'claude:opus' });
+    const out = await sched.deskAction(run, 'create-task', { parent: parent.key, title, complexity: 'S', area: 'db', body: 'Count yesterday\'s fills.', ...extra });
+    return [out, out.match(/D-\d+/)[0]];
+  };
+  const check = { owner: 'needs production access', 'owner-kind': 'check' };
+  try {
+    // You decide: the owner's task, and no record at all.
+    policy({});
+    const [a, ka] = await slice('Count fills (owner mode)', check);
+    assert.match(a, /→ the owner/);
+    assert.deepEqual([store.getTicket(ka).owner_task, store.delegationsForTicket(ka).length], [1, 0]);
+    // Shadow: the rule's route is recorded at once, and the owner keeps the task.
+    policy({ owner_task: 'shadow' });
+    const [b, kb] = await slice('Count fills (shadow)', check);
+    assert.match(b, /→ the owner/);
+    const rb = recFor(`${kb}:owner-task`);
+    assert.deepEqual([rb?.status, rb?.action, rb?.run_id], ['shadow', 'route', null], 'a shadow record, by rule');
+    assert.deepEqual([store.getTicket(kb).owner_task, store.getTicket(kb).assignee], [1, null], 'still the owner\'s');
+    // Morgan decides: a stated check goes to Devon by rule.
+    policy({ owner_task: 'em' });
+    const [c, kc] = await slice('Count fills (em)', check);
+    assert.match(c, /→ sre \(read-only production check\)/);
+    assert.deepEqual([recFor(`${kc}:owner-task`).status, store.getTicket(kc).assignee, store.kvGet(`verify:${kc}`)], ['applied', 'sre', '1']);
+    // An owner step with no kind stays the owner's, however much its words sound like a check.
+    const [d, kd] = await slice('Verify in production that ingest freshness recovered', { owner: 'check the freshness of the Timescale jobs in production' });
+    assert.match(d, /→ the owner/);
+    assert.match(recFor(`${kd}:owner-task`).why, /nobody said what kind of step it is/);
+    // Morgan never routes an owner step Morgan filed.
+    const [, ke] = await groomed('Count fills (filed by Morgan)', check);
+    assert.match(recFor(`${ke}:owner-task`).why, /Morgan filed it as your task/);
+    assert.equal(store.getTicket(ke).owner_task, 1);
+    // --verify is the SRE's route, not an owner request: no delegation record. With access off it is the owner's check.
+    const [, kf] = await groomed('Confirm caggs refresh', { verify: true });
+    assert.deepEqual([store.getTicket(kf).assignee, store.getTicket(kf).owner_task, store.delegationsForTicket(kf).length], ['sre', 0, 0]);
+    store.setSetting('ops_enabled', 'false');
+    const [g, kg] = await groomed('Confirm freshness', { verify: true });
+    assert.match(g, /assigned to the owner/);
+    assert.deepEqual([store.getTicket(kg).owner_task_kind, store.getTicket(kg).owner_task_by], ['check', 'desk']);
+    assert.match(recFor(`${kg}:owner-task`).why, /nobody on the team can read production/);
+    // Halted: nothing is triaged at filing; the sweep does it once the desk runs.
+    store.setSetting('ops_enabled', 'true'); store.setSetting('paused', 'true');
+    const [, kh] = await slice('Count fills (halted)', check);
+    assert.equal(recFor(`${kh}:owner-task`), null);
+    delegation.sweep({ paused: false });
+    assert.equal(recFor(`${kh}:owner-task`).status, 'applied');
+  } finally { store.setSetting('ops_enabled', 'false'); store.setSetting('paused', 'true'); }
+});
+
 test('research holds (em): Morgan coordinates a correction recorded as Morgan\'s; never an approval; the lifetime limit survives revisions', async () => {
   reset();
   policy({ research: 'em' });

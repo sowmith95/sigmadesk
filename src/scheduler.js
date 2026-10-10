@@ -358,13 +358,6 @@ async function readonlyJob(agentId, ticket, kind) {
 }
 
 // ---------------- production verification (SRE + desk ops) ----------------
-/** A read-only production check (verify/confirm/check … in production), not a write, restart, credential or decision. */
-export function isVerifyAsk(text) {
-  const t = String(text || '');
-  return /\b(verify|verif\w*|confirm\w*|check\w*|establish\w*|inspect\w*|investigat\w*|diagnos\w*|look (at|into)|measure\w*|query|read)\b/i.test(t)
-    && /\b(prod|production|live|timescale\w*|database|db|postgres\w*|container\w*|logs?|ingest\w*|hypertable\w*|jobs?|incident|health|freshness)\b/i.test(t)
-    && !/\b(restart\w*|redeploy\w*|deploy\w*|writes?|insert\w*|updat\w*|delet\w*|drop\w*|truncat\w*|alter\w*|migrat\w*|grant\w*|revok\w*|credential\w*|password\w*|secret\w*|tokens?|api key|rotat\w*|vacuum|reindex\w*|kill\w*|terminat\w*|backfill\w*|account\w*|billing|business decision|approv\w*|purchas\w*)\b/i.test(t);
-}
 /** Owner-step kinds a seat may state with desk create-task --owner-kind (#9). check and package can be routed back to
  * the team by delegation; the rest stay the owner's. The desk itself also records 'probe' (no probe could answer it)
  * and 'owner' (the owner took the task). */
@@ -1468,23 +1461,28 @@ export async function deskAction(run, cmd, body = {}) {
       const ownerKind = body['owner-kind'] === undefined || body['owner-kind'] === true ? null : String(body['owner-kind']);
       need(!ownerKind || OWNER_TASK_KINDS.includes(ownerKind), `--owner-kind must be one of ${OWNER_TASK_KINDS.join(', ')}`);
       need(!ownerKind || ownerWhy, '--owner-kind goes with --owner "<why only the owner can do it>"');
-      // --verify (or --owner-kind check, or an --owner step whose text is plainly a read-only production check): the SRE
-      // answers it with desk ops probes; the owner only gets it when production read access is off or the probes cannot.
-      const verifyAsk = body.verify === true || ownerKind === 'check' || (!!ownerWhy && !ownerKind && isVerifyAsk(`${body.title}\n${ownerWhy}`));
-      const toSre = verifyAsk && verifyReady();
-      const ownerReason = ownerWhy || (verifyAsk ? 'Read-only production check, and production read access for the SRE is off (Settings → Production read access).' : null);
+      // Two separate routes, never inferred from the text. --verify asks the SRE for a read-only production check (the
+      // desk's probes; the owner gets it only while production read access is off). --owner is a request to the owner:
+      // it is the owner's task, and only the delegation's mode-checked triage may route a stated kind back to the team.
+      need(!(body.verify === true && ownerWhy), 'use --verify for a read-only production check the SRE answers, or --owner for a step only the owner can do, not both');
+      const verify = body.verify === true;
+      const toSre = verify && verifyReady();
+      const ownerReason = ownerWhy || (verify ? 'Read-only production check, and production read access for the SRE is off (Settings → Production read access).' : null);
       const asOwnerTask = (k) => {
         if (toSre) {
           store.updateTicket(k, { owner_task: 0, assignee: 'sre', assign_pinned: 1 });
           store.kvSet(`verify:${k}`, '1');
-          store.addComment(k, 'system', `🔎 Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes${ownerWhy ? ` instead of the owner (asked: ${ownerWhy})` : ''}. It reaches the owner only if no probe can answer it.`);
+          store.addComment(k, 'system', `🔎 Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes. It reaches the owner only if no probe can answer it.`);
           return;
         }
         if (!ownerReason) return;
-        store.updateTicket(k, { owner_task: 1, owner_task_kind: ownerKind || (verifyAsk ? 'check' : null), owner_task_by: agentId, assignee: null });
+        // A --verify the SRE cannot take yet is still a check; the desk parked it with the owner, not the filing seat.
+        store.updateTicket(k, { owner_task: 1, owner_task_kind: ownerWhy ? ownerKind : 'check', owner_task_by: ownerWhy ? agentId : 'desk', assignee: null });
         store.addComment(k, agentId, `🙋 **This is your task**: ${ownerReason}`);
+        delegation.triageOwnerTask(k);
       };
-      const whoFor = (seat) => (toSre ? 'sre (read-only production check)' : ownerReason ? 'the owner' : seat);
+      const whoFor = (k, seat) => { const t = store.getTicket(k); return t.owner_task ? 'the owner' : t.assignee === 'sre' && store.kvGet(`verify:${k}`) === '1' ? 'sre (read-only production check)' : t.assignee || seat; };
+      const roleFor = (k, seat) => { const t = store.getTicket(k); return t.owner_task ? 'the owner' : agentById[t.assignee || seat]?.role || seat; };
       if (PRINCIPALS.includes(agentId)) {
         // A principal's slices: small, built by cheaper seats, attached to the ticket being designed.
         need(run.kind === 'design' && run.ticket_key, 'slices are created during a design run');
@@ -1498,9 +1496,9 @@ export async function deskAction(run, cmd, body = {}) {
         // The slicer is the context reviewer later; slices inherit the parent's risk.
         store.updateTicket(slice.key, { designer: agentId, risk: parent.risk || null, assign_pinned: body.assign ? 1 : 0, ...(body.after ? { after_key: body.after } : {}) });
         asOwnerTask(slice.key);
-        ev(`sliced ${slice.key} (${body.complexity}) for ${toSre ? agentById.sre.role : ownerReason ? 'the owner' : agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
+        ev(`sliced ${slice.key} (${body.complexity}) for ${roleFor(slice.key, slice.assignee)}${body.after ? ` after ${body.after}` : ''}`, slice.key);
         github.createIssue(slice.key);
-        return `created ${slice.key} → ${whoFor(slice.assignee)}${gateNote}`;
+        return `created ${slice.key} → ${whoFor(slice.key, slice.assignee)}${gateNote}`;
       }
       const parentKey = body.parent || key;
       // The reroute decision uses the risk the task will actually carry (inherited from its parent when not given).
@@ -1515,9 +1513,9 @@ export async function deskAction(run, cmd, body = {}) {
       store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null, assign_pinned: explicit?.pinned ? 1 : 0, ...(body.after ? { after_key: body.after } : {}) });
       if (explicit?.rerouted) store.addComment(t.key, 'system', `Principals design and slice; this ${body.complexity} task goes to ${agentById[assignee].name} instead of ${agentById[explicit.rerouted].name}.`);
       asOwnerTask(t.key);
-      ev(`created task ${t.key} for ${toSre ? agentById.sre.role : ownerReason ? 'the owner' : agentById[assignee].role}${body.after ? ` after ${body.after}` : ''}`, t.key);
+      ev(`created task ${t.key} for ${roleFor(t.key, assignee)}${body.after ? ` after ${body.after}` : ''}`, t.key);
       github.createIssue(t.key);
-      return `created ${t.key} assigned to ${whoFor(assignee)}${gateNote}`;
+      return `created ${t.key} assigned to ${whoFor(t.key, assignee)}${gateNote}`;
     }
     case 'design':
       need(ticket && ticket.key === run.ticket_key && run.kind === 'design', 'design only on the ticket you are designing');
@@ -2286,12 +2284,13 @@ export function ownerTask(key, { owner_task, why = '', by = 'owner', verify = fa
     store.updateTicket(key, { owner_task: 1, owner_task_kind: by === 'owner' ? 'owner' : OWNER_TASK_KINDS.includes(kind) ? kind : null, owner_task_by: by, assignee: null, status: 'todo', resume_status: null, progress_msg: 'your task' });
     if (by === 'manager') store.addComment(key, 'manager', `🙋 **This is your task**: no seat on the team can do it. ${String(why).trim().slice(0, 500)}`);
     else store.addComment(key, 'owner', `🙋 **I will do this one myself**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'}`);
+    if (by !== 'owner') delegation.triageOwnerTask(key); // the owner's own choice is never routed away
   } else {
     need(t.owner_task, 'this is not an owner task');
-    // A read-only production check goes to the SRE (desk ops probes) when production read access is on.
-    // verify:true is the owner's explicit call that this is a read-only check (the text classifier is conservative).
+    // A read-only production check goes to the SRE (desk ops probes) when production read access is on: the owner says
+    // so (verify), or the task is one by its structured kind. Its text is never classified.
     if (by === 'owner' && verify === true) need(verifyReady(), 'production read access is off (Settings → Production read access)');
-    if (((by === 'owner' && verify === true) || isVerifyAsk(`${t.title}\n${t.description || ''}`)) && verifyReady()) {
+    if (((by === 'owner' && verify === true) || t.owner_task_kind === 'check') && verifyReady()) {
       store.updateTicket(key, { owner_task: 0, assignee: 'sre', assign_pinned: 1, status: 'todo', progress_msg: null });
       store.kvSet(`verify:${key}`, '1');
       store.addComment(key, 'owner', `↩️ **Handed back to the team**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'} Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes.`);
