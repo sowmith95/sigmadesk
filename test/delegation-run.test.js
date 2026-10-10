@@ -127,6 +127,22 @@ test('through the real CLI, an answer that cites nothing it was given is not app
   assert.equal(store.getTicket(t.key).status, 'needs_human', 'nothing resumed');
 });
 
+test('bind: evidence that changes while the run\'s workspace is prepared stops the launch; the run is never given a stale brief', async () => {
+  fresh();
+  delegation.setPolicy({ kinds: { question: 'em' } });
+  const t = await held();
+  delegation.sweep({ paused: false });
+  const r = open(t);
+  const before = store.recentRuns(1)[0]?.id;
+  const launching = delegation.launch(r); // runs up to the workspace preparation, then waits for it
+  store.addComment(t.key, 'senior-be', 'Correction: this is the broker order path, not the retry helper.');
+  await launching;
+  assert.equal(store.recentRuns(1)[0]?.id, before, 'no run was started');
+  const after = store.getDelegation(r.id);
+  assert.equal(after.status, 'superseded'); assert.match(after.outcome, /new evidence/);
+  assert.equal(after.citables, null, 'nothing was sealed for a run');
+});
+
 test('one attempt: a run that ends without desk decide hands the decision to the owner, explained', async () => {
   fresh();
   delegation.setPolicy({ kinds: { question: 'em' } });

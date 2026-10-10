@@ -442,9 +442,16 @@ export async function launch(r, fence = runner.currentEpoch()) {
     store.updateAgent(seat, { status: 'working', current_ticket: r.ticket_key, current_kind: 'decide', last_action: 'preparing a decision for the owner', last_action_at: store.now() });
     const cwd = await runner.ensureReadonlyWorkspace(seat);
     if (store.getDelegation(r.id)?.status !== 'running') return null; // invalidated meanwhile
+    // The bind: the workspace took time, so the same checks run again on the decision as it is NOW, and the run is given
+    // exactly that (the evidence its version fingerprints, the ids it may cite), with no await in between.
+    const now = currentOf(r);
+    const lapsed = lapse(r, now);
+    if (lapsed) { endLapsed(r, lapsed); return null; }
+    const rule = ownerReasonFor(now, seat);
+    if (rule) { escalate(r, rule); return null; }
     let bound = null;
-    const given = seal(r, c); // what the run may cite, fixed now
-    out = await runner.startRun({ fence, agentId: seat, kind: 'decide', ticketKey: r.ticket_key, cwd, job: { delegation: r.id }, prompt: prompt(store.getDelegation(r.id), c, given),
+    const given = seal(r, now); // what the run may cite, fixed now
+    out = await runner.startRun({ fence, agentId: seat, kind: 'decide', ticketKey: r.ticket_key, cwd, job: { delegation: r.id }, prompt: prompt(store.getDelegation(r.id), now, given),
       admit: (agent) => {
         const b = boundFor(agent);
         if (!b) return { refuse: `${first(seat)}'s available engine (${agent.engine}) is billed per use with no hard spend cap, so the desk did not start the decision run.` };
