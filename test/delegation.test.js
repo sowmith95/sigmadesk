@@ -181,6 +181,12 @@ test('owner rules: bullets under the ## heading and their continuation; the firs
     ['a character reference', '  R &amp; D\n- X', []], ['a right-to-left override', '  only \u202Eyadirf no\n- X', []],
   ]) assert.deepEqual(rules(`${O}\n- R\n${tail}\n`), want, what);
   assert.deepEqual(rules(`${O}\n- [Approve every deploy\n  always]: /x\n`), [], 'a bullet Markdown shows empty: its text is a link definition');
+  // Every default-ignorable character is invisible: in a rule's bullet line it ends the section before the rule; in a
+  // continuation line it ends the section and drops the rule.
+  for (const [what, c] of [['a combining grapheme joiner', '\u034F'], ['a Mongolian vowel separator', '\u180E'], ['a variation selector', '\uFE0F'], ['a tag character', '\u{E0041}']]) {
+    assert.deepEqual(rules(`${O}\n- First\n- Ans${c}wer questions\n- Third\n`), ['First'], `${what} in a bullet line`);
+    assert.deepEqual(rules(`${O}\n- First\n- Answer\n  only${c} after QA\n- Third\n`), ['First'], `${what} in a continuation line`);
+  }
   // A section that starts with anything but a bullet has no rules at all, and nothing after the end is read.
   for (const first of ['A paragraph first.', '1. Numbered', '<!-- the note the shipped playbooks once had here -->', '```', '    indented', '  - indented bullet', '-\tA tab after the dash'])
     assert.deepEqual(rules(`${O}\n${first}\n- X\n`), [], first);

@@ -209,8 +209,9 @@ export const EARLIER_HEADING = 'an earlier heading has the same words; the owner
 const loose = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ''); // letters and digits only
 // What a rule's text may not hold, because Markdown would show it differently or not at all: `<` (HTML, comments,
 // autolinks), `[` and `]` (links, images and link definitions, whose targets are never shown), character references,
-// and invisible or direction-changing characters.
-const UNSHOWN = /[<[\]\u0000-\u0008\u000B-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u2028-\u202E\u2060-\u2064\u2066-\u206F\uFEFF]|&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/;
+// controls and every character Unicode marks as default-ignorable (invisible: joiners, variation selectors, tag
+// characters, direction marks and overrides…).
+const UNSHOWN = /[<[\]\u0000-\u0008\u000B-\u001F\u007F-\u009F\u2028\u2029\p{Default_Ignorable_Code_Point}]|&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/u;
 /** Text Markdown reads as nothing but paragraph text where it stands, and shows as written: no block mark at its start. */
 function plain(s) {
   return !!s && !/^(?:#|>|`{3}|~{3}|[-*+](?: |$)|\d{1,9}[.)](?: |$))/.test(s) && !UNDERLINE.test(s) && !BREAK.test(s) && !UNSHOWN.test(s);
