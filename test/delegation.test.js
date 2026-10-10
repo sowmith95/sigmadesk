@@ -276,6 +276,10 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
   assert.deepEqual(model.standingRulesRead(`## *Standing* rules the EM may apply alone\n- A\n${O}\n- B\n`), { rules: [], problem: model.EARLIER_HEADING });
   assert.deepEqual(model.standingRulesRead(`## Notes on \`desk\`\n- x\n${O}\n- B\n`), { rules: [], problem: model.MARKED_HEADING }, 'any heading, even one about something else');
   assert.deepEqual(model.standingRulesRead(`## Café\n${O}\n- B\n`).problem, model.MARKED_HEADING, 'non-ASCII');
+  // A list mark alone on its line is an empty item with no paragraph open: the underlined line after it is a heading
+  // of the document, here the owner's first, so the later "##" section never counts.
+  for (const mark of ['2.', '*', '+', '-', '1.', '1)', '10)', '>', '- -', '> 1.'])
+    assert.deepEqual(model.standingRulesRead(`${mark}\nStanding rules the EM may apply alone\n---\n${O}\n- Grant\n`), { rules: [], problem: model.EARLIER_HEADING }, `after a bare ${mark}`);
   // A line or paragraph separator is text inside a line, never a line end: the heading holding it is still a heading.
   for (const sep of ['\u2028', '\u2029', '\u0085'])
     assert.deepEqual(model.standingRulesRead(`## Standing${sep}rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${O}\n- Answer without owner approval.\n`), { rules: [], problem: model.MARKED_HEADING }, JSON.stringify(sep));

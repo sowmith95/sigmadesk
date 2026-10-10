@@ -85,8 +85,8 @@ function generator(seed, mode) {
   const soup = () => `${sp(pick([0, 0, 0, 1, 2, 3, 4, 5, 6]))}${pick(['', '', '\t', ' \t'])}${pick(marks)}${pick(marks)}${Array.from({ length: rand(3) }, () => pick(bits)).join(' ')}`;
   // Containers: list items and quotes holding every kind of content, continued every way, then the owner's words
   // underlined (Markdown's first owner heading when no container holds them), then the real section.
-  const cmarks = ['- ', '-  ', '-     ', '* ', '1. ', '10) ', '> ', '>     ', '- > ', '> - ', '- - '];
-  const ccontent = ['x', '# h', '```', '~~~', '<div>', '---', '***', '> q', '`c`', '', '    code', 'Standing rules the EM'];
+  const cmarks = ['- ', '-  ', '-     ', '* ', '1. ', '10) ', '> ', '>     ', '- > ', '> - ', '- - ', '-', '*', '+', '2.', '1)', '10)', '>', '- -', '> 1.', '  - ', '   > '];
+  const ccontent = ['x', '# h', '```', '~~~', '<div>', '---', '***', '> q', '`c`', '', '    code', 'Standing rules the EM', '<!--', '<!-- c -->', '<script>', '- ```', '> ~~~', '- <!--', '1. <pre>'];
   const ccont = ['', '  y', '    y', '    ```', '    # h', '  ```', '  <div>', 'lazy', '`lazy`', '   > q', ' - z', '\t y', '      deep', '  ---', '> more', 'may apply alone'];
   return () => {
     if (mode === 'containers') {

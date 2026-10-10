@@ -255,7 +255,8 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
   // then the lines under it continue that paragraph, inside the container, and are never a heading of the document.
   const opens = (b) => {
     let t = b, m;
-    while ((m = t.match(/^(?:(?:[-*+]|\d{1,9}[.)])( +)|> ?)/))) { if (m[1] && m[1].length > 4) return false; t = t.slice(m[0].length); } // 5+ spaces: code
+    // A mark alone on its line is an empty item: no paragraph open. Five or more spaces after it: code.
+    while ((m = t.match(/^(?:(?:[-*+]|\d{1,9}[.)])( +|$)|> ?)/))) { if (m[1] && m[1].length > 4) return false; t = t.slice(m[0].length); if (!t) return false; }
     return !!t && !/^ {4}/.test(t) && !/^(?:#{1,6}(?: |$)|`{3}|~{3}|<)/.test(t) && !BREAK.test(t) && !UNDERLINE.test(t);
   };
   // 1. Every heading candidate in the whole playbook, outside fences and comments: each ATX line (any level) and each
