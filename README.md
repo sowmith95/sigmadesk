@@ -260,7 +260,11 @@ publish-guard holds; standing and renewal production access; package installs.
   Every dollar is reserved or charged, never neither: a run's reservation stands, whatever its decision did, until the
   run's cost is charged, and after a restart every ended run is charged to its record. A run that ends without
   deciding, or a decision not started within 30 minutes, comes to you with the reason. Escalations carry a one-line
-  recommendation, so your tap is yes or no. At most 40 decision runs a day; one slot stays free for QA and incidents.
+  recommendation, so your tap is yes or no. At most 40 decision runs a day (`delegation.maxPerDay`): a decision takes
+  one of them as it leaves the queue, holds it while its workspace is prepared and gives it back only if no run starts,
+  and the count is kept in the desk's database, so a restart or two decisions at once cannot exceed it. A decision that
+  finds the day's runs used up waits, and comes to you if it has not started within 30 minutes. One slot stays free for
+  QA and incidents.
 - **Rules before the run and again at apply**, with no model call: a delegate never decides anything it is a party to.
   One list of interested seats serves every kind: whoever put the hold (the asker, the requester, QA, a disagreeing
   reviewer), built, is assigned, designed or worked on the ticket, reviews the change, wrote or reviewed the proposal,

@@ -650,3 +650,75 @@ test('restart: an interrupted decision run is not retried; its spend is rebuilt 
   assert.equal(after.status, 'escalated'); assert.match(after.why, /desk restarted/);
   assert.ok(after.spent_usd > 0, 'an interrupted run is charged at its cap and that lands on the record');
 });
+
+// The day's allowance of decision runs is a reservation in stored state: a record takes one in the transaction that
+// takes it out of the queue, holds it while its workspace is prepared, and gives it back only if no run is created.
+const startedToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return store.handle().prepare("SELECT COUNT(*) n FROM runs WHERE kind='decide' AND started_at >= ?").get(d.toISOString()).n; };
+const holdPreparation = () => {
+  const waiting = [];
+  delegation.setWorkspacePreparer((seat) => new Promise((resolve) => { waiting.push(() => resolve(runner.ensureReadonlyWorkspace(seat))); }));
+  return { release: () => { while (waiting.length) waiting.shift()(); } };
+};
+test('daily allowance: a decision whose workspace is being prepared holds its run, so a second one waits for the next day', async () => {
+  fresh();
+  delegation.setPolicy({ kinds: { question: 'em' } });
+  const prev = { ...config.delegation };
+  config.delegation.maxPerDay = startedToday() + 1; // one run left today
+  config.delegation.maxWaitMinutes = 1440; // long enough to wait for the next day
+  const prep = holdPreparation();
+  try {
+    const t1 = await held();
+    delegation.sweep({ paused: false });
+    const r1 = open(t1);
+    plan([['show']]);
+    const first = delegation.launch(r1); // takes today's last run, then waits on its workspace
+    assert.equal(store.getDelegation(r1.id).status, 'running');
+    // Meanwhile a second factual question is held and swept: it is queued, and it waits.
+    const t2 = await held('Which test covers the retry helper?');
+    delegation.sweep({ paused: false });
+    const r2 = open(t2);
+    assert.equal(r2.status, 'queued', 'not refused: it waits');
+    assert.deepEqual(delegation.nextJobs(), [], 'nothing is offered to the scheduler while the allowance is used');
+    assert.equal(await delegation.launch(r2), null, 'no run while the first one is being prepared');
+    assert.equal(store.getDelegation(r2.id).status, 'queued');
+    prep.release();
+    await first;
+    assert.equal(await delegation.launch(store.getDelegation(r2.id)), null, 'nor once the first one ran');
+    assert.equal(store.getDelegation(r2.id).status, 'queued');
+    assert.equal(startedToday(), config.delegation.maxPerDay, 'exactly one decision run today');
+    // The next day it runs (the sweep would have sent it to the owner had it waited longer than maxWaitMinutes).
+    delegation.setWorkspacePreparer(null);
+    plan([['show']]);
+    await delegation.launch(store.getDelegation(r2.id), undefined, { at: Date.now() + 86400_000 });
+    const r2After = store.getDelegation(r2.id);
+    assert.ok(r2After.run_id, 'its run started');
+    assert.equal(r2After.status, 'escalated', 'it ran (and, ending without a decision, came to the owner)');
+  } finally { delegation.setWorkspacePreparer(null); Object.assign(config.delegation, prev); }
+});
+test('daily allowance: a desk stopped while a workspace was prepared gives the reservation back on recovery', async () => {
+  fresh();
+  delegation.setPolicy({ kinds: { question: 'em' } });
+  const prev = { ...config.delegation };
+  config.delegation.maxPerDay = startedToday() + 1;
+  const prep = holdPreparation();
+  try {
+    const t1 = await held();
+    delegation.sweep({ paused: false });
+    const r1 = open(t1);
+    const interrupted = delegation.launch(r1); // reserved, preparing: the desk stops here
+    const t2 = await held('Which test covers the retry helper?');
+    delegation.sweep({ paused: false });
+    assert.deepEqual(delegation.nextJobs(), [], 'the reservation holds today\'s last run');
+    delegation.recover(); // the restart: the interrupted decision is the owner's, and its reservation is released
+    assert.equal(store.getDelegation(r1.id).status, 'escalated');
+    assert.equal(store.getDelegation(r1.id).run_id, null, 'no run was created for it');
+    assert.deepEqual(delegation.nextJobs().map((r) => r.id), [open(t2).id], 'the run is free again');
+    prep.release(); await interrupted; // the stopped preparation ends without a run
+    assert.equal(store.getDelegation(r1.id).run_id, null);
+    delegation.setWorkspacePreparer(null);
+    plan([['show']]);
+    await delegation.launch(open(t2));
+    assert.ok(store.getDelegation(open(t2).id).run_id, 'the second decision got the run');
+    assert.equal(startedToday(), config.delegation.maxPerDay);
+  } finally { delegation.setWorkspacePreparer(null); Object.assign(config.delegation, prev); }
+});

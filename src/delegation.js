@@ -303,8 +303,19 @@ function escalate(r, why, { recommendation = null, by = null, from = OPEN } = {}
 }
 
 // ---------------- the sweep (every scheduler tick) ----------------
-const today = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.toISOString(); };
-const runsToday = () => store.handle().prepare("SELECT COUNT(*) n FROM runs WHERE kind='decide' AND started_at >= ?").get(today()).n;
+const today = (now = Date.now()) => { const d = new Date(now); d.setHours(0, 0, 0, 0); return d.toISOString(); };
+const runsToday = (now) => store.handle().prepare("SELECT COUNT(*) n FROM runs WHERE kind='decide' AND started_at >= ?").get(today(now)).n;
+/**
+ * Today's allowance of decision runs, from stored state only: the decide runs started today, plus every reservation (a
+ * model-decided record taken for its run, whose run does not exist yet: its workspace is being prepared). A record takes
+ * its reservation in the same transaction that takes it out of the queue; it is released when the record leaves
+ * `running` with no run (escalated, lapsed, failed, or by recovery after a restart), and once its run exists the run
+ * counts instead. except: a record whose own reservation is not counted (its run's admission).
+ */
+const reservedRuns = (except = null) => store.delegationsByStatus('running').filter((x) => !model.KINDS[x.kind]?.deterministic && !x.run_id && x.id !== except).length;
+const runsUsed = (now = Date.now(), except = null) => runsToday(now) + reservedRuns(except);
+const allowanceUsed = (now = Date.now(), except = null) => runsUsed(now, except) >= limits().maxPerDay;
+const usedUpText = () => `today's allowance of ${limits().maxPerDay} delegated decision runs is used up`;
 /**
  * Supersede records whose decision moved on, open records for new decisions, decide owner-task triage by rule, and send
  * a decision back to the owner when a rule says so or its delegate did not get to it in time. Applies nothing while the
@@ -321,14 +332,15 @@ export function sweep({ now = Date.now(), paused = store.getSettings().paused ==
     const l = lapse(r, live.get(r.decision_id) || null, settings);
     if (l) { if (endLapsed(r, l) && l.status === 'superseded') out.superseded++; continue; }
     if (r.status === 'queued' && now - Date.parse(r.created_at) > limits().maxWaitMinutes * 60_000) {
-      const late = `${first(r.seat)} did not get to it within ${limits().maxWaitMinutes} minutes${paused ? ' (the desk is halted)' : ''}`;
+      const full = !model.KINDS[r.kind]?.deterministic && allowanceUsed(now);
+      const late = `${first(r.seat)} did not get to it within ${limits().maxWaitMinutes} minutes${paused ? ' (the desk is halted)' : full ? ` (${usedUpText()})` : ''}`;
       // In shadow the owner decides anyway: a run that never happened is no decision to show, so it ends quietly.
       if (r.mode === 'shadow') store.transitionDelegation(r.id, ['queued'], { status: 'failed', outcome: `Shadow: ${late}; nothing to compare.`, ended_at: isoNow() });
       else if (escalate(r, late)) out.escalated++;
     }
   }
   if (paused || !delegated) { safetyNet(paused); return out; }
-  for (const c of live.values()) consider(c, { pol, out });
+  for (const c of live.values()) consider(c, { pol, out, now });
   safetyNet(paused);
   return out;
 }
@@ -338,7 +350,7 @@ export function sweep({ now = Date.now(), paused = store.getSettings().paused ==
  * included), the owner rules (escalated, with the reason, before any run) and, for owner-task triage, the rule's
  * decision at once. Model-decided records wait for their run (nextJobs).
  */
-function consider(c, { pol = policy(), out = { created: 0, applied: 0, escalated: 0 } } = {}) {
+function consider(c, { pol = policy(), out = { created: 0, applied: 0, escalated: 0 }, now = Date.now() } = {}) {
   const mode = pol.kinds[c.kind];
   if (!mode || mode === 'owner') return null;
   const seat = model.delegateFor(c.kind, mode);
@@ -346,13 +358,10 @@ function consider(c, { pol = policy(), out = { created: 0, applied: 0, escalated
   const L = limits();
   let r = store.delegationFor(c.decision_id, c.version);
   if (!r) {
-    // A day's allowance of decision runs bounds the cost; rule-decided triage costs nothing and is not counted.
-    if (!model.KINDS[c.kind].deterministic && L.maxPerDay >= 0 && runsToday() + store.delegationsByStatus('queued').filter((x) => !model.KINDS[x.kind].deterministic).length >= L.maxPerDay) {
-      if (mode === 'shadow') return null; // the owner decides anyway; no record, no noise
-      r = create(c, mode, seat); out.created++;
-      if (escalate(r, `today's allowance of ${L.maxPerDay} delegated decision runs is used up`)) out.escalated++;
-      return store.getDelegation(r.id);
-    }
+    // A day's allowance of decision runs bounds the cost (rule-decided triage costs nothing and is not counted). It is
+    // enforced where a run is taken (launch); a decision for the owner waits for it like any other, and comes to the
+    // owner if it does not start within maxWaitMinutes. Shadow over it opens nothing: the owner decides anyway.
+    if (mode === 'shadow' && !model.KINDS[c.kind].deterministic && runsUsed(now) + store.delegationsByStatus('queued').filter((x) => !model.KINDS[x.kind].deterministic).length >= L.maxPerDay) return null;
     r = create(c, mode, seat); out.created++;
   }
   if (r.status !== 'queued') return r;
@@ -397,7 +406,7 @@ function safetyNet(paused = store.getSettings().paused === 'true') {
  * Model-decided records waiting for their delegate (the scheduler launches them through its admission). Decisions for
  * the owner go early in the tick (they unblock work); shadow ones only take a seat's idle time, after grooming.
  */
-export const nextJobs = ({ shadow = false } = {}) => store.delegationsByStatus('queued').filter((r) => !model.KINDS[r.kind]?.deterministic && (r.mode === 'shadow') === shadow);
+export const nextJobs = ({ shadow = false, now = Date.now() } = {}) => (allowanceUsed(now) ? [] : store.delegationsByStatus('queued').filter((r) => !model.KINDS[r.kind]?.deterministic && (r.mode === 'shadow') === shadow));
 
 // ---------------- owner-task triage: by rule, no model call ----------------
 const packageSeat = (t) => builderCandidates({ area: t.area, complexity: t.complexity || 'S', risk: t.risk })[0] || null;
@@ -456,9 +465,20 @@ function charge(id, run, steps = 0) {
     store.kvSet(`decide-charged:${run.id}`, '1');
   });
 }
-/** ONE attempt for a queued record; a run that ends without `desk decide` sends the decision to the owner, explained. */
-export async function launch(r, fence = runner.currentEpoch()) {
-  if (!store.transitionDelegation(r.id, ['queued'], { status: 'running', attempts: (r.attempts || 0) + 1, started_at: isoNow() })) return null;
+// The decision run's read-only workspace (tests hold it to reproduce what happens while it is prepared).
+const PREPARE = (seat) => runner.ensureReadonlyWorkspace(seat);
+let prepareWorkspace = PREPARE;
+export function setWorkspacePreparer(fn) { prepareWorkspace = fn || PREPARE; }
+/**
+ * ONE attempt for a queued record; a run that ends without `desk decide` sends the decision to the owner, explained.
+ * The record leaves the queue only with a run of today's allowance reserved for it, in one transaction; with none left
+ * it stays queued: it waits, runs once the allowance has room (the next day at the latest), and comes to the owner if it
+ * has not started within maxWaitMinutes.
+ */
+export async function launch(r, fence = runner.currentEpoch(), { at = Date.now() } = {}) {
+  const took = store.transaction(() => !(!model.KINDS[r.kind]?.deterministic && allowanceUsed(at))
+    && store.transitionDelegation(r.id, ['queued'], { status: 'running', attempts: (r.attempts || 0) + 1, started_at: isoNow() }));
+  if (!took) return null;
   const seat = r.seat;
   let out = null, refused = null;
   try {
@@ -468,7 +488,7 @@ export async function launch(r, fence = runner.currentEpoch()) {
     const why = ownerReasonFor(c, seat, r.id);
     if (why) { escalate(r, why); return null; }
     store.updateAgent(seat, { status: 'working', current_ticket: r.ticket_key, current_kind: 'decide', last_action: 'preparing a decision for the owner', last_action_at: store.now() });
-    const cwd = await runner.ensureReadonlyWorkspace(seat);
+    const cwd = await prepareWorkspace(seat);
     if (store.getDelegation(r.id)?.status !== 'running') return null; // invalidated meanwhile
     // The bind: the workspace took time, so the same checks run again on the decision as it is NOW, and the run is given
     // exactly that (the evidence its version fingerprints, the ids it may cite), with no await in between.
@@ -481,6 +501,9 @@ export async function launch(r, fence = runner.currentEpoch()) {
     const given = seal(r, now, { base: runner.workspaceBase(cwd) }); // what the run may cite, and the commit it reads, fixed now
     out = await runner.startRun({ fence, agentId: seat, kind: 'decide', ticketKey: r.ticket_key, cwd, job: { delegation: r.id }, prompt: prompt(store.getDelegation(r.id), now, given),
       admit: (agent) => {
+        // Checked again as the run is admitted (no await before it is created): the runs started today and every other
+        // reservation, besides this record's own.
+        if (allowanceUsed(at, r.id)) return { refuse: `${usedUpText()}, so the desk did not start the decision run` };
         const b = boundFor(agent);
         if (!b) return { refuse: `${first(seat)}'s available engine (${agent.engine}) is billed per use with no hard spend cap, so the desk did not start the decision run.` };
         const a = reserve(r.id, b, agent); // the engine it actually got, capped at what its allowance has left
