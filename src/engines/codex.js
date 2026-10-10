@@ -208,8 +208,10 @@ export const codex = {
       case 'thread.started': return [{ type: 'session', id: ev.thread_id }];
       case 'item.started':
         if (it.type === 'command_execution') {
+          // Counted as it starts (the step limit must see a command before it can act), desk calls included; the
+          // completion repeats the id and is not counted again.
           const cmd = unwrap(it.command);
-          return /^\s*desk\s/.test(cmd) ? [] : [{ type: 'tool', text: `$ ${short(cmd)}` }];
+          return [{ type: 'cmd-start', id: it.id, cmd }, ...(/^\s*desk\s/.test(cmd) ? [] : [{ type: 'tool', text: `$ ${short(cmd)}` }])];
         }
         return [];
       case 'item.completed':

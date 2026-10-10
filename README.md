@@ -192,7 +192,9 @@ publish-guard holds; standing and renewal production access; package installs.
   the recommendation.
 - **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and ends with one
   `desk decide` (or `desk decide escalate "<recommendation>" --why "<why it is yours>"`): up to $0.75 on an engine with a
-  spending cap, or 6 minutes and 30 steps on a plan-billed one; an engine with neither is refused. The bound is reserved
+  spending cap, or 6 minutes and 30 steps on a plan-billed one; an engine with neither is refused. Steps count every tool
+  call and command as it starts, and the desk counts each desk request itself before carrying it out, so a request past
+  the limit is refused and the run stopped before it can apply anything. The bound is reserved
   for the engine the run actually gets (a fallback included). A research proposal's delegated runs share a $1.50
   lifetime allowance: each run is capped at what is left of it, and an engine that cannot cap dollars only starts when
   its whole reservation fits. A run that ends without deciding, or a decision not started within 30 minutes, comes to

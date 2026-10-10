@@ -297,6 +297,86 @@ test('steps: a decision run is stopped past its step allowance, like a tagged re
   assert.ok(store.recentEvents({ limit: 20 }).some((e) => /limit for a delegated decision/.test(e.text)));
 });
 
+test('steps in Codex\'s real order: a command counts when it starts, and the desk refuses a request past the limit before it applies', async () => {
+  fresh();
+  delegation.setPolicy({ kinds: { question: 'em' } });
+  const { codex } = await import('../src/engines/codex.js');
+  const feed = (ctx, id, command, { complete = true } = {}) => {
+    const item = { id, type: 'command_execution', command, aggregated_output: '', exit_code: null, status: 'in_progress' };
+    runner.applyEvents(codex.parse(JSON.stringify({ type: 'item.started', item }), tmp, ctx.state), ctx);
+    if (complete) runner.applyEvents(codex.parse(JSON.stringify({ type: 'item.completed', item: { ...item, exit_code: 0, status: 'completed' } }), tmp, ctx.state), ctx);
+  };
+  const answer = { action: 'answer', body: 'utils/net.py:40.', cite: 'R1,E1', why: 'utils/net.py:40 defines retry(); the playbook says reuse.' };
+  // A bound decision run that already ran `before` commands (started and completed, as Codex reports them).
+  const decision = async (before) => {
+    const t = await held();
+    delegation.sweep({ paused: false });
+    const r = open(t);
+    delegation.seal(r);
+    const run = store.createRun({ agent_id: 'manager', ticket_key: t.key, kind: 'decide', token: `cx-${Math.random()}`, model: 'codex:', job: { delegation: r.id } });
+    store.updateDelegation(r.id, { status: 'running', run_id: run.id, attempts: 1 });
+    const ctx = { run, state: {}, presence: false, maxSteps: 30 };
+    for (let i = 1; i <= before; i++) feed(ctx, `item_${i}`, "/bin/zsh -lc 'rg -n retry utils'");
+    return { t, r, run, ctx };
+  };
+  // 30 commands; the 31st is desk decide, and its request reaches the desk before its item.started is read.
+  const a = await decision(30);
+  assert.deepEqual([a.ctx.state.steps, store.getRun(a.run.id).status], [30, 'running'], 'started and completed: counted once each');
+  await assert.rejects(sched.deskAction(a.run, 'decide', answer), /used its 30 steps, so it was stopped and this desk command was not carried out/);
+  assert.deepEqual([store.getRun(a.run.id).status, store.getRun(a.run.id).result_text], ['killed', 'step limit (30)']);
+  assert.notEqual(store.getDelegation(a.r.id).status, 'applied'); assert.equal(store.getTicket(a.t.key).status, 'needs_human');
+  // The stream first: item.started of the 31st stops the run at once, and its request is refused when it arrives.
+  const b = await decision(30);
+  feed(b.ctx, 'item_31', "/bin/zsh -lc 'desk decide answer x'", { complete: false });
+  assert.equal(store.getRun(b.run.id).status, 'killed', 'counted when it started, not when it completed');
+  await assert.rejects(sched.deskAction(b.run, 'decide', answer), /used its 30 steps/);
+  assert.notEqual(store.getDelegation(b.r.id).status, 'applied');
+  // Within the allowance the 30th step decides, counted once although the stream and the desk both saw it.
+  const c = await decision(29);
+  feed(c.ctx, 'item_30', "/bin/zsh -lc 'desk decide answer x'", { complete: false });
+  assert.match(await sched.deskAction(c.run, 'decide', answer), /Decided for the owner and applied/);
+  assert.equal(store.getRun(c.run.id).steps, 30);
+});
+
+test('steps end to end on a Codex stand-in that writes events in the real order: a 31st command that is desk decide is never applied', async () => {
+  fresh();
+  const cli = path.join(tmp, 'codex-steps.mjs'), args = path.join(tmp, 'codex-steps-args.json');
+  // Like Codex: each event line is written (synchronously) before the command runs, then the completion after it.
+  fs.writeFileSync(cli, `#!/usr/bin/env node
+import fs from 'node:fs'; import { spawnSync } from 'node:child_process';
+const out = (o) => fs.writeSync(1, JSON.stringify(o) + '\\n');
+process.stdin.on('data', () => {}); process.stdin.on('end', () => {
+  out({ type: 'thread.started', thread_id: 'steps' });
+  for (let i = 1; i <= 30; i++) {
+    const item = { id: 'item_' + i, type: 'command_execution', command: "/bin/zsh -lc 'ls'", aggregated_output: '', exit_code: null, status: 'in_progress' };
+    out({ type: 'item.started', item }); out({ type: 'item.completed', item: { ...item, exit_code: 0, status: 'completed' } });
+  }
+  const argv = JSON.parse(fs.readFileSync(${JSON.stringify(args)}, 'utf8'));
+  const item = { id: 'item_31', type: 'command_execution', command: "/bin/zsh -lc 'desk decide answer'", aggregated_output: '', exit_code: null, status: 'in_progress' };
+  out({ type: 'item.started', item });
+  const r = spawnSync('desk', argv, { encoding: 'utf8', env: process.env });
+  out({ type: 'item.completed', item: { ...item, exit_code: r.status, aggregated_output: String(r.stdout) + String(r.stderr), status: 'completed' } });
+  out({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
+});`); fs.chmodSync(cli, 0o755);
+  const oldBin = config.engines.codex.bin;
+  config.engines.codex.bin = cli;
+  team.applyTeamOverrides({ manager: { engine: 'codex', model: '' } });
+  const poll = setInterval(() => server.pollMailboxes(), 25); // the file transport Codex runs use
+  try {
+    delegation.setPolicy({ kinds: { question: 'em' } });
+    const t = await held();
+    delegation.sweep({ paused: false });
+    const r = open(t);
+    fs.writeFileSync(args, JSON.stringify(['decide', 'answer', 'It is utils/net.py:40.', '--cite', 'R1,E1', '--why', 'utils/net.py:40 defines retry(); the playbook says reuse.']));
+    await delegation.launch(r);
+    const after = store.getDelegation(r.id);
+    assert.equal(after.status, 'escalated', after.outcome); assert.match(after.why, /stopped \(step limit \(30\)\)/);
+    assert.equal(store.getRun(after.run_id).result_text, 'step limit (30)');
+    assert.equal(store.getTicket(t.key).status, 'needs_human', 'nothing resumed');
+    assert.ok(!store.listComments(t.key).some((c) => c.author === 'manager'), 'no answer was posted');
+  } finally { clearInterval(poll); config.engines.codex.bin = oldBin; team.applyTeamOverrides({}); }
+});
+
 test('the scheduler launches a decide run through its admission (budget, capacity, an idle seat) and shadow leaves the owner deciding', async () => {
   fresh();
   delegation.setPolicy({ kinds: { question: 'shadow' } });

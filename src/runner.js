@@ -40,20 +40,61 @@ const evidence = new Map(); // runId -> { pending: Map(id -> cmd), done: [{cmd, 
 export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
 
 /**
- * A tagged run (@mention) stops after its step allowance: every tool call and every command (desk calls too), each
- * counted once whatever the engine chooses to display. The desk-side bound when dollars cannot be capped.
+ * Step-bounded runs (tagged replies, delegated decisions #9) stop after their step allowance: every tool call and every
+ * command (desk calls too), each counted once whatever the engine chooses to display. The desk-side bound when dollars
+ * cannot be capped. A command is counted when it STARTS (by its id, never again when it completes). A desk command is
+ * seen twice, in the engine's stream and when its request reaches the desk, and is counted once, whichever comes first
+ * (the larger of the two counts): so the desk refuses the request that would exceed the allowance before it is carried
+ * out, even when the engine reports the command late.
  */
-const STEP_BOUNDED = new Set(['mention', 'decide']); // tagged replies and delegated decisions (#9)
-function stepLimit(ctx, id) {
+const STEP_BOUNDED = new Set(['mention', 'decide']);
+export const isStepBounded = (kind) => STEP_BOUNDED.has(kind);
+const ledgers = new Map(); // run id → { max, ids: stream command ids, other: tool calls and other commands, desk: stream desk command ids, arrived: desk requests }
+function ledgerOf(run, max = null) {
+  let l = ledgers.get(run.id);
+  if (!l) { l = { max: null, ids: new Set(), other: 0, desk: new Set(), arrived: 0, stopped: false }; ledgers.set(run.id, l); }
+  if (max != null) l.max = max;
+  return l;
+}
+const ledgerSteps = (l) => l.other + Math.max(l.desk.size, l.arrived);
+const ledgerMax = (run, l) => l.max ?? (run.kind === 'decide' ? Number(config.delegation?.maxSteps) || 30 : Number(config.mentions?.maxSteps) || 60);
+/** The steps a run has taken so far (its ledger when it is step-bounded). */
+const stepsTaken = (ctx) => { const l = ledgers.get(ctx.run.id); return l ? ledgerSteps(l) : ctx.state.steps || 0; };
+function stopAtLimit(run, l) {
+  const max = ledgerMax(run, l);
+  if (ledgerSteps(l) <= max || l.stopped) return false;
+  l.stopped = true;
+  store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for ${run.kind === 'decide' ? 'a delegated decision' : 'a tagged reply'})` });
+  killRun(run.id, `step limit (${max})`);
+  return true;
+}
+function stepLimit(ctx, id = null, cmd = '') {
   if (!STEP_BOUNDED.has(ctx.run.kind)) return;
-  if (id != null) { const seen = (ctx.state.stepIds ||= new Set()); if (seen.has(id)) return; seen.add(id); }
-  ctx.state.steps = (ctx.state.steps || 0) + 1;
-  store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the tag's steps from it
-  const max = ctx.maxSteps ?? (Number(config.mentions?.maxSteps) || 60);
-  if (ctx.state.steps === max + 1) {
-    store.logEvent({ run_id: ctx.run.id, agent_id: ctx.run.agent_id, ticket_key: ctx.run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for ${ctx.run.kind === 'decide' ? 'a delegated decision' : 'a tagged reply'})` });
-    killRun(ctx.run.id, `step limit (${max})`);
+  const l = ledgerOf(ctx.run, ctx.maxSteps ?? null);
+  if (id != null) {
+    if (l.ids.has(id)) return;
+    l.ids.add(id);
+    if (/^\s*desk\s/.test(String(cmd || ''))) l.desk.add(id); else l.other++;
+  } else l.other++;
+  ctx.state.steps = ledgerSteps(l);
+  store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the run's steps from it
+  stopAtLimit(ctx.run, l);
+}
+/**
+ * A desk request from a step-bounded run, BEFORE the desk carries it out: it is a step of its own unless the stream
+ * already counted it. Past the allowance the run is stopped and the request refused, so nothing it asked for happens.
+ */
+export function admitDeskCall(run) {
+  if (!STEP_BOUNDED.has(run.kind)) return;
+  const l = ledgerOf(run);
+  const max = ledgerMax(run, l);
+  if (l.other + Math.max(l.desk.size, l.arrived + 1) > max) {
+    l.arrived++;
+    stopAtLimit(run, l);
+    throw Object.assign(new Error(`this run has used its ${max} steps, so it was stopped and this desk command was not carried out`), { status: 409 });
   }
+  l.arrived++;
+  store.setRunSteps(run.id, ledgerSteps(l));
 }
 
 // Apply an engine's normalized events to the desk (activity log, presence, progress, result).
@@ -84,7 +125,7 @@ export function applyEvents(events, ctx) {
       case 'error': ctx.state.lastError = e.text; store.logEvent({ ...base, kind: 'error', text: short(e.text, 300) }); break;
       case 'wait': store.logEvent({ ...base, kind: 'system', text: e.text }); break;
       case 'cmd-start': {
-        stepLimit(ctx, e.id); // every command, including desk calls an engine does not display
+        stepLimit(ctx, e.id, e.cmd); // every command, including desk calls an engine does not display
         const ev = evidence.get(run.id) || { pending: new Map(), done: [] };
         ev.pending.set(e.id, e.cmd);
         evidence.set(run.id, ev);
@@ -721,6 +762,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0));
   const deadlineAt = Date.now() + timeoutMin * 60_000;
   if (limits?.steps != null) ctx.maxSteps = limits.steps;
+  if (STEP_BOUNDED.has(kind)) ledgerOf(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
   // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
   if (store.getRun(run.id)?.status !== 'running') return Promise.resolve(endBeforeSpawn('killed', store.getRun(run.id)?.result_text || 'refused before start'));
   if (!pplx) return spawnChild();
@@ -748,6 +790,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
 
   function endBeforeSpawn(status, text) {
     context.release(run.id);
+    ledgers.delete(run.id);
     store.updateRun(run.id, { status, token: null, ended_at: store.now(), result_text: text, cost_usd: 0 });
     store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text });
     if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
@@ -766,6 +809,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   } catch (err) {
     sock?.close();
     mailboxes.delete(run.id);
+    ledgers.delete(run.id);
     store.updateRun(run.id, { status: 'error', token: null, ended_at: store.now(), result_text: `Run setup failed: ${store.redact(err.message)}` });
     if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null });
     throw err;
@@ -847,7 +891,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
           status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
           result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
         });
-        onEnd?.(store.getRun(run.id), { steps: ctx.state.steps || 0 });
+        onEnd?.(store.getRun(run.id), { steps: stepsTaken(ctx) });
       });
       const estimated = !knownCost;
       const costTxt = cost ? ` · $${cost.toFixed(2)}${estimated ? ' estimated charge (provider cost unreported)' : ''}` : '';
@@ -856,7 +900,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: status !== 'success' ? 'error' : blocked ? 'system' : 'done',
         text: `${outcome}${r?.subtype && r.subtype !== 'success' ? ` (${r.subtype})` : ''}${costTxt}${status !== 'success' && stderr ? ` — ${short(stderr, 200)}` : ''}` });
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
-      resolve({ run: store.getRun(run.id), result: r, failure, steps: ctx.state.steps || 0 });
+      resolve({ run: store.getRun(run.id), result: r, failure, steps: stepsTaken(ctx) });
+      ledgers.delete(run.id);
     };
     child.on('close', finish);
     child.on('error', (err) => {
