@@ -287,7 +287,8 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
   // and digits compared) must be the exact column-0 `## <heading>` line; a later one never opens a section. The scan
   // runs to the end of the file, and anything Markdown may read differently (HTML-like text, a fence or comment a
   // less indented line interrupts), wherever it is, leaves no rules.
-  let at = -1, fence = null, comment = null, run = [], untracked = false;
+  // A heading that leaves no rules is noted, and the scan runs on: HTML-like text anywhere is the reason given first.
+  let at = -1, fence = null, comment = null, run = [], untracked = false, headingProblem = null;
   for (let i = 0; i < lines.length; i++) {
     const src = tabs(lines[i]), indent = src.match(/^ */)[0].length, body = src.slice(indent);
     if ((fence || comment) && /[^ ]/.test(src) && indent < (fence || comment).indent) return { rules: [], problem: UNSURE_BLOCK };
@@ -327,16 +328,16 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     const atx = indent <= 3 && body.match(/^(#{1,6})(?:[ ]+(.*?))?[ ]*$/s); // the whole line, separators included
     if (atx) {
       const t = (atx[2] || '').replace(/(?:^|[ ]+)#+$/, '');
-      if (MARKED.test(t)) return { rules: [], problem: MARKED_HEADING };
-      if (at < 0 && loose(t) === target) { if (indent === 0 && atx[1] === '##' && norm(t) === norm(heading)) at = i; else return { rules: [], problem: EARLIER_HEADING }; }
+      if (MARKED.test(t)) headingProblem ??= MARKED_HEADING;
+      else if (at < 0 && !headingProblem && loose(t) === target) { if (indent === 0 && atx[1] === '##' && norm(t) === norm(heading)) at = i; else headingProblem = EARLIER_HEADING; }
       run = []; continue;
     }
     if (indent <= 3 && UNDERLINE.test(body) && run.length) {
       // Markdown's paragraph is a tail of the run that starts at a line of the document's own: not a list item or
       // quote line, and not a line continuing the paragraph one of those left open.
       const starts = run.map((r, k) => k).filter((k) => run[k].doc);
-      if (starts.some((k) => MARKED.test(run.slice(k).map((r) => r.body).join(' ')))) return { rules: [], problem: MARKED_HEADING };
-      if (at < 0 && starts.some((k) => loose(run.slice(k).map((r) => r.body).join(' ')) === target)) return { rules: [], problem: EARLIER_HEADING };
+      if (starts.some((k) => MARKED.test(run.slice(k).map((r) => r.body).join(' ')))) headingProblem ??= MARKED_HEADING;
+      else if (at < 0 && !headingProblem && starts.some((k) => loose(run.slice(k).map((r) => r.body).join(' ')) === target)) headingProblem = EARLIER_HEADING;
       run = []; continue;
     }
     if (indent <= 3 && BREAK.test(body)) { run = []; continue; }
@@ -353,6 +354,7 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     const held = !marked && !starts && !untracked && !!last && (last.open || last.held);
     run.push({ body, indent, doc: !marked && !held, open: marked && !untracked && opens(body), held });
   }
+  if (headingProblem) return { rules: [], problem: headingProblem };
   if (at < 0) return none;
   // 2. The section, line by line.
   const rules = [];

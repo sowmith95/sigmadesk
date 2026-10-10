@@ -323,6 +323,13 @@ test('owner rules: HTML-like text anywhere outside a fence or comment block leav
     assert.deepEqual(model.standingRules(doc), ['Grant'], JSON.stringify(doc));
   for (const doc of [`<!-- a --> --!> <div hidden>${grant}`, `<!--\na\n--> --!> <div hidden>${grant}`])
     assert.deepEqual(model.standingRulesRead(doc), none, JSON.stringify(doc));
+  // HTML-like text is the reason given whichever comes first in the file: a heading refusal does not end the scan.
+  for (const [what, head, alone] of [['an earlier ATX heading with the owner\'s words', '# Standing rules the EM may apply alone', model.EARLIER_HEADING],
+    ['an earlier underlined one', 'Standing rules the EM may apply alone\n---', model.EARLIER_HEADING], ['a marked heading', '## Notes on `desk`', model.MARKED_HEADING]]) {
+    assert.deepEqual(model.standingRulesRead(`${head}${grant}`), { rules: [], problem: alone }, `${what}, alone`);
+    for (const doc of [`${head}\n\nIntro <div hidden>${grant}`, `${head}${grant}\n## Later\nSee <https://example.com>\n`])
+      assert.deepEqual(model.standingRulesRead(doc), none, `${what}, then HTML-like text: ${JSON.stringify(doc)}`);
+  }
   // A closer four or more columns in still closes a fence opened inside a list item, so what Markdown reads after it
   // (here a textarea that swallows the rest of the page) is not known.
   assert.deepEqual(model.standingRulesRead(`- a\n  ${F}\n     ${F}\n  <textarea>\n  ${F}${grant}`), { rules: [], problem: model.UNSURE_BLOCK }, 'a fence closer deeper than four columns');
