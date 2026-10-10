@@ -200,6 +200,14 @@ const UNDERLINE = /^(?:=+|-+) *$/;
 const FENCE = /^(`{3,}|~{3,})(.*)$/;
 const fenceOpens = (s) => { const f = s.match(FENCE); return !!f && !(f[1][0] === '`' && f[2].includes('`')); };
 const strip = (s) => s.replace(/^[ \t]+|[ \t]+$/g, ''); // what Markdown strips from a line: spaces and tabs only
+/** Roughly the text Markdown shows for a line's inline content (marks dropped, links reduced to their text, character
+ * references decoded): enough to spot a heading that reads like the owner's however it is written. */
+function shownText(s) {
+  const ch = (n) => (n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : '\ufffd');
+  return s.replace(/&#[xX]([0-9a-fA-F]{1,6});/g, (_, h) => ch(parseInt(h, 16))).replace(/&#([0-9]{1,7});/g, (_, d) => ch(Number(d)))
+    .replace(/&(amp|lt|gt|quot|apos|nbsp);/gi, (_, n) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' })[n.toLowerCase()])
+    .replace(/\]\([^)]*\)|\]\[[^\]]*\]/g, '').replace(/[*_`\\[\]!]/g, '');
+}
 /** Text Markdown reads as nothing but paragraph text where it stands: no block mark at its start, no `<` in it. */
 function plain(s) {
   return !!s && !/^(?:#|>|`{3}|~{3}|[-*+](?: |$)|\d{1,9}[.)](?: |$)|\[[^\]]*\]:)/.test(s) && !UNDERLINE.test(s) && !BREAK.test(s) && !s.includes('<');
@@ -219,8 +227,8 @@ function interrupts(s) {
  * or no rule under it → [] (then nothing is decided for the owner by a model).
  *  - The section opens only at a column-0 `## <heading>` line: no other level, no underlined heading. Before it,
  *    nothing may be read differently by Markdown: a line starting with raw HTML (a comment aside), an indented fence
- *    that a less indented line interrupts, or an earlier line or paragraph with the heading's words leaves the
- *    playbook with no rules.
+ *    or comment that a less indented line interrupts, or an earlier heading (any level, underlined too, however
+ *    marked up) that reads like the owner's leaves the playbook with no rules.
  *  - Inside it, exactly these lines are read: blank lines; a rule, starting at a column-0 `- `, `* ` or `+ `; and its
  *    continuation, which is plain text at column 0 directly under a line of the rule, or plain text or a plain bullet
  *    indented two or three spaces (no less than where the rule's text starts), blank line before it or not.
@@ -232,25 +240,25 @@ function interrupts(s) {
 export function standingRuleLines(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
   const lines = String(text || '').split(/\r\n|\r|\n/);
-  const owner = norm(heading), titled = (t) => norm(strip(t.replace(/^#{1,6}(?= |$)/, '')).replace(/(?:^|[ ]+)#+$/, '')) === owner;
+  const owner = norm(heading), like = (t) => norm(shownText(t)).includes(owner); // may read as the owner's heading
   // 1. The heading: outside every fence and comment, with nothing before it Markdown could read otherwise, and no
-  // earlier line or paragraph with its words (Markdown may show that one as the owner's heading instead).
-  let at = -1, fence = null, comment = false, para = '';
+  // earlier heading that reads like it (Markdown may show that one as the owner's heading instead).
+  let at = -1, fence = null, comment = null, para = '';
   for (let i = 0; i < lines.length && at < 0; i++) {
     const src = lines[i].replace(/\t/g, '    '), indent = src.match(/^ */)[0].length, body = src.slice(indent);
-    if (fence) { // only a closer at least as indented as the fence ends it; a less indented line may end its list item
-      if (/[^ ]/.test(src) && indent < fence.indent) return [];
-      if (indent <= 3 && fence.close.test(src)) fence = null;
-      continue;
-    }
-    if (comment) { if (src.includes('-->')) comment = false; continue; } // Markdown: the closing line is all comment
+    // In a fence or comment, a line less indented than its start may end the list item it was in (and so the block):
+    // Markdown would read on differently from here.
+    if ((fence || comment) && /[^ ]/.test(src) && indent < (fence || comment).indent) return [];
+    if (fence) { if (indent <= 3 && fence.close.test(src)) fence = null; continue; }
+    if (comment) { if (src.includes('-->')) comment = null; continue; } // Markdown: the closing line is all comment
     if (/^ *$/.test(src)) { para = ''; continue; }
-    if (indent <= 3 && body.startsWith('<!--')) { comment = !body.slice(2).includes('-->'); para = ''; continue; } // a comment block
+    if (indent <= 3 && body.startsWith('<!--')) { comment = body.slice(2).includes('-->') ? null : { indent }; para = ''; continue; } // a comment block
     if (indent <= 3 && HTML_BLOCK.test(body)) return []; // a raw HTML block may run on past the heading
-    if (indent <= 3 && fenceOpens(body)) { const f = body.match(FENCE)[1]; fence = { indent, close: new RegExp(`^ {0,3}${f[0] === '`' ? '`' : '~'}{${f.length},}\\s*$`) }; para = ''; continue; }
+    if (indent <= 3 && fenceOpens(body)) { const f = body.match(FENCE)[1]; fence = { indent, close: new RegExp(`^ {0,3}${f[0] === '`' ? '`' : '~'}{${f.length},} *$`) }; para = ''; continue; }
     const h = src.match(/^##(?:[ ]+(.*?))?[ ]*$/);
     if (h && norm((h[1] || '').replace(/(?:^|[ ]+)#+$/, '')) === owner) { at = i; break; }
-    if (titled(body) || (indent <= 3 && UNDERLINE.test(body) && norm(para) === owner)) return [];
+    const atx = indent <= 3 && body.match(/^#{1,6}(?: +(.*?))?[ ]*$/);
+    if ((atx && like((atx[1] || '').replace(/(?:^|[ ]+)#+$/, ''))) || (indent <= 3 && UNDERLINE.test(body) && like(para))) return [];
     // The run of plain lines just before (a paragraph Markdown may underline): four or more in only continues one.
     para = (indent <= 3 && plain(body)) || (indent > 3 && para) ? `${para} ${body}` : '';
   }

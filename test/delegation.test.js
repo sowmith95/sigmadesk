@@ -239,6 +239,12 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
     ['an earlier heading with the same words', `# Standing rules the EM may apply alone\n`, []],
     ['an earlier indented one', ` ## Standing rules the EM may apply alone\n`, []],
     ['an earlier underlined one over two lines', 'Standing rules the EM\nmay apply alone\n---\n', []],
+    ['an earlier one with emphasis', '## *Standing* rules the EM may apply alone\n', []],
+    ['an earlier one with a character reference', '## &#83;tanding rules the EM may apply alone\n', []],
+    ['an earlier one in code and a link', '### Standing rules the EM may apply [`alone`](x)\n', []],
+    ['an earlier underlined one with emphasis inside a word', 'St*and*ing rules the EM may apply alone\n---\n', []],
+    ['a fence whose last line is no closer (a no-break space after it)', `${F}\n${O}\n${F}\u00A0\n`, []],
+    ['a comment in a list item a column-0 line interrupts', '- Item\n  <!--\nText\n-->\n', []],
   ]) assert.deepEqual(model.standingRules(`# Playbook\n${before}\n${after}`), want, what);
 });
 

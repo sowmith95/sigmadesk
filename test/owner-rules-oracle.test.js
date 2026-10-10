@@ -66,9 +66,11 @@ function generator(seed, mode) {
     ownerAtx: () => pick([`## ${O}`, `# ${O}`, `### ${O}`, ` ## ${O}`, `## ${O} ##`, `##\t${O}`]),
     cr: () => `- Rule ${++id}\r- CR rule ${++id}`,
     unicode: () => pick(['\u00A0', `\u00A0\u00A0text ${++id}`, `-\u00A0x ${++id}`, '\f', `\u00A0- x ${++id}`, `  \u00A0more ${++id}`, '---\u00A0', `- \u00A0text ${++id}`, `\u2028line ${++id}`, `#\u00A0x ${++id}`]),
+    lookalike: () => pick(['## *Standing* rules the EM may apply alone', '# Standing rules the EM may apply [alone](x)', '## &#83;tanding rules the EM may apply alone', 'St*and*ing rules the EM may apply alone\n---', '### Standing rules the EM may apply `alone`', '\\Standing rules the EM may apply alone\n===', '## Standing rules the EM may apply alone:', '## STANDING RULES THE EM MAY APPLY ALONE', '## Standing  rules the EM may apply alone']),
+    closers: () => pick(['```\n## Standing rules the EM may apply alone\n```\u00A0', '~~~\n- x\n~~~ \t', `- item ${++id}\n  <!--\n# Heading ${++id}\n-->`, `- item ${++id}\n  <!--\n  hidden\n  -->`]),
     indentedFence: () => `- Step ${++id}\n${pick(['  ', '   '])}\`\`\`\n${pick(['  ', '   ', '', ' '])}code ${++id}\n${pick(['  ', '   ', ' ', ''])}\`\`\``,
   };
-  const w = { bullet0: 6, bulletIn: 3, text0: 3, textIn: 4, blank: 5, atx: 1, under: 1, brk: 1, fence: 1, comment: 1, hash: 1, html: 1, setextOwner: mode === 'prefix' ? 2 : 0, ownerAtx: mode === 'prefix' ? 2 : 1, cr: 1, unicode: 2, indentedFence: mode === 'prefix' ? 2 : 1 };
+  const w = { bullet0: 6, bulletIn: 3, text0: 3, textIn: 4, blank: 5, atx: 1, under: 1, brk: 1, fence: 1, comment: 1, hash: 1, html: 1, setextOwner: mode === 'prefix' ? 2 : 0, ownerAtx: mode === 'prefix' ? 2 : 1, cr: 1, unicode: 2, lookalike: mode === 'prefix' ? 2 : 1, closers: mode === 'prefix' ? 2 : 1, indentedFence: mode === 'prefix' ? 2 : 1 };
   const bag = Object.keys(kinds).flatMap((k) => Array(w[k]).fill(k));
   const clean = () => pick(['Answer which-file questions from the code', 'Use `desk show` first', '*only* after QA passed', 'Docs & tests only', 'See [the runbook](docs/run.md)']) + ` (${++id})`;
   return () => {
@@ -104,6 +106,6 @@ test('owner rules match what Markdown shows, line for line, over generated playb
     }
     if (process.env.SIGMADESK_CM_ORACLE_REPORT) console.log(`${mode}: ${N} documents, ${count} read wrongly; rules found ${found} of the ${shown} bullets Markdown shows`);
     assert.equal(count, 0, `${mode}: ${count} of ${N} documents read wrongly, first:\n${JSON.stringify(first, null, 1)}`);
-    assert.ok(found > (mode === 'clean' ? 0.99 * shown : N / 20), `${mode}: the generator gave the grammar too little to read (${found} of ${shown})`);
+    assert.ok(found > (mode === 'clean' ? 0.99 * shown : N / 40), `${mode}: the generator gave the grammar too little to read (${found} of ${shown})`);
   }
 });
