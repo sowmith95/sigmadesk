@@ -210,7 +210,8 @@ publish-guard holds; standing and renewal production access; package installs.
   before it can apply anything. The bound is reserved
   for the engine the run actually gets (a fallback included). A research proposal's delegated runs share a $1.50
   lifetime allowance: each run is capped at what is left of it, and an engine that cannot cap dollars only starts when
-  its whole reservation fits. A run that ends without deciding, or a decision not started within 30 minutes, comes to
+  its whole reservation fits. Every dollar is reserved or charged, never neither: a run's reservation stands, whatever
+  its decision did, until the run's cost is charged, and after a restart every ended run is charged to its record. A run that ends without deciding, or a decision not started within 30 minutes, comes to
   you with the reason. Escalations carry a one-line recommendation, so your tap is yes or no. At most 40 decision runs a
   day; one slot stays free for QA and incidents.
 - **Rules before the run and again at apply**, with no model call: a delegate never decides anything it is a party to.

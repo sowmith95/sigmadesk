@@ -185,12 +185,14 @@ function endLapsed(r, l) {
 }
 /**
  * Delegated decisions on this ticket and kind over the ticket's whole life (they survive revision generations): the
- * corrections applied, the spend charged, and what other open records (not `except`) hold reserved for their runs.
+ * corrections applied, and the dollars committed by every record but `except` (the decision being judged), whatever
+ * state it is in. Every dollar is reserved or charged, never neither: a record's reservation stands until its run's
+ * cost is charged, so a record commits the larger of what was charged and what is still reserved.
  */
 function lifetime(key, kind, except = null) {
   const rows = store.delegationsForTicket(key).filter((r) => r.kind === kind);
-  return { count: rows.filter((r) => ['applied', 'overridden', 'reopened'].includes(r.status) && r.action === 'changes').length, spend: rows.reduce((a, r) => a + (Number(r.spent_usd) || 0), 0),
-    reserved: rows.filter((r) => r.id !== except && OPEN.includes(r.status)).reduce((a, r) => a + (Number(r.reserved_usd) || 0), 0) };
+  return { count: rows.filter((r) => ['applied', 'overridden', 'reopened'].includes(r.status) && r.action === 'changes').length,
+    spend: rows.filter((r) => r.id !== except).reduce((a, r) => a + Math.max(Number(r.spent_usd) || 0, Number(r.reserved_usd) || 0), 0) };
 }
 // What the seat that put a hold on a ticket is to the decision (hold_seat, by the hold's kind).
 const HOLDER = { question: 'asked this question', qa_loops: 'failed it in QA', review_loops: 'asked for the changes', review_disagree: 'is the reviewer who disagrees',
@@ -222,20 +224,20 @@ export function interestedSeats(c) {
   for (const seat of store.contributorsOf(t)) add(seat, 'worked on this ticket');
   return out;
 }
-function factsFor(c, seat) {
+function factsFor(c, seat, recordId = null) {
   const t = c.ticket;
   const L = limits();
   const f = { kind: c.kind, delegate: seat, ticket: t, limits: L, delegateOff: !agentById[seat] || agentById[seat].enabled === false, interest: interestedSeats(c).get(seat) || null,
     rules: model.KINDS[c.kind]?.deterministic ? null : ownerRules().length, rulesSection: L.rulesSection };
   if (c.kind === 'owner_task') { f.ownerTaskKind = t.owner_task_kind || null; f.verifyReady = verifyReady(); f.packagesEnabled = config.packages?.enabled !== false && BUILDERS.some((id) => agentById[id]?.enabled !== false); }
   if (c.kind === 'question') f.scope = t.hold_scope || null; // what the asker says it is about: only a factual one is delegable
-  if (c.kind === 'research') f.lifetime = lifetime(t.key, 'research');
-  if (c.kind === 'loop_limit') f.lifetime = lifetime(t.key, 'loop_limit');
+  if (c.kind === 'research') f.lifetime = lifetime(t.key, 'research', recordId); // its own spend was capped at what was left
+  if (c.kind === 'loop_limit') f.lifetime = lifetime(t.key, 'loop_limit', recordId);
   if (c.kind === 'design') { f.designStatus = c.ref.status; f.stale = c.ref.stale; }
   return f;
 }
 /** Why the owner must decide this one (deterministic, no model call), or null. */
-export const ownerReasonFor = (c, seat) => model.ownerReason(factsFor(c, seat), first);
+export const ownerReasonFor = (c, seat, recordId = null) => model.ownerReason(factsFor(c, seat, recordId), first);
 /** The actions this decision allows (a council correction queues a paid council: budget, so the owner's). */
 const actionsFor = (c) => (c.kind === 'design' && c.ref?.type === 'council' ? ['approve', 'reject', 'escalate'] : model.allowedActions(c.kind));
 
@@ -349,7 +351,7 @@ function consider(c, { pol = policy(), out = { created: 0, applied: 0, escalated
     r = create(c, mode, seat); out.created++;
   }
   if (r.status !== 'queued') return r;
-  const why = ownerReasonFor(c, seat);
+  const why = ownerReasonFor(c, seat, r.id);
   if (why) { if (escalate(r, why)) out.escalated++; return store.getDelegation(r.id); }
   if (model.KINDS[c.kind].deterministic) { const res = triage(r, c); if (res === 'applied' || res === 'shadow') out.applied++; }
   return store.getDelegation(r.id);
@@ -423,7 +425,7 @@ function reserve(id, b, agent) {
   return store.transaction(() => {
     const rec = store.getDelegation(id);
     const life = rec.kind === 'research' ? lifetime(rec.ticket_key, rec.kind, rec.id) : null;
-    const a = model.allowance({ bound: b, left: life ? limits().research.maxSpendUsd - life.spend - life.reserved : null, reserveAt: (usd) => runner.runReserve(agent, 'decide', usd) });
+    const a = model.allowance({ bound: b, left: life ? limits().research.maxSpendUsd - life.spend : null, reserveAt: (usd) => runner.runReserve(agent, 'decide', usd) });
     if (!a.refuse) store.updateDelegation(id, { reserved_usd: a.reserve });
     return a;
   });
@@ -451,7 +453,7 @@ export async function launch(r, fence = runner.currentEpoch()) {
     const c = currentOf(r);
     const l = lapse(r, c);
     if (l) { endLapsed(r, l); return null; }
-    const why = ownerReasonFor(c, seat);
+    const why = ownerReasonFor(c, seat, r.id);
     if (why) { escalate(r, why); return null; }
     store.updateAgent(seat, { status: 'working', current_ticket: r.ticket_key, current_kind: 'decide', last_action: 'preparing a decision for the owner', last_action_at: store.now() });
     const cwd = await runner.ensureReadonlyWorkspace(seat);
@@ -461,7 +463,7 @@ export async function launch(r, fence = runner.currentEpoch()) {
     const now = currentOf(r);
     const lapsed = lapse(r, now);
     if (lapsed) { endLapsed(r, lapsed); return null; }
-    const rule = ownerReasonFor(now, seat);
+    const rule = ownerReasonFor(now, seat, r.id);
     if (rule) { escalate(r, rule); return null; }
     let bound = null;
     const given = seal(r, now, { base: runner.workspaceBase(cwd) }); // what the run may cite, and the commit it reads, fixed now
@@ -488,6 +490,11 @@ export async function launch(r, fence = runner.currentEpoch()) {
     throw e;
   } finally {
     if (!store.getAgentState(seat)?.current_run || store.getAgentState(seat)?.current_kind === 'decide') store.updateAgent(seat, { status: 'idle', current_ticket: null, current_run: null, current_kind: null });
+    // Every dollar is reserved or charged: a run that ended is charged now; a reservation no run exists for is released.
+    const rec = store.getDelegation(r.id);
+    const ran = rec?.run_id ? store.getRun(rec.run_id) : out?.run || null;
+    if (ran && ran.status !== 'running' && !store.kvGet(`decide-charged:${ran.id}`)) charge(r.id, ran, ran.steps || 0);
+    if (!ran && rec?.reserved_usd) store.updateDelegation(r.id, { reserved_usd: 0 });
     const after = store.getDelegation(r.id);
     if (after?.status === 'running') {
       const run = out?.run;
@@ -500,10 +507,11 @@ export async function launch(r, fence = runner.currentEpoch()) {
 
 // ---------------- what a decision run may cite ----------------
 /**
- * What a decision run may cite, fixed when its run starts (#9): R<n>, the owner's standing rules (each rule line of the
- * project playbook), and E<n>, the evidence in its brief (the ticket description, the kind's own record, the messages
- * on the thread except the question itself). The prompt lists them, and desk decide --cite is checked against exactly
- * this list; repository files are cited as file:<path>[:<line>[-<line>]] and checked against the trusted base.
+ * What a decision run may cite, fixed when its run starts (#9): R<n>, the standing rules the owner marked in the
+ * playbook for a delegate to apply alone, and E<n>, the evidence in its brief (the ticket description, the kind's own
+ * record, the messages on the thread except the question itself). The prompt lists them, and desk decide --cite is
+ * checked against exactly this list; repository files are cited as file:<path>[:<line>[-<line>]] and checked at the
+ * trusted commit the run was pinned to.
  */
 function citablesFor(r, c) {
   const t = c.ticket;
@@ -694,7 +702,7 @@ export function decide(r, choice, { run = null, deterministic = false } = {}) {
       message = 'The repository changed while you decided: nothing was applied. Stop now.';
       return;
     }
-    const rule = ownerReasonFor(c, rec.seat);
+    const rule = ownerReasonFor(c, rec.seat, rec.id);
     if (rule) { escalate(rec, rule); message = `This one is the owner's: ${rule}. Nothing was applied. Stop now.`; return; }
     need(json(rec.allowed, []).includes(choice.action), `this decision allows ${json(rec.allowed, []).join(', ')}`);
     if (choice.action === 'escalate') { escalate(rec, choice.why, { recommendation: choice.text, by: rec.seat }); message = 'Left for the owner with your recommendation. Stop now.'; return; }
@@ -852,13 +860,15 @@ export function ownerReopen(id, { note = '' } = {}) {
 // ---------------- recovery ----------------
 /** After a restart: spend is rebuilt from the run rows; an interrupted decision run is not retried (one attempt). */
 export function recover() {
-  for (const r of store.delegationsByStatus('running')) {
-    const runs = store.runsOfDelegation(r.id);
-    const usd = runs.reduce((a, x) => a + (x.cost_usd || 0), 0), steps = runs.reduce((a, x) => a + (x.steps || 0), 0);
-    store.updateDelegation(r.id, { spent_usd: Math.max(usd, r.spent_usd || 0), reserved_usd: 0, steps_used: Math.max(steps, r.steps_used || 0) });
-    for (const x of runs) store.kvSet(`decide-charged:${x.id}`, '1');
-    escalate(r, 'the desk restarted while the decision run was working. One attempt per decision, so it is yours now.', { from: ['running'] });
+  // Every dollar is reserved or charged, never neither: a decision run that ended (the restart ended the interrupted
+  // ones, charged at their reservation) but was never charged to its record is charged now, whatever state that record
+  // reached: applied, escalated, shadow or lapsed while its run was still working.
+  for (const run of store.endedDecisionRuns()) {
+    if (store.kvGet(`decide-charged:${run.id}`)) continue;
+    const id = Number(json(run.job, {})?.delegation);
+    if (store.getDelegation(id)) charge(id, run, run.steps || 0);
   }
+  for (const r of store.delegationsByStatus('running')) escalate(r, 'the desk restarted while the decision run was working. One attempt per decision, so it is yours now.', { from: ['running'] });
 }
 
 // ---------------- views ----------------

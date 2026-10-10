@@ -277,6 +277,42 @@ test('lifetime spend: with $1.40 of a proposal\'s $1.50 charged, its run is capp
   } finally { config.delegation.research = old; team.applyTeamOverrides({}); }
 });
 
+test('lifetime spend: every dollar is reserved or charged, never neither, through a desk crash after the decision applied', async () => {
+  fresh();
+  const old = config.delegation.research;
+  config.delegation.research = { ...(old || {}), maxCorrections: 5 }; // the spend is what is limited here
+  try {
+    delegation.setPolicy({ kinds: { research: 'em' } });
+    const t = heldProposal(0.75); // an earlier generation was charged $0.75 of the $1.50
+    delegation.sweep({ paused: false });
+    const r = open(t);
+    // Its run is admitted with what is left, reserved on the record, and the correction applies...
+    delegation.seal(r);
+    const run = store.createRun({ agent_id: 'manager', ticket_key: t.key, kind: 'decide', token: `crash-${Math.random()}`, model: 'claude:opus', job: { delegation: r.id } });
+    store.updateRun(run.id, { reserve_usd: 0.75 });
+    store.updateDelegation(r.id, { status: 'running', run_id: run.id, attempts: 1, reserved_usd: 0.75 });
+    assert.match(await sched.deskAction(run, 'decide', { action: 'changes', body: 'Cite the vendor changelog.', cite: 'R2,E2', why: 'The reviewer found no source; the marked rule says send it back.' }), /Decided for the owner and applied/);
+    // ...and the desk dies before the run's cost is recorded: applied, uncharged, and the reservation still stands.
+    assert.deepEqual([store.getDelegation(r.id).status, store.getDelegation(r.id).spent_usd, store.getDelegation(r.id).reserved_usd], ['applied', 0, 0.75]);
+    // The author revises, the reviewer holds it again: the allowance already counts that reservation, nothing is left.
+    researchReview.revise(store.getTicket(t.key), { kind: 'research_revision', ticket_key: t.key, agent_id: 'pm' }, { body: '## Problem\nSlow fills, measured.\n## Evidence\nThe vendor log, linked.' });
+    const rv2 = store.createResearchReview({ ticket_key: t.key, generation: 2, input_hash: researchReview.hashOf(store.getTicket(t.key)), reviewer: 'principal-be', status: 'pending' });
+    researchReview.complete(rv2.id, { report: { verdict: 'changes', summary: 'Still thin', evidence_checked: [], findings: ['x'], conditions: ['y'] } });
+    delegation.sweep({ paused: false });
+    const r2 = open(t);
+    assert.equal(r2.decision_id, `${t.key}:research:2`);
+    assert.deepEqual([r2.status, r2.run_id], ['escalated', null]);
+    assert.match(r2.why, /already cost \$1\.50 of its \$1\.50 lifetime limit/, 'the applied decision\'s uncharged reservation counts');
+    // The restart: the interrupted run is ended and charged at its reservation onto the applied record, whatever its state.
+    sched.recoverOrphans();
+    const after = store.getDelegation(r.id);
+    assert.deepEqual([after.status, after.spent_usd, after.reserved_usd], ['applied', 0.75, 0], 'charged once, the reservation gone with the charge');
+    assert.deepEqual([store.getRun(run.id).status, store.getRun(run.id).cost_usd], ['killed', 0.75]);
+    sched.recoverOrphans(); // a second restart charges nothing twice
+    assert.equal(store.getDelegation(r.id).spent_usd, 0.75);
+  } finally { config.delegation.research = old; }
+});
+
 test('fallback admission: the engine the run actually gets is the one bounded, and a per-use fallback with no cap is refused', async () => {
   fresh();
   const codex = path.join(tmp, 'codex-quick.mjs');
