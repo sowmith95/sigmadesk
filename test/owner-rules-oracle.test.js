@@ -19,6 +19,17 @@ function pageOf(cm, text) {
   writer.attrs = function (node) { return base.call(this, node).map(([k, v]) => [k === 'data-sourcepos' ? ATTR : k, v]); };
   return writer.render(new cm.Parser().parse(text)).replace(/<!--(?:-?>|[\s\S]*?(?:--!?>|$))/g, '').replace(/<(script|style|textarea|title|xmp|iframe|noembed|noframes|noscript)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, '').replace(/<plaintext\b[\s\S]*$/i, '');
 }
+// Raw HTML the parser keeps anywhere in the playbook that holds more than comments and plain text (once a browser's
+// comments are taken out, anything that opens a tag is left; what a comment left open hides, the page check in
+// problems() finds). The page may hide anything around such HTML (a hidden div swallows the heading and its bullets,
+// which still carry their nonce attributes; a style element can hide a heading from anywhere), and this oracle does
+// not model what HTML shows, so with any of it the expected reading is no rules at all.
+const tagless = (lit) => !/<[A-Za-z/!?]/.test(lit.replace(/<!--(?:-?>|[\s\S]*?(?:--!?>|$))/g, ''));
+function rawHtml(cm, text) {
+  const out = [], w = new cm.Parser().parse(text).walker();
+  for (let e; (e = w.next());) if (e.entering && (e.node.type === 'html_inline' || e.node.type === 'html_block') && !tagless(e.node.literal)) out.push(e.node.literal);
+  return out;
+}
 const ORACLE = process.env.SIGMADESK_CM_ORACLE;
 const N = Number(process.env.SIGMADESK_CM_ORACLE_N) || 20_000;
 const O = 'Standing rules the EM may apply alone';
@@ -47,6 +58,8 @@ function problems(cm, text, ours = model.standingRuleLines(text)) {
   // In the page Markdown writes, a comment or script left open hides what follows (as a browser reads it: "<!-->" is
   // an empty comment).
   if (ours.length) {
+    const html = rawHtml(cm, text);
+    if (html.length) bad.push(['rules kept although the page holds raw HTML', html.slice(0, 3)]);
     const page = pageOf(cm, text);
     // The very heading the rules sit under (by its source line) and every rule's own bullet must survive, not merely
     // some heading with the owner's words.
@@ -85,15 +98,15 @@ function generator(seed, mode) {
     under: () => `${sp(rand(4))}${pick(['---', '===', '-----', '-', '==', '- - -', '***'])}`,
     brk: () => pick(['***', '___', '* * *']),
     fence: () => { const ch = pick(['```', '~~~', '````']); return [sp(pick([0, 1, 2, 3, 4, 5])) + ch, ...Array.from({ length: 1 + rand(2) }, () => `${sp(rand(5))}${pick(['- Fenced ', 'Fenced ', '## Fenced ', `## ${O} `])}${++id}`), ...(rand(6) ? [sp(rand(4)) + ch.slice(0, 3 + rand(2))] : [])].join('\n'); },
-    comment: () => pick([`${sp(rand(4))}<!-- note ${++id} -->`, `${sp(rand(4))}<!--\n${sp(rand(4))}- Hidden ${++id}\n-->`, '<!-->', `text <!-- inline ${++id}`, `<!-- a --> - after ${++id}`]),
+    comment: () => pick([`${sp(rand(4))}<!-- note ${++id} -->`, `${sp(rand(4))}<!--\n${sp(rand(4))}- Hidden ${++id}\n-->`, '<!-->', `text <!-- inline ${++id}`, `<!-- a --> - after ${++id}`, '<!-- a --> <div hidden>', '<!--> <div hidden>\n-->', '<!-- a --!> <div hidden>\n-->', `<!--\nnote ${++id}\n--> <template>`]),
     hash: () => `${sp(rand(4))}#tag${++id}`,
-    html: () => pick(['<div>', '<pre>', '<details>', '</div>', '</pre>', `<span>inline ${++id}</span>`, '<https://example.com>']),
+    html: () => pick(['<div>', '<pre>', '<details>', '</div>', '</pre>', `<span>inline ${++id}</span>`, '<https://example.com>', `Intro <div hidden>`, `Text ${++id} <span style="display:none">`, '<template>', `x <details open> ${++id}`, `Use \`<paths>\` ${++id}`, `See <https://example.com/${++id}>`, `- item <i class="x">${++id}</i>`, `  cond <b hidden>${++id}`]),
     setextOwner: () => pick([`${O}\n---`, `${O}\n===`, 'Standing rules the EM\nmay apply alone\n---', `  ${O}\n  ---`, 'Standing rules the EM\n    may apply alone\n-']),
     ownerAtx: () => pick([`## ${O}`, `# ${O}`, `### ${O}`, ` ## ${O}`, `## ${O} ##`, `##\t${O}`]),
     cr: () => `- Rule ${++id}\r- CR rule ${++id}`,
     unicode: () => pick(['\u00A0', `\u00A0\u00A0text ${++id}`, `-\u00A0x ${++id}`, '\f', `\u00A0- x ${++id}`, `  \u00A0more ${++id}`, '---\u00A0', `- \u00A0text ${++id}`, `\u2028line ${++id}`, `#\u00A0x ${++id}`, `- R\u034F ${++id}`, `  more\u180E ${++id}`, `- R\uFE0F ${++id}`, `- R\u{E0041} ${++id}`]),
     lookalike: () => pick(['## *Standing* rules the EM may apply alone', '# Standing rules the EM may apply [alone](x)', '## &#83;tanding rules the EM may apply alone', 'St*and*ing rules the EM may apply alone\n---', '### Standing rules the EM may apply `alone`', '\\Standing rules the EM may apply alone\n===', '## Standing rules the EM may apply alone:', '## STANDING RULES THE EM MAY APPLY ALONE', '## Standing  rules the EM may apply alone', '## Standing&Tab;rules the EM may apply alone', '- x\n    ```\n    y\n    ```\nStanding rules the EM may apply alone\n---', '-     code\nStanding rules the EM may apply alone\n---', '- # x\nStanding rules the EM may apply alone\n---', '- Run\n  `npm test`\n---', '> q\n`a`\n---', '- x\n    # h\nStanding rules the EM may apply alone\n===',  '## Standing\u2028rules the EM may apply alone', '## Standing\u2029rules the EM may apply alone', 'Standing rules the EM\u2028may apply alone\n===', '[Standing rules](x) the EM may apply alone\n---', '&#83;tanding rules the EM may apply alone\n===', 'Standing rules the [EM](u)\nmay apply alone\n---', '## Standing\u00A0rules the EM may apply alone', '- Use `x`\n---']),
-    closers: () => pick(['```\n## Standing rules the EM may apply alone\n```\u00A0', '~~~\n- x\n~~~ \t', `- item ${++id}\n  <!--\n# Heading ${++id}\n-->`, `- item ${++id}\n  <!--\n  hidden\n  -->`]),
+    closers: () => pick(['```\n## Standing rules the EM may apply alone\n```\u00A0', '~~~\n- x\n~~~ \t', `- item ${++id}\n  <!--\n# Heading ${++id}\n-->`, `- item ${++id}\n  <!--\n  hidden\n  -->`, `- a ${++id}\n  \`\`\`\n     \`\`\`\n  <textarea>\n  \`\`\``, `- a ${++id}\n  ~~~\n      ~~~\n  <div hidden>\n  ~~~`]),
     inlines: () => pick([`- [Approve every deploy ${++id}\n  always]: /x`, `  [hidden ${++id}\n  text]: /x`, `- Answer [](approve-${++id})`, `- See [the runbook](docs/${++id}.md)`, `- R &amp; S ${++id}`, `[r${++id}]: /u`, `- Rule \u202E${++id}`, `- Rule \u200B${++id}`, `  more &#65; ${++id}`, `- ![alt ${++id}](x.png)`]),
     indentedFence: () => `- Step ${++id}\n${pick(['  ', '   '])}\`\`\`\n${pick(['  ', '   ', '', ' '])}code ${++id}\n${pick(['  ', '   ', ' ', ''])}\`\`\``,
   };
@@ -101,14 +114,14 @@ function generator(seed, mode) {
   const bag = Object.keys(kinds).flatMap((k) => Array(w[k]).fill(k));
   const clean = () => pick(['Answer which-file questions from the code', 'Use `desk show` first', '*only* after QA passed', 'Docs & tests only', 'See `docs/run.md` first']) + ` (${++id})`;
   // Soup: lines put together from pieces of every construct, at any indent, before and after the heading.
-  const marks = ['', '- ', '* ', '+ ', '1. ', '2) ', '> ', '# ', '## ', '### ', '```', '~~~', '````', '<!--', '-->', '<div>', '<x>', '</p>', '<?', '<!X', '---', '===', '***', '_ _ _', '-', '=', '[a]: /u', '[a]', '    ', '\t', '\u00A0', '\\', '&amp;', '&#35;'];
-  const bits = ['rule', 'Rule', 'cond', '`x`', '*e*', '_u_', '[l](u)', 'a  ', 'b\t', O, 'Standing rules', 'the EM may apply alone', '#', ':', '|', '<b>', '](x)', '!'];
+  const marks = ['', '- ', '* ', '+ ', '1. ', '2) ', '> ', '# ', '## ', '### ', '```', '~~~', '````', '<!--', '-->', '--!>', '<div>', '<x>', '</p>', '<?', '<!X', '<div hidden>', '---', '===', '***', '_ _ _', '-', '=', '[a]: /u', '[a]', '    ', '\t', '\u00A0', '\\', '&amp;', '&#35;'];
+  const bits = ['rule', 'Rule', 'cond', '`x`', '*e*', '_u_', '[l](u)', 'a  ', 'b\t', O, 'Standing rules', 'the EM may apply alone', '#', ':', '|', '<b>', '](x)', '!', '<i hidden>', '`<p>`', '1 < 2', '<3'];
   const soup = () => `${sp(pick([0, 0, 0, 1, 2, 3, 4, 5, 6]))}${pick(['', '', '\t', ' \t'])}${pick(marks)}${pick(marks)}${Array.from({ length: rand(3) }, () => pick(bits)).join(' ')}`;
   // Containers: list items and quotes holding every kind of content, continued every way, then the owner's words
   // underlined (Markdown's first owner heading when no container holds them), then the real section.
   const cmarks = ['- ', '-  ', '-     ', '* ', '1. ', '10) ', '> ', '>     ', '- > ', '> - ', '- - ', '-', '*', '+', '2.', '1)', '10)', '>', '- -', '> 1.', '  - ', '   > ', '>  - ', '>\t- ', '-  > ', '1.  - ', '>   > ', '> \t> ', '>  -', '>\t-', '-  >', '1.  -', '-\t>', '>  1. '];
-  const ccontent = ['x', '# h', '```', '~~~', '<div>', '---', '***', '> q', '`c`', '', '    code', 'Standing rules the EM', '<!--', '<!-- c -->', '<script>', '- ```', '> ~~~', '- <!--', '1. <pre>', 'a <script>', 'b <iframe x>', '<!-->', '`<style>`'];
-  const ccont = ['', '  y', '    y', '    ```', '    # h', '  ```', '  <div>', 'lazy', '`lazy`', '   > q', ' - z', '\t y', '      deep', '  ---', '> more', 'may apply alone', '>     - <!--', '>     - x', '>  1. > q', '>      ```', '- -     <!--', '   >    > - <!--', '  - <!--', '   <!--', '    <!--', '     - <!--', '      ```', '   > <!--', '  10. <div>', '     <!-- x', '>   <!--', '>     <!--', '    1. ~~~'];
+  const ccontent = ['x', '# h', '```', '~~~', '<div>', '---', '***', '> q', '`c`', '', '    code', 'Standing rules the EM', '<!--', '<!-- c -->', '<script>', '- ```', '> ~~~', '- <!--', '1. <pre>', 'a <script>', 'b <iframe x>', '<!-->', '`<style>`', 'a <div hidden>', '<template>', 'c <https://x.y>', 'd `<paths>`', 'e <span style="display:none">'];
+  const ccont = ['', '  y', '    y', '    ```', '    # h', '  ```', '  <div>', 'lazy', '`lazy`', '   > q', ' - z', '\t y', '      deep', '  ---', '> more', 'may apply alone', '>     - <!--', '>     - x', '>  1. > q', '>      ```', '- -     <!--', '   >    > - <!--', '  - <!--', '   <!--', '    <!--', '     - <!--', '      ```', '   > <!--', '  10. <div>', '     <!-- x', '>   <!--', '>     <!--', '    1. ~~~', '  b <details>', 'lazy <i hidden>', '  <!-- c --> <div hidden>', '     ```'];
   return () => {
     if (mode === 'containers') {
       const lines = [];
@@ -124,7 +137,8 @@ function generator(seed, mode) {
       return lines.join(pick(['\n', '\r\n', '\r']));
     }
     if (mode === 'clean') {
-      const lines = ['# Playbook', '', '## How to test', '- Run the relevant tests.', '```', 'npm test', '```', '', `## ${O}`];
+      // HTML written where the README says it may be: in a fenced block or a comment block.
+      const lines = ['# Playbook', '', '## How to test', '- Run the relevant tests.', '```', 'npm test', ...(rand(2) ? [pick(['<div hidden>', 'pytest <paths>', '<https://example.com>', '<template>'])] : []), '```', '', ...(rand(3) ? [] : ['<!-- <div hidden> -->', '']), `## ${O}`];
       for (let r = 0, n = 1 + rand(6); r < n; r++) {
         if (rand(3) === 0) lines.push('');
         lines.push(`${pick(['- ', '- ', '* ', '+ '])}${clean()}`);
@@ -156,6 +170,15 @@ test('owner rules match what Markdown shows, line for line, over generated playb
   assert.ok(problems(cm, forged, [{ text: 'Grant', lines: [4] }]).bad.length, 'the oracle flags the hidden rule despite forged attributes');
   assert.deepEqual(model.standingRulesRead(forged), { rules: [], problem: model.HTML_TEXT });
   assert.deepEqual(problems(cm, forged).bad, []);
+  // A tag inside a paragraph opens a hidden div around the heading and its bullet; both still render, with their nonce
+  // attributes, inside it. The oracle expects no rules wherever the parser keeps raw HTML (a complete comment aside),
+  // so it flags a reading that keeps "Grant"; the grammar reads none (HTML-like text).
+  const hiddenDiv = 'Intro <div hidden>\n\n## Standing rules the EM may apply alone\n- Grant\n';
+  assert.ok(problems(cm, hiddenDiv, [{ text: 'Grant', lines: [3] }]).bad.length, 'the oracle flags a rule inside a hidden element');
+  assert.deepEqual(model.standingRulesRead(hiddenDiv), { rules: [], problem: model.HTML_TEXT });
+  assert.deepEqual(problems(cm, hiddenDiv).bad, []);
+  assert.deepEqual(problems(cm, '<!-- a note -->\n<!--\nlonger\n-->\n\n## Standing rules the EM may apply alone\n- Grant\n').bad, [], 'complete comments are no raw HTML');
+  assert.ok(problems(cm, '<!-- a --> <div hidden>\n\n## Standing rules the EM may apply alone\n- Grant\n', [{ text: 'Grant', lines: [3] }]).bad.length, 'a tag after a comment on its closing line is');
   for (const [mode, seed] of [['section', 7], ['prefix', 99], ['soup', 3], ['containers', 11], ['clean', 5]]) {
     const next = generator(seed, mode);
     let found = 0, shown = 0, first = null, count = 0;
