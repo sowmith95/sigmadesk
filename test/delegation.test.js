@@ -317,6 +317,12 @@ test('owner rules: HTML-like text anywhere outside a fence or comment block leav
   // A browser ends a comment at "--!>", where Markdown does not: what follows it is live HTML.
   for (const doc of [`<!-- a --!> <div hidden>\n-->${grant}`, `<!--\na --!>\n-->${grant}`])
     assert.deepEqual(model.standingRulesRead(doc), { rules: [], problem: model.UNSURE_BLOCK }, JSON.stringify(doc));
+  // Only before the comment's first "-->": after it, "--!>" is plain text on the closing line, which keeps the rules
+  // unless it holds HTML-like text.
+  for (const doc of [`<!-- a --> --!> plain${grant}`, `<!--\na\n--> --!> plain${grant}`, `<!-- a -->--!>${grant}`])
+    assert.deepEqual(model.standingRules(doc), ['Grant'], JSON.stringify(doc));
+  for (const doc of [`<!-- a --> --!> <div hidden>${grant}`, `<!--\na\n--> --!> <div hidden>${grant}`])
+    assert.deepEqual(model.standingRulesRead(doc), none, JSON.stringify(doc));
   // A closer four or more columns in still closes a fence opened inside a list item, so what Markdown reads after it
   // (here a textarea that swallows the rest of the page) is not known.
   assert.deepEqual(model.standingRulesRead(`- a\n  ${F}\n     ${F}\n  <textarea>\n  ${F}${grant}`), { rules: [], problem: model.UNSURE_BLOCK }, 'a fence closer deeper than four columns');
