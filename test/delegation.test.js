@@ -323,6 +323,11 @@ test('owner rules: HTML-like text anywhere outside a fence or comment block leav
     assert.deepEqual(model.standingRules(doc), ['Grant'], JSON.stringify(doc));
   for (const doc of [`<!-- a --> --!> <div hidden>${grant}`, `<!--\na\n--> --!> <div hidden>${grant}`])
     assert.deepEqual(model.standingRulesRead(doc), none, JSON.stringify(doc));
+  // More complete comments after the first on its closing line are comments too; anything else HTML-like there is not.
+  for (const doc of [`<!-- a --> text <!-- b -->${grant}`, `<!--\nx\n--> t <!-- b --> u <!---->${grant}`, `<!-- a --><!-->${grant}`])
+    assert.deepEqual(model.standingRules(doc), ['Grant'], JSON.stringify(doc));
+  for (const doc of [`<!-- a --> <!-- b --> <div hidden>${grant}`, `<!-- a --> t <!-- b${grant}`, `<!-- a --> <!-- b --!> <div hidden> -->${grant}`])
+    assert.deepEqual(model.standingRulesRead(doc), none, JSON.stringify(doc));
   // HTML-like text is the reason given whichever comes first in the file: a heading refusal does not end the scan.
   for (const [what, head, alone] of [['an earlier ATX heading with the owner\'s words', '# Standing rules the EM may apply alone', model.EARLIER_HEADING],
     ['an earlier underlined one', 'Standing rules the EM may apply alone\n---', model.EARLIER_HEADING], ['a marked heading', '## Notes on `desk`', model.MARKED_HEADING]]) {

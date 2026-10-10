@@ -212,6 +212,8 @@ const MARKED = /[&<[\]\\`]|[^\x00-\x7F]/;
 // Inline code is not exempt: the desk does not decode inline syntax.
 const HTML_LIKE = /<[A-Za-z/!?]/;
 /** A "--!>" in a comment's text before its first "-->" (end, or the whole line when -1): a browser ends the comment there. */
+/** What follows a comment block's end on its line, as a browser reads it: HTML-like once its complete comments are out. */
+const tailHtml = (t) => HTML_LIKE.test(t.replace(/<!--(?:-?>|[\s\S]*?--!?>)/g, ''));
 const bangBefore = (s, from, end) => { const k = s.indexOf('--!>', from); return k >= 0 && (end < 0 || k < end); };
 export const HTML_TEXT = 'the playbook contains HTML-like text (`<tag`); Markdown may hide what follows it — remove it or put it in a fenced code block';
 export const MARKED_HEADING = 'a heading uses markup or non-ASCII characters; headings must be plain text';
@@ -302,7 +304,7 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     if (comment) { // Markdown: the closing line is all raw HTML, the comment and whatever follows it on that line
       const end = src.indexOf('-->');
       if (bangBefore(src, 0, end)) return { rules: [], problem: UNSURE_BLOCK }; // a browser ends the comment there
-      if (end >= 0) { comment = null; if (HTML_LIKE.test(src.slice(end + 3))) return { rules: [], problem: HTML_TEXT }; }
+      if (end >= 0) { comment = null; if (tailHtml(src.slice(end + 3))) return { rules: [], problem: HTML_TEXT }; }
       continue;
     }
     if (/^ *$/.test(src)) { run = []; continue; }
@@ -312,7 +314,7 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     if (indent <= 3 && body.startsWith('<!--')) { // a comment block; what follows its end on that line is raw HTML too
       const end = body.indexOf('-->', 2); // "<!-->" and "<!--->" are closed, empty comments
       if (bangBefore(body, 2, end)) return { rules: [], problem: UNSURE_BLOCK };
-      if (end >= 0 && HTML_LIKE.test(body.slice(end + 3))) return { rules: [], problem: HTML_TEXT };
+      if (end >= 0 && tailHtml(body.slice(end + 3))) return { rules: [], problem: HTML_TEXT };
       comment = end >= 0 ? null : { indent }; run = []; continue;
     }
     // Anything else HTML-like, anywhere in a line (a tag, an autolink, inline code holding one): no rules.
