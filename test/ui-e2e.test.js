@@ -350,7 +350,8 @@ test('delegation (#9): Decided for you with Override, the delegate\'s take on an
   // The preview's playbook marks no standing rules: Settings says plainly that every decision still comes to the owner.
   assert.equal(await page.locator('[data-standing-rules]').getAttribute('data-standing-rules'), '0');
   const rules = await page.locator('[data-standing-rules]').textContent();
-  assert.match(rules, /You have not written any standing rules yet \(a “Standing rules the EM may apply alone” section in your playbook\), so nothing below is decided for you by judgment/);
+  assert.match(rules, /The desk found no standing rules in your playbook, so nothing below is decided for you by judgment/);
+  assert.match(rules, /dash bullets right under a “## Standing rules the EM may apply alone” heading, and stops at the first line of another kind/);
   assert.match(rules, /Owner tasks are the exception: a step filed as a check or a package is routed by rule/, 'the rule-decided exception is stated');
   assert.match(rules, /cannot undo what the team already did after a decision/, 'override is not a rollback');
   await q.getByRole('radio', { name: 'Morgan decides' }).click();
@@ -406,7 +407,7 @@ test('delegation (#9): Settings follows the playbook as the owner edits it, with
     assert.equal(poke.status, 200, JSON.stringify(poke.body));
     await page.waitForSelector('[data-standing-rules="1"]', { timeout: 20_000 });
     const text = await line.textContent();
-    assert.match(text, /only under the standing rule you wrote in your playbook under “Standing rules the EM may apply alone”/);
+    assert.match(text, /only under the standing rule the desk found in your playbook under “Standing rules the EM may apply alone”/);
     assert.match(text, /The desk checks that what they cite is your rule and was in the brief; whether the rule fits the decision is their judgment/);
     assert.match(text, /cannot undo what the team already did after a decision/);
   } finally { fs.writeFileSync(PLAYBOOK, shipped); }
