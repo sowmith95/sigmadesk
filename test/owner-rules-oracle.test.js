@@ -7,8 +7,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { randomBytes } from 'node:crypto';
 import * as model from '../src/delegation-model.js';
 
+// The page Markdown writes, as a browser reads it (an open comment or raw-text element hides what follows; "<!-->" is
+// an empty comment), with each block's source position under an attribute named by a nonce drawn for this run: raw
+// HTML in a playbook cannot forge it, so a heading or bullet found by it is one the renderer wrote.
+const ATTR = `data-sp-${randomBytes(8).toString('hex')}`;
+function pageOf(cm, text) {
+  const writer = new cm.HtmlRenderer({ sourcepos: true }), base = writer.attrs;
+  writer.attrs = function (node) { return base.call(this, node).map(([k, v]) => [k === 'data-sourcepos' ? ATTR : k, v]); };
+  return writer.render(new cm.Parser().parse(text)).replace(/<!--(?:-?>|[\s\S]*?(?:--!?>|$))/g, '').replace(/<(script|style|textarea|title|xmp|iframe|noembed|noframes|noscript)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, '').replace(/<plaintext\b[\s\S]*$/i, '');
+}
 const ORACLE = process.env.SIGMADESK_CM_ORACLE;
 const N = Number(process.env.SIGMADESK_CM_ORACLE_N) || 20_000;
 const O = 'Standing rules the EM may apply alone';
@@ -37,11 +47,11 @@ function problems(cm, text, ours = model.standingRuleLines(text)) {
   // In the page Markdown writes, a comment or script left open hides what follows (as a browser reads it: "<!-->" is
   // an empty comment).
   if (ours.length) {
-    const page = new cm.HtmlRenderer({ sourcepos: true }).render(new cm.Parser().parse(text)).replace(/<!--(?:-?>|[\s\S]*?(?:--!?>|$))/g, '').replace(/<(script|style|textarea|title|xmp|iframe|noembed|noframes|noscript)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, '').replace(/<plaintext\b[\s\S]*$/i, '');
+    const page = pageOf(cm, text);
     // The very heading the rules sit under (by its source line) and every rule's own bullet must survive, not merely
     // some heading with the owner's words.
-    if (!shown.headingLine || !page.includes(`data-sourcepos="${shown.headingLine}:`)) bad.push(['a heading the page hides', ours[0]]);
-    for (const r of ours) if (!page.includes(`<li data-sourcepos="${r.lines[0] + 1}:`)) bad.push(['a rule the page hides', r]);
+    if (!shown.headingLine || !new RegExp(`<h[1-6] ${ATTR}="${shown.headingLine}:`).test(page)) bad.push(['a heading the page hides', ours[0]]);
+    for (const r of ours) if (!page.includes(`<li ${ATTR}="${r.lines[0] + 1}:`)) bad.push(['a rule the page hides', r]);
   }
   for (const r of ours) {
     const b = shown.find((x) => x.from === r.lines[0]);
@@ -139,6 +149,13 @@ test('owner rules match what Markdown shows, line for line, over generated playb
   const hidden = '>  - <!--\n\n## Standing rules the EM may apply alone\n- Grant\n\n## Next\nx <!-- closed -->\n\n## Standing rules the EM may apply alone\n- Visible\n';
   assert.ok(problems(cm, hidden, [{ text: 'Grant', lines: [3] }]).bad.length, 'the oracle flags a rule the page hides');
   assert.deepEqual(problems(cm, hidden).bad, []);
+  // Raw HTML cannot forge what the renderer wrote: a copy of the heading's and bullet's position attributes typed into
+  // the playbook does not make the hidden first "Grant" count as shown. (The grammar keeps nothing here either: the
+  // comment opened inside the quote's list item leaves the playbook with no rules.)
+  const forged = '>  1. > q\n>     - <!--\n\n## Standing rules the EM may apply alone\n- Grant\n\n## Next\nx <!-- closed -->\n\n## Standing rules the EM may apply alone\n- Grant\n\n## Other\nx <i data-sourcepos="4:">ok</i> <li data-sourcepos="5:">Grant</li>\n';
+  assert.ok(problems(cm, forged, [{ text: 'Grant', lines: [4] }]).bad.length, 'the oracle flags the hidden rule despite forged attributes');
+  assert.deepEqual(model.standingRulesRead(forged), { rules: [], problem: model.UNSURE_BLOCK });
+  assert.deepEqual(problems(cm, forged).bad, []);
   for (const [mode, seed] of [['section', 7], ['prefix', 99], ['soup', 3], ['containers', 11], ['clean', 5]]) {
     const next = generator(seed, mode);
     let found = 0, shown = 0, first = null, count = 0;
