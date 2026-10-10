@@ -220,8 +220,10 @@ publish-guard holds; standing and renewal production access; package installs.
   counted apart: the desk never guesses which command sent a request, so **a desk command costs two steps**. Admission
   assumes the worst order of reports: a request is carried out only if the steps reported so far plus two for every
   request so far (this one included) fit, as if no command that sent a request had been reported yet. Otherwise it is
-  refused and the run stopped before it can apply anything, and no report that arrives later can push a run past its
-  allowance after a request was carried out. The same counting applies to tagged replies (`mentions.maxSteps`) and
+  refused and the run stopped before it can apply anything. That keeps room for the command behind each request, not
+  for a plain command (one that sent no request) whose report arrives late: such a report can still take the run past
+  its allowance after a decision applied, and stop it then. Stopping only takes away the run's authority; the decision
+  it already applied stands. The same counting applies to tagged replies (`mentions.maxSteps`) and
   post-deploy checks (`watch.maxSteps`) on a plan-billed engine; admitted on an engine with a dollar cap, those are
   bounded by the dollars instead, and their steps are recorded but never stop them. A decision run keeps its own steps
   on either kind of engine. The bound is reserved for the engine the run

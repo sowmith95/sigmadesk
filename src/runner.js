@@ -44,10 +44,12 @@ export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
  * desk-side bound when dollars cannot be capped. Two kinds of step, counted apart and never matched to each other (the
  * desk cannot know which command sent a request, so it does not guess): every command or tool call the engine reports
  * (a command once, by its id, when it starts) and every desk request that reaches the desk. A desk command therefore
- * costs two steps. Admission assumes the worst order of reports: that the command carrying every request so far is
- * still unreported. A request is carried out only while the reported steps plus two for every request so far, this
- * one included, fit in the allowance; otherwise it is refused, and the run stopped, before anything it asked for
- * happens. So no order of late reports can take a run past its allowance after a request was carried out.
+ * costs two steps. Admission assumes the worst order of reports for requests: that the command carrying every request
+ * so far is still unreported. A request is carried out only while the reported steps plus two for every request so
+ * far, this one included, fit in the allowance; otherwise it is refused, and the run stopped, before anything it asked
+ * for happens. That keeps room for each request's own command and for nothing else: a plain command (one that sent no
+ * request) that started before a request and is reported after it can still take the run past its allowance, and stop
+ * it, after the request was carried out. Stopping only takes away the run's authority; what a request applied stands.
  */
 // Post-deploy checks (watch) and tagged replies are bounded by what is left of their steps when the engine cannot cap
 // dollars; admitted on dollars, their allowance is dollars, so their steps are counted (the checkpoint or tag keeps

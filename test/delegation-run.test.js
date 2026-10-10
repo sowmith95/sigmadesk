@@ -412,7 +412,7 @@ async function stepFixture() {
     assert.deepEqual([store.getRun(d.run.id).status, store.getRun(d.run.id).result_text], ['killed', 'step limit (30)'], what);
     assert.notEqual(store.getDelegation(d.r.id).status, 'applied', what); assert.equal(store.getTicket(d.t.key).status, 'needs_human', what);
   };
-  // Applied within the allowance, and nothing reported after it can stop the run.
+  // Applied within the allowance, and what each case reports after it (its own carrying command included) fits.
   const applied = async (d, what, late = () => {}) => {
     assert.match(await sched.deskAction(d.run, 'decide', answer), /Decided for the owner and applied/, what);
     late();
@@ -540,6 +540,38 @@ test('steps (property): under any order of late reports, nothing a carried-out r
   }
   for (const id of made) store.handle().prepare('DELETE FROM runs WHERE id = ?').run(id);
   for (const [what, count] of Object.entries(seen)) assert.ok(count >= 20, `the generator produced ${what} only ${count} times`);
+});
+
+// What admission does not reserve for: a plain command (one that sent no request) issued before a decision and reported
+// after it. Its report can stop the run after the decision applied; stopping only takes away the run's authority, so
+// the decision, the resumed ticket and its answer stand, through another sweep and a desk restart.
+test('steps: a plain command reported late can stop a run after its decision applied; the applied decision stands', async () => {
+  fresh();
+  delegation.setPolicy({ kinds: { question: 'em' } });
+  const { start, ran, decision, steps, answer } = await stepFixture();
+  const d = await decision();
+  d.ctx.maxSteps = 60; runner.boundSteps(d.run, 60); // a decision's own allowance
+  ran(d.ctx, 58); // 58 commands reported; an earlier plain `ls` has run but is not reported yet
+  assert.match(await sched.deskAction(d.run, 'decide', answer), /Decided for the owner and applied/, '58 + 2 for the request fits 60');
+  assert.equal(steps(d), 59);
+  start(d.ctx, 'decide', "/bin/zsh -lc 'desk decide answer x'"); // the command that carried the request, reported late
+  assert.deepEqual([steps(d), store.getRun(d.run.id).status], [60, 'running'], 'its own late report was reserved for');
+  start(d.ctx, 'ls', "/bin/zsh -lc 'ls'"); // the earlier plain command, reported last
+  assert.deepEqual([steps(d), store.getRun(d.run.id).status, store.getRun(d.run.id).result_text], [61, 'killed', 'step limit (60)'], 'a plain late report was not');
+  assert.equal(store.getRun(d.run.id).token, null, 'the run has no authority left');
+  // The decision it already applied is untouched: the record, the resumed ticket and the answer on its thread.
+  const decided = (r) => ({ status: r.status, action: r.action, text: r.text, why: r.why, outcome: r.outcome, citations: r.citations, provenance: r.provenance, comment_id: r.comment_id });
+  const thread = () => store.listComments(d.t.key).map((c) => [c.id, c.author, c.body]);
+  const was = { record: decided(store.getDelegation(d.r.id)), ticket: store.getTicket(d.t.key).status, thread: thread() };
+  assert.deepEqual([was.record.status, was.ticket], ['applied', 'todo']);
+  assert.match(was.thread.at(-1)[2], /Morgan answered Riley for you[\s\S]*utils\/net\.py:40/);
+  delegation.sweep({ paused: false });
+  sched.recoverOrphans(); // a desk restart: the stopped run is charged, nothing about the decision changes
+  sched.recoverOrphans();
+  assert.deepEqual(decided(store.getDelegation(d.r.id)), was.record);
+  assert.equal(store.getTicket(d.t.key).status, was.ticket);
+  assert.deepEqual(thread(), was.thread);
+  assert.equal(store.kvGet(`decide-charged:${d.run.id}`), '1', 'its run was charged, once');
 });
 
 test('steps end to end on a Codex stand-in that writes events in the real order: a 61st command that is desk decide is never applied', async () => {
