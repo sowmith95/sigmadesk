@@ -94,6 +94,17 @@ test('model: the deterministic owner rules (self-interest, risk, lifetime limits
   assert.match(r({ kind: 'research', interest: 'wrote the proposal' }), /wrote the proposal/);
   assert.match(r({ kind: 'research', lifetime: { count: 1, spend: 0 } }), /already sent this proposal back 1 time \(limit 1/);
   assert.match(r({ kind: 'research', lifetime: { count: 0, spend: 1.6 } }), /already cost \$1\.60/);
+  assert.match(r({ kind: 'research', lifetime: { count: 0, spend: 1.46 } }), /already cost \$1\.46 of its \$1\.50 lifetime limit/, 'less than a minimal run is left');
+  assert.equal(r({ kind: 'research', lifetime: { count: 0, spend: 1.4 } }), null, '$0.10 is left: a run may still start, capped');
+  // Admission: a capped run gets at most what is left; an uncappable one starts only if its whole reservation fits.
+  const usd = { kind: 'usd', usd: 0.75 }, time = { kind: 'time', minutes: 6, steps: 30 };
+  const at = (cap) => (cap == null ? 0.75 : Math.min(0.75, cap));
+  assert.deepEqual(model.allowance({ bound: usd, left: 1.5 - 1.4, reserveAt: at }), { usd: 0.1, reserve: 0.1 });
+  assert.deepEqual(model.allowance({ bound: usd, left: null, reserveAt: at }), { usd: 0.75, reserve: 0.75 });
+  assert.match(model.allowance({ bound: usd, left: 0.04, reserveAt: at }).refuse, /only \$0\.04 is left/);
+  assert.match(model.allowance({ bound: time, left: 0.1, reserveAt: at }).refuse, /cannot cap a run in dollars, and its \$0\.75 reservation is more than the \$0\.10 left/);
+  assert.deepEqual(model.allowance({ bound: time, left: 1, reserveAt: at }), { usd: null, reserve: 0.75 });
+  assert.ok(model.allowance({ bound: null }).refuse);
   assert.match(r({ kind: 'loop_limit', interest: 'asked for the changes' }), /manager asked for the changes, so manager cannot decide it/);
   assert.match(r({ kind: 'design', interest: 'wrote the recommendation' }), /wrote the recommendation/, 'the EM never approves its own plan');
   assert.match(r({ kind: 'design', ticket: { ...low, risk: null }, designStatus: 'complete' }), /positively low-risk/);

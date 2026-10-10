@@ -592,6 +592,9 @@ export function kindCap(kind) {
   return null;
 }
 const capped = (kind, usd) => (kindCap(kind) ? Math.min(usd, kindCap(kind)) : usd);
+/** What a run reserves, and is charged when its engine reports no cost: the engine's per-run budget under the kind's cap
+ *  and the job's own dollar cap (usd: the admitted limit, null: none). One formula for admission and accounting. */
+export const runReserve = (agent, kind, usd = null) => Math.min(capped(kind, engineOf(agent).budgetUsd(agent)), usd ?? Infinity);
 
 // Provenance: which charter/playbook/engine/model produced this run, so scorecards can be split by version.
 const engineVersions = {};
@@ -696,7 +699,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   packages.recordLaunch(run.id, pkg.ids);
   // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
   if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
-  store.updateRun(run.id, { reserve_usd: Math.min(capped(kind, engineOf(agent).budgetUsd(agent)), limits?.usd ?? Infinity) });
+  store.updateRun(run.id, { reserve_usd: runReserve(agent, kind, limits?.usd ?? null) });
   // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
   // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
   if (kind !== 'mention' && kind !== 'decide') access.bindRun(agentId, ticketKey, run.id); // a decision run (#9) is not the ticket's work either
@@ -837,7 +840,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (failure) holdProvider(engine.id, failure, r?.result || stderr || ctx.state.lastError);
       // No terminal result (killed, crashed, timed out): charge the full per-run cap so the risk limit stays honest.
       const knownCost = r?.cost_known !== false && r && (r.total_cost_usd || !r.is_error);
-      const cost = knownCost ? (r.total_cost_usd ?? 0) : Math.min(capped(kind, engine.budgetUsd(agent)), limits?.usd ?? Infinity);
+      const cost = knownCost ? (r.total_cost_usd ?? 0) : runReserve(agent, kind, limits?.usd ?? null);
       // The run's final record and the job's own accounting (onEnd: e.g. a tag's cumulative allowance) commit together.
       store.transaction(() => {
         store.updateRun(run.id, {

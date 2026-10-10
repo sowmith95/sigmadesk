@@ -544,6 +544,7 @@ CREATE TABLE IF NOT EXISTS delegated_decisions (
   spent_usd REAL DEFAULT 0,
   spent_ms INTEGER DEFAULT 0,
   steps_used INTEGER DEFAULT 0,
+  reserved_usd REAL DEFAULT 0,    -- what its run holds of a lifetime allowance until it is charged (research proposals)
   brief TEXT,                     -- JSON: the decision brief it was based on (audit)
   citables TEXT,                  -- JSON: the rule (R) and evidence (E) ids its run was given, fixed when the run started
   citations TEXT,                 -- JSON: the ids the delegate cited for its decision (checked against citables)
@@ -637,7 +638,7 @@ function migrate() {
     deploy_watches: { hold_kind: 'TEXT', retired_targets: 'TEXT', retired_resources: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
     // a database created by an earlier build of delegation (#9) gains the columns added since
-    delegated_decisions: { citables: 'TEXT', citations: 'TEXT' },
+    delegated_decisions: { citables: 'TEXT', citations: 'TEXT', reserved_usd: 'REAL DEFAULT 0' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     // prod_access 0: the owner chose "ask me in my Inbox" for this delivery, so its run never gets automatic access
     mention_deliveries: { spent_usd: 'REAL DEFAULT 0', spent_ms: 'INTEGER DEFAULT 0', steps_used: 'INTEGER DEFAULT 0', prod_access: 'INTEGER DEFAULT 1' },
@@ -1403,7 +1404,7 @@ export function updateMention(id, patch) {
 
 // ---------- delegated decisions (#9) ----------
 const DD_INSERT = ['kind', 'decision_id', 'ticket_key', 'version', 'policy_version', 'delegation_version', 'mode', 'seat', 'asker', 'allowed', 'status', 'brief', 'provenance', 'outcome', 'action', 'text', 'why', 'decided_at', 'ended_at'];
-const DD_FIELDS = ['status', 'action', 'text', 'why', 'recommendation', 'outcome', 'assign', 'attempts', 'run_id', 'spent_usd', 'spent_ms', 'steps_used', 'brief', 'provenance',
+const DD_FIELDS = ['status', 'action', 'text', 'why', 'recommendation', 'outcome', 'assign', 'attempts', 'run_id', 'spent_usd', 'spent_ms', 'steps_used', 'reserved_usd', 'brief', 'provenance',
   'citables', 'citations', 'comment_id', 'override_note', 'override_at', 'started_at', 'decided_at', 'ended_at'];
 const ddVal = (v) => (v !== null && typeof v === 'object' ? JSON.stringify(v) : v ?? null);
 /** One record per (decision, evidence version): a repeat returns the existing row ({ row, created }). */

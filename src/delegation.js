@@ -171,10 +171,14 @@ function endLapsed(r, l) {
   if (l.status === 'invalidated') noticeOwner(store.getDelegation(r.id), `${first(r.seat)} no longer decides this: ${l.why.replace(/ The decision is yours\.$/, '')}`);
   return true;
 }
-/** Delegated decisions on this ticket and kind over the ticket's whole life (they survive revision generations). */
-function lifetime(key, kind) {
+/**
+ * Delegated decisions on this ticket and kind over the ticket's whole life (they survive revision generations): the
+ * corrections applied, the spend charged, and what other open records (not `except`) hold reserved for their runs.
+ */
+function lifetime(key, kind, except = null) {
   const rows = store.delegationsForTicket(key).filter((r) => r.kind === kind);
-  return { count: rows.filter((r) => ['applied', 'overridden', 'reopened'].includes(r.status) && r.action === 'changes').length, spend: rows.reduce((a, r) => a + (Number(r.spent_usd) || 0), 0) };
+  return { count: rows.filter((r) => ['applied', 'overridden', 'reopened'].includes(r.status) && r.action === 'changes').length, spend: rows.reduce((a, r) => a + (Number(r.spent_usd) || 0), 0),
+    reserved: rows.filter((r) => r.id !== except && OPEN.includes(r.status)).reduce((a, r) => a + (Number(r.reserved_usd) || 0), 0) };
 }
 // What the seat that put a hold on a ticket is to the decision (hold_seat, by the hold's kind).
 const HOLDER = { question: 'asked this question', qa_loops: 'failed it in QA', review_loops: 'asked for the changes', review_disagree: 'is the reviewer who disagrees',
@@ -397,6 +401,19 @@ export function boundFor(seat) {
   if (billingOf(seat.engine || 'claude') === 'plan') return { kind: 'time', minutes: L.maxMinutes, steps: L.maxSteps };
   return null;
 }
+/**
+ * Atomically reserve one run's share: the engine's bound, lowered to what is left of the proposal's lifetime allowance
+ * (after everything charged and every other open reservation), or a refusal when that cannot be enforced.
+ */
+function reserve(id, b, agent) {
+  return store.transaction(() => {
+    const rec = store.getDelegation(id);
+    const life = rec.kind === 'research' ? lifetime(rec.ticket_key, rec.kind, rec.id) : null;
+    const a = model.allowance({ bound: b, left: life ? limits().research.maxSpendUsd - life.spend - life.reserved : null, reserveAt: (usd) => runner.runReserve(agent, 'decide', usd) });
+    if (!a.refuse) store.updateDelegation(id, { reserved_usd: a.reserve });
+    return a;
+  });
+}
 const boundText = (seat, b) => (b.kind === 'usd' ? `${first(seat.id)} has up to $${b.usd} and ${b.minutes} minutes for this decision` : `${first(seat.id)} has ${b.minutes} minutes (at most ${b.steps} steps) for this decision`);
 /** The live record a decide run serves: only the server-owned run job names it. */
 export function forRun(run) {
@@ -408,7 +425,7 @@ function charge(id, run, steps = 0) {
   if (store.kvGet(`decide-charged:${run.id}`)) return;
   store.kvSet(`decide-charged:${run.id}`, '1');
   const r = store.getDelegation(id);
-  store.updateDelegation(id, { spent_usd: (r.spent_usd || 0) + (run.cost_usd || 0), steps_used: (r.steps_used || 0) + (steps || 0),
+  store.updateDelegation(id, { spent_usd: (r.spent_usd || 0) + (run.cost_usd || 0), reserved_usd: 0, steps_used: (r.steps_used || 0) + (steps || 0),
     spent_ms: (r.spent_ms || 0) + Math.max(0, Date.parse(run.ended_at || isoNow()) - Date.parse(run.started_at || isoNow())) });
 }
 /** ONE attempt for a queued record; a run that ends without `desk decide` sends the decision to the owner, explained. */
@@ -431,8 +448,10 @@ export async function launch(r, fence = runner.currentEpoch()) {
       admit: (agent) => {
         const b = boundFor(agent);
         if (!b) return { refuse: `${first(seat)}'s available engine (${agent.engine}) is billed per use with no hard spend cap, so the desk did not start the decision run.` };
-        bound = { seat: agent, b };
-        return { limits: b.kind === 'usd' ? { usd: b.usd, minutes: b.minutes, steps: b.steps } : { minutes: b.minutes, steps: b.steps } };
+        const a = reserve(r.id, b, agent); // the engine it actually got, capped at what its allowance has left
+        if (a.refuse) return { refuse: `${a.refuse}, so the desk did not start the decision run` };
+        bound = { seat: agent, b: { ...b, usd: a.usd ?? b.usd } };
+        return { limits: b.kind === 'usd' ? { usd: a.usd, minutes: b.minutes, steps: b.steps } : { minutes: b.minutes, steps: b.steps } };
       },
       onEnd: (run, { steps }) => charge(r.id, run, steps),
       onStart: (run) => {
@@ -784,7 +803,7 @@ export function recover() {
   for (const r of store.delegationsByStatus('running')) {
     const runs = store.runsOfDelegation(r.id);
     const usd = runs.reduce((a, x) => a + (x.cost_usd || 0), 0), steps = runs.reduce((a, x) => a + (x.steps || 0), 0);
-    store.updateDelegation(r.id, { spent_usd: Math.max(usd, r.spent_usd || 0), steps_used: Math.max(steps, r.steps_used || 0) });
+    store.updateDelegation(r.id, { spent_usd: Math.max(usd, r.spent_usd || 0), reserved_usd: 0, steps_used: Math.max(steps, r.steps_used || 0) });
     for (const x of runs) store.kvSet(`decide-charged:${x.id}`, '1');
     escalate(r, 'the desk restarted while the decision run was working. One attempt per decision, so it is yours now.', { from: ['running'] });
   }

@@ -34,13 +34,14 @@ let prompt = ''; process.stdin.on('data', (d) => { prompt += d; }); process.stdi
 });
 `); fs.chmodSync(fixture, 0o755);
 
-let config, store, sched, dispatch, team, runner, server, delegation;
+let config, store, sched, dispatch, team, runner, server, delegation, researchReview;
 let sockDir;
 before(async () => {
   ({ config } = await import('../src/config.js')); config.root = tmp; config.dataDir = path.join(tmp, 'data'); config.bins.claude = fixture;
   store = await import('../src/db.js'); store.openDb(':memory:');
   sched = await import('../src/scheduler.js'); dispatch = await import('../src/dispatch.js'); team = await import('../src/team.js');
   runner = await import('../src/runner.js'); server = await import('../src/server.js'); delegation = await import('../src/delegation.js');
+  researchReview = await import('../src/research-review.js');
   dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: true }]);
   fs.mkdirSync(path.join(tmp, 'bin'), { recursive: true });
   fs.copyFileSync(path.join(ROOT, 'bin', 'desk'), path.join(tmp, 'bin', 'desk')); fs.chmodSync(path.join(tmp, 'bin', 'desk'), 0o755);
@@ -199,6 +200,90 @@ process.stdin.resume(); process.stdin.on('end', () => { setTimeout(() => {
     assert.equal(store.recentRuns(1)[0]?.id, before, 'no run was created');
     assert.match(store.getDelegation(r2.id).why, /could not start \(.*billed per use with no hard spend cap/);
   } finally { config.engines.codex.bin = old.bin; config.delegation.maxMinutes = old.max; config.engines.codex.billing = 'plan'; team.applyTeamOverrides({}); }
+});
+
+// A research proposal the second reviewer holds, with $spent already charged to earlier delegated decisions on it.
+function heldProposal(spent = 0) {
+  const t = store.createTicket({ title: `Proposal fixture ${++n}`, status: 'proposed', reporter: 'pm', source: 'research', description: '## Problem\nSlow fills.\n## Evidence\nThe vendor log.' });
+  researchReview.open(t, { program: 'product-discovery', review: { minReviewers: 1, reviewers: ['principal-be'] } }, { id: 1 });
+  const rv = store.createResearchReview({ ticket_key: t.key, generation: 1, input_hash: researchReview.hashOf(store.getTicket(t.key)), reviewer: 'principal-be', status: 'pending' });
+  researchReview.complete(rv.id, { report: { verdict: 'reject', summary: 'No source', evidence_checked: [], findings: ['no source'], conditions: ['cite one'] } });
+  if (spent) {
+    const earlier = store.createDelegation({ kind: 'research', decision_id: `${t.key}:research:0`, ticket_key: t.key, version: `earlier-${n}`, policy_version: 'x', delegation_version: 'x', mode: 'em', seat: 'manager', allowed: ['changes', 'escalate'], status: 'superseded' }).row;
+    store.updateDelegation(earlier.id, { spent_usd: spent });
+  }
+  return store.getTicket(t.key);
+}
+
+test('lifetime spend: with $1.40 of a proposal\'s $1.50 charged, its run is capped at $0.10; an engine that cannot cap dollars is refused', async () => {
+  fresh();
+  const old = config.delegation.research;
+  config.delegation.research = { ...(old || {}), maxCorrections: 5 }; // the spend is what is limited here
+  try {
+    delegation.setPolicy({ kinds: { research: 'em' } });
+    const t = heldProposal(1.4);
+    delegation.sweep({ paused: false });
+    const r = open(t);
+    assert.equal(r.status, 'queued');
+    plan([['decide', 'changes', 'Cite the vendor changelog.', '--cite', 'R1,E2', '--why', 'The reviewer found no source; the playbook needs cited evidence.']]);
+    await delegation.launch(r);
+    assert.equal(lastArgv()[lastArgv().indexOf('--max-budget-usd') + 1], '0.1', 'the engine is capped at what is left, not at $0.75');
+    const after = store.getDelegation(r.id);
+    assert.equal(store.getRun(after.run_id).reserve_usd, 0.1, 'the reservation is what is left');
+    assert.equal(after.status, 'applied', after.why || after.outcome);
+    assert.deepEqual([after.reserved_usd, Math.round(after.spent_usd * 100) / 100], [0, 0.02], 'charged what it cost; nothing stays reserved');
+    // A plan-billed engine cannot enforce $0.10: refused before any run exists.
+    const t2 = heldProposal(1.4);
+    delegation.sweep({ paused: false });
+    const r2 = open(t2);
+    team.applyTeamOverrides({ manager: { engine: 'codex', model: '' } });
+    const before = store.recentRuns(1)[0]?.id;
+    await delegation.launch(r2);
+    assert.equal(store.recentRuns(1)[0]?.id, before, 'no run was created');
+    assert.match(store.getDelegation(r2.id).why, /could not start \(the engine cannot cap a run in dollars, and its \$0\.75 reservation is more than the \$0\.10 left/);
+    // Less than a minimal run left: the owner's by rule, before any run.
+    team.applyTeamOverrides({});
+    const t3 = heldProposal(1.46);
+    delegation.sweep({ paused: false });
+    assert.match(open(t3).why, /already cost \$1\.46 of its \$1\.50 lifetime limit/);
+  } finally { config.delegation.research = old; team.applyTeamOverrides({}); }
+});
+
+test('fallback admission: the engine the run actually gets is the one bounded, and a per-use fallback with no cap is refused', async () => {
+  fresh();
+  const codex = path.join(tmp, 'codex-quick.mjs');
+  fs.writeFileSync(codex, `#!/usr/bin/env node
+process.stdin.resume(); process.stdin.on('end', () => {
+  console.log(JSON.stringify({ type: 'thread.started', thread_id: 'f' }));
+  console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }));
+});`); fs.chmodSync(codex, 0o755);
+  const old = { bin: config.engines.codex.bin, fallback: store.getSettings().auto_fallback };
+  config.engines.codex.bin = codex;
+  store.setSetting('auto_fallback', 'true');
+  dispatch.setAvailability([{ id: 'claude', available: false }, { id: 'codex', available: true }]);
+  try {
+    delegation.setPolicy({ kinds: { question: 'em' } });
+    const t = await held();
+    delegation.sweep({ paused: false });
+    const r = open(t);
+    await delegation.launch(r);
+    const after = store.getDelegation(r.id);
+    const run = store.getRun(after.run_id);
+    assert.equal(run.model.split(':')[0], 'codex', 'Claude was unavailable, so the fallback engine ran it');
+    assert.ok(store.recentEvents({ ticket_key: t.key, limit: 50 }).some((e) => /Morgan has 6 minutes \(at most 30 steps\) for this decision/.test(e.text)), 'bounded by time and steps, not by the Claude cap');
+    assert.equal(after.status, 'escalated', 'it ended without a decision');
+    config.engines.codex.billing = 'api';
+    const t2 = await held();
+    delegation.sweep({ paused: false });
+    const r2 = open(t2);
+    const before = store.recentRuns(1)[0]?.id;
+    await delegation.launch(r2);
+    assert.equal(store.recentRuns(1)[0]?.id, before, 'refused before any run exists');
+    assert.match(store.getDelegation(r2.id).why, /could not start \(.*\(codex\) is billed per use with no hard spend cap/);
+  } finally {
+    config.engines.codex.bin = old.bin; config.engines.codex.billing = 'plan'; store.setSetting('auto_fallback', old.fallback);
+    dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: true }]);
+  }
 });
 
 test('steps: a decision run is stopped past its step allowance, like a tagged reply', () => {

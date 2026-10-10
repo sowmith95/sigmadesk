@@ -110,6 +110,29 @@ export function delegateFor(kind, mode) {
 /** The actions a delegate may take on this decision (escalate is always one of them). */
 export const allowedActions = (kind) => [...(KINDS[kind]?.actions || []), 'escalate'];
 
+/** The smallest dollar cap a decision run is started with (below it, an allowance counts as used up). */
+export const MIN_RUN_USD = 0.05;
+/**
+ * The hard bound one decision run is admitted with. bound: the engine's own (src/delegation.js boundFor: 'usd', a dollar
+ * cap the engine enforces; 'time', minutes and steps on a plan, charged at its reservation). left: what remains of a
+ * lifetime spend allowance (a research proposal's) after everything charged and every other open reservation, or null.
+ * reserveAt(usd): what the run reserves, and is charged without a cost report, under a dollar cap usd (null: none).
+ * A capped run gets at most what is left; a run that cannot be capped starts only when its whole reservation fits.
+ * → { usd, reserve } or { refuse }.
+ */
+export function allowance({ bound, left = null, reserveAt = () => 0 }) {
+  if (!bound) return { refuse: 'the engine has no hard bound' };
+  const money = (n) => `$${Math.max(0, n).toFixed(2)}`;
+  if (bound.kind === 'usd') {
+    const usd = left == null ? bound.usd : Math.min(bound.usd, Math.floor(left * 100 + 1e-6) / 100);
+    if (usd < MIN_RUN_USD) return { refuse: `only ${money(left)} is left of this proposal's lifetime allowance for delegated decisions` };
+    return { usd, reserve: reserveAt(usd) };
+  }
+  const reserve = reserveAt(null);
+  if (left != null && reserve > left + 1e-9) return { refuse: `the engine cannot cap a run in dollars, and its ${money(reserve)} reservation is more than the ${money(left)} left of this proposal's lifetime allowance` };
+  return { usd: null, reserve };
+}
+
 /** Positively low risk: the stored risk says low and the diff classifier does not say high. Unknown counts as high. */
 export const positivelyLow = (t) => !!t && t.risk === 'low' && t.diff_risk !== 'high';
 
@@ -145,7 +168,7 @@ export function ownerReason(f, nameOf = (s) => s) {
       return null;
     case 'research':
       if (f.lifetime && f.lifetime.count >= f.limits.research.maxCorrections) return `${who} already sent this proposal back ${f.lifetime.count} time${f.lifetime.count === 1 ? '' : 's'} (limit ${f.limits.research.maxCorrections} for its whole life)`;
-      if (f.lifetime && f.lifetime.spend >= f.limits.research.maxSpendUsd) return `delegated decisions on this proposal already cost $${f.lifetime.spend.toFixed(2)} (limit $${f.limits.research.maxSpendUsd.toFixed(2)})`;
+      if (f.lifetime && f.limits.research.maxSpendUsd - f.lifetime.spend < MIN_RUN_USD) return `delegated decisions on this proposal already cost $${f.lifetime.spend.toFixed(2)} of its $${f.limits.research.maxSpendUsd.toFixed(2)} lifetime limit`;
       return null;
     case 'loop_limit':
       if (f.lifetime && f.lifetime.count >= f.limits.loopLimit.maxRescopes) return `${who} already rescoped this ticket ${f.lifetime.count} time${f.lifetime.count === 1 ? '' : 's'} (limit ${f.limits.loopLimit.maxRescopes})`;
