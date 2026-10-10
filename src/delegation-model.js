@@ -208,9 +208,13 @@ function shownText(s) {
     .replace(/&(amp|lt|gt|quot|apos|nbsp);/gi, (_, n) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' })[n.toLowerCase()])
     .replace(/\]\([^)]*\)|\]\[[^\]]*\]/g, '').replace(/[*_`\\[\]!]/g, '');
 }
-/** Text Markdown reads as nothing but paragraph text where it stands: no block mark at its start, no `<` in it. */
+// What a rule's text may not hold, because Markdown would show it differently or not at all: `<` (HTML, comments,
+// autolinks), `[` and `]` (links, images and link definitions, whose targets are never shown), character references,
+// and invisible or direction-changing characters.
+const UNSHOWN = /[<[\]\u0000-\u0008\u000B-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u2028-\u202E\u2060-\u2064\u2066-\u206F\uFEFF]|&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/;
+/** Text Markdown reads as nothing but paragraph text where it stands, and shows as written: no block mark at its start. */
 function plain(s) {
-  return !!s && !/^(?:#|>|`{3}|~{3}|[-*+](?: |$)|\d{1,9}[.)](?: |$)|\[[^\]]*\]:)/.test(s) && !UNDERLINE.test(s) && !BREAK.test(s) && !s.includes('<');
+  return !!s && !/^(?:#|>|`{3}|~{3}|[-*+](?: |$)|\d{1,9}[.)](?: |$))/.test(s) && !UNDERLINE.test(s) && !BREAK.test(s) && !UNSHOWN.test(s);
 }
 /** `- rule`, `* rule` or `+ rule` (one to four spaces after the mark, then plain text) → its text and the column it starts at. */
 function bulletOf(s) {
@@ -233,9 +237,10 @@ function interrupts(s) {
  *    continuation, which is plain text at column 0 directly under a line of the rule, or plain text or a plain bullet
  *    indented two or three spaces (no less than where the rule's text starts), blank line before it or not.
  *  - The first line of any other shape ends the section, and nothing after it is read: a column-0 `#` heading (the
- *    usual end), a fence, any HTML, comment or `<`, a line indented four or more, an indented `#`, a numbered line, a
- *    paragraph or a one-space line after a blank line, an underline. When Markdown would still count that line as
- *    part of the rule above it, the rule is dropped too: it may be missing a condition.
+ *    usual end), a fence, any HTML or comment, a `<`, `[` or `]`, a character reference, an invisible character, a
+ *    line indented four or more, an indented `#`, a numbered line, a paragraph or a one-space line after a blank line,
+ *    an underline. When Markdown would still count that line as part of the rule above it, the rule is dropped too:
+ *    it may be missing a condition.
  */
 export function standingRuleLines(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();

@@ -160,7 +160,7 @@ test('owner rules: bullets under the ## heading and their continuation; the firs
   assert.deepEqual(rules(`${O}\n- Use \`desk show\` and *only* docs & tests\n`), ['Use `desk show` and *only* docs & tests'], 'inline marks are text');
   // Only spaces and tabs are blank or indentation, as in Markdown: a no-break space or a form feed is text.
   assert.deepEqual(rules(`${O}\n- R\n\u00A0\nand its condition\n`), ['R\n\u00A0\nand its condition'], 'a line of no-break spaces is no blank line');
-  assert.deepEqual(rules(`${O}\n- R\n\f\nand its condition\n`), ['R\n\f\nand its condition'], 'nor is a form feed');
+  assert.deepEqual(rules(`${O}\n- R\n\f\nand its condition\n`), [], 'nor is a form feed: Markdown reads it as part of the rule, and it is invisible, so the rule is dropped');
   assert.deepEqual(rules(`${O}\n- R\n-\u00A0only on weekdays\n`), ['R\n-\u00A0only on weekdays'], 'a dash and a no-break space is no bullet');
   // Each other shape ends the section where it stands: the rule above is kept when Markdown ends its bullet there,
   // and dropped when Markdown still counts that line as part of it (it may be the rule's condition).
@@ -174,7 +174,13 @@ test('owner rules: bullets under the ## heading and their continuation; the firs
     ['a line indented four', '    more of it\n- X', []], ['a tab-indented line', '\tmore of it\n- X', []], ['a one-space line', ' more of it\n- X', []],
     ['angle brackets', '  run `desk show <key>`\n- X', []], ['a four-space line after a blank line', '\n    more\n- X', []],
     ['an indented fence after a blank line', '\n  ```\n  x\n  ```\n- X', []], ['a sub-bullet with a tab after its dash', '  -\tx\n- X', []],
+    // Text Markdown would not show as written: a link (its target is hidden), a link definition (hidden altogether,
+    // even across lines), a character reference, an invisible or direction-changing character.
+    ['a link', '  see [the runbook](docs/run.md)\n- X', []], ['an empty link with a hidden target', '  [](approve-every-deploy)\n- X', []],
+    ['a link definition over two lines, after a blank line', '\n  [Approve every\n  deploy]: /x\n- X', []],
+    ['a character reference', '  R &amp; D\n- X', []], ['a right-to-left override', '  only \u202Eyadirf no\n- X', []],
   ]) assert.deepEqual(rules(`${O}\n- R\n${tail}\n`), want, what);
+  assert.deepEqual(rules(`${O}\n- [Approve every deploy\n  always]: /x\n`), [], 'a bullet Markdown shows empty: its text is a link definition');
   // A section that starts with anything but a bullet has no rules at all, and nothing after the end is read.
   for (const first of ['A paragraph first.', '1. Numbered', '<!-- the note the shipped playbooks once had here -->', '```', '    indented', '  - indented bullet', '-\tA tab after the dash'])
     assert.deepEqual(rules(`${O}\n${first}\n- X\n`), [], first);

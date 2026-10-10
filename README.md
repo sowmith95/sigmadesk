@@ -193,8 +193,9 @@ publish-guard holds; standing and renewal production access; package installs.
   - The heading is a `##` heading at the start of its line (not `#` or `###`, not underlined with `---` or `===`).
   - Each rule is a dash bullet (`- `) at the start of its line, right under the heading or under the rule before it.
   - A rule's conditions go on its bullet line, or on lines indented two spaces under it (sub-bullets included).
-  - No code blocks, HTML or comments, numbered lists, lines indented four or more spaces, or other headings inside
-    the section, and no `<` in a rule.
+  - No code blocks, links, HTML or comments, numbered lists, lines indented four or more spaces, or other headings
+    inside the section; and in a rule no `<`, `[` or `]`, no character reference such as `&amp;`, and no invisible
+    character. The desk reads only what Markdown shows as written, so nothing in a rule can be hidden from you.
 
   Anything else ends the section where it stands, and nothing after it is read; a rule the line may still belong to
   is dropped, since it may be missing a condition. Settings tells you how many rules the desk found, so a count lower

@@ -17,17 +17,19 @@ const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g
 /** The list items the parser shows directly under the first document-level heading with the owner's words. */
 function bulletsShown(cm, text) {
   const inline = (node) => { let out = ''; const w = node.walker(); let e; while ((e = w.next())) if (e.entering && ['text', 'code', 'html_inline'].includes(e.node.type)) out += e.node.literal; else if (e.entering && ['softbreak', 'linebreak'].includes(e.node.type)) out += '\n'; return out; };
-  const simple = (item) => { for (let c = item.firstChild; c; c = c.next) { if (c.type === 'paragraph') continue; if (c.type !== 'list') return false; for (let i = c.firstChild; i; i = i.next) if (!simple(i)) return false; } return true; };
+  // Only paragraphs and sub-bullets, collecting each paragraph's lines and the text Markdown shows for it.
+  const simple = (item, paras) => { for (let c = item.firstChild; c; c = c.next) { if (c.type === 'paragraph') { paras.push({ from: c.sourcepos[0][0] - 1, to: c.sourcepos[1][0] - 1, text: inline(c) }); continue; } if (c.type !== 'list') return false; for (let i = c.firstChild; i; i = i.next) if (!simple(i, paras)) return false; } return true; };
   const doc = new cm.Parser().parse(text);
   let h = doc.firstChild;
   while (h && !(h.type === 'heading' && norm(inline(h)) === norm(O))) h = h.next;
   if (!h) return [];
   const out = [];
   for (let s = h.next; s && !(s.type === 'heading' && s.level <= h.level); s = s.next)
-    if (s.type === 'list') for (let i = s.firstChild; i; i = i.next) out.push({ from: i.sourcepos[0][0] - 1, to: i.sourcepos[1][0] - 1, simple: simple(i) });
+    if (s.type === 'list') for (let i = s.firstChild; i; i = i.next) { const paras = []; out.push({ from: i.sourcepos[0][0] - 1, to: i.sourcepos[1][0] - 1, simple: simple(i, paras), paras }); }
   return out;
 }
-/** What is wrong with the desk's reading of one playbook: a rule Markdown does not show, or not exactly its lines. */
+/** What is wrong with the desk's reading of one playbook: a rule Markdown does not show, not exactly the lines of its
+ * bullet, a line of it Markdown hides, or text Markdown shows otherwise. */
 function problems(cm, text) {
   const ours = model.standingRuleLines(text), shown = bulletsShown(cm, text), src = text.split(/\r\n|\r|\n/), bad = [];
   for (const r of ours) {
@@ -35,6 +37,9 @@ function problems(cm, text) {
     if (!b) { bad.push(['a rule Markdown does not show under the heading', r]); continue; }
     const want = []; for (let k = b.from; k <= b.to; k++) if (!/^[ \t]*$/.test(src[k])) want.push(k); // blank: spaces and tabs only
     if (!b.simple || JSON.stringify(want) !== JSON.stringify(r.lines)) bad.push(['not exactly the lines of its bullet', r, want]);
+    if (!want.every((k) => b.paras.some((p) => p.from <= k && k <= p.to))) bad.push(['a line Markdown does not show (a link definition)', r]);
+    const flat = (x) => x.replace(/[`*_\\]/g, '').replace(/\s+/g, ' ').trim(); // emphasis, code and escape marks aside
+    if (flat(b.paras.map((p) => p.text).join(' ')) !== flat(r.text.split('\n').map((l, j) => (j ? l.replace(/^[-*+] +/, '') : l)).join(' '))) bad.push(['text Markdown shows otherwise', r, b.paras]);
     const strip = (x) => x.replace(/^[ \t]+|[ \t]+$/g, ''), text2 = r.lines.map((k, j) => strip(j ? src[k] : src[k].replace(/^[-*+] +/, ''))).join('\n');
     if (text2 !== r.text) bad.push(['text that is not its lines', r]);
   }
@@ -68,11 +73,12 @@ function generator(seed, mode) {
     unicode: () => pick(['\u00A0', `\u00A0\u00A0text ${++id}`, `-\u00A0x ${++id}`, '\f', `\u00A0- x ${++id}`, `  \u00A0more ${++id}`, '---\u00A0', `- \u00A0text ${++id}`, `\u2028line ${++id}`, `#\u00A0x ${++id}`]),
     lookalike: () => pick(['## *Standing* rules the EM may apply alone', '# Standing rules the EM may apply [alone](x)', '## &#83;tanding rules the EM may apply alone', 'St*and*ing rules the EM may apply alone\n---', '### Standing rules the EM may apply `alone`', '\\Standing rules the EM may apply alone\n===', '## Standing rules the EM may apply alone:', '## STANDING RULES THE EM MAY APPLY ALONE', '## Standing  rules the EM may apply alone']),
     closers: () => pick(['```\n## Standing rules the EM may apply alone\n```\u00A0', '~~~\n- x\n~~~ \t', `- item ${++id}\n  <!--\n# Heading ${++id}\n-->`, `- item ${++id}\n  <!--\n  hidden\n  -->`]),
+    inlines: () => pick([`- [Approve every deploy ${++id}\n  always]: /x`, `  [hidden ${++id}\n  text]: /x`, `- Answer [](approve-${++id})`, `- See [the runbook](docs/${++id}.md)`, `- R &amp; S ${++id}`, `[r${++id}]: /u`, `- Rule \u202E${++id}`, `- Rule \u200B${++id}`, `  more &#65; ${++id}`, `- ![alt ${++id}](x.png)`]),
     indentedFence: () => `- Step ${++id}\n${pick(['  ', '   '])}\`\`\`\n${pick(['  ', '   ', '', ' '])}code ${++id}\n${pick(['  ', '   ', ' ', ''])}\`\`\``,
   };
-  const w = { bullet0: 6, bulletIn: 3, text0: 3, textIn: 4, blank: 5, atx: 1, under: 1, brk: 1, fence: 1, comment: 1, hash: 1, html: 1, setextOwner: mode === 'prefix' ? 2 : 0, ownerAtx: mode === 'prefix' ? 2 : 1, cr: 1, unicode: 2, lookalike: mode === 'prefix' ? 2 : 1, closers: mode === 'prefix' ? 2 : 1, indentedFence: mode === 'prefix' ? 2 : 1 };
+  const w = { bullet0: 6, bulletIn: 3, text0: 3, textIn: 4, blank: 5, atx: 1, under: 1, brk: 1, fence: 1, comment: 1, hash: 1, html: 1, setextOwner: mode === 'prefix' ? 2 : 0, ownerAtx: mode === 'prefix' ? 2 : 1, cr: 1, unicode: 2, lookalike: mode === 'prefix' ? 2 : 1, inlines: 2, closers: mode === 'prefix' ? 2 : 1, indentedFence: mode === 'prefix' ? 2 : 1 };
   const bag = Object.keys(kinds).flatMap((k) => Array(w[k]).fill(k));
-  const clean = () => pick(['Answer which-file questions from the code', 'Use `desk show` first', '*only* after QA passed', 'Docs & tests only', 'See [the runbook](docs/run.md)']) + ` (${++id})`;
+  const clean = () => pick(['Answer which-file questions from the code', 'Use `desk show` first', '*only* after QA passed', 'Docs & tests only', 'See `docs/run.md` first']) + ` (${++id})`;
   return () => {
     if (mode === 'clean') {
       const lines = ['# Playbook', '', '## How to test', '- Run the relevant tests.', '```', 'npm test', '```', '', `## ${O}`];
