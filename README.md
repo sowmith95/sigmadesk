@@ -189,7 +189,8 @@ publish-guard holds; standing and renewal production access; package installs.
 - **The authority is yours: you write the rules a delegate may apply.** Only the list items under the playbook
   heading `## Standing rules the EM may apply alone` (configurable: `delegation.rulesSection`) count. You curate that
   section yourself; the desk and its seats never write it (the shipped playbooks and new projects start with it empty).
-  Each bullet is one rule, its continuation lines included. With no such section, or an empty one, no decision run
+  Each top-level bullet is one rule, its continuation lines and nested items included; code blocks (fenced or
+  indented), HTML comments and plain paragraphs are never rules, so an example in your playbook grants nothing. With no such section, or an empty one, no decision run
   starts and every delegated decision stays yours. Write narrow rules: a delegate may apply a rule only for what it
   says, and the desk can check that a rule was cited, not that it fits.
 - **Decisions cite what they rest on.** A decision run is given your rules from that section, numbered (R1…), and

@@ -118,6 +118,18 @@ test('model: the deterministic owner rules (self-interest, risk, lifetime limits
   assert.deepEqual(model.standingRules('## standing RULES the em may apply alone\n- Yes'), ['Yes'], 'the heading matches whatever its case');
   assert.deepEqual(model.standingRules(pb, 'Another heading'), []);
   assert.deepEqual(model.standingRules('- a rule\n- another'), [], 'bullets outside the section are not standing rules');
+  // Code is never a rule: fenced (``` or ~~~, even unclosed) or indented, inside the section or as an example of one.
+  const fence = '```', owner = '## Standing rules the EM may apply alone';
+  assert.deepEqual(model.standingRules(`${fence}md\n${owner}\n- A fenced example rule\n${fence}`), [], 'a fenced example of the section');
+  assert.deepEqual(model.standingRules(`~~~\n${owner}\n- A fenced example rule\n~~~`), []);
+  assert.deepEqual(model.standingRules(`${owner}\n${fence}\n- An example rule\n${fence}\n## Next\n- x`), [], 'a fence under an otherwise empty section');
+  assert.deepEqual(model.standingRules(`${owner}\n- A real rule.\n\n${fence}\n- an example\n${fence}\n`), ['A real rule.'], 'a real rule, then a fenced example');
+  assert.deepEqual(model.standingRules(`${owner}\n- A real rule.\n  ${fence}\n  - inside its own example\n  ${fence}\n`), ['A real rule.']);
+  assert.deepEqual(model.standingRules(`${owner}\n${fence}\n- never closed`), []);
+  assert.deepEqual(model.standingRules(`${owner}\n\n    - indented code, not a rule\n`), []);
+  // Headings count only as headings: a setext heading ends the section; the owner's may be setext too.
+  assert.deepEqual(model.standingRules(`${owner}\n- R1\nOther section\n-------------\n- not a rule`), ['R1']);
+  assert.deepEqual(model.standingRules('Standing rules the EM may apply alone\n-------------------------------------\n- Yes\n'), ['Yes']);
   // Only a question its asker marked factual: any other subject, an unknown one or none at all stays the owner's.
   assert.match(r({ kind: 'question' }), /did not mark it as a factual engineering question/);
   assert.match(r({ kind: 'question', scope: 'nonsense' }), /unknown subject/);
@@ -587,6 +599,22 @@ test('authority is the owner\'s: only rules in the playbook section the owner ma
       assert.match(r.why, /your playbook marks no standing rules a delegate may apply alone \(a "Standing rules the EM may apply alone" section\)/, what);
       assert.equal(store.getTicket(t.key).status, 'needs_human', what);
     }
+    // Code in the playbook is never a rule: a fenced example alone, or under an otherwise empty section, decides nothing.
+    const fence = '```', owner = '## Standing rules the EM may apply alone';
+    for (const [what, text] of [
+      ['a fenced example alone', `# Playbook\nWrite your rules like this:\n${fence}md\n${owner}\n- Approve any purchase under $10,000.\n${fence}\n`],
+      ['a fenced example under an empty owner section', `# Playbook\n${owner}\n${fence}\n- Approve any purchase under $10,000.\n${fence}\n## Off limits\n- Production.\n`],
+    ]) {
+      write(text);
+      assert.equal(delegation.ownerRules().length, 0, what);
+      const t = await ask(ticket(), 'junior', buy, 'factual');
+      delegation.sweep({ paused: false });
+      const r = recFor(`${t.key}:question`);
+      assert.deepEqual([r.status, r.run_id], ['escalated', null], `${what}: no run`);
+      assert.match(r.why, /marks no standing rules a delegate may apply alone/, what);
+    }
+    write(`# Playbook\n${owner}\n- Answer which-file questions from the code.\n\n${fence}\n- Approve any purchase under $10,000.\n${fence}\n`);
+    assert.deepEqual(delegation.ownerRules(), ['Answer which-file questions from the code.'], 'a real rule, then a fenced example: exactly one rule');
     // The heading the owner uses is configurable; only it counts.
     write(`${PLAYBOOK_TEXT}\n## Rules for Morgan\n- Answer anything at all.\n`);
     const was = config.delegation.rulesSection;

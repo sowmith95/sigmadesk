@@ -191,33 +191,63 @@ export function ownerReason(f, nameOf = (s) => s) {
 
 // ---------------- what a decision may cite ----------------
 /**
- * The standing rules a delegate may apply alone: the list items under the playbook heading the OWNER marks for them
- * (delegation.rulesSection, any heading level), in order (R1, R2 …), each with its continuation lines and sub-items,
- * until the next heading of the same or a higher level. Text outside list items and HTML comments are not rules. No
- * such heading, or no item under it → [] (then nothing can be decided for the owner).
+ * The playbook's Markdown as a reader sees its blocks. Fenced code (``` or ~~~, closed by a matching fence), HTML comments
+ * (across lines too) and everything inside them are dropped whole, so nothing in an example can be a heading or a rule;
+ * an unclosed fence or comment swallows the rest. ATX and setext headings become headings, a thematic break a break.
+ * → [{ t: 'h', level, text } | { t: 'break' } | { t: 'blank' } | { t: 'line', indent, text }], tabs as four spaces.
+ */
+function markdownBlocks(text = '') {
+  const out = [];
+  let fence = null, comment = false;
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const src = raw.replace(/\t/g, '    ');
+    if (fence) { if (fence.test(src)) fence = null; continue; }
+    let line = '', rest = src;
+    while (rest) {
+      if (comment) { const end = rest.indexOf('-->'); if (end < 0) break; comment = false; rest = rest.slice(end + 3); continue; }
+      const at = rest.indexOf('<!--');
+      if (at < 0) { line += rest; break; }
+      line += rest.slice(0, at); rest = rest.slice(at + 4); comment = true;
+    }
+    const open = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (open) { fence = new RegExp(`^ {0,3}${open[1][0] === '`' ? '`' : '~'}{${open[1].length},}\\s*$`); continue; }
+    if (!line.trim()) { if (!src.trim()) out.push({ t: 'blank' }); continue; } // a line that was only a comment is nothing
+    const h = line.match(/^ {0,3}(#{1,6})(?:\s+(.*?))?\s*(?:#+\s*)?$/);
+    if (h) { out.push({ t: 'h', level: h[1].length, text: (h[2] || '').trim() }); continue; }
+    const under = line.match(/^ {0,3}(=+|-+)\s*$/);
+    if (under && out.at(-1)?.t === 'line') { const prev = out.pop(); out.push({ t: 'h', level: under[1][0] === '=' ? 1 : 2, text: prev.text.trim() }); continue; }
+    if (/^ {0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})$/.test(line)) { out.push({ t: 'break' }); continue; }
+    out.push({ t: 'line', indent: line.match(/^ */)[0].length, text: line });
+  }
+  return out;
+}
+/**
+ * The standing rules a delegate may apply alone: the top-level list items under the playbook heading the OWNER marks
+ * for them (delegation.rulesSection, any heading level), in order (R1, R2 …), each with its continuation lines and
+ * nested items, until the next heading of the same or a higher level. Code (fenced or indented), HTML comments, text
+ * outside list items and anything outside the section are not rules. No such heading, or no item under it → [] (then
+ * nothing is decided for the owner by a model).
  */
 export function standingRules(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
-  const lines = String(text || '').replace(/<!--[\s\S]*?(-->|$)/g, '').split('\n');
-  let i = 0, level = 0;
-  for (; i < lines.length && !level; i++) { const h = lines[i].match(/^(#{1,6})\s+(.*?)\s*#*\s*$/); if (h && norm(h[2]) === norm(heading)) level = h[1].length; }
-  if (!level) return [];
+  const blocks = markdownBlocks(text);
+  const at = blocks.findIndex((b) => b.t === 'h' && norm(b.text) === norm(heading));
+  if (at < 0) return [];
+  const level = blocks[at].level;
   const rules = [];
-  let cur = null, base = null, blank = false;
-  for (; i < lines.length; i++) {
-    const line = lines[i];
-    const h = line.match(/^(#{1,6})\s/);
-    if (h && h[1].length <= level) break; // the owner's section ends at the next heading of its level or higher
-    if (h) { cur = null; continue; }
-    if (!line.trim()) { blank = true; continue; }
-    const item = line.match(/^(\s*)(?:[-*+]|\d+[.)])\s+(.*\S)\s*$/);
-    const indent = line.match(/^\s*/)[0].length;
-    if (item && (base == null || indent <= base)) { base = base ?? indent; cur = [item[2]]; rules.push(cur); blank = false; continue; }
-    // A continuation (or a sub-item) belongs to the rule above it; after a blank line only an indented one does.
-    if (cur && (!blank || indent > (base ?? 0))) { cur.push(line.trim()); blank = false; continue; }
-    cur = null; blank = false; // a paragraph between rules is not a rule
+  let cur = null, blank = false;
+  for (const b of blocks.slice(at + 1)) {
+    if (b.t === 'h') { if (b.level <= level) break; cur = null; continue; } // the section ends at a heading of its level or higher
+    if (b.t === 'break') { cur = null; continue; }
+    if (b.t === 'blank') { blank = true; continue; }
+    const item = b.text.match(/^( {0,3})([-*+]|\d{1,9}[.)])( +)(\S.*)$/);
+    if (item && !(cur && b.indent >= 2)) { cur = { lines: [item[4].trim()], content: item[1].length + item[2].length + Math.min(item[3].length, 4) }; rules.push(cur); blank = false; continue; }
+    if (cur && !blank) { cur.lines.push(b.text.trim()); continue; } // a lazy continuation of the rule's paragraph
+    if (cur && b.indent >= 2 && b.indent < cur.content + 4) { cur.lines.push(b.text.trim()); blank = false; continue; } // more of the item
+    if (cur && b.indent >= cur.content + 4) continue; // code indented inside the item: nothing
+    cur = null; blank = false; // a paragraph or indented code outside every item: not a rule
   }
-  return rules.map((r) => r.join('\n').trim()).filter(Boolean).slice(0, 60);
+  return rules.map((r) => r.lines.join('\n').trim()).filter(Boolean).slice(0, 60);
 }
 /** desk decide --cite "R2, E1, file:src/x.py:40": the ids, in order, each once. */
 export function parseCites(raw) {
