@@ -1521,3 +1521,12 @@ export function kvSet(key, value) {
   db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
   q('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value));
 }
+export function kvDelete(key) {
+  db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
+  q('DELETE FROM kv WHERE key=?').run(key);
+}
+/** Every key that starts with `prefix` (a range scan on the primary key, so no LIKE wildcards apply), in key order. */
+export function kvByPrefix(prefix) {
+  db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
+  return q('SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key').all(prefix, `${prefix}\uffff`);
+}

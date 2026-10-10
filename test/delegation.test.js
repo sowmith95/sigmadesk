@@ -374,7 +374,7 @@ test('self-interest and risk escalate by rule, before any run: the asker never a
   for (const [t, re] of [[own, /Morgan asked this question, so Morgan cannot decide it for you/], [risky, /high risk/], [unknown, /no low-risk classification/]]) {
     const r = recFor(`${t.key}:question`);
     assert.equal(r.status, 'escalated', t.key); assert.match(r.why, re); assert.equal(r.run_id, null, 'no model call');
-    assert.ok(store.kvGet(`delegation:noticed:${r.decision_id}:${r.version}`), 'the owner is told, once');
+    assert.equal(store.kvGet(`delegation:owed:${t.key}`), null, 'nothing is owed: the owner was told when it was held');
   }
   assert.ok(!delegation.nextJobs().some((r) => [own.key, risky.key, unknown.key].includes(r.ticket_key)));
   const B = attention.board({ tickets: store.listTickets(), agents: [], events: [], settings: { ...store.getSettings(), paused: 'false' }, meta: { delegation: delegation.summary() } });
@@ -717,28 +717,50 @@ test('incidents: the SRE holds deploying merges and prepares an owner-only rever
   await assert.rejects(deploywatch.sreSuspects({ why: 'x', hours: 24 }), /no deployment in the last 24 hours is on record/);
 });
 
-test('notices: a delegated hold is announced only when it comes back to the owner, even if the kind is switched off first', async () => {
+test('notices: a held-back notice is an obligation on the hold; no change of evidence, decision, kind or mode loses it, and it is paid once', async () => {
   reset();
   policy({ question: 'em' });
   store.setSetting('paused', 'false');
+  const owed = (t) => store.kvGet(`delegation:owed:${t.key}`);
+  const noticed = (t) => store.kvGet(`delegation:noticed:${t.key}`);
   try {
-    const t = await ask(ticket());
-    const d = `${t.key}:question`;
-    const key = store.handle().prepare("SELECT key FROM kv WHERE key LIKE ?").get(`delegation:deferred:${d}:%`)?.key;
-    assert.ok(key, 'the hold\'s notice was deferred and remembered');
-    const version = key.split(':').at(-1);
-    assert.equal(store.kvGet(`delegation:noticed:${d}:${version}`), null, 'not announced yet: Morgan has it');
-    // The owner switches questions back to themselves before any record exists: the deferred hold must not sit silent.
+    // The reproduced sequence: held back, head_sha changes before any record exists, questions go back to the owner.
+    const a = await ask(ticket());
+    assert.ok(owed(a), 'held back: Morgan has it'); assert.equal(noticed(a), null);
+    store.updateTicket(a.key, { head_sha: 'b'.repeat(40) });
     policy({ question: 'owner' });
     delegation.sweep({ paused: false });
-    assert.ok(store.kvGet(`delegation:noticed:${d}:${version}`), 'announced once the decision is the owner\'s again');
-    // A hold the delegate still has is not announced.
+    assert.ok(noticed(a), 'announced once the decision is the owner\'s again'); assert.equal(owed(a), null, 'and only once');
+    // Every other way a held-back decision comes back to the owner announces it too.
+    for (const [what, comeBack] of [
+      ['new evidence, then the kind went to shadow', (t) => { store.addComment(t.key, 'senior-be', 'One more detail.'); policy({ question: 'shadow' }); delegation.sweep({ paused: false }); }],
+      ['the hold became one no delegate may decide', (t) => { store.updateTicket(t.key, { hold_kind: 'guard', hold_ref: null }); delegation.sweep({ paused: false }); }],
+      ['the desk was halted with it queued', () => { delegation.sweep({ paused: true }); }],
+      ['a rule sent the new version back (now high risk)', (t) => { store.updateTicket(t.key, { risk: 'high' }); delegation.sweep({ paused: false }); }],
+      ['the matrix changed while it was queued', () => { policy({ question: 'em', design: 'sre' }); }],
+      ['the desk restarted while its run worked', (t) => { const r = recFor(`${t.key}:question`); bind(r); sched.recoverOrphans(); }],
+    ]) {
+      policy({ question: 'em' });
+      const t = await ask(ticket());
+      delegation.sweep({ paused: false });
+      assert.equal(recFor(`${t.key}:question`)?.status, 'queued', what);
+      assert.equal(noticed(t), null, `${what}: not announced while Morgan has it`);
+      comeBack(store.getTicket(t.key));
+      delegation.sweep({ paused: store.getSettings().paused === 'true' });
+      assert.ok(noticed(t), `${what}: announced`);
+      assert.equal(owed(t), null, `${what}: paid`);
+    }
+    // Nothing is owed when the delegate decides it, or when the hold ends before anyone needs to be told.
     policy({ question: 'em' });
-    const t2 = await ask(ticket());
+    const done = await ask(ticket());
     delegation.sweep({ paused: false });
-    const r2 = recFor(`${t2.key}:question`);
-    assert.equal(r2.status, 'queued');
-    assert.equal(store.kvGet(`delegation:noticed:${r2.decision_id}:${r2.version}`), null);
+    await sched.deskAction(bind(recFor(`${done.key}:question`)), 'decide', { cite: 'R1,E1', action: 'answer', body: 'utils/net.py:40.', why: 'utils/net.py:40 defines retry(); the playbook says reuse.' });
+    delegation.sweep({ paused: false });
+    assert.deepEqual([owed(done), noticed(done)], [null, null], 'decided for the owner: nothing to announce');
+    const answered = await ask(ticket());
+    sched.ownerReply(answered.key, 'Use the shared helper.', 'answer', { mentions: [] });
+    delegation.sweep({ paused: false });
+    assert.deepEqual([owed(answered), noticed(answered)], [null, null], 'the owner answered it first');
   } finally { store.setSetting('paused', 'true'); }
 });
 

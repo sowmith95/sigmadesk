@@ -232,20 +232,23 @@ export function takesNotice(t, settings = store.getSettings()) {
   const m = policy(settings).kinds[d.kind];
   return m === 'em' || m === 'sre';
 }
-const deferredKey = (decisionId, v) => `delegation:deferred:${decisionId}:${v}`;
-/** takesNotice, and remember that the owner was not told (the sweep's safety net then makes sure they will be). */
+// The owner's notice of a hold, while delegation holds it back: an obligation on the HOLD (the ticket's needs_human
+// episode), not on a decision version, so no change of evidence, decision or mode can lose it. It is discharged by
+// telling the owner, by the delegate applying the decision, or by the hold ending.
+const owedKey = (key) => `delegation:owed:${key}`;
+/** takesNotice, and record that the owner was not told (the sweep's safety net then makes sure they will be). */
 export function deferNotice(t, settings = store.getSettings()) {
   if (!takesNotice(t, settings)) return false;
-  const d = ticketDecision(t, { settled: false });
-  store.kvSet(deferredKey(d.decision_id, evidenceFingerprint(d.kind, t)), isoNow());
+  store.kvSet(owedKey(t.key), JSON.stringify({ at: isoNow(), decision_id: ticketDecision(t, { settled: false })?.decision_id || null }));
   return true;
 }
+/** Tell the owner about a held ticket, if delegation still owes them that notice (once per hold). */
 function noticeOwner(r, text) {
-  if (!r || !['em', 'sre'].includes(r.mode)) return; // shadow and owner mode: the hold notified the owner already
-  const k = `delegation:noticed:${r.decision_id}:${r.version}`;
-  if (store.kvGet(k)) return;
-  store.kvSet(k, isoNow());
-  notify('needs_human', r.ticket_key ? store.getTicket(r.ticket_key) : null, text);
+  const key = r?.ticket_key;
+  if (!key || store.kvGet(owedKey(key)) == null) return; // told when it was held (or since): never twice
+  store.kvDelete(owedKey(key));
+  store.kvSet(`delegation:noticed:${key}`, isoNow());
+  notify('needs_human', store.getTicket(key), text);
 }
 
 // ---------------- records ----------------
@@ -299,9 +302,9 @@ export function sweep({ now = Date.now(), paused = store.getSettings().paused ==
       else if (escalate(r, late)) out.escalated++;
     }
   }
-  if (paused || !delegated) { safetyNet(); return out; }
+  if (paused || !delegated) { safetyNet(paused); return out; }
   for (const c of live.values()) consider(c, { pol, out });
-  safetyNet();
+  safetyNet(paused);
   return out;
 }
 /**
@@ -348,19 +351,21 @@ export function triageOwnerTask(key, { paused = store.getSettings().paused === '
   return consider({ ...d, ticket: t, version: evidenceFingerprint(d.kind, t) });
 }
 /**
- * Safety net, after records are opened: a hold whose notice was deferred must never sit silent. Unless its delegate still
- * has it (queued or running for the owner) or decided it, tell the owner now, once per decision version: no record could
- * be opened, the run failed, the kind was switched to shadow or to the owner, or the decision lapsed.
+ * Safety net, after records are opened: a hold whose notice was held back never sits silent. Each obligation is checked
+ * against the ticket as it is now. The hold ended: nothing to tell. Its run is still finishing: wait. Otherwise the
+ * owner is told now unless the delegate still has the CURRENT decision for the owner (running, or queued while the
+ * desk runs): a decision that changed, moved to another kind, has no record, was halted with the desk, failed, lapsed,
+ * went to shadow or to the owner, or is no longer delegable at all is the owner's again.
  */
-function safetyNet() {
-  for (const t of store.ticketsByStatus('needs_human')) {
+function safetyNet(paused = store.getSettings().paused === 'true') {
+  for (const { key: k } of store.kvByPrefix('delegation:owed:')) {
+    const t = store.getTicket(k.slice('delegation:owed:'.length));
+    if (!t || t.status !== 'needs_human') { store.kvDelete(k); continue; }
+    if (t.active_run) continue;
     const d = ticketDecision(t);
-    if (!d) continue;
-    const v = evidenceFingerprint(d.kind, t);
-    if (!store.kvGet(deferredKey(d.decision_id, v))) continue;
-    const r = store.delegationFor(d.decision_id, v);
-    const handled = r && ['em', 'sre'].includes(r.mode) && ['queued', 'running', 'applied'].includes(r.status);
-    if (!handled) noticeOwner({ mode: 'em', decision_id: d.decision_id, version: v, ticket_key: t.key }, 'needs you');
+    const r = d ? store.delegationFor(d.decision_id, evidenceFingerprint(d.kind, t)) : null;
+    const handled = r && ['em', 'sre'].includes(r.mode) && (r.status === 'running' || (r.status === 'queued' && !paused));
+    if (!handled) noticeOwner({ ticket_key: t.key }, 'needs you');
   }
 }
 /**
@@ -641,6 +646,7 @@ export function decide(r, choice, { run = null, deterministic = false } = {}) {
       decided_at: isoNow(), ended_at: isoNow(), outcome: applied.outcome,
       provenance: { ...json(rec.provenance, {}), applied_at: isoNow(), run_id: run?.id || null, model: run ? store.getRun(run.id)?.model : null, delegation_version: rec.delegation_version, policy_version: rec.policy_version, deterministic } }),
     'this decision changed while it was being applied', 409);
+    store.kvDelete(owedKey(rec.ticket_key)); // decided for the owner: nothing comes back to them to be told about
     message = `Decided for the owner and applied: ${applied.outcome} Stop now.`;
   });
   after = store.getDelegation(r.id);

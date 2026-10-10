@@ -129,7 +129,10 @@ test('through the real CLI, an answer that cites nothing it was given is not app
 test('one attempt: a run that ends without desk decide hands the decision to the owner, explained', async () => {
   fresh();
   delegation.setPolicy({ kinds: { question: 'em' } });
-  const t = await held();
+  store.setSetting('paused', 'false'); // the desk is running: the hold's notice waits for the delegate
+  let t;
+  try { t = await held(); } finally { store.setSetting('paused', 'true'); }
+  assert.ok(store.kvGet(`delegation:owed:${t.key}`), 'not announced while Morgan has it');
   delegation.sweep({ paused: false });
   const r = open(t);
   plan([['show']]);
@@ -137,7 +140,8 @@ test('one attempt: a run that ends without desk decide hands the decision to the
   const after = store.getDelegation(r.id);
   assert.equal(after.status, 'escalated');
   assert.match(after.why, /Morgan ended without a decision\. One attempt per decision, so it is yours now\./);
-  assert.ok(store.kvGet(`delegation:noticed:${after.decision_id}:${after.version}`), 'the owner is told');
+  assert.ok(store.kvGet(`delegation:noticed:${t.key}`), 'the owner is told');
+  assert.equal(store.kvGet(`delegation:owed:${t.key}`), null);
   assert.equal(await delegation.launch(store.getDelegation(r.id)), null, 'never retried');
   assert.equal(store.getTicket(t.key).status, 'needs_human', 'still the owner\'s to answer');
 });

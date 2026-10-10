@@ -203,6 +203,11 @@ publish-guard holds; standing and renewal production access; package installs.
   low-risk tickets; lifetime limits that survive revisions. A decision is applied in one transaction after re-checking
   its evidence fingerprint, the delegation settings and the desk's general policy (production access, merge and sync
   settings); if any of them changed, nothing is applied.
+- **Notices.** While a delegate holds a decision for you, the hold's push notice waits. It is owed on the hold itself,
+  not on a version of the decision: when the decision comes back to you for any reason (an escalation, a failed run,
+  a halted desk, a policy change, the kind switched to shadow or back to you, a hold no delegate may decide) you are
+  told once, however its evidence changed in between. A decision the delegate applies is listed under Decided for you
+  instead.
 - **Escalate everything** (Settings) makes every decision yours at once and stops decisions in progress; so does any
   change to the matrix for the decisions in flight. `delegation.enabled: false` in the config (or
   `SIGMADESK_DELEGATION=off`) turns delegation off whatever is saved.
