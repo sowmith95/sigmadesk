@@ -774,10 +774,20 @@ function evidenceLines(ev) {
  * Record a checkpoint verdict and post it. A regression is held FIRST, in its own transaction (hold, page, verdict);
  * the publisher work for the revert plan and the incident/revert tickets come after (and are recovered by the sweep).
  */
-export async function finish(cp, verdict, { summary, evidence, limited = false, author = 'system', sre = null }) {
+/**
+ * Record a checkpoint's verdict and its effects (the ticket comment, a regression hold, the roll-up). expect: the SRE
+ * run giving it ({ id, token }); its authority is checked inside the same transaction, before anything is written, so
+ * a run stopped (cancelled, timed out, over its steps) or a checkpoint that moved on while the verdict was being
+ * checked records nothing.
+ */
+export async function finish(cp, verdict, { summary, evidence, limited = false, author = 'system', sre = null, expect = null }) {
   const ev = { ...(evidence || {}), ...(sre ? { sre } : {}) };
-  let held = null;
+  let held = null, stale = false;
   store.transaction(() => {
+    if (expect) {
+      const live = store.getRun(expect.id), now = store.getCheckpoint(cp.id);
+      if (!live || live.status !== 'running' || !live.token || live.token !== expect.token || !now || now.status !== 'sre_running' || now.run_id !== expect.id) { stale = true; return; }
+    }
     const fresh = store.getWatch(cp.watch_id);
     if (!fresh || fresh.status === 'superseded') { store.updateCheckpoint(cp.id, { status: 'superseded', completed_at: iso(clock.now()), evidence: JSON.stringify(ev) }); return; }
     const t = fresh.ticket_key ? store.getTicket(fresh.ticket_key) : null;
@@ -790,6 +800,7 @@ export async function finish(cp, verdict, { summary, evidence, limited = false, 
     if (verdict === 'regression') { holdRegression(fresh, cp, ev); held = store.getWatch(fresh.id); }
     else rollUp(fresh.id);
   });
+  if (stale) throw err('this run was stopped, or its checkpoint moved on, while its verdict was being checked, so nothing was recorded; stop now');
   if (held) await ensureRegressionTickets(held, cp, ev).catch((e) => store.logEvent({ kind: 'error', agent_id: 'system', ticket_key: held.ticket_key, text: `regression tickets: ${String(e.message).slice(0, 200)}` }));
   github.flushOutbox()?.catch?.(() => {});
   return { status: 'done', verdict };
@@ -1022,7 +1033,8 @@ export async function command(run, body) {
     finalEv = { ...re, sre_settled: (re.items || []).filter((i) => i.result === 'anomaly').map(evKey) };
   }
   const limited = action === 'verified' && store.getWatch(cp.watch_id)?.criteria_source !== 'ticket';
-  await finish(cp, action, { summary: text, evidence: finalEv, limited, author: run.agent_id, sre: { seat: run.agent_id, verdict: action, text, run_id: run.id, fresh_probes: fresh, at: iso(clock.now()) } });
+  await finish(cp, action, { summary: text, evidence: finalEv, limited, author: run.agent_id, sre: { seat: run.agent_id, verdict: action, text, run_id: run.id, fresh_probes: fresh, at: iso(clock.now()) },
+    expect: { id: run.id, token: run.token } }); // the run's authority, rechecked when the verdict is written
   return 'Recorded. Stop now.';
 }
 

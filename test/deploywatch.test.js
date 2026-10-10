@@ -66,7 +66,7 @@ process.env.SIGMADESK_CONFIG = cfgFile;
 process.env.SIGMADESK_WORKSPACES = path.join(tmp, 'workspaces');
 
 let config, store, ops, access, sched, train, dw, cal, reviews, attention, departments;
-let appSrv; const app = { status: 200, body: '{"status":"ok"}' };
+let appSrv; const app = { status: 200, body: '{"status":"ok"}', delayMs: 0 };
 before(async () => {
   ({ config } = await import('../src/config.js'));
   config.root = tmp; config.dataDir = path.join(tmp, 'data');
@@ -80,7 +80,7 @@ before(async () => {
   reviews = await import('../src/reviews.js');
   attention = await import('../public/attention.js');
   departments = await import('../public/departments.js');
-  appSrv = http.createServer((req, res) => { res.writeHead(app.status, { 'Content-Type': 'application/json' }); res.end(app.body); });
+  appSrv = http.createServer((req, res) => setTimeout(() => { res.writeHead(app.status, { 'Content-Type': 'application/json' }); res.end(app.body); }, app.delayMs || 0));
   await new Promise((r) => appSrv.listen(0, '127.0.0.1', r));
   config.ops.appHealth.baseUrl = `http://127.0.0.1:${appSrv.address().port}`;
   ops.setNow(() => new Date('2026-10-03T15:00:00Z')); // a Saturday: normal (not market-hours) probe limits
@@ -1195,4 +1195,39 @@ test('watch steps are enforced across attempts: a plan-billed check stops past w
   tools(ctx3, 100);
   assert.deepEqual([store.getRun(run3.id).status, ctx3.state.steps], ['running', 100]);
   store.updateRun(run3.id, { status: 'success', token: null, ended_at: store.now() });
+});
+
+test('a watch run stopped while the desk takes its fresh look records no verdict: cancelled, timed out or over its steps', async () => {
+  const runner = await import('../src/runner.js');
+  for (const [what, stop] of [
+    ['cancelled', (r) => runner.killRun(r.id, 'owner cancelled')],
+    ['timed out', (r) => runner.killRun(r.id, 'timeout')],
+    ['over its steps', (r) => runner.applyEvents([1, 2, 3].map((i) => ({ type: 'tool', text: `Probe ${i}` })), { run: r, state: {}, presence: false, maxSteps: 1 })],
+  ]) {
+    reset();
+    const t = doneTicket({ prod_verify: 'fills panel shows today' });
+    const { m } = await deployed(t);
+    app.body = sha40(m);
+    docker({ inspect: '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' }); // one restart: the SRE is asked
+    dw.clock.now = () => at(9);
+    await dw.sweep({ now: at(9) });
+    const cp = dw.claimJob(dw.nextJobs()[0].checkpoint);
+    const r = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t.key, token: `stop${++seq}`, model: 'x', job: { checkpoint: cp.id } });
+    store.updateCheckpoint(cp.id, { run_id: r.id });
+    const g = access.ownerGrant({ seat: 'sre', probes: ['*'], minutes: 30, reason: 'test' });
+    ops.clearCache();
+    await ops.handle(r, { probe: 'container_status' }); // the anomaly's own fresh probe: "verified" is allowed
+    app.delayMs = 900; // the desk's own fresh look (the app's health) takes a while
+    try {
+      const recording = sched.deskAction(store.getRun(r.id), 'watch', { action: 'verified', body: 'the restart was the deploy itself; all healthy' });
+      await new Promise((res) => setTimeout(res, 300));
+      stop(store.getRun(r.id));
+      assert.equal(store.getRun(r.id).status, 'killed', what);
+      await assert.rejects(recording, /was stopped, or its checkpoint moved on, while its verdict was being checked, so nothing was recorded/, what);
+    } finally { app.delayMs = 0; store.endGrant(g.id, 'owner', 'reset'); }
+    const after = store.getCheckpoint(cp.id);
+    assert.notEqual(after.verdict, 'verified', `${what}: no verdict`);
+    assert.equal(after.status, 'sre_running', `${what}: still the SRE's to finish (or ask again)`);
+    assert.ok(!store.listComments(t.key).some((c) => /Production .*: verified/i.test(c.body)), `${what}: nothing posted`);
+  }
 });
