@@ -1411,6 +1411,7 @@ export const getDelegation = (id) => q('SELECT * FROM delegated_decisions WHERE 
 export const delegationFor = (decisionId, version) => q('SELECT * FROM delegated_decisions WHERE decision_id=? AND version=?').get(decisionId, version) || null;
 export const delegationsByStatus = (...statuses) => q(`SELECT * FROM delegated_decisions WHERE status IN (${statuses.map(() => '?').join(',')}) ORDER BY id`).all(...statuses);
 export const delegationsSince = (iso) => q('SELECT * FROM delegated_decisions WHERE created_at >= ? ORDER BY id').all(iso);
+export const delegationsByStatusSince = (iso, ...statuses) => q(`SELECT * FROM delegated_decisions WHERE created_at >= ? AND status IN (${statuses.map(() => '?').join(',')}) ORDER BY id`).all(iso, ...statuses);
 export const delegationsForTicket = (key) => q('SELECT * FROM delegated_decisions WHERE ticket_key=? ORDER BY id').all(key);
 export const recentDelegations = (limit = 50) => q('SELECT * FROM delegated_decisions ORDER BY id DESC LIMIT ?').all(limit);
 export const runsOfDelegation = (id) => q("SELECT * FROM runs WHERE kind='decide' AND json_extract(job, '$.delegation') = ? ORDER BY id").all(id);

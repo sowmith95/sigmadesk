@@ -470,3 +470,71 @@ test('incidents: the SRE holds deploying merges and prepares an owner-only rever
   store.updateWatch(w.id, { status: 'superseded', hold: 0 });
   await assert.rejects(deploywatch.sreSuspects({ why: 'x', hours: 24 }), /no deployment in the last 24 hours is on record/);
 });
+
+test('notices: a delegated hold is announced only when it comes back to the owner, even if the kind is switched off first', async () => {
+  reset();
+  policy({ question: 'em' });
+  store.setSetting('paused', 'false');
+  try {
+    const t = await ask(ticket());
+    const d = `${t.key}:question`;
+    const key = store.handle().prepare("SELECT key FROM kv WHERE key LIKE ?").get(`delegation:deferred:${d}:%`)?.key;
+    assert.ok(key, 'the hold\'s notice was deferred and remembered');
+    const version = key.split(':').at(-1);
+    assert.equal(store.kvGet(`delegation:noticed:${d}:${version}`), null, 'not announced yet: Morgan has it');
+    // The owner switches questions back to themselves before any record exists: the deferred hold must not sit silent.
+    policy({ question: 'owner' });
+    delegation.sweep({ paused: false });
+    assert.ok(store.kvGet(`delegation:noticed:${d}:${version}`), 'announced once the decision is the owner\'s again');
+    // A hold the delegate still has is not announced.
+    policy({ question: 'em' });
+    const t2 = await ask(ticket());
+    delegation.sweep({ paused: false });
+    const r2 = recFor(`${t2.key}:question`);
+    assert.equal(r2.status, 'queued');
+    assert.equal(store.kvGet(`delegation:noticed:${r2.decision_id}:${r2.version}`), null);
+  } finally { store.setSetting('paused', 'true'); }
+});
+
+test('shadow only takes idle time: its runs queue apart, a late one ends quietly, and the daily allowance never opens one', async () => {
+  reset();
+  policy({ question: 'shadow', loop_limit: 'em' });
+  const s = await ask(ticket());
+  const l = ticket({ status: 'needs_human', assignee: 'junior', builder: 'junior', qa_loops: 3, resume_status: 'todo', hold_kind: 'qa_loops' });
+  delegation.sweep({ paused: false });
+  const rs = recFor(`${s.key}:question`), rl = recFor(`${l.key}:stuck`);
+  assert.deepEqual(delegation.nextJobs({ shadow: false }).map((r) => r.id).filter((id) => [rs.id, rl.id].includes(id)), [rl.id], 'decisions for the owner run early in the tick');
+  assert.deepEqual(delegation.nextJobs({ shadow: true }).map((r) => r.id).filter((id) => [rs.id, rl.id].includes(id)), [rs.id], 'shadow ones after grooming');
+  store.handle().prepare('UPDATE delegated_decisions SET created_at=? WHERE id=?').run(new Date(Date.now() - 31 * 60_000).toISOString(), rs.id);
+  delegation.sweep({ paused: false });
+  assert.equal(store.getDelegation(rs.id).status, 'failed', 'a shadow decision that never ran is not an escalation');
+  assert.equal(delegation.summary().open[`${s.key}:question`], undefined, 'nothing is shown on the card for it');
+  const prev = config.delegation.maxPerDay;
+  config.delegation.maxPerDay = 0;
+  try {
+    const s2 = await ask(ticket());
+    delegation.sweep({ paused: false });
+    assert.equal(recFor(`${s2.key}:question`), null, 'shadow over the allowance: no record, no noise');
+  } finally { config.delegation.maxPerDay = prev; }
+});
+
+test('overrides replace what the next run reads: a proposal\'s revision notes, and the latest rework note', async () => {
+  reset();
+  policy({ research: 'em', loop_limit: 'em' });
+  const t = store.createTicket({ title: 'Override fixture', status: 'proposed', reporter: 'pm', source: 'research', description: '## Problem\nx\n## Evidence\ny' });
+  researchReview.open(t, { program: 'product-discovery', review: { minReviewers: 1, reviewers: ['principal-be'] } }, { id: 1 });
+  const rv = store.createResearchReview({ ticket_key: t.key, generation: 1, input_hash: researchReview.hashOf(store.getTicket(t.key)), reviewer: 'principal-be', status: 'pending' });
+  researchReview.complete(rv.id, { report: { verdict: 'reject', summary: 'No evidence', evidence_checked: [], findings: ['x'], conditions: ['y'] } });
+  delegation.sweep({ paused: false });
+  const r = recFor(`${t.key}:research:1`);
+  await sched.deskAction(bind(r), 'decide', { action: 'changes', body: 'Cite a source.', why: 'The reviewer found no source; the playbook needs one.' });
+  delegation.ownerOverride(r.id, { message: 'Narrow it to the alert only and cite the vendor docs.' });
+  assert.equal(store.kvGet(`research-notes:${t.key}`), 'Narrow it to the alert only and cite the vendor docs.', 'the revision run reads the owner\'s notes');
+  const l = ticket({ status: 'needs_human', assignee: 'junior', builder: 'junior', qa_loops: 3, resume_status: 'todo', hold_kind: 'qa_loops' });
+  delegation.sweep({ paused: false });
+  const rl = recFor(`${l.key}:stuck`);
+  await sched.deskAction(bind(rl), 'decide', { action: 'changes', body: 'Fix only the parser.', why: 'Three QA fails on the cache; smallest change.' });
+  delegation.ownerOverride(rl.id, { message: 'Keep the cache; fix its key.' });
+  const notes = store.listComments(l.key).filter((c) => /^(❌|🔁)/.test(c.body));
+  assert.match(notes.at(-1).body, /^🔁 \*\*The owner overrode Morgan's decision\*\*[\s\S]*Keep the cache; fix its key/, 'rework reads the owner\'s note, not Morgan\'s');
+});

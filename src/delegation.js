@@ -180,6 +180,14 @@ export function takesNotice(t, settings = store.getSettings()) {
   const m = policy(settings).kinds[d.kind];
   return m === 'em' || m === 'sre';
 }
+const deferredKey = (decisionId, v) => `delegation:deferred:${decisionId}:${v}`;
+/** takesNotice, and remember that the owner was not told (the sweep's safety net then makes sure they will be). */
+export function deferNotice(t, settings = store.getSettings()) {
+  if (!takesNotice(t, settings)) return false;
+  const d = ticketDecision(t, { settled: false });
+  store.kvSet(deferredKey(d.decision_id, versionFor(d.kind, t)), isoNow());
+  return true;
+}
 function noticeOwner(r, text) {
   if (!r || !['em', 'sre'].includes(r.mode)) return; // shadow and owner mode: the hold notified the owner already
   const k = `delegation:noticed:${r.decision_id}:${r.version}`;
@@ -232,16 +240,21 @@ export function sweep({ now = Date.now(), paused = store.getSettings().paused ==
   const out = { created: 0, applied: 0, escalated: 0, superseded: 0 };
   const settings = store.getSettings();
   const pol = policy(settings);
-  const live = new Map(candidates().map((c) => [c.decision_id, c]));
-  for (const r of store.delegationsByStatus(...OPEN)) {
+  const delegated = Object.values(pol.kinds).some((m) => m !== 'owner');
+  const open = store.delegationsByStatus(...OPEN);
+  const live = delegated || open.length ? new Map(candidates().map((c) => [c.decision_id, c])) : new Map();
+  for (const r of open) {
     const c = live.get(r.decision_id);
     if (!c || c.version !== r.version) { if (supersede(r, c ? 'The decision changed before it was applied (a newer question, hold or revision).' : 'It was settled before it was applied (you or the team acted first).')) out.superseded++; continue; }
     if (r.delegation_version !== version(settings) || pol.kinds[r.kind] !== r.mode) { if (store.transitionDelegation(r.id, OPEN, { status: 'invalidated', outcome: 'The delegation settings changed before it was applied. The decision is yours.', ended_at: isoNow() })) { if (r.run_id && store.getRun(r.run_id)?.token) runner.killRun(r.run_id, 'delegation settings changed'); noticeOwner(store.getDelegation(r.id), `${first(r.seat)} no longer decides this: the delegation settings changed`); } continue; }
     if (r.status === 'queued' && now - Date.parse(r.created_at) > limits().maxWaitMinutes * 60_000) {
-      if (escalate(r, `${first(r.seat)} did not get to it within ${limits().maxWaitMinutes} minutes${paused ? ' (the desk is halted)' : ''}`)) out.escalated++;
+      const late = `${first(r.seat)} did not get to it within ${limits().maxWaitMinutes} minutes${paused ? ' (the desk is halted)' : ''}`;
+      // In shadow the owner decides anyway: a run that never happened is no decision to show, so it ends quietly.
+      if (r.mode === 'shadow') store.transitionDelegation(r.id, ['queued'], { status: 'failed', outcome: `Shadow: ${late}; nothing to compare.`, ended_at: isoNow() });
+      else if (escalate(r, late)) out.escalated++;
     }
   }
-  if (paused) return out;
+  if (paused || !delegated) { safetyNet(); return out; }
   const L = limits();
   for (const c of live.values()) {
     const mode = pol.kinds[c.kind];
@@ -252,6 +265,7 @@ export function sweep({ now = Date.now(), paused = store.getSettings().paused ==
     if (!r) {
       // A day's allowance of decision runs bounds the cost; rule-decided triage costs nothing and is not counted.
       if (!model.KINDS[c.kind].deterministic && L.maxPerDay >= 0 && runsToday() + store.delegationsByStatus('queued').filter((x) => !model.KINDS[x.kind].deterministic).length >= L.maxPerDay) {
+        if (mode === 'shadow') continue; // the owner decides anyway; no record, no noise
         r = create(c, mode, seat); out.created++;
         if (escalate(r, `today's allowance of ${L.maxPerDay} delegated decision runs is used up`)) out.escalated++;
         continue;
@@ -263,19 +277,30 @@ export function sweep({ now = Date.now(), paused = store.getSettings().paused ==
     if (why) { if (escalate(r, why)) out.escalated++; continue; }
     if (model.KINDS[c.kind].deterministic) { const res = triage(r, c); if (res === 'applied' || res === 'shadow') out.applied++; }
   }
-  // Safety net: a delegated hold must never sit silent. If its decision came back to the owner by a path that did not
-  // notify (the run failed, a record could not be opened), notify now (once per decision version).
-  for (const t of store.ticketsByStatus('needs_human')) {
-    if (!takesNotice(t, settings)) continue;
-    const d = ticketDecision(t);
-    if (!d) continue;
-    const r = store.delegationFor(d.decision_id, versionFor(d.kind, t));
-    if (!r || ['escalated', 'invalidated', 'failed', 'superseded'].includes(r.status)) noticeOwner(r || { mode: pol.kinds[d.kind], decision_id: d.decision_id, version: versionFor(d.kind, t), ticket_key: t.key }, 'needs you');
-  }
+  safetyNet();
   return out;
 }
-/** Model-decided records waiting for their delegate (the scheduler launches them through its admission). */
-export const nextJobs = () => store.delegationsByStatus('queued').filter((r) => !model.KINDS[r.kind]?.deterministic);
+/**
+ * Safety net, after records are opened: a hold whose notice was deferred must never sit silent. Unless its delegate still
+ * has it (queued or running for the owner) or decided it, tell the owner now, once per decision version: no record could
+ * be opened, the run failed, the kind was switched to shadow or to the owner, or the decision lapsed.
+ */
+function safetyNet() {
+  for (const t of store.ticketsByStatus('needs_human')) {
+    const d = ticketDecision(t);
+    if (!d) continue;
+    const v = versionFor(d.kind, t);
+    if (!store.kvGet(deferredKey(d.decision_id, v))) continue;
+    const r = store.delegationFor(d.decision_id, v);
+    const handled = r && ['em', 'sre'].includes(r.mode) && ['queued', 'running', 'applied'].includes(r.status);
+    if (!handled) noticeOwner({ mode: 'em', decision_id: d.decision_id, version: v, ticket_key: t.key }, 'needs you');
+  }
+}
+/**
+ * Model-decided records waiting for their delegate (the scheduler launches them through its admission). Decisions for
+ * the owner go early in the tick (they unblock work); shadow ones only take a seat's idle time, after grooming.
+ */
+export const nextJobs = ({ shadow = false } = {}) => store.delegationsByStatus('queued').filter((r) => !model.KINDS[r.kind]?.deterministic && (r.mode === 'shadow') === shadow);
 
 // ---------------- owner-task triage: by rule, no model call ----------------
 const packageSeat = (t) => builderCandidates({ area: t.area, complexity: t.complexity || 'S', risk: t.risk })[0] || null;
@@ -561,7 +586,9 @@ export function ownerOverride(id, { message = '' } = {}) {
   need(t, 'the ticket is gone', 409);
   store.transaction(() => {
     need(store.transitionDelegation(r.id, ['applied'], { status: 'overridden', override_note: text.slice(0, 2000), override_at: isoNow(), outcome: `You overrode it: ${text.slice(0, 300)}` }), 'this decision changed meanwhile', 409);
-    store.addComment(t.key, 'owner', `↩️ **The owner overrode ${first(r.seat)}'s decision** (${model.lineFor(r, first)})\n\n${text}\n\nFollow this instead of ${first(r.seat)}'s ${r.action === 'answer' ? 'answer' : 'decision'}.`);
+    // What the next run reads: a proposal not yet revised takes the owner's notes; rework reads the latest 🔁 note.
+    if (r.kind === 'research' && t.research_review === 'changes') store.kvSet(`research-notes:${t.key}`, text.slice(0, 4000));
+    store.addComment(t.key, 'owner', `${r.kind === 'loop_limit' ? '🔁' : '↩️'} **The owner overrode ${first(r.seat)}'s decision** (${model.lineFor(r, first)})\n\n${text}\n\nFollow this instead of ${first(r.seat)}'s ${r.action === 'answer' ? 'answer' : 'decision'}.`);
   });
   store.logEvent({ kind: 'action', agent_id: 'owner', ticket_key: r.ticket_key, text: `overrode ${first(r.seat)}'s delegated decision #${r.id}` });
   github.flushComments();
@@ -637,7 +664,7 @@ export function summary(now = Date.now(), settings = store.getSettings()) {
   const recs = store.delegationsSince(since).map((r) => view(r, stats));
   const pol = policy(settings);
   const open = {};
-  for (const r of store.delegationsByStatus('queued', 'running', 'shadow', 'escalated')) {
+  for (const r of store.delegationsByStatusSince(new Date(now - 14 * 86400_000).toISOString(), 'queued', 'running', 'shadow', 'escalated')) {
     const c = currentOf(r);
     if (!c || c.version !== r.version) continue; // an older version of this decision: not about what is open now
     const prev = open[r.decision_id];

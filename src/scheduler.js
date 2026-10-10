@@ -190,7 +190,7 @@ export function setStatus(key, status, extra = {}) {
   const t = store.updateTicket(key, { status, ...extra });
   github.syncIssueState(key);
   // A hold whose kind is delegated (#9) is announced by the delegation only if it comes back to the owner.
-  if (status !== before && status === 'needs_human' && !delegation.takesNotice(t)) notify('needs_human', t, 'needs you');
+  if (status !== before && status === 'needs_human' && !delegation.deferNotice(t)) notify('needs_human', t, 'needs you');
   if (status !== before && status === 'ready_for_human') notify('ready_for_human', t, 'ready for your review');
   if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key); // clones are full copies now; free the disk
   if (['done', 'wontdo'].includes(status)) store.clearReservation(key);
@@ -1026,7 +1026,7 @@ export async function tick() {
     const discussion = store.pendingDiscussions().find((d) => d.status === 'queued');
     if (discussion && slots > 0 && agentIdle('manager')) go('manager', (f) => launchDiscussion(discussion, f), null, 'owner_discussion');
     // Delegated decisions (#9): one bounded decide run each, while a slot stays free for QA and incidents.
-    for (const r of delegation.nextJobs()) {
+    for (const r of delegation.nextJobs({ shadow: false })) {
       if (slots <= (capacity(s) > 1 ? 1 : 0)) break;
       if (!agentIdle(r.seat)) continue;
       go(r.seat, (f) => delegation.launch(r, f), null, 'decide');
@@ -1141,6 +1141,12 @@ export async function tick() {
     // 4. Manager grooms proposals (consulting principals inside the run); research proposals wait for their second review.
     const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run && !researchReview.blocks(t) && !features.holds(t));
     if (proposed && slots > 0 && agentIdle('manager')) go('manager', (f) => launchGroom(proposed, f), groomEngine(), 'groom');
+    // Shadow decisions (#9) only take a seat's idle time: the owner decides them anyway.
+    for (const r of delegation.nextJobs({ shadow: true })) {
+      if (slots <= (capacity(s) > 1 ? 1 : 0)) break;
+      if (!agentIdle(r.seat)) continue;
+      go(r.seat, (f) => delegation.launch(r, f), null, 'decide');
+    }
     // 5. Research programs on their own cadence and market window while the funnel is thin (oldest last run first).
     for (const p of research.due(s)) {
       if (slots <= 0 || researchAllowance(s) <= 0) break;
