@@ -622,7 +622,8 @@ function migrate() {
       // to (the question's comment id), set by the code that holds the ticket. Delegation reads these, never message text.
       // owner_task_kind: what kind of step an owner task is (check | package | write | restart | credential | business |
       // other | probe | owner), stated by whoever made it the owner's. null = unknown (never delegated).
-      hold_kind: 'TEXT', hold_seat: 'TEXT', hold_ref: 'TEXT', owner_task_kind: 'TEXT' },
+      // owner_task_by: who made it the owner's (a seat, 'owner', or 'desk' when the desk parked a check with the owner).
+      hold_kind: 'TEXT', hold_seat: 'TEXT', hold_ref: 'TEXT', owner_task_kind: 'TEXT', owner_task_by: 'TEXT' },
     // health: an app probe that answered but reported the application unhealthy (HTTP 5xx) is not evidence of health
     ops_audit: { health: 'TEXT', resources: 'TEXT' }, // resources: what the call actually observed (containers, database, app)
     // a post-deploy checkpoint's run-bound grant names its checkpoint (re-checked at every probe)
@@ -831,7 +832,7 @@ const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', '
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
   'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base',
   'research_program', 'research_run', 'research_policy', 'research_review', 'research_generation', 'research_revisions', 'research_sources',
-  'prod_verify', 'prod_verify_by', 'owner_merge_only', 'hold_kind', 'hold_seat', 'hold_ref', 'owner_task_kind']);
+  'prod_verify', 'prod_verify_by', 'owner_merge_only', 'hold_kind', 'hold_seat', 'hold_ref', 'owner_task_kind', 'owner_task_by']);
 export const HOLD_FIELDS = ['hold_kind', 'hold_seat', 'hold_ref'];
 
 export function updateTicket(key, patch) {
@@ -843,7 +844,7 @@ export function updateTicket(key, patch) {
     const missing = HOLD_FIELDS.filter((f) => !(f in patch));
     if (missing.length) patch = { ...patch, ...Object.fromEntries(missing.map((f) => [f, null])) };
   }
-  if ('owner_task' in patch && !('owner_task_kind' in patch)) patch = { ...patch, owner_task_kind: null };
+  if ('owner_task' in patch) for (const f of ['owner_task_kind', 'owner_task_by']) if (!(f in patch)) patch = { ...patch, [f]: null };
   const cols = Object.keys(patch).filter((k) => TICKET_FIELDS.has(k));
   if (!cols.length) return getTicket(key);
   const sql = `UPDATE tickets SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE key=?`;

@@ -385,7 +385,7 @@ async function launchAccessReview(r, approver, fence) {
 }
 function verifyToOwner(t, why = 'a read-only production check, and production read access is off (Settings → Production read access).') {
   store.kvSet(`verify:${t.key}`, '');
-  store.updateTicket(t.key, { owner_task: 1, owner_task_kind: 'check', assignee: null }); // still a check: it is the owner's only while nobody can read production
+  store.updateTicket(t.key, { owner_task: 1, owner_task_kind: 'check', owner_task_by: 'desk', assignee: null }); // still a check: it is the owner's only while nobody can read production
   store.addComment(t.key, 'system', `🙋 **This is your task**: ${why}`);
 }
 async function launchVerify(t, fence) {
@@ -1476,7 +1476,7 @@ export async function deskAction(run, cmd, body = {}) {
           return;
         }
         if (!ownerReason) return;
-        store.updateTicket(k, { owner_task: 1, owner_task_kind: ownerKind || (verifyAsk ? 'check' : null), assignee: null });
+        store.updateTicket(k, { owner_task: 1, owner_task_kind: ownerKind || (verifyAsk ? 'check' : null), owner_task_by: agentId, assignee: null });
         store.addComment(k, agentId, `🙋 **This is your task**: ${ownerReason}`);
       };
       const whoFor = (seat) => (toSre ? 'sre (read-only production check)' : ownerReason ? 'the owner' : seat);
@@ -1625,7 +1625,7 @@ export async function deskAction(run, cmd, body = {}) {
         store.transaction(() => {
           store.recordQaVerdict({ ...fact, verdict: 'fail', reason: body.reason, lesson_id: lesson?.id ?? null });
           store.addComment(ticket.key, agentId, `❌ **QA failed** (round ${loops}, ${body.reason}${lesson ? `, repeats lesson #${lesson.id}` : ''})\n\n${body.body || ''}`);
-          if (loops > config.limits.maxQaLoops) setStatus(ticket.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'QA failed repeatedly', hold_kind: 'qa_loops' });
+          if (loops > config.limits.maxQaLoops) setStatus(ticket.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'QA failed repeatedly', hold_kind: 'qa_loops', hold_seat: agentId });
           else setStatus(ticket.key, 'todo', { qa_loops: loops, progress: 50, progress_msg: 'fixing QA findings' });
           ev(`QA failed ${ticket.key}`);
         });
@@ -1763,7 +1763,7 @@ export async function deskAction(run, cmd, body = {}) {
         return 'Recorded; the tasks waiting on this check can start. Stop now.';
       }
       store.kvSet(`verify:${ticket.key}`, '');
-      store.updateTicket(ticket.key, { owner_task: 1, owner_task_kind: 'probe', assignee: null, status: 'todo' }); // no probe answers it: never routed back
+      store.updateTicket(ticket.key, { owner_task: 1, owner_task_kind: 'probe', owner_task_by: agentId, assignee: null, status: 'todo' }); // no probe answers it: never routed back
       store.addComment(ticket.key, agentId, `🙋 **This is your task**: ${body.body}\n\n_(The SRE's read-only production probes could not answer it.)_`);
       ev(`handed to the owner: ${String(body.body).slice(0, 140)}`);
       github.flushComments();
@@ -2278,7 +2278,7 @@ export function ownerTask(key, { owner_task, why = '', by = 'owner', verify = fa
     need(['triage', 'proposed', 'todo', 'needs_human'].includes(t.status), 'only work that has not started can become your task');
     // The owner taking a task is the owner's choice ('owner'): delegation never routes it away. A manager's (epic review)
     // states its kind when it knows it, else unknown.
-    store.updateTicket(key, { owner_task: 1, owner_task_kind: by === 'owner' ? 'owner' : OWNER_TASK_KINDS.includes(kind) ? kind : null, assignee: null, status: 'todo', resume_status: null, progress_msg: 'your task' });
+    store.updateTicket(key, { owner_task: 1, owner_task_kind: by === 'owner' ? 'owner' : OWNER_TASK_KINDS.includes(kind) ? kind : null, owner_task_by: by, assignee: null, status: 'todo', resume_status: null, progress_msg: 'your task' });
     if (by === 'manager') store.addComment(key, 'manager', `🙋 **This is your task**: no seat on the team can do it. ${String(why).trim().slice(0, 500)}`);
     else store.addComment(key, 'owner', `🙋 **I will do this one myself**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'}`);
   } else {

@@ -92,7 +92,7 @@ export function ticketDecision(t, { settled = true } = {}) {
  * changing: the run in flight, progress text, stall counts, timestamps, GitHub issue numbers, assignment notes.
  */
 export const EVIDENCE_FIELDS = ['key', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee', 'builder', 'designer', 'reporter',
-  'risk', 'diff_risk', 'head_sha', 'qa_sha', 'pr_url', 'branch', 'resume_status', 'after_key', 'parent_key', 'owner_task', 'owner_task_kind',
+  'risk', 'diff_risk', 'head_sha', 'qa_sha', 'pr_url', 'branch', 'resume_status', 'after_key', 'parent_key', 'owner_task', 'owner_task_kind', 'owner_task_by',
   'hold_kind', 'hold_seat', 'hold_ref', 'qa_loops', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent', 'contributors', 'assign_pinned',
   'research_review', 'research_generation', 'research_revisions', 'research_policy', 'prod_verify', 'merge_hold', 'owner_merge_only'];
 /**
@@ -176,25 +176,43 @@ function lifetime(key, kind) {
   const rows = store.delegationsForTicket(key).filter((r) => r.kind === kind);
   return { count: rows.filter((r) => ['applied', 'overridden', 'reopened'].includes(r.status) && r.action === 'changes').length, spend: rows.reduce((a, r) => a + (Number(r.spent_usd) || 0), 0) };
 }
-function factsFor(c, seat) {
-  const t = c.ticket;
-  const f = { kind: c.kind, delegate: seat, ticket: t, limits: limits(), delegateOff: !agentById[seat] || agentById[seat].enabled === false };
-  if (c.kind === 'owner_task') { f.ownerTaskKind = t.owner_task_kind || null; f.verifyReady = verifyReady(); f.packagesEnabled = config.packages?.enabled !== false && BUILDERS.some((id) => agentById[id]?.enabled !== false); }
-  if (c.kind === 'question') f.asker = t.hold_seat || null;
+// What the seat that put a hold on a ticket is to the decision (hold_seat, by the hold's kind).
+const HOLDER = { question: 'asked this question', qa_loops: 'failed it in QA', review_loops: 'asked for the changes', review_disagree: 'is the reviewer who disagrees',
+  ci_loops: 'put the hold on it', github_loops: 'put the hold on it', research: 'put the hold on it' };
+/**
+ * Who has a stake in a decision, from structured state only: seat → what makes it a party, in plain words. ONE list for
+ * every kind, used when a delegate is chosen (the sweep and the start of its run) and again inside the applying
+ * transaction: a seat on it never decides that decision for the owner. Every kind: whoever put the hold (the asker, the
+ * requester, QA, the disagreeing reviewer), built, is assigned, designed or worked on the ticket. A loop limit adds
+ * both reviewers and, for a requester's loop, the seat that requested the work; a proposal its author and current
+ * reviewers; a design its author or council chair; an owner task whoever filed it as the owner's.
+ */
+export function interestedSeats(c) {
+  const t = c.ticket || {};
+  const out = new Map();
+  const add = (seat, why) => { if (seat && typeof seat === 'string' && !out.has(seat)) out.set(seat, why); };
+  add(t.hold_seat, c.kind === 'question' ? HOLDER.question : HOLDER[t.hold_kind] || 'put the hold on it');
+  if (c.kind === 'owner_task') add(t.owner_task_by, 'filed it as your task');
   if (c.kind === 'research') {
-    f.author = t.reporter;
-    f.parties = store.listResearchReviews(t.key).filter((r) => r.generation === t.research_generation).map((r) => r.reviewer);
-    f.lifetime = lifetime(t.key, 'research');
+    add(t.reporter, 'wrote the proposal');
+    for (const r of store.listResearchReviews(t.key).filter((x) => x.generation === t.research_generation)) add(r.reviewer, 'reviewed the proposal');
   }
   if (c.kind === 'loop_limit') {
-    f.parties = [...store.contributorsOf(t), t.hold_kind === 'review_disagree' ? t.hold_seat : null, t.hold_kind === 'review_disagree' ? t.reviewer_context : null, t.hold_kind === 'review_disagree' ? t.reviewer_independent : null].filter(Boolean);
-    f.lifetime = lifetime(t.key, 'loop_limit');
+    if (t.hold_kind === 'review_loops') add(t.reporter, 'requested this work and asked for the changes');
+    add(t.reviewer_context, 'reviews this change'); add(t.reviewer_independent, 'reviews this change');
   }
-  if (c.kind === 'design') {
-    if (c.ref.type === 'design') f.author = c.ref.author; // the manager writes a design response (after consulting principals)
-    else f.parties = [c.ref.chair];
-    f.designStatus = c.ref.status; f.stale = c.ref.stale;
-  }
+  if (c.kind === 'design') add(c.ref?.type === 'design' ? c.ref.author : c.ref?.chair, c.ref?.type === 'design' ? 'wrote the recommendation' : 'chaired the council');
+  add(t.builder, 'built this change'); add(t.assignee, 'is assigned this ticket'); add(t.designer, 'designed this ticket');
+  for (const seat of store.contributorsOf(t)) add(seat, 'worked on this ticket');
+  return out;
+}
+function factsFor(c, seat) {
+  const t = c.ticket;
+  const f = { kind: c.kind, delegate: seat, ticket: t, limits: limits(), delegateOff: !agentById[seat] || agentById[seat].enabled === false, interest: interestedSeats(c).get(seat) || null };
+  if (c.kind === 'owner_task') { f.ownerTaskKind = t.owner_task_kind || null; f.verifyReady = verifyReady(); f.packagesEnabled = config.packages?.enabled !== false && BUILDERS.some((id) => agentById[id]?.enabled !== false); }
+  if (c.kind === 'research') f.lifetime = lifetime(t.key, 'research');
+  if (c.kind === 'loop_limit') f.lifetime = lifetime(t.key, 'loop_limit');
+  if (c.kind === 'design') { f.designStatus = c.ref.status; f.stale = c.ref.stale; }
   return f;
 }
 /** Why the owner must decide this one (deterministic, no model call), or null. */
@@ -650,7 +668,7 @@ export function ownerReopen(id, { note = '' } = {}) {
     } else if (r.kind === 'owner_task') {
       need(!t.head_sha && !t.pr_url && ['todo', 'triage', 'proposed'].includes(t.status), 'the team already started on it; tell them on the ticket instead', 409);
       store.kvSet(`verify:${t.key}`, '');
-      store.updateTicket(t.key, { owner_task: 1, owner_task_kind: 'owner', assignee: null, status: 'todo', progress_msg: 'your task' });
+      store.updateTicket(t.key, { owner_task: 1, owner_task_kind: 'owner', owner_task_by: 'owner', assignee: null, status: 'todo', progress_msg: 'your task' });
     } else {
       setStatus(t.key, 'needs_human', { resume_status: t.status === 'needs_human' ? t.resume_status : t.status === 'in_progress' ? 'todo' : t.status, progress_msg: `You reopened ${first(r.seat)}'s decision`, hold_kind: 'reopened', hold_ref: String(r.id) });
     }

@@ -179,18 +179,22 @@ publish-guard holds; standing and renewal production access; package installs.
   (`hold_ref`); owner tasks record their kind (`desk create-task --owner "<why>" --owner-kind
   check|package|write|restart|credential|business|other`). Delegation never classifies message text.
 - **One record per decision and evidence version** (`delegated_decisions`): the decision brief you see, the policy and
-  delegation versions, the delegate, the actions it may take, attempts, spend and the outcome. A new question, hold or
-  revision is a new decision.
+  delegation versions, the delegate, the actions it may take, attempts, spend and the outcome. The evidence version is
+  one fingerprint of every substantive ticket field, the whole thread, the changed files and the kind's own evidence (a
+  proposal and its reviews, a design's text): a new question, hold, message or revision is a new decision.
 - **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and answers with
   `desk decide answer|approve|changes|reject|escalate "<text>" --why "<evidence and your standing rule>"`: up to $0.75 on
   an engine with a spending cap, or 6 minutes and 30 steps on a plan-billed one; an engine with neither is refused. A run
   that ends without deciding, or a decision not started within 30 minutes, comes to you with the reason. Escalations carry
   a one-line recommendation, so your tap is yes or no. At most 40 decision runs a day; one slot stays free for QA and
   incidents.
-- **Rules before the run and again at apply**, with no model call: never the asker's own question, the author's own
-  proposal or plan, or a review the delegate is party to; questions and designs only on positively low-risk tickets;
-  lifetime limits that survive revisions. A decision is applied in one transaction after re-checking that it is the same
-  version under the same policy; otherwise nothing is applied.
+- **Rules before the run and again at apply**, with no model call: a delegate never decides anything it is a party to.
+  One list of interested seats serves every kind: whoever put the hold (the asker, the requester, QA, a disagreeing
+  reviewer), built, is assigned, designed or worked on the ticket, reviews the change, wrote or reviewed the proposal,
+  wrote the recommendation or chaired the council, or filed the owner task. Questions and designs only on positively
+  low-risk tickets; lifetime limits that survive revisions. A decision is applied in one transaction after re-checking
+  its evidence fingerprint, the delegation settings and the desk's general policy (production access, merge and sync
+  settings); if any of them changed, nothing is applied.
 - **Escalate everything** (Settings) makes every decision yours at once and stops decisions in progress; so does any
   change to the matrix for the decisions in flight. `delegation.enabled: false` in the config (or
   `SIGMADESK_DELEGATION=off`) turns delegation off whatever is saved.

@@ -106,8 +106,8 @@ export const positivelyLow = (t) => !!t && t.risk === 'low' && t.diff_risk !== '
 
 /**
  * The deterministic rules, checked before any model call and again when a decision is applied. facts:
- *   { kind, delegate, ticket, asker, author, parties: [seats who are a party], selfAuthored, lifetime: { count, spend },
- *     limits: settingsFrom(), councilStatus, designStatus, verifyReady, packagesEnabled, ownerTaskKind }
+ *   { kind, delegate, ticket, interest: why the delegate is a party (src/delegation.js interestedSeats) or null,
+ *     lifetime: { count, spend }, limits: settingsFrom(), designStatus, stale, verifyReady, packagesEnabled, ownerTaskKind }
  * → null (the delegate may decide) or a plain-language reason it is the owner's.
  */
 export function ownerReason(f, nameOf = (s) => s) {
@@ -116,10 +116,8 @@ export function ownerReason(f, nameOf = (s) => s) {
   if (!f.delegate) return 'no delegate is set for this kind';
   if (f.delegateOff) return `${who}'s seat is switched off`;
   if (t && ['done', 'wontdo'].includes(t.status)) return 'the ticket is closed';
-  // Never decide one's own matter: the asker's question, one's own proposal, review or plan.
-  if (f.asker && f.asker === f.delegate) return `${who} asked this question, so ${who} cannot answer it for you`;
-  if (f.author && f.author === f.delegate) return `${who} wrote it, so approving or correcting it is not ${who}'s call`;
-  if ((f.parties || []).includes(f.delegate)) return `${who} is a party to this decision`;
+  // Never decide one's own matter: one's own question, request, work, review, proposal or plan.
+  if (f.interest) return `${who} ${f.interest}, so ${who} cannot decide it for you`;
   switch (f.kind) {
     case 'owner_task': {
       const k = f.ownerTaskKind;

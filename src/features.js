@@ -269,7 +269,7 @@ export function approve(key, { expected_revision, edits = [], message = '' } = {
         + `\n\n## Part of feature ${key}: ${t.title}\n${p.plan.goal}\n\nFeature acceptance criteria:\n${p.plan.acceptance.map((a) => `- ${a}`).join('\n')}`;
       const k = store.createTicket({ title: x.title, description: body, type: 'task', status: 'todo', area: x.area, complexity: x.complexity, priority: t.priority,
         assignee: routeTicket({ area: x.area, complexity: x.complexity, risk: x.risk }), reporter: 'manager', source: 'agent', parent_key: key });
-      store.updateTicket(k.key, { risk: x.risk, ...(after ? { after_key: after } : {}), ...(x.owner ? { owner_task: 1, assignee: null } : {}) });
+      store.updateTicket(k.key, { risk: x.risk, ...(after ? { after_key: after } : {}), ...(x.owner ? { owner_task: 1, owner_task_by: 'manager', assignee: null } : {}) });
       if (x.owner) store.addComment(k.key, 'manager', `🙋 **This is your task**: ${x.owner}`);
       keys[x.ref] = k.key;
     }

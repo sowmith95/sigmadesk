@@ -80,18 +80,18 @@ test('model: the deterministic owner rules (self-interest, risk, lifetime limits
   const L = model.settingsFrom({});
   const low = { status: 'needs_human', risk: 'low' };
   const r = (f) => model.ownerReason({ limits: L, delegate: 'manager', ticket: low, ...f });
-  assert.equal(r({ kind: 'question', asker: 'junior' }), null);
-  assert.match(r({ kind: 'question', asker: 'manager' }), /asked this question, so manager cannot answer it/);
+  assert.equal(r({ kind: 'question' }), null);
+  assert.match(r({ kind: 'question', interest: 'asked this question' }), /manager asked this question, so manager cannot decide it for you/);
   assert.match(r({ kind: 'question', ticket: { ...low, risk: 'high' } }), /high risk/);
   assert.match(r({ kind: 'question', ticket: { ...low, risk: null } }), /no low-risk classification/, 'unknown risk counts as high');
   assert.match(r({ kind: 'question', ticket: { ...low, diff_risk: 'high' } }), /high risk/);
-  assert.match(r({ kind: 'research', author: 'manager' }), /wrote it/);
+  assert.match(r({ kind: 'research', interest: 'wrote the proposal' }), /wrote the proposal/);
   assert.match(r({ kind: 'research', lifetime: { count: 1, spend: 0 } }), /already sent this proposal back 1 time \(limit 1/);
   assert.match(r({ kind: 'research', lifetime: { count: 0, spend: 1.6 } }), /already cost \$1\.60/);
-  assert.match(r({ kind: 'loop_limit', parties: ['manager'] }), /party to this decision/);
-  assert.match(r({ kind: 'design', author: 'manager' }), /wrote it/, 'the EM never approves its own plan');
+  assert.match(r({ kind: 'loop_limit', interest: 'asked for the changes' }), /manager asked for the changes, so manager cannot decide it/);
+  assert.match(r({ kind: 'design', interest: 'wrote the recommendation' }), /wrote the recommendation/, 'the EM never approves its own plan');
   assert.match(r({ kind: 'design', ticket: { ...low, risk: null }, designStatus: 'complete' }), /positively low-risk/);
-  assert.equal(r({ kind: 'design', designStatus: 'complete', parties: ['principal-be'] }), null);
+  assert.equal(r({ kind: 'design', designStatus: 'complete' }), null);
   for (const [k, re] of [['write', /production write/], ['restart', /restart/], ['credential', /credentials/], ['business', /business decision/], ['probe', /could not answer/], ['owner', /took this task yourself/], [null, /kind of step/]])
     assert.match(r({ kind: 'owner_task', ownerTaskKind: k }), re, String(k));
   assert.match(r({ kind: 'owner_task', ownerTaskKind: 'check', verifyReady: false }), /nobody on the team can read production/);
@@ -305,7 +305,7 @@ test('self-interest and risk escalate by rule, before any run: the asker never a
   const risky = await ask(ticket({ risk: 'high' }));
   const unknown = await ask(ticket({ risk: null }));
   delegation.sweep({ paused: false });
-  for (const [t, re] of [[own, /Morgan asked this question, so Morgan cannot answer it/], [risky, /high risk/], [unknown, /no low-risk classification/]]) {
+  for (const [t, re] of [[own, /Morgan asked this question, so Morgan cannot decide it for you/], [risky, /high risk/], [unknown, /no low-risk classification/]]) {
     const r = recFor(`${t.key}:question`);
     assert.equal(r.status, 'escalated', t.key); assert.match(r.why, re); assert.equal(r.run_id, null, 'no model call');
     assert.ok(store.kvGet(`delegation:noticed:${r.decision_id}:${r.version}`), 'the owner is told, once');
@@ -397,12 +397,73 @@ test('loop limits (em): rescope or reassign, recorded as Morgan\'s; never a QA p
   const d = ticket({ status: 'needs_human', assignee: 'junior', resume_status: 'review', hold_kind: 'review_disagree', hold_seat: 'senior-fe', reviewer_context: 'manager', review_round: 4 });
   delegation.sweep({ paused: false });
   const rd = recFor(`${d.key}:conflict`);
-  assert.equal(rd.status, 'escalated'); assert.match(rd.why, /party to this decision/);
+  assert.equal(rd.status, 'escalated'); assert.match(rd.why, /Morgan reviews this change, so Morgan cannot decide it for you/);
   // A second rescope of the same ticket is over the lifetime limit.
   store.updateTicket(t.key, { status: 'needs_human', qa_loops: 4, resume_status: 'todo', hold_kind: 'qa_loops' });
   delegation.sweep({ paused: false });
   assert.equal(store.delegationsForTicket(t.key).at(-1).status, 'escalated');
   assert.match(store.delegationsForTicket(t.key).at(-1).why, /already rescoped this ticket 1 time/);
+});
+
+test('self-interest (property): whoever holds, requested, built, reviews, designed or filed a decision never decides it, in every kind', async () => {
+  reset();
+  policy({ owner_task: 'em', question: 'em', research: 'em', loop_limit: 'em', design: 'em' });
+  const me = 'manager';
+  const cases = []; // [what, decision id, the reason it must give]
+  // Questions: the asker, and every work role on the ticket.
+  cases.push(['question: the asker', `${(await ask(ticket(), me)).key}:question`, /Morgan asked this question/]);
+  for (const [role, value, re] of [['assignee', me, /is assigned this ticket/], ['builder', me, /built this change/], ['designer', me, /designed this ticket/], ['contributors', JSON.stringify([me]), /worked on this ticket/]]) {
+    const t = await ask(ticket());
+    store.updateTicket(t.key, { [role]: value });
+    cases.push([`question: the ${role}`, `${t.key}:question`, re]);
+  }
+  // Loop limits: the seat that put the hold, for EVERY loop kind; the requester of a requester's loop; both reviewers.
+  for (const hold of model.LOOP_HOLDS) {
+    const t = ticket({ status: 'needs_human', resume_status: 'todo', qa_loops: 3, hold_kind: hold, hold_seat: me });
+    cases.push([`loop limit (${hold}): the seat that held it`, `${t.key}:${hold === 'review_disagree' ? 'conflict' : 'stuck'}`, /Morgan (failed it in QA|asked for the changes|is the reviewer who disagrees|put the hold on it)/]);
+  }
+  const legacy = store.createTicket({ title: 'Requester loop without a holder', status: 'needs_human', area: 'backend', complexity: 'S', assignee: 'junior', reporter: me });
+  store.updateTicket(legacy.key, { risk: 'low', resume_status: 'todo', qa_loops: 3, hold_kind: 'review_loops' }); // a hold recorded before hold_seat
+  cases.push(['loop limit: the requester of a requester\'s loop', `${legacy.key}:stuck`, /Morgan requested this work/]);
+  for (const role of ['reviewer_context', 'reviewer_independent']) {
+    const t = ticket({ status: 'needs_human', resume_status: 'todo', qa_loops: 3, hold_kind: 'qa_loops', hold_seat: 'qa', [role]: me });
+    cases.push([`loop limit: the ${role}`, `${t.key}:stuck`, /Morgan reviews this change/]);
+  }
+  // Research: the author, and a reviewer of the current generation.
+  for (const [who, reviewer] of [[me, 'principal-be'], ['pm', me]]) {
+    const t = store.createTicket({ title: `Proposal by ${who}`, status: 'proposed', reporter: who, source: 'research', description: '## Problem\nx\n## Evidence\ny' });
+    researchReview.open(t, { program: 'product-discovery', review: { minReviewers: 1, reviewers: [reviewer] } }, { id: 1 });
+    const rv = store.createResearchReview({ ticket_key: t.key, generation: 1, input_hash: researchReview.hashOf(store.getTicket(t.key)), reviewer, status: 'pending' });
+    researchReview.complete(rv.id, { report: { verdict: 'reject', summary: 'No source', evidence_checked: [], findings: ['x'], conditions: ['y'] } });
+    cases.push([`research: ${who === me ? 'the author' : 'a reviewer'}`, `${t.key}:research:1`, who === me ? /Morgan wrote the proposal/ : /Morgan reviewed the proposal/]);
+  }
+  // Design: the recommendation's author. Owner tasks: whoever filed it as the owner's.
+  const dt = ticket({ status: 'todo' });
+  const disc = store.createDiscussion(dt.key, 'Design the retention.');
+  store.updateDiscussion(disc.id, { status: 'complete', response: 'Keep 30 days.' });
+  cases.push(['design: the author', `${dt.key}:design:${disc.id}`, /Morgan wrote the recommendation/]);
+  const ot = ticket(); store.updateTicket(ot.key, { owner_task: 1, owner_task_kind: 'package', owner_task_by: me, assignee: null });
+  cases.push(['owner task: whoever filed it', `${ot.key}:owner-task`, /Morgan filed it as your task/]);
+  delegation.sweep({ paused: false });
+  for (const [what, id, re] of cases) {
+    const r = recFor(id);
+    assert.ok(r, `${what}: a record`);
+    assert.deepEqual([r.status, r.run_id], ['escalated', null], `${what}: left to the owner before any run`);
+    assert.match(r.why, re, what);
+  }
+  // The same one list everywhere: every seat it names gets an owner reason for every open decision on the board.
+  const live = delegation.candidates();
+  for (const c of live) for (const [seat] of delegation.interestedSeats(c)) assert.ok(delegation.ownerReasonFor(c, seat), `${c.decision_id}: ${seat} is a party`);
+  assert.ok(delegation.interestedSeats({ kind: 'design', ticket: dt, ref: { type: 'council', chair: 'sre' } }).has('sre'), 'a council chair never decides its own verdict');
+  // And at apply: a seat that becomes a party after its run started decides nothing.
+  const late = ticket({ status: 'needs_human', resume_status: 'todo', qa_loops: 3, hold_kind: 'review_loops', hold_seat: 'principal-be' });
+  delegation.sweep({ paused: false });
+  const rl = recFor(`${late.key}:stuck`); const run = bind(rl);
+  store.updateTicket(late.key, { hold_seat: me });
+  const out = await sched.deskAction(run, 'decide', { action: 'changes', body: 'Narrow it to the parser.', why: 'Three rounds on the cache; playbook: smallest change.' });
+  assert.match(out, /nothing was applied/);
+  assert.notEqual(store.getDelegation(rl.id).status, 'applied');
+  assert.equal(store.getTicket(late.key).status, 'needs_human');
 });
 
 test('design (sre): Devon approves a positively low-risk recommendation; Morgan never approves the design Morgan wrote', async () => {
@@ -413,7 +474,7 @@ test('design (sre): Devon approves a positively low-risk recommendation; Morgan 
   store.updateDiscussion(disc.id, { status: 'complete', response: 'Keep 30 days; prune nightly.' });
   delegation.sweep({ paused: false });
   const r = recFor(`${t.key}:design:${disc.id}`);
-  assert.equal(r.status, 'escalated'); assert.match(r.why, /Morgan wrote it/);
+  assert.equal(r.status, 'escalated'); assert.match(r.why, /Morgan wrote the recommendation/);
   policy({ design: 'sre' });
   const disc2 = store.createDiscussion(t.key, 'Design the export.');
   store.updateDiscussion(disc2.id, { status: 'complete', response: 'One CSV per day.' });
