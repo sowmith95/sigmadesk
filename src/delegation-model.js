@@ -306,7 +306,7 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     if (cur && (own || indent >= cur.col)) rules.pop(); // indented four or more inside its bullet, or more of its paragraph
     break;
   }
-  return { rules: rules.slice(0, 60).map((r) => ({ text: r.text.join('\n'), lines: r.lines })), problem: null };
+  return { rules: rules.map((r) => ({ text: r.text.join('\n'), lines: r.lines })), problem: null }; // every one: no ceiling
 }
 export const standingRules = (text = '', heading = RULES_SECTION) => standingRuleLines(text, heading).map((r) => r.text);
 /**

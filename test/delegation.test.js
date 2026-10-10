@@ -191,6 +191,8 @@ test('owner rules: bullets under the ## heading and their continuation; the firs
   for (const first of ['A paragraph first.', '1. Numbered', '<!-- the note the shipped playbooks once had here -->', '```', '    indented', '  - indented bullet', '-\tA tab after the dash'])
     assert.deepEqual(rules(`${O}\n${first}\n- X\n`), [], first);
   assert.deepEqual(rules(`${O}\n- R\n\nThe end.\n\n- not read\n`), ['R']);
+  // No ceiling: the 61st rule and the 100th count like the first.
+  for (const n of [60, 61, 100]) assert.equal(rules(`${O}\n${Array.from({ length: n }, (_, i) => `- Rule ${i + 1}`).join('\n')}\n`).length, n, `${n} rules`);
   // The heading: `##` at column 0 (closing #s allowed), whatever its case; no other level, no underlined heading.
   assert.deepEqual(rules(`## Standing rules the EM may apply alone ##\n- Yes`), ['Yes']);
   for (const h of ['# Standing rules the EM may apply alone', '### Standing rules the EM may apply alone', ' ## Standing rules the EM may apply alone', 'Standing rules the EM may apply alone\n---', 'Standing rules the EM may apply alone\n==='])
