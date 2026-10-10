@@ -186,23 +186,26 @@ publish-guard holds; standing and renewal production access; package installs.
   proposal's reviews, a design's discussion, a council and its members), read as stored, plus the changed files. Only a
   short, explicit list of bookkeeping columns is left out (timestamps, progress, counters, the GitHub mirror), so a
   column added later counts as evidence by default: a new question, hold, message or revision is a new decision.
-- **The authority is yours: you write the rules a delegate may apply.** Only the list items under the playbook
-  heading `## Standing rules the EM may apply alone` (configurable: `delegation.rulesSection`) count. You curate that
-  section yourself; the desk and its seats never write it (the shipped playbooks and new projects start with it empty).
-  The section is read strictly, more narrowly than Markdown: the heading must start at column 0 (an underlined one must
-  be a paragraph of its own), and a rule starts only at a column-0 bullet (`- `, `* `, `+ `, `1. `); lines indented one
-  to three spaces (text or nested bullets) continue the rule above. Fenced code, HTML comments, any line indented four
-  or more spaces and any `#` line not at column 0 contribute nothing at all, so an example in your playbook grants
-  nothing; a rule whose paragraph runs on into a line indented four or more is dropped rather than kept without it. A
-  heading Markdown shows ends the section even when it is indented, and raw HTML (other than a comment) before the end
-  of the section leaves you with no standing rules, since Markdown may show what follows it as HTML. Write a rule's
-  conditions on its bullet or indented one to three spaces. With
-  no such section, or an empty one, no decision run starts: nothing is decided for you by judgment. Owner-task triage
-  is the one exception, because it is decided by rule, not judgment: a step filed as a check or a package is routed
-  back to the team (when that kind is delegated) whatever the section says. Write narrow rules. The desk checks that a
-  decision cites one of your rules and evidence from its brief; whether the rule fits the decision is the delegate's
-  judgment, which you review in the Inbox. Override and Reopen let you decide again, but they cannot undo what the team
-  already did after a decision.
+- **The authority is yours: you write the rules a delegate may apply.** Only the bullets under the playbook heading
+  `## Standing rules the EM may apply alone` (configurable: `delegation.rulesSection`) count. You curate that section
+  yourself; the desk and its seats never write it (the shipped playbooks and new projects start with it empty). The
+  desk reads it strictly, as a small part of Markdown it can check line by line:
+  - The heading is a `##` heading at the start of its line (not `#` or `###`, not underlined with `---` or `===`).
+  - Each rule is a dash bullet (`- `) at the start of its line, right under the heading or under the rule before it.
+  - A rule's conditions go on its bullet line, or on lines indented two spaces under it (sub-bullets included).
+  - No code blocks, HTML or comments, numbered lists, lines indented four or more spaces, or other headings inside
+    the section, and no `<` in a rule.
+
+  Anything else ends the section where it stands, and nothing after it is read; a rule the line may still belong to
+  is dropped, since it may be missing a condition. Settings tells you how many rules the desk found, so a count lower
+  than you expect means a line ended the section early. Text before the heading must not leave Markdown room to read
+  it differently either: raw HTML at the start of a line, a fenced block it might end elsewhere, or another heading
+  with the same words leaves you with no standing rules. With no such section, or an empty one, no decision run
+  starts: nothing is decided for you by judgment. Owner-task triage is the one exception, because it is decided by
+  rule, not judgment: a step filed as a check or a package is routed back to the team (when that kind is delegated)
+  whatever the section says. Write narrow rules. The desk checks that a decision cites one of your rules and evidence
+  from its brief; whether the rule fits the decision is the delegate's judgment, which you review in the Inbox.
+  Override and Reopen let you decide again, but they cannot undo what the team already did after a decision.
 - **Decisions cite what they rest on.** A decision run is given your rules from that section, numbered (R1…), and
   numbered evidence (E1…: the ticket description, the kind's own record and the thread's messages), and answers with
   `desk decide answer|approve|changes|reject "<text>" --cite "R2,E1[,file:<path>:<line>]" --why "<how they settle

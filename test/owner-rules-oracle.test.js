@@ -1,0 +1,108 @@
+// Owner rules against a reference CommonMark parser (#9): every rule the desk finds must be, line for line, a bullet
+// the parser shows directly under the owner's heading, holding nothing but paragraphs and sub-bullets. It runs only
+// when SIGMADESK_CM_ORACLE names a commonmark.js module (its package directory or entry file), so the suite itself
+// keeps no dependencies:
+//   SIGMADESK_CM_ORACLE=/path/to/node_modules/commonmark node --test test/owner-rules-oracle.test.js
+// SIGMADESK_CM_ORACLE_N sets how many documents each generator writes (default 20,000).
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import * as model from '../src/delegation-model.js';
+
+const ORACLE = process.env.SIGMADESK_CM_ORACLE;
+const N = Number(process.env.SIGMADESK_CM_ORACLE_N) || 20_000;
+const O = 'Standing rules the EM may apply alone';
+const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
+
+/** The list items the parser shows directly under the first document-level heading with the owner's words. */
+function bulletsShown(cm, text) {
+  const inline = (node) => { let out = ''; const w = node.walker(); let e; while ((e = w.next())) if (e.entering && ['text', 'code', 'html_inline'].includes(e.node.type)) out += e.node.literal; else if (e.entering && ['softbreak', 'linebreak'].includes(e.node.type)) out += '\n'; return out; };
+  const simple = (item) => { for (let c = item.firstChild; c; c = c.next) { if (c.type === 'paragraph') continue; if (c.type !== 'list') return false; for (let i = c.firstChild; i; i = i.next) if (!simple(i)) return false; } return true; };
+  const doc = new cm.Parser().parse(text);
+  let h = doc.firstChild;
+  while (h && !(h.type === 'heading' && norm(inline(h)) === norm(O))) h = h.next;
+  if (!h) return [];
+  const out = [];
+  for (let s = h.next; s && !(s.type === 'heading' && s.level <= h.level); s = s.next)
+    if (s.type === 'list') for (let i = s.firstChild; i; i = i.next) out.push({ from: i.sourcepos[0][0] - 1, to: i.sourcepos[1][0] - 1, simple: simple(i) });
+  return out;
+}
+/** What is wrong with the desk's reading of one playbook: a rule Markdown does not show, or not exactly its lines. */
+function problems(cm, text) {
+  const ours = model.standingRuleLines(text), shown = bulletsShown(cm, text), src = text.split(/\r\n|\r|\n/), bad = [];
+  for (const r of ours) {
+    const b = shown.find((x) => x.from === r.lines[0]);
+    if (!b) { bad.push(['a rule Markdown does not show under the heading', r]); continue; }
+    const want = []; for (let k = b.from; k <= b.to; k++) if (src[k].trim()) want.push(k);
+    if (!b.simple || JSON.stringify(want) !== JSON.stringify(r.lines)) bad.push(['not exactly the lines of its bullet', r, want]);
+    const text2 = r.lines.map((k, j) => (j ? src[k].trim() : src[k].replace(/^[-*+] +/, '').trim())).join('\n');
+    if (text2 !== r.text) bad.push(['text that is not its lines', r]);
+  }
+  return { bad, found: ours.length, shown: shown.length };
+}
+
+// The generators: messy sections (every shape the grammar refuses, next to the ones it reads), random text before
+// the heading, and clean playbooks written the way the README says.
+function generator(seed, mode) {
+  const rand = (n) => { seed = (seed * 48271) % 2147483647; return seed % n; };
+  const pick = (a) => a[rand(a.length)];
+  const sp = (n) => ' '.repeat(n);
+  let id = 0;
+  const words = () => pick(['Rule', 'Use `desk show` first', '*only* after QA', 'Docs & tests', 'See [the runbook](docs/run.md)', 'a\ttab', 'ends with \\', 'x <https://ex.com>', 'two  spaces']) + ` ${++id}`;
+  const kinds = {
+    bullet0: () => `${pick(['- ', '* ', '+ ', '1. ', '10. ', '-   ', '-  ', '-\t', '- # ', '- > ', '- 1. ', '-    ', '-     '])}${words()}`,
+    bulletIn: () => `${sp(pick([1, 2, 3, 4, 6]))}${pick(['- ', '* ', '1. ', '-  ', '-\t'])}${words()}`,
+    text0: () => pick([words(), `#tag${++id}`, `*em* ${++id}`, `-x ${++id}`, `[r${++id}]: /url`, `> quoted ${++id}`, `=x ${++id}`]),
+    textIn: () => `${pick([' ', '  ', '   ', '    ', '      ', '\t', ' \t', '  \t'])}${pick(['', '- ', '# ', '> ', '1. '])}${words()}`,
+    blank: () => pick(['', '   ', '\t']),
+    atx: () => `${sp(rand(4))}${'#'.repeat(1 + rand(3))} ${rand(4) ? `Heading ${++id}` : O}`,
+    under: () => `${sp(rand(4))}${pick(['---', '===', '-----', '-', '==', '- - -', '***'])}`,
+    brk: () => pick(['***', '___', '* * *']),
+    fence: () => { const ch = pick(['```', '~~~', '````']); return [sp(pick([0, 1, 2, 3, 4, 5])) + ch, ...Array.from({ length: 1 + rand(2) }, () => `${sp(rand(5))}${pick(['- Fenced ', 'Fenced ', '## Fenced ', `## ${O} `])}${++id}`), ...(rand(6) ? [sp(rand(4)) + ch.slice(0, 3 + rand(2))] : [])].join('\n'); },
+    comment: () => pick([`${sp(rand(4))}<!-- note ${++id} -->`, `${sp(rand(4))}<!--\n${sp(rand(4))}- Hidden ${++id}\n-->`, '<!-->', `text <!-- inline ${++id}`, `<!-- a --> - after ${++id}`]),
+    hash: () => `${sp(rand(4))}#tag${++id}`,
+    html: () => pick(['<div>', '<pre>', '<details>', '</div>', '</pre>', `<span>inline ${++id}</span>`, '<https://example.com>']),
+    setextOwner: () => pick([`${O}\n---`, `${O}\n===`, 'Standing rules the EM\nmay apply alone\n---', `  ${O}\n  ---`, 'Standing rules the EM\n    may apply alone\n-']),
+    ownerAtx: () => pick([`## ${O}`, `# ${O}`, `### ${O}`, ` ## ${O}`, `## ${O} ##`, `##\t${O}`]),
+    cr: () => `- Rule ${++id}\r- CR rule ${++id}`,
+    indentedFence: () => `- Step ${++id}\n${pick(['  ', '   '])}\`\`\`\n${pick(['  ', '   ', '', ' '])}code ${++id}\n${pick(['  ', '   ', ' ', ''])}\`\`\``,
+  };
+  const w = { bullet0: 6, bulletIn: 3, text0: 3, textIn: 4, blank: 5, atx: 1, under: 1, brk: 1, fence: 1, comment: 1, hash: 1, html: 1, setextOwner: mode === 'prefix' ? 2 : 0, ownerAtx: mode === 'prefix' ? 2 : 1, cr: 1, indentedFence: mode === 'prefix' ? 2 : 1 };
+  const bag = Object.keys(kinds).flatMap((k) => Array(w[k]).fill(k));
+  const clean = () => pick(['Answer which-file questions from the code', 'Use `desk show` first', '*only* after QA passed', 'Docs & tests only', 'See [the runbook](docs/run.md)']) + ` (${++id})`;
+  return () => {
+    if (mode === 'clean') {
+      const lines = ['# Playbook', '', '## How to test', '- Run the relevant tests.', '```', 'npm test', '```', '', `## ${O}`];
+      for (let r = 0, n = 1 + rand(6); r < n; r++) {
+        if (rand(3) === 0) lines.push('');
+        lines.push(`${pick(['- ', '- ', '* ', '+ '])}${clean()}`);
+        for (let j = 0, c = rand(4); j < c; j++) lines.push(...[[`  ${clean()}`], [`  - ${clean()}`], [clean()], ['', `  ${clean()}`]][rand(4)]);
+      }
+      lines.push('', pick(['## Off limits', '# Appendix']), '- Production.');
+      return lines.join('\n');
+    }
+    const lines = [];
+    if (mode === 'prefix') for (let j = 0, n = rand(8); j < n; j++) lines.push(kinds[pick(bag)]());
+    lines.push(rand(6) ? `## ${O}` : pick([`${O}\n---`, `# ${O}`, `## ${O}:`]));
+    for (let j = 0, n = 2 + rand(10); j < n; j++) lines.push(kinds[pick(bag)]());
+    lines.push(pick(['## Next', '# Top', '### Deeper', '']), '- Outside');
+    return lines.join(pick(['\n', '\r\n', '\n']));
+  };
+}
+
+test('owner rules match what Markdown shows, line for line, over generated playbooks (with SIGMADESK_CM_ORACLE)', { skip: ORACLE ? false : 'set SIGMADESK_CM_ORACLE to a commonmark.js module to run it', timeout: 600_000 }, () => {
+  const cm = createRequire(import.meta.url)(ORACLE);
+  for (const [mode, seed] of [['section', 7], ['prefix', 99], ['clean', 5]]) {
+    const next = generator(seed, mode);
+    let found = 0, shown = 0, first = null, count = 0;
+    for (let k = 0; k < N; k++) {
+      const doc = next(), r = problems(cm, doc);
+      found += r.found; shown += r.shown;
+      if (r.bad.length) { count++; first ??= { doc, bad: r.bad }; }
+      if (mode === 'clean' && r.found !== r.shown) { count++; first ??= { doc, bad: [['a clean bullet the desk did not find']] }; }
+    }
+    if (process.env.SIGMADESK_CM_ORACLE_REPORT) console.log(`${mode}: ${N} documents, ${count} read wrongly; rules found ${found} of the ${shown} bullets Markdown shows`);
+    assert.equal(count, 0, `${mode}: ${count} of ${N} documents read wrongly, first:\n${JSON.stringify(first, null, 1)}`);
+    assert.ok(found > (mode === 'clean' ? 0.99 * shown : N / 20), `${mode}: the generator gave the grammar too little to read (${found} of ${shown})`);
+  }
+});

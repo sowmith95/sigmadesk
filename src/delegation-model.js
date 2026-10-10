@@ -190,129 +190,95 @@ export function ownerReason(f, nameOf = (s) => s) {
 }
 
 // ---------------- what a decision may cite ----------------
-/**
- * The owner section's strict grammar, line by line (#9): deliberately narrower than Markdown, so that nothing nested,
- * indented or quoted as an example can open the section or become a rule, and a heading Markdown shows always ends it.
- *  - Nothing at all: a line inside a fence (``` or ~~~ opened at indent 0-3, the rest of a ``` line holding no
- *    backtick; closed by the same character, as long or longer, at indent 0-3; an unclosed fence swallows the rest), an
- *    HTML comment (across lines too), a line indented four or more spaces (a tab counts four), and a # line that is not
- *    at column 0. None of these is rule text, and none is skipped either: each keeps its place as a line of its own,
- *    so whatever it stands between is not adjacent.
- *  - Raw HTML (a line starting with a tag, `<?` or `<!`; an autolink is not one): Markdown may show what follows it as
- *    raw HTML, so a playbook with any before the end of the owner's section has no standing rules at all.
- *  - A heading: a column-0 `#` … `######` line (then a space or nothing), or a column-0 text line that is not a list
- *    item, immediately followed by a column-0 `===` or `---` line. Only one whose text line is a paragraph of its own
- *    can be the owner's: a text line straight after a list item or another line of text continues that paragraph.
- *    Inside the section, a heading Markdown shows where this grammar would not also ends it (at its level or higher)
- *    and never opens one: an indented `#` heading outside every rule's bullet (no rule open, or indented less than the
- *    rule's text), and an underline under a paragraph that is no rule's own. A rule open when one comes is dropped.
- *  - A rule: starts only at a column-0 list marker (`- `, `* `, `+ `, `1. `), but a number other than 1 directly under
- *    a paragraph that is no rule's own is more of that paragraph, as in Markdown. Lines indented one to three spaces,
- *    text or list items, continue the rule above, and so does a column-0 text line directly after one of its lines
- *    (the same paragraph), however the rule reached that line. A blank line and then column-0 text, a column-0 thematic
- *    break, or a heading end it. A rule is never kept without part of its own text: one whose paragraph a setext
- *    heading cut short is dropped (part of it became the heading), and so is one whose paragraph runs on into a line
- *    indented four or more, which Markdown reads as more of it (an indented fence there opens an example instead).
- * One token per physical line, in order: → [{ t: 'h', level, text, cuts } | { t: 'item', text, start, offset } |
- *    { t: 'more', text, indent, under } | { t: 'text', text, under } | { t: 'break', under } | { t: 'blank' } |
- *    { t: 'nothing' } (fenced, commented) | { t: 'deep', opens } (indented four or more; opens: a fence) |
- *    { t: 'hash', indent, level } (an indented # line; level when it is a heading) | { t: 'html' }]
- *    (offset: the column the item's text starts at; under: the character of a line Markdown may read as an underline)
- */
-function ownerGrammar(text = '') {
-  const lines = [];
-  let fence = null, comment = false;
-  const html = (line) => /^\s*<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|\/[A-Za-z]|\?|![A-Za-z[])/.test(line);
-  for (const raw of String(text || '').split(/\r?\n/)) {
-    const src = raw.replace(/\t/g, '    ');
-    if (fence) { if (fence.test(src)) fence = null; lines.push({ t: 'nothing' }); continue; }
-    const commented = comment;
-    let line = '', rest = src;
-    while (rest) {
-      if (comment) { const end = rest.indexOf('-->'); if (end < 0) break; comment = false; rest = rest.slice(end + 3); continue; }
-      const at = rest.indexOf('<!--');
-      if (at < 0) { line += rest; break; }
-      line += rest.slice(0, at); rest = rest.slice(at + 4); comment = true;
-    }
-    const open = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (open && !(open[1][0] === '`' && open[2].includes('`'))) { fence = new RegExp(`^ {0,3}${open[1][0] === '`' ? '`' : '~'}{${open[1].length},}\\s*$`); lines.push({ t: 'nothing' }); continue; }
-    if (!line.trim()) { lines.push(src.trim() || commented ? { t: 'nothing' } : { t: 'blank' }); continue; } // a comment, not a blank line
-    if (html(line)) { lines.push({ t: 'html' }); continue; }
-    const indent = line.match(/^ */)[0].length;
-    if (indent >= 4) { const f = line.trim().match(/^(`{3,}|~{3,})(.*)$/); lines.push({ t: 'deep', opens: !!f && !(f[1][0] === '`' && f[2].includes('`')) }); continue; }
-    if (indent > 0) {
-      const h = line.match(/^ +(#{1,6})(?:\s|$)/), u = line.trim().match(/^(=+|-+)$/);
-      lines.push(/^ +#/.test(line) ? { t: 'hash', indent, level: h ? h[1].length : 0 } : { t: 'more', text: line.trim(), indent, under: u ? u[1][0] : null });
-      continue;
-    }
-    const h = line.match(/^(#{1,6})(?:\s+(.*?))?\s*$/);
-    if (h) { lines.push({ t: 'h', level: h[1].length, text: (h[2] || '').replace(/\s+#+\s*$/, '').trim() }); continue; }
-    if (/^#/.test(line)) { lines.push({ t: 'text', text: line.trim() }); continue; } // #hashtag: plain text
-    if (/^(=+|-+)\s*$/.test(line)) { lines.push({ t: 'under', ch: line[0], text: line.trim() }); continue; }
-    if (/^((\*\s*){3,}|(_\s*){3,})$/.test(line)) { lines.push({ t: 'break' }); continue; }
-    const item = line.match(/^([-*+]|(\d{1,9})\.)( +)(\S.*)$/);
-    if (item) { lines.push({ t: 'item', text: item[4].trim(), start: item[2] == null ? null : Number(item[2]), offset: item[1].length + (item[3].length > 4 ? 1 : item[3].length) }); continue; }
-    lines.push({ t: 'text', text: line.trim() });
-  }
-  // Setext, on the physical lines: a column-0 text line and the column-0 underline on the very next line (anything in
-  // between, even an ignored line, and it is no heading). `cuts`: the line before it may be the same paragraph (a list
-  // item, text, or a line Markdown could read as more of it), so the heading may have taken a rule's last line, and its
-  // text may be only the end of its own title. Any other underline is a thematic break or text.
-  const out = [];
-  for (let i = 0; i < lines.length; i++) {
-    const a = lines[i], b = lines[i + 1];
-    if (a.t === 'text' && b?.t === 'under') {
-      const prev = out.at(-1);
-      out.push({ t: 'h', level: b.ch === '=' ? 1 : 2, text: a.text, cuts: !!prev && ['item', 'more', 'text', 'deep', 'hash'].includes(prev.t) }, { t: 'nothing' });
-      i++; continue;
-    }
-    out.push(a.t === 'under' ? (a.ch === '-' && a.text.length >= 3 ? { t: 'break', under: '-' } : { t: 'text', text: a.text, under: a.ch }) : a);
-  }
-  return out;
+// The owner section is read as a strict subset of Markdown: every rule the desk finds is a bullet Markdown shows under
+// the owner's heading, made of exactly that bullet's lines (test/owner-rules-oracle.test.js checks this against a
+// reference CommonMark parser when one is given). Line ends are LF, CRLF or a lone CR; a tab counts as four spaces.
+const HTML_BLOCK = /^<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|\/[A-Za-z]|\?|![A-Za-z[])/; // a tag, <? or <! (not an autolink)
+const BREAK = /^([-*_])[ ]*(?:\1[ ]*){2,}$/; // a thematic break (it wins over a bullet: "- - -")
+const UNDERLINE = /^(?:=+|-+)\s*$/;
+const FENCE = /^(`{3,}|~{3,})(.*)$/;
+const fenceOpens = (s) => { const f = s.match(FENCE); return !!f && !(f[1][0] === '`' && f[2].includes('`')); };
+/** Text Markdown reads as nothing but paragraph text where it stands: no block mark at its start, no `<` in it. */
+function plain(s) {
+  return !!s && !/^(?:#|>|`{3}|~{3}|[-*+](?:\s|$)|\d{1,9}[.)](?:\s|$)|\[[^\]]*\]:)/.test(s) && !UNDERLINE.test(s) && !BREAK.test(s) && !s.includes('<');
+}
+/** `- rule`, `* rule` or `+ rule` (one to four spaces after the mark, then plain text) → its text and the column it starts at. */
+function bulletOf(s) {
+  const m = s.match(/^([-*+])( {1,4})(\S.*)$/);
+  return m && !BREAK.test(s) && plain(m[3]) ? { text: m[3].trim(), col: 1 + m[2].length } : null;
+}
+/** A column-0 line Markdown starts a block with even under a list item's paragraph, ending that list item. */
+function interrupts(s) {
+  return /^(?:#{1,6}(?:\s|$)|>|[-*+]\s|\d{1,9}[.)](?:\s|$)|<!--)/.test(s) || BREAK.test(s) || fenceOpens(s);
 }
 /**
- * The standing rules a delegate may apply alone: the rules (see ownerGrammar) under the column-0 playbook heading the
- * OWNER marks for them (delegation.rulesSection, any level), in order (R1, R2 …), until the next heading of the same or
- * a higher level. No such heading, or no rule under it → [] (then nothing is decided for the owner by a model).
+ * The standing rules a delegate may apply alone (#9), in order (R1, R2 …): the rules under the owner's heading
+ * (delegation.rulesSection), read strictly, each with the playbook lines it was read from (0-based). No such heading,
+ * or no rule under it → [] (then nothing is decided for the owner by a model).
+ *  - The section opens only at a column-0 `## <heading>` line: no other level, no underlined heading. Before it,
+ *    nothing may be read differently by Markdown: a line starting with raw HTML (a comment aside), an indented fence
+ *    that a less indented line interrupts, or an earlier line or paragraph with the heading's words leaves the
+ *    playbook with no rules.
+ *  - Inside it, exactly these lines are read: blank lines; a rule, starting at a column-0 `- `, `* ` or `+ `; and its
+ *    continuation, which is plain text at column 0 directly under a line of the rule, or plain text or a plain bullet
+ *    indented two or three spaces (no less than where the rule's text starts), blank line before it or not.
+ *  - The first line of any other shape ends the section, and nothing after it is read: a column-0 `#` heading (the
+ *    usual end), a fence, any HTML, comment or `<`, a line indented four or more, an indented `#`, a numbered line, a
+ *    paragraph or a one-space line after a blank line, an underline. When Markdown would still count that line as
+ *    part of the rule above it, the rule is dropped too: it may be missing a condition.
  */
-export function standingRules(text = '', heading = RULES_SECTION) {
+export function standingRuleLines(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
-  const blocks = ownerGrammar(text);
-  const at = blocks.findIndex((b) => b.t === 'h' && !b.cuts && norm(b.text) === norm(heading)); // a paragraph of its own
-  if (at < 0 || blocks.slice(0, at).some((b) => b.t === 'html')) return [];
-  const level = blocks[at].level;
-  const rules = [];
-  const drop = (rule) => rules.splice(rules.indexOf(rule), 1);
-  // About the line just before this one, physically. own: it was the current rule's own text. prose: it was text of
-  // a paragraph that is no rule's own, outside every bullet, as Markdown reads it. gap: it was blank or ignored.
-  let cur = null, own = false, prose = false, gap = false;
-  for (const b of blocks.slice(at + 1)) {
-    const after = own, para = prose, apart = gap;
-    own = false; prose = false; gap = b.t === 'blank' || b.t === 'nothing';
-    if (b.t === 'html') return []; // raw HTML in the section: Markdown may show the rest of it as HTML
-    // A heading Markdown shows where the strict grammar sees none: never the owner's, but it ends the section.
-    const shown = para && b.under ? (b.under === '=' ? 1 : 2) : b.t === 'hash' && b.level && (!cur || b.indent < cur.offset) ? b.level : 0;
-    if (shown) { if (cur) drop(cur); if (shown <= level) break; cur = null; continue; }
-    if (b.t === 'h') {
-      if (b.cuts && cur) drop(cur); // its paragraph was cut short: never a partial rule
-      if (b.level <= level) break; // the section ends at a heading of its level or higher
-      cur = null; continue;
-    }
-    if (b.t === 'item') {
-      if (para && b.start != null && b.start !== 1) { if (cur) drop(cur); cur = null; prose = true; continue; } // more of that paragraph
-      cur = Object.assign([b.text], { offset: b.offset }); rules.push(cur); own = true; continue;
-    }
-    if (b.t === 'more') { // indented one to three spaces: the rule above (outside its bullet after a gap, if less indented than its text)
-      if (cur) { cur.push(b.text); own = true; prose = (apart || !after) && b.indent < cur.offset; } else prose = true;
+  const lines = String(text || '').split(/\r\n|\r|\n/);
+  const owner = norm(heading), titled = (t) => norm(t.replace(/^#{1,6}(?=\s|$)/, '').trim().replace(/(?:^|[ ]+)#+$/, '')) === owner;
+  // 1. The heading: outside every fence and comment, with nothing before it Markdown could read otherwise, and no
+  // earlier line or paragraph with its words (Markdown may show that one as the owner's heading instead).
+  let at = -1, fence = null, comment = false, para = '';
+  for (let i = 0; i < lines.length && at < 0; i++) {
+    const src = lines[i].replace(/\t/g, '    '), indent = src.match(/^ */)[0].length, body = src.slice(indent);
+    if (fence) { // only a closer at least as indented as the fence ends it; a less indented line may end its list item
+      if (src.trim() && indent < fence.indent) return [];
+      if (indent <= 3 && fence.close.test(src)) fence = null;
       continue;
     }
-    if (b.t === 'text') { if (cur && after) { cur.push(b.text); own = true; } else { cur = null; prose = true; } continue; } // directly after its text: the same paragraph; else a paragraph between rules
-    if (b.t === 'deep') { if (cur && after && !b.opens) { drop(cur); cur = null; } prose = para && !b.opens; continue; } // more of the paragraph above (a rule's is never rule text here: dropped)
-    if (b.t === 'hash' && !b.level && !cur) prose = true; // #text
-    if (b.t === 'break') cur = null;
+    if (comment) { if (src.includes('-->')) comment = false; continue; } // Markdown: the closing line is all comment
+    if (!src.trim()) { para = ''; continue; }
+    if (indent <= 3 && body.startsWith('<!--')) { comment = !body.slice(2).includes('-->'); para = ''; continue; } // a comment block
+    if (indent <= 3 && HTML_BLOCK.test(body)) return []; // a raw HTML block may run on past the heading
+    if (indent <= 3 && fenceOpens(body)) { const f = body.match(FENCE)[1]; fence = { indent, close: new RegExp(`^ {0,3}${f[0] === '`' ? '`' : '~'}{${f.length},}\\s*$`) }; para = ''; continue; }
+    const h = src.match(/^##(?:[ ]+(.*?))?[ ]*$/);
+    if (h && norm((h[1] || '').replace(/(?:^|[ ]+)#+$/, '')) === owner) { at = i; break; }
+    if (titled(body) || (indent <= 3 && UNDERLINE.test(body) && norm(para) === owner)) return [];
+    // The run of plain lines just before (a paragraph Markdown may underline): four or more in only continues one.
+    para = (indent <= 3 && plain(body)) || (indent > 3 && para) ? `${para} ${body}` : '';
   }
-  return rules.map((r) => r.join('\n').trim()).filter(Boolean).slice(0, 60);
+  if (at < 0) return [];
+  // 2. The section, line by line.
+  const rules = [];
+  let cur = null, gap = false; // gap: a blank line since the rule's last line
+  const take = (r, i, t) => { r.text.push(t); r.lines.push(i); };
+  for (let i = at + 1; i < lines.length; i++) {
+    const raw = lines[i], src = raw.replace(/\t/g, '    ');
+    if (!src.trim()) { gap = true; continue; }
+    const indent = src.match(/^ */)[0].length, body = src.slice(indent), own = !!cur && !gap;
+    const spaced = /^[-*+] /.test(raw.trimStart()) && !/^[-*+] *\t/.test(raw.trimStart()); // no tab after the mark
+    if (indent === 0) {
+      const b = spaced ? bulletOf(body) : null;
+      if (b) { cur = { text: [raw.replace(/^[-*+] +/, '').trim()], lines: [i], col: b.col }; rules.push(cur); gap = false; continue; }
+      if (own && plain(body)) { take(cur, i, raw.trim()); continue; } // the same paragraph
+      if (own && !interrupts(body)) rules.pop(); // Markdown reads it as more of the rule
+      break;
+    }
+    if (cur && indent < 4 && indent >= cur.col) {
+      if (plain(body) || (spaced && bulletOf(body))) { take(cur, i, raw.trim()); gap = false; continue; }
+      rules.pop(); break; // inside the rule's bullet, but not something the desk reads
+    }
+    if (cur && (own || indent >= cur.col)) rules.pop(); // indented four or more inside its bullet, or more of its paragraph
+    break;
+  }
+  return rules.slice(0, 60).map((r) => ({ text: r.text.join('\n'), lines: r.lines }));
 }
+export const standingRules = (text = '', heading = RULES_SECTION) => standingRuleLines(text, heading).map((r) => r.text);
 /** desk decide --cite "R2, E1, file:src/x.py:40": the ids, in order, each once. */
 export function parseCites(raw) {
   if (raw == null || raw === true) return [];

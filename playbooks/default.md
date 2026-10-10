@@ -23,9 +23,11 @@ Every seat reads it on every run. Keep it short and concrete.
 ## Off limits
 - Secrets files, deployment configuration, CI workflows, and anything that talks to production.
 
+<!-- The next section is yours alone: the desk and its seats never write it. When you let Morgan (or Devon, for design
+     reviews) decide a kind of decision for you (Settings → Autonomy), they may decide only under a rule listed under
+     its heading, and must cite it; left empty, every delegated decision stays yours. Write each rule as a dash bullet
+     right under the heading, for instance "- Answer which-file and which-test questions from the code, citing the
+     file and line.", with any condition on the same line or indented two spaces under it. No code blocks, HTML,
+     comments or numbered lists there: the desk stops reading at the first line of another kind, and Settings shows
+     how many rules it found. -->
 ## Standing rules the EM may apply alone
-<!-- Yours alone: the desk and its seats never write here. When you let Morgan (or Devon, for design reviews) decide a
-     kind of decision for you (Settings → Autonomy), they may decide only under a rule listed in this section, and
-     must cite it. Left empty, every delegated decision stays yours. One bullet per rule; lines under a bullet are part
-     of it. For instance a rule could read: Answer which-file and which-test questions from the code, citing the
-     file and line. -->
