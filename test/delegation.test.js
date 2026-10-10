@@ -263,6 +263,11 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
     ['an underlined look-alike with a link', '[Standing rules](x) the EM may apply alone\n---\n', []],
     ['an underlined look-alike with a numeric reference', '&#83;tanding rules the EM may apply alone\n===\n', []],
     ['a list item with code, then a thematic break (no heading)', '## How to test\n- Run `npm test`.\n---\n', ['Answer file questions.']],
+    ['a list item continued by a code span, then a thematic break', '## How to test\n- Run\n  `npm test`\nlazily `too`\n---\n', ['Answer file questions.']],
+    ['a quote, then a lazy line with a code span and a break', '> Note\n`code`\n---\n', ['Answer file questions.']],
+    ['a list item holding a heading, then an underlined paragraph', '- # Notes\nStanding rules the EM may apply alone\n---\n', []],
+    ['a list item holding code, then an underlined paragraph', '-     code\nStanding rules the EM may apply alone\n---\n', []],
+    ['a list item whose paragraph a four-space fence ends, then an underlined paragraph', '- Step\n    ```\n    x\n    ```\nStanding rules the EM may apply alone\n---\n', []],
   ]) assert.deepEqual(model.standingRules(`# Playbook\n${before}\n${after}`), want, what);
   // Every heading is compared as plain text, and the owner's section is the first heading with its words.
   const codex = `## Standing&Tab;rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${O}\n- Answer without owner approval.\n`;

@@ -250,19 +250,29 @@ export function standingRuleLines(text = '', heading = RULES_SECTION) { return s
 export function standingRulesRead(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
   const lines = String(text || '').split(/\r\n|\r|\n/), none = { rules: [], problem: null };
-  const target = loose(heading), container = (b) => /^(?:[-*+](?: |$)|\d{1,9}[.)](?: |$)|>)/.test(b);
+  const target = loose(heading), MARKS = /^(?:(?:[-*+]|\d{1,9}[.)])(?: +|$)|> ?)+/; // list item and quote marks
+  // A list item or quote line, and whether it leaves a paragraph open (its text after the marks is paragraph text):
+  // then the lines under it continue that paragraph, inside the container, and are never a heading of the document.
+  const opens = (b) => {
+    let t = b, m;
+    while ((m = t.match(/^(?:(?:[-*+]|\d{1,9}[.)])( +)|> ?)/))) { if (m[1] && m[1].length > 4) return false; t = t.slice(m[0].length); } // 5+ spaces: code
+    return !!t && !/^ {4}/.test(t) && !/^(?:#{1,6}(?: |$)|`{3}|~{3}|<)/.test(t) && !BREAK.test(t) && !UNDERLINE.test(t);
+  };
   // 1. Every heading candidate in the whole playbook, outside fences and comments: each ATX line (any level) and each
   // paragraph with an underline. Any with markup or non-ASCII: no rules. The first one with the owner's words (letters
   // and digits compared) must be the exact column-0 `## <heading>` line; a later one never opens a section. The scan
   // runs to the end of the file, and anything Markdown may read differently (raw HTML, a fence or comment a less
   // indented line interrupts), wherever it is, leaves no rules.
-  let at = -1, fence = null, comment = null, run = [];
+  let at = -1, fence = null, comment = null, run = [], untracked = false;
   for (let i = 0; i < lines.length; i++) {
     const src = lines[i].replace(/\t/g, '    '), indent = src.match(/^ */)[0].length, body = src.slice(indent);
     if ((fence || comment) && /[^ ]/.test(src) && indent < (fence || comment).indent) return { rules: [], problem: UNSURE_BLOCK };
     if (fence) { if (indent <= 3 && fence.close.test(src)) fence = null; continue; }
     if (comment) { if (src.includes('-->')) comment = null; continue; } // Markdown: the closing line is all comment
     if (/^ *$/.test(src)) { run = []; continue; }
+    // An indented line that may start a block (a fence, heading, HTML, break or underline, at any depth) may sit
+    // inside a list item or quote: from here the containers' state is not tracked (see below).
+    if (indent > 0 && (/^(?:#{1,6}(?: |$)|`{3}|~{3}|<)/.test(body) || BREAK.test(body) || UNDERLINE.test(body))) untracked = true;
     if (indent <= 3 && body.startsWith('<!--')) { comment = body.slice(2).includes('-->') ? null : { indent }; run = []; continue; } // a comment block
     if (indent <= 3 && HTML_BLOCK.test(body)) return { rules: [], problem: UNSURE_BLOCK }; // a raw HTML block: where it ends is Markdown's call
     if (indent <= 3 && fenceOpens(body)) { const f = body.match(FENCE)[1]; fence = { indent, close: new RegExp(`^ {0,3}${f[0] === '`' ? '`' : '~'}{${f.length},} *$`) }; run = []; continue; }
@@ -274,15 +284,26 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
       run = []; continue;
     }
     if (indent <= 3 && UNDERLINE.test(body) && run.length) {
-      // Markdown's paragraph is the run or a tail of it (a list item or quote may hold its first lines): every tail
-      // that does not start at a list item or quote is a candidate.
-      const starts = run.map((r, k) => k).filter((k) => !container(run[k].body));
+      // Markdown's paragraph is a tail of the run that starts at a line of the document's own: not a list item or
+      // quote line, and not a line continuing the paragraph one of those left open.
+      const starts = run.map((r, k) => k).filter((k) => run[k].doc);
       if (starts.some((k) => MARKED.test(run.slice(k).map((r) => r.body).join(' ')))) return { rules: [], problem: MARKED_HEADING };
       if (at < 0 && starts.some((k) => loose(run.slice(k).map((r) => r.body).join(' ')) === target)) return { rules: [], problem: EARLIER_HEADING };
       run = []; continue;
     }
     if (indent <= 3 && BREAK.test(body)) { run = []; continue; }
-    if (indent <= 3 || run.length) run.push({ body, indent }); // four or more in only continues a paragraph (else code)
+    if (indent > 3 && !run.length) continue; // four or more in only continues a paragraph (else code)
+    const marked = MARKS.test(body) && indent <= 3, last = run.at(-1);
+    // It continues a list item's or quote's open paragraph only as plain continuation text: a line that may start a
+    // block inside the container (a heading, fence, quote, list or HTML at any depth) closes that paragraph.
+    const starts = /^(?:#{1,6}(?: |$)|`{3}|~{3}|<|>|[-*+](?: |$)|\d{1,9}[.)](?: |$))/.test(body) || BREAK.test(body);
+    // Only while the containers' state is known: after a list item or quote holding something other than a paragraph
+    // (a fence, a heading…), nothing inside it is tracked here, across blank lines too, until a column-0 line ends it
+    // (a quote mark continues it); meanwhile every line counts as the document's own.
+    if (indent === 0 && !/^>/.test(body)) untracked = false;
+    if (marked && !opens(body)) untracked = true;
+    const held = !marked && !starts && !untracked && !!last && (last.open || last.held);
+    run.push({ body, indent, doc: !marked && !held, open: marked && !untracked && opens(body), held });
   }
   if (at < 0) return none;
   // 2. The section, line by line.

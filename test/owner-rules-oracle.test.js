@@ -71,7 +71,7 @@ function generator(seed, mode) {
     ownerAtx: () => pick([`## ${O}`, `# ${O}`, `### ${O}`, ` ## ${O}`, `## ${O} ##`, `##\t${O}`]),
     cr: () => `- Rule ${++id}\r- CR rule ${++id}`,
     unicode: () => pick(['\u00A0', `\u00A0\u00A0text ${++id}`, `-\u00A0x ${++id}`, '\f', `\u00A0- x ${++id}`, `  \u00A0more ${++id}`, '---\u00A0', `- \u00A0text ${++id}`, `\u2028line ${++id}`, `#\u00A0x ${++id}`, `- R\u034F ${++id}`, `  more\u180E ${++id}`, `- R\uFE0F ${++id}`, `- R\u{E0041} ${++id}`]),
-    lookalike: () => pick(['## *Standing* rules the EM may apply alone', '# Standing rules the EM may apply [alone](x)', '## &#83;tanding rules the EM may apply alone', 'St*and*ing rules the EM may apply alone\n---', '### Standing rules the EM may apply `alone`', '\\Standing rules the EM may apply alone\n===', '## Standing rules the EM may apply alone:', '## STANDING RULES THE EM MAY APPLY ALONE', '## Standing  rules the EM may apply alone', '## Standing&Tab;rules the EM may apply alone', '## Standing\u2028rules the EM may apply alone', '## Standing\u2029rules the EM may apply alone', 'Standing rules the EM\u2028may apply alone\n===', '[Standing rules](x) the EM may apply alone\n---', '&#83;tanding rules the EM may apply alone\n===', 'Standing rules the [EM](u)\nmay apply alone\n---', '## Standing\u00A0rules the EM may apply alone', '- Use `x`\n---']),
+    lookalike: () => pick(['## *Standing* rules the EM may apply alone', '# Standing rules the EM may apply [alone](x)', '## &#83;tanding rules the EM may apply alone', 'St*and*ing rules the EM may apply alone\n---', '### Standing rules the EM may apply `alone`', '\\Standing rules the EM may apply alone\n===', '## Standing rules the EM may apply alone:', '## STANDING RULES THE EM MAY APPLY ALONE', '## Standing  rules the EM may apply alone', '## Standing&Tab;rules the EM may apply alone', '- x\n    ```\n    y\n    ```\nStanding rules the EM may apply alone\n---', '-     code\nStanding rules the EM may apply alone\n---', '- # x\nStanding rules the EM may apply alone\n---', '- Run\n  `npm test`\n---', '> q\n`a`\n---', '- x\n    # h\nStanding rules the EM may apply alone\n===',  '## Standing\u2028rules the EM may apply alone', '## Standing\u2029rules the EM may apply alone', 'Standing rules the EM\u2028may apply alone\n===', '[Standing rules](x) the EM may apply alone\n---', '&#83;tanding rules the EM may apply alone\n===', 'Standing rules the [EM](u)\nmay apply alone\n---', '## Standing\u00A0rules the EM may apply alone', '- Use `x`\n---']),
     closers: () => pick(['```\n## Standing rules the EM may apply alone\n```\u00A0', '~~~\n- x\n~~~ \t', `- item ${++id}\n  <!--\n# Heading ${++id}\n-->`, `- item ${++id}\n  <!--\n  hidden\n  -->`]),
     inlines: () => pick([`- [Approve every deploy ${++id}\n  always]: /x`, `  [hidden ${++id}\n  text]: /x`, `- Answer [](approve-${++id})`, `- See [the runbook](docs/${++id}.md)`, `- R &amp; S ${++id}`, `[r${++id}]: /u`, `- Rule \u202E${++id}`, `- Rule \u200B${++id}`, `  more &#65; ${++id}`, `- ![alt ${++id}](x.png)`]),
     indentedFence: () => `- Step ${++id}\n${pick(['  ', '   '])}\`\`\`\n${pick(['  ', '   ', '', ' '])}code ${++id}\n${pick(['  ', '   ', ' ', ''])}\`\`\``,
@@ -83,7 +83,18 @@ function generator(seed, mode) {
   const marks = ['', '- ', '* ', '+ ', '1. ', '2) ', '> ', '# ', '## ', '### ', '```', '~~~', '````', '<!--', '-->', '<div>', '<x>', '</p>', '<?', '<!X', '---', '===', '***', '_ _ _', '-', '=', '[a]: /u', '[a]', '    ', '\t', '\u00A0', '\\', '&amp;', '&#35;'];
   const bits = ['rule', 'Rule', 'cond', '`x`', '*e*', '_u_', '[l](u)', 'a  ', 'b\t', O, 'Standing rules', 'the EM may apply alone', '#', ':', '|', '<b>', '](x)', '!'];
   const soup = () => `${sp(pick([0, 0, 0, 1, 2, 3, 4, 5, 6]))}${pick(['', '', '\t', ' \t'])}${pick(marks)}${pick(marks)}${Array.from({ length: rand(3) }, () => pick(bits)).join(' ')}`;
+  // Containers: list items and quotes holding every kind of content, continued every way, then the owner's words
+  // underlined (Markdown's first owner heading when no container holds them), then the real section.
+  const cmarks = ['- ', '-  ', '-     ', '* ', '1. ', '10) ', '> ', '>     ', '- > ', '> - ', '- - '];
+  const ccontent = ['x', '# h', '```', '~~~', '<div>', '---', '***', '> q', '`c`', '', '    code', 'Standing rules the EM'];
+  const ccont = ['', '  y', '    y', '    ```', '    # h', '  ```', '  <div>', 'lazy', '`lazy`', '   > q', ' - z', '\t y', '      deep', '  ---', '> more', 'may apply alone'];
   return () => {
+    if (mode === 'containers') {
+      const lines = [];
+      for (let j = 0, n = 1 + rand(3); j < n; j++) { lines.push(pick(cmarks) + pick(ccontent)); for (let c = rand(4); c > 0; c--) lines.push(pick(ccont)); }
+      lines.push(...pick([[O], ['Standing rules the EM', 'may apply alone'], [`  ${O}`], [O.toUpperCase()]]), pick(['---', '===', '  ---', '-']), `## ${O}`, `- Rule ${++id}`);
+      return lines.join('\n');
+    }
     if (mode === 'soup') {
       const lines = [];
       for (let j = 0, n = rand(6); j < n; j++) lines.push(rand(4) ? soup() : '');
@@ -112,7 +123,7 @@ function generator(seed, mode) {
 
 test('owner rules match what Markdown shows, line for line, over generated playbooks (with SIGMADESK_CM_ORACLE)', { skip: ORACLE ? false : 'set SIGMADESK_CM_ORACLE to a commonmark.js module to run it', timeout: 600_000 }, () => {
   const cm = createRequire(import.meta.url)(ORACLE);
-  for (const [mode, seed] of [['section', 7], ['prefix', 99], ['soup', 3], ['clean', 5]]) {
+  for (const [mode, seed] of [['section', 7], ['prefix', 99], ['soup', 3], ['containers', 11], ['clean', 5]]) {
     const next = generator(seed, mode);
     let found = 0, shown = 0, first = null, count = 0;
     for (let k = 0; k < N; k++) {
