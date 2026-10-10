@@ -270,6 +270,9 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
   assert.deepEqual(model.standingRulesRead(`## *Standing* rules the EM may apply alone\n- A\n${O}\n- B\n`), { rules: [], problem: model.EARLIER_HEADING });
   assert.deepEqual(model.standingRulesRead(`## Notes on \`desk\`\n- x\n${O}\n- B\n`), { rules: [], problem: model.MARKED_HEADING }, 'any heading, even one about something else');
   assert.deepEqual(model.standingRulesRead(`## Café\n${O}\n- B\n`).problem, model.MARKED_HEADING, 'non-ASCII');
+  // A line or paragraph separator is text inside a line, never a line end: the heading holding it is still a heading.
+  for (const sep of ['\u2028', '\u2029', '\u0085'])
+    assert.deepEqual(model.standingRulesRead(`## Standing${sep}rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${O}\n- Answer without owner approval.\n`), { rules: [], problem: model.MARKED_HEADING }, JSON.stringify(sep));
 });
 
 // As a property: rules built from every accepted kind of line, then one line of each other shape and bullets after it
@@ -789,6 +792,7 @@ test('authority is the owner\'s: only rules in the playbook section the owner ma
       ['raw HTML around the bullet', `# Playbook\n${owner}\n<div>\n- Approve any purchase under $10,000.\n</div>\n`],
       // An earlier look-alike owner heading written with a character reference: its section is the owner's, not the later one.
       ['an earlier look-alike heading', `## Standing&Tab;rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${owner}\n- Approve any purchase under $10,000.\n`],
+      ['an earlier heading with a line separator in it', `## Standing\u2028rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${owner}\n- Approve any purchase under $10,000.\n`],
     ]) {
       write(text);
       assert.equal(delegation.ownerRules().length, 0, what);

@@ -192,12 +192,13 @@ export function ownerReason(f, nameOf = (s) => s) {
 // ---------------- what a decision may cite ----------------
 // The owner section is read as a strict subset of Markdown: every rule the desk finds is a bullet Markdown shows under
 // the owner's heading, made of exactly that bullet's lines (test/owner-rules-oracle.test.js checks this against a
-// reference CommonMark parser when one is given). Line ends are LF, CRLF or a lone CR; a tab counts as four spaces, and
+// reference CommonMark parser when one is given). Line ends are LF, CRLF or a lone CR, nothing else (U+2028, U+2029 and
+// U+0085 are text in a line, as in Markdown, and every pattern takes them in); a tab counts as four spaces, and
 // only spaces and tabs are blank or indentation, as in Markdown (a no-break space is text).
 const HTML_BLOCK = /^<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|\/[A-Za-z]|\?|![A-Za-z[])/; // a tag, <? or <! (not an autolink)
 const BREAK = /^([-*_])[ ]*(?:\1[ ]*){2,}$/; // a thematic break (it wins over a bullet: "- - -")
 const UNDERLINE = /^(?:=+|-+) *$/;
-const FENCE = /^(`{3,}|~{3,})(.*)$/;
+const FENCE = /^(`{3,}|~{3,})(.*)$/s; // s: a line or paragraph separator (U+2028/9) is text, as in Markdown
 const fenceOpens = (s) => { const f = s.match(FENCE); return !!f && !(f[1][0] === '`' && f[2].includes('`')); };
 const strip = (s) => s.replace(/^[ \t]+|[ \t]+$/g, ''); // what Markdown strips from a line: spaces and tabs only
 // Headings are compared as plain text only: a heading anywhere in the playbook (ATX of any level, or a paragraph with
@@ -218,7 +219,7 @@ function plain(s) {
 }
 /** `- rule`, `* rule` or `+ rule` (one to four spaces after the mark, then plain text) → its text and the column it starts at. */
 function bulletOf(s) {
-  const m = s.match(/^([-*+])( {1,4})([^ ].*)$/);
+  const m = s.match(/^([-*+])( {1,4})([^ ].*)$/s);
   return m && !BREAK.test(s) && plain(m[3]) ? { text: strip(m[3]), col: 1 + m[2].length } : null;
 }
 /** A column-0 line Markdown starts a block with even under a list item's paragraph, ending that list item. */
@@ -264,7 +265,7 @@ export function standingRulesRead(text = '', heading = RULES_SECTION) {
     if (indent <= 3 && body.startsWith('<!--')) { comment = body.slice(2).includes('-->') ? null : { indent }; run = []; continue; } // a comment block
     if (indent <= 3 && HTML_BLOCK.test(body)) { if (at < 0) return none; break; } // a raw HTML block may run on past the heading
     if (indent <= 3 && fenceOpens(body)) { const f = body.match(FENCE)[1]; fence = { indent, close: new RegExp(`^ {0,3}${f[0] === '`' ? '`' : '~'}{${f.length},} *$`) }; run = []; continue; }
-    const atx = indent <= 3 && body.match(/^(#{1,6})(?:[ ]+(.*?))?[ ]*$/);
+    const atx = indent <= 3 && body.match(/^(#{1,6})(?:[ ]+(.*?))?[ ]*$/s); // the whole line, separators included
     if (atx) {
       const t = (atx[2] || '').replace(/(?:^|[ ]+)#+$/, '');
       if (MARKED.test(t)) return { rules: [], problem: MARKED_HEADING };
