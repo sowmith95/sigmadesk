@@ -339,6 +339,9 @@ test('delegation (#9): Decided for you with Override, the delegate\'s take on an
   const q = page.locator('[data-delegation-kind="question"]');
   await q.waitFor();
   assert.equal(await q.getAttribute('data-mode'), 'shadow', 'every kind starts in shadow');
+  // The preview's playbook marks no standing rules: Settings says plainly that every decision still comes to the owner.
+  assert.equal(await page.locator('[data-standing-rules]').getAttribute('data-standing-rules'), '0');
+  assert.match(await page.locator('[data-standing-rules]').textContent(), /You have not written any standing rules yet \(a “Standing rules the EM may apply alone” section in your playbook\)/);
   await q.getByRole('radio', { name: 'Morgan decides' }).click();
   await page.waitForSelector('[data-delegation-kind="question"][data-mode="em"]');
   assert.equal((await api('GET', '/api/delegation')).body.kinds.find((k) => k.id === 'question').mode, 'em');

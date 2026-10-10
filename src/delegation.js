@@ -919,6 +919,8 @@ export function details(settings = store.getSettings()) {
     kinds: model.KIND_IDS.map((k) => ({ id: k, label: model.KINDS[k].label, scope: model.KINDS[k].scope, mode: pol.kinds[k], configured: pol.configured[k],
       modes: ['owner', 'shadow', ...model.KINDS[k].delegates], deterministic: !!model.KINDS[k].deterministic, delegate: model.delegateFor(k, pol.configured[k] === 'owner' ? 'shadow' : pol.configured[k]) })),
     limits: { budget_usd: L.budgetUsd, max_minutes: L.maxMinutes, max_steps: L.maxSteps, max_wait_minutes: L.maxWaitMinutes, max_per_day: L.maxPerDay, research: L.research, loop_limit: L.loopLimit },
+    // The owner's standing rules (the playbook section): with none, a delegate never decides anything by model.
+    rules: { section: L.rulesSection, count: ownerRules().length },
     never: ['Budget, policies and this matrix', 'Merges of high-risk work, revert merges and releasing holds', 'Publish-guard holds', 'Standing grants and renewals of production access', 'Package installs'],
     recent: store.recentDelegations(30).map(view) };
 }
