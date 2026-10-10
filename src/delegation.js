@@ -437,12 +437,19 @@ export function forRun(run) {
   const r = store.getDelegation(Number(json(live?.job, {})?.delegation));
   return r && r.seat === run.agent_id && r.run_id === run.id ? r : null;
 }
+/**
+ * Charge a run's cost to its record, exactly once. One transaction: the spend, the released reservation and the marker
+ * that it was charged commit together or not at all, so a failure leaves it to the next attempt, never half-charged.
+ */
 function charge(id, run, steps = 0) {
-  if (store.kvGet(`decide-charged:${run.id}`)) return;
-  store.kvSet(`decide-charged:${run.id}`, '1');
-  const r = store.getDelegation(id);
-  store.updateDelegation(id, { spent_usd: (r.spent_usd || 0) + (run.cost_usd || 0), reserved_usd: 0, steps_used: (r.steps_used || 0) + (steps || 0),
-    spent_ms: (r.spent_ms || 0) + Math.max(0, Date.parse(run.ended_at || isoNow()) - Date.parse(run.started_at || isoNow())) });
+  store.transaction(() => {
+    if (store.kvGet(`decide-charged:${run.id}`)) return;
+    const r = store.getDelegation(id);
+    if (!r) return;
+    store.updateDelegation(id, { spent_usd: (r.spent_usd || 0) + (run.cost_usd || 0), reserved_usd: 0, steps_used: (r.steps_used || 0) + (steps || 0),
+      spent_ms: (r.spent_ms || 0) + Math.max(0, Date.parse(run.ended_at || isoNow()) - Date.parse(run.started_at || isoNow())) });
+    store.kvSet(`decide-charged:${run.id}`, '1');
+  });
 }
 /** ONE attempt for a queued record; a run that ends without `desk decide` sends the decision to the owner, explained. */
 export async function launch(r, fence = runner.currentEpoch()) {
@@ -866,7 +873,9 @@ export function recover() {
   for (const run of store.endedDecisionRuns()) {
     if (store.kvGet(`decide-charged:${run.id}`)) continue;
     const id = Number(json(run.job, {})?.delegation);
-    if (store.getDelegation(id)) charge(id, run, run.steps || 0);
+    if (!store.getDelegation(id)) continue;
+    try { charge(id, run, run.steps || 0); } // nothing of it stays half-written: the next recovery charges it again
+    catch (err) { store.logEvent({ kind: 'error', agent_id: 'system', run_id: run.id, text: `delegation: could not charge decision run ${run.id} (${store.redact(err.message).slice(0, 200)}); the next restart retries` }); }
   }
   for (const r of store.delegationsByStatus('running')) escalate(r, 'the desk restarted while the decision run was working. One attempt per decision, so it is yours now.', { from: ['running'] });
   // A reservation with no run behind it (the desk stopped between admitting the run and creating it) can spend nothing.

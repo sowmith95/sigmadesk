@@ -317,6 +317,28 @@ test('lifetime spend: every dollar is reserved or charged, never neither, throug
   } finally { config.delegation.research = old; }
 });
 
+test('a charge is all or nothing: a failure between its writes leaves it to the next recovery, which charges it exactly once', async () => {
+  fresh();
+  delegation.setPolicy({ kinds: { research: 'em' } });
+  const t = heldProposal();
+  delegation.sweep({ paused: false });
+  const r = open(t);
+  // A run that ended but was never charged (the desk stopped first): $0.75 still reserved on its escalated record.
+  const run = store.createRun({ agent_id: 'manager', ticket_key: t.key, kind: 'decide', token: `ch-${Math.random()}`, model: 'claude:opus', job: { delegation: r.id } });
+  store.updateRun(run.id, { status: 'success', token: null, cost_usd: 0.75, ended_at: store.now() });
+  store.updateDelegation(r.id, { status: 'escalated', run_id: run.id, reserved_usd: 0.75 });
+  // The spend write fails after the marker could have been written.
+  store.handle().exec('CREATE TRIGGER fail_charge BEFORE UPDATE OF spent_usd ON delegated_decisions BEGIN SELECT RAISE(ABORT, \'injected charge failure\'); END');
+  try { try { sched.recoverOrphans(); } catch { /* an older recovery let it escape */ } } finally { store.handle().exec('DROP TRIGGER fail_charge'); }
+  assert.equal(store.kvGet(`decide-charged:${run.id}`), null, 'no marker without the charge');
+  assert.deepEqual([store.getDelegation(r.id).spent_usd, store.getDelegation(r.id).reserved_usd], [0, 0.75], 'the reservation still stands');
+  // The next recovery charges it, once.
+  sched.recoverOrphans();
+  assert.deepEqual([store.getDelegation(r.id).spent_usd, store.getDelegation(r.id).reserved_usd], [0.75, 0]);
+  sched.recoverOrphans();
+  assert.equal(store.getDelegation(r.id).spent_usd, 0.75, 'never twice');
+});
+
 test('fallback admission: the engine the run actually gets is the one bounded, and a per-use fallback with no cap is refused', async () => {
   fresh();
   const codex = path.join(tmp, 'codex-quick.mjs');
