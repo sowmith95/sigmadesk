@@ -202,12 +202,14 @@ export function ownerReason(f, nameOf = (s) => s) {
  *    item, immediately followed by a column-0 `===` or `---` line. Only one whose text line is a paragraph of its own
  *    can be the owner's: a text line straight after a list item or another line of text continues that paragraph.
  *  - A rule: starts only at a column-0 list marker (`- `, `* `, `+ `, `1. `). Lines indented one to three spaces, text
- *    or list items, continue the rule above; so does a column-0 text line directly after its text (the same
- *    paragraph). A blank line and then column-0 text, a column-0 thematic break, or a heading end it; a rule whose
- *    paragraph a setext heading cut short is dropped (part of it became the heading).
+ *    or list items, continue the rule above, and so does a column-0 text line directly after one of its lines (the
+ *    same paragraph), however the rule reached that line. A blank line and then column-0 text, a column-0 thematic
+ *    break, or a heading end it. A rule is never kept without part of its own text: one whose paragraph a setext
+ *    heading cut short is dropped (part of it became the heading), and so is one whose paragraph runs on into a line
+ *    indented four or more, which Markdown reads as more of it (an indented fence there opens an example instead).
  * One token per physical line, in order: → [{ t: 'h', level, text, cuts } | { t: 'item', text } | { t: 'more', text } |
  *    { t: 'text', text } | { t: 'break' } | { t: 'blank' } | { t: 'nothing' } (fenced, commented) |
- *    { t: 'deep' } (indented four or more) | { t: 'hash' } (an indented # line)]
+ *    { t: 'deep', opens } (indented four or more; opens: a fence) | { t: 'hash' } (an indented # line)]
  */
 function ownerGrammar(text = '') {
   const lines = [];
@@ -227,7 +229,7 @@ function ownerGrammar(text = '') {
     if (open && !(open[1][0] === '`' && open[2].includes('`'))) { fence = new RegExp(`^ {0,3}${open[1][0] === '`' ? '`' : '~'}{${open[1].length},}\\s*$`); lines.push({ t: 'nothing' }); continue; }
     if (!line.trim()) { lines.push(src.trim() || commented ? { t: 'nothing' } : { t: 'blank' }); continue; } // a comment, not a blank line
     const indent = line.match(/^ */)[0].length;
-    if (indent >= 4) { lines.push({ t: 'deep' }); continue; }
+    if (indent >= 4) { const f = line.trim().match(/^(`{3,}|~{3,})(.*)$/); lines.push({ t: 'deep', opens: !!f && !(f[1][0] === '`' && f[2].includes('`')) }); continue; }
     if (indent > 0) { lines.push(/^ +#/.test(line) ? { t: 'hash' } : { t: 'more', text: line.trim() }); continue; }
     const h = line.match(/^(#{1,6})(?:\s+(.*?))?\s*$/);
     if (h) { lines.push({ t: 'h', level: h[1].length, text: (h[2] || '').replace(/\s+#+\s*$/, '').trim() }); continue; }
@@ -266,19 +268,22 @@ export function standingRules(text = '', heading = RULES_SECTION) {
   if (at < 0) return [];
   const level = blocks[at].level;
   const rules = [];
-  let cur = null, blank = false;
+  const drop = (rule) => rules.splice(rules.indexOf(rule), 1);
+  // own: the line just before this one, physically, was the current rule's own text (a blank or ignored line between
+  // them, and it was not).
+  let cur = null, own = false;
   for (const b of blocks.slice(at + 1)) {
+    const after = own; own = false;
     if (b.t === 'h') {
-      if (b.cuts && cur) rules.splice(rules.indexOf(cur), 1); // its paragraph was cut short: never a partial rule
+      if (b.cuts && cur) drop(cur); // its paragraph was cut short: never a partial rule
       if (b.level <= level) break; // the section ends at a heading of its level or higher
       cur = null; continue;
     }
-    if (b.t === 'break') { cur = null; continue; }
-    if (b.t !== 'item' && b.t !== 'more' && b.t !== 'text') { blank = true; continue; } // a blank or ignored line: what follows is not directly after
-    if (b.t === 'item') { cur = [b.text]; rules.push(cur); blank = false; continue; }
-    if (b.t === 'more') { if (cur) cur.push(b.text); continue; } // indented one to three spaces: the rule above
-    if (cur && !blank) { cur.push(b.text); continue; } // column-0 text directly after it: the same paragraph
-    cur = null; blank = false; // a paragraph between rules is not a rule
+    if (b.t === 'item') { cur = [b.text]; rules.push(cur); own = true; continue; }
+    if (b.t === 'more') { if (cur) { cur.push(b.text); own = true; } continue; } // indented one to three spaces: the rule above
+    if (b.t === 'text') { if (cur && after) { cur.push(b.text); own = true; } else cur = null; continue; } // directly after its text: the same paragraph; else a paragraph between rules
+    if (b.t === 'deep' && cur && after && !b.opens) { drop(cur); cur = null; continue; } // more of its paragraph that is never rule text here
+    if (b.t === 'break') cur = null;
   }
   return rules.map((r) => r.join('\n').trim()).filter(Boolean).slice(0, 60);
 }

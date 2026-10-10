@@ -224,6 +224,50 @@ test('owner rules (property): the rules are exactly the column-0 bullets of the 
   used.forEach((count, q) => assert.ok(count >= 20, `noise ${q} was used only ${count} times`));
 });
 
+// A rule's text, as a property: every continuation line the grammar accepts is in the rule, in order, and nothing
+// else is; a rule whose paragraph runs on into a line it never reads as rule text is dropped, never kept without it.
+test('owner rules (property): a rule keeps every line of its own text, whatever came before that line', () => {
+  const O = '## Standing rules the EM may apply alone';
+  // The reported case: a blank line, an indented condition, then a column-0 line directly after that condition.
+  assert.deepEqual(model.standingRules(`${O}\n- Permit a deploy\n\n  Only if QA passed\nand the owner approved it\n`), ['Permit a deploy\nOnly if QA passed\nand the owner approved it']);
+  assert.deepEqual(model.standingRules(`${O}\n- Permit a deploy\n<!-- a note -->\n  Only if QA passed\nand the owner approved it\n`), ['Permit a deploy\nOnly if QA passed\nand the owner approved it'], 'after an ignored line too');
+  // More of its paragraph, indented four (a tab counts four): Markdown shows it in the rule, the grammar never reads it.
+  for (const deep of ['    only after QA passed', '\tonly after QA passed', '    only after QA passed\nand the owner approved it'])
+    assert.deepEqual(model.standingRules(`${O}\n- Permit a deploy\n${deep}\n- Next rule\n`), ['Next rule'], JSON.stringify(deep));
+  let seed = 11;
+  const rand = (n) => { seed = (seed * 48271) % 2147483647; return seed % n; }; // exact in a double, unlike a 2^31 LCG whose low bits went to zero
+  const seen = { lazy: 0, ended: 0, dropped: 0, afterGap: 0 }; // the generator really varies
+  for (let k = 0; k < 400; k++) {
+    const lines = [O], want = [];
+    for (let i = 0, n = 1 + rand(4); i < n; i++) {
+      const text = [`Rule ${k}.${i}`];
+      lines.push(`- Rule ${k}.${i}`);
+      let own = true, kept = true; // own: the line before was this rule's own text
+      for (let j = 0, m = rand(7); j < m; j++) {
+        const id = `${k}.${i}.${j}`, kind = ['more', 'nested', 'lazy', 'lazy', 'blank', 'comment', 'fence', 'deep'][rand(8)];
+        if (kind === 'more') { lines.push(`  and condition ${id}`); text.push(`and condition ${id}`); if (!own) seen.afterGap++; own = true; }
+        else if (kind === 'nested') { lines.push(`  - nested condition ${id}`); text.push(`- nested condition ${id}`); own = true; }
+        else if (kind === 'lazy') {
+          lines.push(`and lazy condition ${id}`);
+          if (!own) { seen.ended++; break; } // after a blank or ignored line: a paragraph between rules, and the rule has ended
+          text.push(`and lazy condition ${id}`); seen.lazy++;
+        } else if (kind === 'blank') { lines.push(''); own = false; }
+        else if (kind === 'comment') { lines.push(`<!-- note ${id} -->`); own = false; }
+        else if (kind === 'fence') { lines.push('  ```', `  - FAKE example ${id}`, '  ```'); own = false; }
+        else {
+          lines.push(`    deep ${id}`);
+          if (own) { kept = false; seen.dropped++; break; } // more of its own paragraph, never rule text: the rule is dropped
+        }
+      }
+      if (kept) want.push(text.join('\n'));
+    }
+    lines.push('## Next', '- FAKE outside the section');
+    const doc = lines.join('\n');
+    assert.deepEqual(model.standingRules(doc), want, doc);
+  }
+  for (const [what, count] of Object.entries(seen)) assert.ok(count >= 20, `the generator produced ${what} only ${count} times`);
+});
+
 test('model: metrics count each decision once per kind; avoided excludes overrides and reopens; spend says what was estimated', () => {
   const now = Date.now(), at = new Date(now - 3600_000).toISOString(), old = new Date(now - 9 * 86400_000).toISOString();
   const m = model.metrics([
