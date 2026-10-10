@@ -1283,14 +1283,19 @@ export async function deskAction(run, cmd, body = {}) {
     decideActions.set(run.id, used);
     need(used <= delegation.limits().maxActions, `this decision run used its ${delegation.limits().maxActions} desk actions; decide with what you have or escalate`);
   } else need(cmd !== 'decide', 'desk decide only works inside a decision run');
-  // A step-bounded run's desk request (a tagged reply, a decision run) is a step of its own, counted BEFORE it is carried
-  // out: past the allowance the run is stopped and nothing it asked for happens. The engine's stream gets one turn of the
-  // event loop first to report the commands it already ran.
-  if (runner.isStepBounded(run.kind)) { await new Promise((resolve) => setImmediate(resolve)); runner.admitDeskCall(run); }
   if (run.kind === 'verify') need(['show', 'list', 'comment', 'progress', 'ops', 'verify', 'context-file'].includes(cmd), 'a verify run reads production through desk ops and finishes with desk verify done|owner');
   // A post-deploy checkpoint run reads and decides; it never comments, submits, publishes or changes a ticket.
   if (run.kind === 'watch') need(['show', 'list', 'ops', 'watch', 'context-file'].includes(cmd), 'a post-deploy check reads production through desk ops and finishes with desk watch verified|regression|inconclusive');
   else need(cmd !== 'watch', 'desk watch only works inside a post-deploy check run');
+  // A step-bounded run's desk request (a tagged reply, a decision run, a post-deploy check) is a step of its own,
+  // admitted BEFORE it is carried out: past the allowance the run is stopped and nothing it asked for happens.
+  if (!runner.isStepBounded(run.kind)) return carryOut(run, cmd, body);
+  const done = runner.admitDeskCall(run);
+  try { return await carryOut(run, cmd, body); } finally { done(); }
+}
+/** What a desk command does, once the gates above let its run send it. */
+async function carryOut(run, cmd, body) {
+  const agentId = run.agent_id;
   if (PERMS[cmd]) need(PERMS[cmd].includes(agentId), `${agentById[agentId].role} cannot run "${cmd}"`);
   const key = body.key || run.ticket_key;
   const ticket = key ? store.getTicket(key) : null;

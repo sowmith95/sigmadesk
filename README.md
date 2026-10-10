@@ -204,17 +204,18 @@ publish-guard holds; standing and renewal production access; package installs.
   was stopped (cancelled, timed out, over its steps) never applies anything, even if its decision was already sent.
 - **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and ends with one
   `desk decide` (or `desk decide escalate "<recommendation>" --why "<why it is yours>"`): up to $0.75 on an engine with a
-  spending cap, or 6 minutes and 30 steps on a plan-billed one; an engine with neither is refused. Steps count every tool
-  call and command as it starts; a desk request is paired one to one with the command that carries it (a compound shell
-  and its request are one step, a local `desk --help` is one step, and a request no command accounts for is a step of
-  its own), and the desk counts it before carrying it out, so a request past the limit is refused and the run stopped
-  before it can apply anything. The bound is reserved
-  for the engine the run actually gets (a fallback included). A research proposal's delegated runs share a $1.50
-  lifetime allowance: each run is capped at what is left of it, and an engine that cannot cap dollars only starts when
-  its whole reservation fits. Every dollar is reserved or charged, never neither: a run's reservation stands, whatever
-  its decision did, until the run's cost is charged, and after a restart every ended run is charged to its record. A run that ends without deciding, or a decision not started within 30 minutes, comes to
-  you with the reason. Escalations carry a one-line recommendation, so your tap is yes or no. At most 40 decision runs a
-  day; one slot stays free for QA and incidents.
+  spending cap, or 6 minutes and 40 steps on a plan-billed one (`delegation.maxSteps`); an engine with neither is
+  refused. A step is every command or tool call the engine reports, counted as it starts, and every desk request,
+  counted apart: the desk never guesses which command sent a request, so **a desk command costs two steps**. A request
+  is carried out only if it still leaves room for the late report of the command that sent it; otherwise it is refused
+  and the run stopped before it can apply anything. The same counting applies to tagged replies (`mentions.maxSteps`)
+  and post-deploy checks on a plan-billed engine (`watch.maxSteps`). The bound is reserved for the engine the run
+  actually gets (a fallback included). A research proposal's delegated runs share a $1.50 lifetime allowance: each run
+  is capped at what is left of it, and an engine that cannot cap dollars only starts when its whole reservation fits.
+  Every dollar is reserved or charged, never neither: a run's reservation stands, whatever its decision did, until the
+  run's cost is charged, and after a restart every ended run is charged to its record. A run that ends without
+  deciding, or a decision not started within 30 minutes, comes to you with the reason. Escalations carry a one-line
+  recommendation, so your tap is yes or no. At most 40 decision runs a day; one slot stays free for QA and incidents.
 - **Rules before the run and again at apply**, with no model call: a delegate never decides anything it is a party to.
   One list of interested seats serves every kind: whoever put the hold (the asker, the requester, QA, a disagreeing
   reviewer), built, is assigned, designed or worked on the ticket, reviews the change, wrote or reviewed the proposal,

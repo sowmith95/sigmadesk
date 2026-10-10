@@ -58,7 +58,7 @@ export function settingsFrom(cfg = {}) {
   const kinds = Object.fromEntries(KIND_IDS.map((k) => [k, validMode(k, cfg.kinds?.[k]) ? cfg.kinds[k] : 'shadow']));
   return {
     enabled: cfg.enabled !== false, kinds, peerAccess: cfg.peerAccess === true,
-    budgetUsd: num(cfg.budgetUsd, 0.75, 0.05, 20), maxMinutes: num(cfg.maxMinutes, 6, 0.01, 60), maxSteps: num(cfg.maxSteps, 30, 3, 200),
+    budgetUsd: num(cfg.budgetUsd, 0.75, 0.05, 20), maxMinutes: num(cfg.maxMinutes, 6, 0.01, 60), maxSteps: num(cfg.maxSteps, 40, 3, 200),
     maxActions: num(cfg.maxActions, 12, 2, 60), maxWaitMinutes: num(cfg.maxWaitMinutes, 30, 1, 1440), maxPerDay: num(cfg.maxPerDay, 40, 0, 1000),
     research: { maxCorrections: num(cfg.research?.maxCorrections, 1, 0, 5), maxSpendUsd: num(cfg.research?.maxSpendUsd, 1.5, 0, 50) },
     loopLimit: { maxRescopes: num(cfg.loopLimit?.maxRescopes, 1, 0, 5) },

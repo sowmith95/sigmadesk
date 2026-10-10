@@ -40,82 +40,69 @@ const evidence = new Map(); // runId -> { pending: Map(id -> cmd), done: [{cmd, 
 export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
 
 /**
- * Step-bounded runs (tagged replies, delegated decisions #9) stop after their step allowance, the desk-side bound when
- * dollars cannot be capped. A step is a stream event (a tool call, or a command, counted when it STARTS, once by its id)
- * OR a desk request, never both. A request is matched one to one, in order, with a command that invokes desk and is
- * still in flight (started, not ended, not yet matched); whichever of the two the desk sees first, the pair is one
- * step. A command that invokes desk but ends without a request (desk --help) matches nothing later; a request that no
- * in-flight command accounts for is a step of its own until a late-reported command claims it. steps = stream steps +
- * unmatched requests, and a request that would take the run past its allowance is refused, and the run stopped,
- * before the desk carries it out.
+ * Step-bounded runs (tagged replies, delegated decisions #9, post-deploy checks) stop after their step allowance, the
+ * desk-side bound when dollars cannot be capped. Two kinds of step, counted apart and never matched to each other (the
+ * desk cannot know which command sent a request, so it does not guess): every command or tool call the engine reports
+ * (a command once, by its id, when it starts) and every desk request that reaches the desk. A desk command therefore
+ * costs two steps. A request is admitted only while it, the stream step of the command that sent it (which the engine
+ * may not have reported yet) and one such step for every request still being carried out all fit in the allowance;
+ * otherwise it is refused, and the run stopped, before anything it asked for happens. So a late-reported step can
+ * never take a run past its allowance after a request was carried out.
  */
 // Post-deploy checks (watch) are bounded too, by what is left of their checkpoint's steps when the engine cannot cap
 // dollars; with a dollar cap their allowance is dollars, so their steps are counted (the checkpoint keeps the total)
 // but never stop them.
 const STEP_BOUNDED = new Set(['mention', 'decide', 'watch']);
 export const isStepBounded = (kind) => STEP_BOUNDED.has(kind);
-const DESK_CALL = /(^|[\s;&|(){}`'"$])desk(\s|$)/; // a command line that runs the desk CLI somewhere in it
-// run id → { max, tools: tool calls, ids: stream command ids, inflight: desk-invoking commands not ended or matched,
-// pending: requests no stream command has claimed yet, stopped }
+// run id → { max, tools: tool calls, ids: reported command ids, requests: desk requests, open: requests being carried out, stopped }
 const ledgers = new Map();
 function ledgerOf(run, max = null) {
   let l = ledgers.get(run.id);
-  if (!l) { l = { max: null, tools: 0, ids: new Set(), inflight: [], pending: 0, stopped: false }; ledgers.set(run.id, l); }
+  if (!l) { l = { max: null, tools: 0, ids: new Set(), requests: 0, open: 0, stopped: false }; ledgers.set(run.id, l); }
   if (max != null) l.max = max;
   return l;
 }
-const ledgerSteps = (l) => l.tools + l.ids.size + l.pending;
-const ledgerMax = (run, l) => l.max ?? (run.kind === 'decide' ? Number(config.delegation?.maxSteps) || 30 : run.kind === 'mention' ? Number(config.mentions?.maxSteps) || 60 : Infinity);
+const ledgerSteps = (l) => l.tools + l.ids.size + l.requests;
+const ledgerMax = (run, l) => l.max ?? (run.kind === 'decide' ? Number(config.delegation?.maxSteps) || 40 : run.kind === 'mention' ? Number(config.mentions?.maxSteps) || 60 : Infinity);
 const LIMIT_OF = { decide: 'a delegated decision', mention: 'a tagged reply', watch: 'a post-deploy check' };
 /** The steps a run has taken so far (its ledger when it is step-bounded). */
 const stepsTaken = (ctx) => { const l = ledgers.get(ctx.run.id); return l ? ledgerSteps(l) : ctx.state.steps || 0; };
-function stopAtLimit(run, l) {
-  const max = ledgerMax(run, l);
-  if (ledgerSteps(l) <= max || l.stopped) return false;
+function stopRun(run, l, max) {
+  if (l.stopped) return;
   l.stopped = true;
   store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for ${LIMIT_OF[run.kind] || 'this run'})` });
   killRun(run.id, `step limit (${max})`);
-  return true;
 }
-function settleSteps(ctx, l) {
-  ctx.state.steps = ledgerSteps(l);
-  store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the run's steps from it
-  stopAtLimit(ctx.run, l);
-}
-/** A stream step: a tool call (id null) or a command as it starts. A desk-invoking command claims a waiting request. */
-function stepLimit(ctx, id = null, cmd = '') {
+/** A step the engine reported: a tool call (id null) or a command as it starts (once by its id). */
+function stepLimit(ctx, id = null) {
   if (!STEP_BOUNDED.has(ctx.run.kind)) return;
   const l = ledgerOf(ctx.run, ctx.maxSteps ?? null);
   if (id == null) l.tools++;
-  else {
-    if (l.ids.has(id)) return;
-    l.ids.add(id);
-    if (DESK_CALL.test(String(cmd || ''))) { if (l.pending > 0) l.pending--; else l.inflight.push(id); }
-  }
-  settleSteps(ctx, l);
+  else if (l.ids.has(id)) return;
+  else l.ids.add(id);
+  ctx.state.steps = ledgerSteps(l);
+  store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the run's steps from it
+  if (ctx.state.steps > ledgerMax(ctx.run, l)) stopRun(ctx.run, l, ledgerMax(ctx.run, l));
 }
-/** A command ended: from now on it can no longer account for a request. */
-function stepEnded(ctx, id) {
-  const l = STEP_BOUNDED.has(ctx.run.kind) ? ledgers.get(ctx.run.id) : null;
-  if (!l || id == null) return;
-  const at = l.inflight.indexOf(id);
-  if (at >= 0) l.inflight.splice(at, 1);
-}
+const refusedFor = (max) => Object.assign(new Error(`this desk command would take the run past its ${max} steps (a desk command counts twice: as a command and as a request), so the run was stopped and nothing it asked for was carried out`), { status: 409 });
 /**
- * A desk request from a step-bounded run, BEFORE the desk carries it out: the in-flight command that carries it was
- * counted when it started; otherwise the request is a step of its own. Past the allowance the run is stopped and the
- * request refused, so nothing it asked for happens; a run already stopped carries nothing out.
+ * A desk request from a step-bounded run, BEFORE the desk carries it out: a step of its own, admitted only with room
+ * left for the stream step of the command that sent it and for those of every request still being carried out. →
+ * a function to call once the request has been carried out. A refused request stops the run.
  */
 export function admitDeskCall(run) {
-  if (!STEP_BOUNDED.has(run.kind)) return;
+  if (!STEP_BOUNDED.has(run.kind)) return () => {};
   const l = ledgerOf(run);
   const max = ledgerMax(run, l);
-  if (l.stopped) throw Object.assign(new Error(`this run has used its ${max} steps, so it was stopped and this desk command was not carried out`), { status: 409 });
+  if (l.stopped) throw refusedFor(max);
   if (store.getRun(run.id)?.status !== 'running') throw Object.assign(new Error('this run is no longer open (it was stopped), so this desk command was not carried out; stop now'), { status: 409 });
-  if (l.inflight.length) { l.inflight.shift(); return; }
-  l.pending++;
+  const fits = ledgerSteps(l) + 1 + 1 + l.open <= max;
+  l.requests++;
   store.setRunSteps(run.id, ledgerSteps(l));
-  if (stopAtLimit(run, l)) throw Object.assign(new Error(`this run has used its ${max} steps, so it was stopped and this desk command was not carried out`), { status: 409 });
+  if (!fits) { stopRun(run, l, max); throw refusedFor(max); }
+  l.open++;
+  let done = false;
+  return () => { if (!done) { done = true; l.open = Math.max(0, l.open - 1); } };
 }
 
 // Apply an engine's normalized events to the desk (activity log, presence, progress, result).
@@ -146,14 +133,13 @@ export function applyEvents(events, ctx) {
       case 'error': ctx.state.lastError = e.text; store.logEvent({ ...base, kind: 'error', text: short(e.text, 300) }); break;
       case 'wait': store.logEvent({ ...base, kind: 'system', text: e.text }); break;
       case 'cmd-start': {
-        stepLimit(ctx, e.id, e.cmd); // every command, including desk calls an engine does not display
+        stepLimit(ctx, e.id); // every command, including desk calls an engine does not display
         const ev = evidence.get(run.id) || { pending: new Map(), done: [] };
         ev.pending.set(e.id, e.cmd);
         evidence.set(run.id, ev);
         break;
       }
       case 'cmd-end': {
-        stepEnded(ctx, e.id);
         const ev = evidence.get(run.id);
         const cmd = ev?.pending.get(e.id);
         if (cmd != null) { ev.done.push({ cmd, ok: e.ok }); ev.pending.delete(e.id); }

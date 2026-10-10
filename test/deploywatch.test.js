@@ -1183,7 +1183,7 @@ test('watch steps are enforced across attempts: a plan-billed check stops past w
   const ctx2 = { run: run2, state: {}, presence: false, maxSteps: a2.limits.steps };
   tools(ctx2, 15);
   assert.equal(store.getRun(run2.id).status, 'running', '15 steps: within what was left');
-  await assert.rejects(sched.deskAction(store.getRun(run2.id), 'watch', { action: 'verified', body: 'healthy after the deploy' }), /used its 15 steps/);
+  await assert.rejects(sched.deskAction(store.getRun(run2.id), 'watch', { action: 'verified', body: 'healthy after the deploy' }), /would take the run past its 15 steps/);
   assert.deepEqual([store.getRun(run2.id).status, store.getRun(run2.id).result_text], ['killed', 'step limit (15)']);
   assert.notEqual(store.getCheckpoint(cp.id).verdict, 'verified', 'no verdict past the allowance');
   dw.chargeJob(cp.id, store.getRun(run2.id), 16);

@@ -132,7 +132,7 @@ const DEFAULTS = {
     // Engines with no per-run dollar cap but billed to the owner's plan (engines.*.billing = 'plan'): the bound is
     // time and steps instead. The desk stops the run at either limit. API-billed engines without a cap are refused.
     maxMinutes: 10,
-    maxSteps: 60, // tool calls and commands in one tagged run
+    maxSteps: 60, // tool calls and commands in one tagged run, plus its desk requests (a desk command counts twice)
     maxActions: 30, // desk commands one tagged run may send (counted by the desk itself)
   },
   resolve: {
@@ -163,7 +163,7 @@ const DEFAULTS = {
     // for a plan-billed engine without a cap, these time and step limits.
     budgetUsd: 1,
     maxMinutes: 10,
-    maxSteps: 40,
+    maxSteps: 40, // commands and tool calls the engine reports, plus desk requests (a desk command counts twice)
   },
   // Push to your phone when the desk needs you (Discord/Slack webhook or an ntfy.sh topic URL).
   notify: {
@@ -305,7 +305,7 @@ const DEFAULTS = {
     peerAccess: false, // the EM and the SRE may approve each other's ticket-bound production read access (renewals stay yours)
     budgetUsd: 0.75, // hard spend cap per decision attempt on an engine that enforces one (Claude)
     maxMinutes: 6, // plan-billed engines without a dollar cap (Codex): time and step bounds per attempt
-    maxSteps: 30,
+    maxSteps: 40, // every command and tool call the engine reports, plus every desk request (a desk command counts twice)
     maxActions: 12, // desk commands one decision run may send (counted by the desk itself)
     maxWaitMinutes: 30, // a delegated decision not started within this comes to you, explained
     maxPerDay: 40, // decision runs per day across every kind
