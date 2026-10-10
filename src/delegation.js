@@ -92,28 +92,36 @@ export function ticketDecision(t, { settled = true } = {}) {
   return null;
 }
 /**
- * Every ticket field a delegated decision rests on (#9). Bookkeeping is left out because it moves without the decision
- * changing: the run in flight, progress text, stall counts, timestamps, GitHub issue numbers, assignment notes.
+ * What is NOT evidence: the few columns that move without the decision changing (bookkeeping, timestamps, counters,
+ * cache fields). Every other column of the ticket row, of every message on its thread and of the kind's own records is
+ * evidence, so a column added to any of them later is covered without anyone listing it. An entry here is a claim
+ * that the column can never change what is decided: keep it short.
  */
-export const EVIDENCE_FIELDS = ['key', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee', 'builder', 'designer', 'reporter',
-  'risk', 'diff_risk', 'head_sha', 'qa_sha', 'pr_url', 'branch', 'resume_status', 'after_key', 'parent_key', 'owner_task', 'owner_task_kind', 'owner_task_by',
-  'hold_kind', 'hold_seat', 'hold_ref', 'hold_scope', 'qa_loops', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent', 'contributors', 'assign_pinned',
-  'research_review', 'research_generation', 'research_revisions', 'research_policy', 'prod_verify', 'merge_hold', 'owner_merge_only'];
+export const NOT_EVIDENCE = Object.freeze({
+  // the run in flight, progress (a percentage and its display line, rolled up from sub-tasks), stall count, the GitHub
+  // issue number, an engine session, the assignment note, done time. A decision run is never shown progress text.
+  tickets: Object.freeze(['updated_at', 'active_run', 'progress', 'progress_msg', 'stalls', 'issue_number', 'origin_session', 'assign_reason', 'done_at']),
+  comments: Object.freeze(['gh_synced']), // mirrored to GitHub
+  research_reviews: Object.freeze(['run_id', 'created_at', 'ended_at']),
+  owner_discussions: Object.freeze(['run_id', 'attempts', 'created_at', 'ended_at']),
+  councils: Object.freeze(['created_at', 'ended_at']),
+  council_members: Object.freeze(['run_id', 'reserve_usd', 'started_at', 'ended_at']),
+});
+const evidenceOf = (table, row) => (row ? Object.keys(row).filter((col) => !NOT_EVIDENCE[table].includes(col)).sort().map((col) => [col, row[col] ?? null]) : null);
 /**
- * The one fingerprint of what a delegated decision rests on: the ticket's substantive fields, its whole thread (every
- * message, by id, author and text), the changed files, and the kind's own evidence (a proposal's text and the current
- * reviews; a design's recommendation). A record keeps it as its version. The desk recomputes it when the record is
- * swept, when its run starts and inside the applying transaction: anything different means the delegate decided on
- * something else, so nothing is applied. A new hold, question, message or revision is therefore a new decision.
+ * The one fingerprint of what a delegated decision rests on: every column but NOT_EVIDENCE of the ticket row, of
+ * every message on its thread and of the kind's own records (the current reviews of a proposal; a design's discussion,
+ * or a council and its members), read as stored, plus the changed files. A record keeps it as its version. The desk
+ * recomputes it when the record is swept, when its run is bound and inside the applying transaction: anything
+ * different means the delegate decided on something else, so nothing is applied.
  */
 export function evidenceFingerprint(kind, t, ref = null) {
   if (!t) return null;
-  const thread = store.listComments(t.key).map((c) => [c.id, c.author, hash(c.body)]);
-  const own = kind === 'research' ? { proposal: researchReview.hashOf(t), reviews: store.listResearchReviews(t.key).filter((r) => r.generation === t.research_generation)
-    .map((r) => [r.id, r.reviewer, r.status, r.verdict ?? null, hash(r.report ?? null)]) }
-    : kind === 'design' ? { type: ref?.type ?? null, id: ref?.id ?? null, status: ref?.status ?? null, text: hash(ref?.text ?? ''), stale: !!ref?.stale, chair: ref?.chair ?? null, author: ref?.author ?? null }
-      : null;
-  return hash([kind, EVIDENCE_FIELDS.map((f) => t[f] ?? null), thread, store.kvGet(`diff-files:${t.key}`), own]);
+  const rows = store.evidenceRows(t.key, { generation: kind === 'research' ? t.research_generation : null,
+    discussion: kind === 'design' && ref?.type === 'design' ? ref.id : null, council: kind === 'design' && ref?.type === 'council' ? ref.id : null });
+  if (!rows.tickets) return null;
+  return hash([kind, ...Object.entries(rows).map(([table, v]) => [table, Array.isArray(v) ? v.map((row) => evidenceOf(table, row)) : evidenceOf(table, v)]),
+    store.kvGet(`diff-files:${t.key}`), kind === 'design' ? !!ref?.stale : null]);
 }
 function designRef(decisionId) {
   const m = String(decisionId).match(/^(.+):(design|council):(\d+)$/);
@@ -565,7 +573,7 @@ export function prompt(r, c, given = citablesFor(r, c)) {
 Answer it only if a reader can settle it from this repository or its documentation (cite the file and line, a test or the doc you read). If it is really about money, credentials, a product preference, trading semantics or a schema change, escalate: those are the owner's whatever the asker called it. The ticket's work resumes with your answer.`;
   } else if (r.kind === 'research') {
     const review = ev((x) => x.review);
-    what = `A research proposal by ${first(t.reporter)} is held: ${fence(t.progress_msg || 'the second reviewer did not pass it')}.
+    what = `A research proposal by ${first(t.reporter)} is held: its second-person review did not pass it (the review is below).
 <review untrusted="true"${review ? ` id="${review.id}"` : ''}>\n${fence(review?.text || '(no structured review)').slice(0, 3000)}\n</review>
 You COORDINATE: send it back to ${first(t.reporter)} with concrete corrections or a narrower v1 scope, or escalate. You cannot approve it past the reviewer's dissent: that is the owner's.`;
   } else if (r.kind === 'loop_limit') {

@@ -290,44 +290,130 @@ test('re-validation at apply: a changed decision is superseded, a policy change 
   } finally { team.applyTeamOverrides({}); }
 });
 
-// Values a fixture writes to change one field (anything different from what the ticket holds).
-const changed = (f, v) => (['qa_loops', 'review_round', 'owner_task', 'assign_pinned', 'research_generation', 'research_revisions', 'owner_merge_only'].includes(f) ? (Number(v) || 0) + 1
-  : f === 'contributors' ? JSON.stringify(['senior-be', 'manager']) : f === 'risk' ? 'high' : f === 'status' ? 'todo' : `${v ?? ''}~changed`);
-test('evidence and policy at apply (property): any one substantive change after the run started means nothing is applied', async () => {
+// What the code may leave out of the evidence, written out here on its own: growing that list is a decision a test sees.
+const EXPECTED_NOT_EVIDENCE = { tickets: ['updated_at', 'active_run', 'progress', 'progress_msg', 'stalls', 'issue_number', 'origin_session', 'assign_reason', 'done_at'],
+  comments: ['gh_synced'], research_reviews: ['run_id', 'created_at', 'ended_at'], owner_discussions: ['run_id', 'attempts', 'created_at', 'ended_at'],
+  councils: ['created_at', 'ended_at'], council_members: ['run_id', 'reserve_usd', 'started_at', 'ended_at'] };
+// Every column of a table as the live database has it, by its declared type.
+const schema = (table) => store.handle().prepare(`PRAGMA table_info(${table})`).all();
+// Change one column of one row in place, whatever its type (the code under test never sees this list).
+function mutate(table, col, where, ...args) {
+  const set = col.pk ? `${col.name} = ${col.name} + 100000` : /INT/i.test(col.type) ? `${col.name} = COALESCE(${col.name}, 0) + 1000` // clear of unique neighbours
+    : /REAL|FLOA|DOUB/i.test(col.type) ? `${col.name} = COALESCE(${col.name}, 0) + 0.5` : `${col.name} = COALESCE(${col.name}, '') || '~'`;
+  const n = store.handle().prepare(`UPDATE ${table} SET ${set} WHERE ${where}`).run(...args).changes;
+  assert.equal(n, 1, `${table}.${col.name} was changed`);
+}
+test('evidence (property): every column of the live schema but the explicit bookkeeping list is evidence; changing any one after bind applies nothing', async () => {
+  reset();
+  policy({ question: 'em', research: 'em', design: 'sre' });
+  assert.deepEqual(JSON.parse(JSON.stringify(delegation.NOT_EVIDENCE)), EXPECTED_NOT_EVIDENCE, 'a column is left out of the evidence only on purpose');
+  for (const [table, cols] of Object.entries(EXPECTED_NOT_EVIDENCE)) for (const c of cols) assert.ok(schema(table).some((x) => x.name === c), `${table}.${c} exists`);
+  const covered = (table) => schema(table).filter((c) => !EXPECTED_NOT_EVIDENCE[table].includes(c.name));
+  const refused = async (what, run, r, body, key) => {
+    const out = await sched.deskAction(run, 'decide', body);
+    const after = store.getDelegation(r.id);
+    assert.ok(['superseded', 'invalidated'].includes(after.status), `${what}: ${after.status} (${out})`);
+    assert.match(out, /nothing was applied/, what);
+    assert.ok(!store.listComments(key).some((c) => ['manager', 'sre'].includes(c.author)), `${what}: nothing posted as the delegate's`);
+  };
+  const answer = { cite: 'R1,E1', action: 'answer', body: 'utils/net.py:40.', why: 'utils/net.py:40 defines retry(); the marked rule says answer from the code.' };
+  // The ticket row and the thread: a question.
+  for (const col of covered('tickets')) {
+    const t = await ask(ticket());
+    delegation.sweep({ paused: false });
+    const r = recFor(`${t.key}:question`); const run = bind(r);
+    mutate('tickets', col, 'key = ?', t.key);
+    await refused(`tickets.${col.name}`, run, r, answer, t.key);
+  }
+  for (const col of covered('comments')) {
+    const t = await ask(ticket());
+    const extra = store.addComment(t.key, 'senior-be', 'The helper lives in utils/net.py.');
+    delegation.sweep({ paused: false });
+    const r = recFor(`${t.key}:question`); const run = bind(r);
+    mutate('comments', col, 'id = ?', extra.id);
+    await refused(`comments.${col.name}`, run, r, answer, t.key);
+  }
+  // A proposal's current reviews: a research hold.
+  for (const col of covered('research_reviews')) {
+    const t = store.createTicket({ title: `Proposal ${col.name}`, status: 'proposed', reporter: 'pm', source: 'research', description: '## Problem\nx\n## Evidence\ny' });
+    researchReview.open(t, { program: 'product-discovery', review: { minReviewers: 1, reviewers: ['principal-be'] } }, { id: 1 });
+    const rv = store.createResearchReview({ ticket_key: t.key, generation: 1, input_hash: researchReview.hashOf(store.getTicket(t.key)), reviewer: 'principal-be', status: 'pending' });
+    researchReview.complete(rv.id, { report: { verdict: 'reject', summary: 'No source', evidence_checked: [], findings: ['x'], conditions: ['y'] } });
+    delegation.sweep({ paused: false });
+    const r = recFor(`${t.key}:research:1`); const run = bind(r);
+    mutate('research_reviews', col, 'id = ?', rv.id);
+    await refused(`research_reviews.${col.name}`, run, r, { cite: 'R2,E1', action: 'changes', body: 'Cite a source.', why: 'The reviewer found no source; the marked rule says send it back.' }, t.key);
+  }
+  // A design recommendation: its discussion row.
+  for (const col of covered('owner_discussions')) {
+    const t = ticket({ status: 'todo' });
+    const d = store.createDiscussion(t.key, 'Design the export.');
+    store.updateDiscussion(d.id, { status: 'complete', response: 'One CSV per day.' });
+    delegation.sweep({ paused: false });
+    const r = recFor(`${t.key}:design:${d.id}`); const run = bind(r);
+    mutate('owner_discussions', col, 'id = ?', d.id);
+    await refused(`owner_discussions.${col.name}`, run, r, { cite: 'R4,E1', action: 'approve', body: 'One CSV per day.', why: 'Low risk; the marked rule covers it.' }, t.key);
+  }
+  // A council and its members: the same one fingerprint (what the sweep, the bind and the apply compare) moves.
+  const council = await import('../src/council.js');
+  const ct = ticket({ status: 'todo' });
+  const c = council.create(ct.key, { members: [{ model: 'perplexity/kimi-k3', lens: 'architecture' }, { model: 'perplexity/glm-5.3', lens: 'reliability' }], synthesizer: 'perplexity/kimi-k3' });
+  store.updateCouncil(c.id, { status: 'complete', result: 'Proceed with one CSV per day.' });
+  const id = `${ct.key}:council:${c.id}`;
+  const fp = () => delegation.candidates().find((x) => x.decision_id === id)?.version ?? null;
+  assert.ok(fp(), 'the council is an open decision');
+  store.handle().exec('PRAGMA foreign_keys = OFF'); // a council's members point at its id, which is changed too
+  try { for (const [table, where, arg] of [['councils', 'id = ?', c.id], ['council_members', 'id = ?', store.councilMembers(c.id)[0].id]]) {
+    for (const col of covered(table)) {
+      const before = fp();
+      const snap = store.handle().prepare(`SELECT * FROM ${table} WHERE ${where}`).get(arg);
+      mutate(table, col, where, arg);
+      assert.notEqual(fp(), before, `${table}.${col.name} is evidence`);
+      // put it back for the next column (the row's id may have moved with it)
+      store.handle().prepare(`DELETE FROM ${table} WHERE ${col.pk ? `${col.name} = ?` : where}`).run(col.pk ? snap[col.name] + 100000 : arg);
+      store.handle().prepare(`INSERT INTO ${table}(${Object.keys(snap).join(',')}) VALUES (${Object.keys(snap).map(() => '?').join(',')})`).run(...Object.values(snap));
+      assert.equal(fp(), before, `${table}.${col.name} restored`);
+    }
+  } } finally { store.handle().exec('PRAGMA foreign_keys = ON'); }
+  // And the bookkeeping really is not evidence: it moves while a decision is open, which must not churn it.
+  const t = await ask(ticket());
+  delegation.sweep({ paused: false });
+  const r = recFor(`${t.key}:question`);
+  store.handle().prepare("UPDATE tickets SET updated_at = 'x', progress = 77, progress_msg = 'rolled up', stalls = 3, issue_number = 9, origin_session = 's', assign_reason = 'n', done_at = NULL, active_run = NULL WHERE key = ?").run(t.key);
+  store.handle().prepare('UPDATE comments SET gh_synced = 1 WHERE ticket_key = ?').run(t.key);
+  assert.equal(delegation.candidates().find((x) => x.decision_id === r.decision_id)?.version, r.version);
+});
+
+test('policy (property): production access, sync and PR settings, the access policy and the playbook each lapse a decision between bind and apply', async () => {
   reset();
   policy({ question: 'em' });
-  const fields = delegation.EVIDENCE_FIELDS.filter((f) => !['key', 'reporter'].includes(f)); // set once, at creation
   const savedPolicy = store.getSettings().access_policy;
   const mutations = [
-    ...fields.map((f) => [`the ticket's ${f}`, (t) => { store.updateTicket(t.key, { [f]: changed(f, t[f]) }); assert.notEqual(String(store.getTicket(t.key)[f]), String(t[f]), `${f} changed`); }]),
-    ['a new message on the thread', (t) => store.addComment(t.key, 'senior-be', 'This now touches the broker order path.')],
-    ['the changed files', (t) => store.kvSet(`diff-files:${t.key}`, JSON.stringify(['broker/orders.py']))],
     ['production read access', () => store.setSetting('ops_enabled', 'true')],
     ['GitHub sync', () => store.setSetting('github_sync', store.getSettings().github_sync === 'true' ? 'false' : 'true')],
     ['opening PRs', () => store.setSetting('open_draft_prs', store.getSettings().open_draft_prs === 'true' ? 'false' : 'true')],
     ['the access policy', () => store.writeSetting('access_policy', JSON.stringify({ approvers: ['manager'], seats: ['sre'], probes: ['*'], maxMinutes: 30 }))],
-    ['the owner\'s standing rules (the playbook)', () => fs.appendFileSync(config.project.playbook, '\n- Never answer for the owner on Fridays.\n')],
+    ['the owner\'s playbook', () => fs.appendFileSync(config.project.playbook, '\n- Never answer for the owner on Fridays.\n')],
+    ['the changed files', (t) => store.kvSet(`diff-files:${t.key}`, JSON.stringify(['broker/orders.py']))],
   ];
   // The playbook a run is given is the owner's: this test edits a private copy of it.
   const playbookWas = config.project.playbook;
   config.project.playbook = path.join(tmp, 'playbook-edited.md');
   const sync = store.getSettings().github_sync, prs = store.getSettings().open_draft_prs;
   try {
-    for (const [what, mutate] of mutations) {
+    for (const [what, change] of mutations) {
       fs.copyFileSync(playbookWas, config.project.playbook);
-      const t = await ask(ticket({ description: 'Fix the retry helper in utils/net.py.' }));
+      const t = await ask(ticket());
       delegation.sweep({ paused: false });
       const r = recFor(`${t.key}:question`);
       assert.equal(r?.status, 'queued', what);
       const run = bind(r);
-      const thread = store.listComments(t.key).length;
-      mutate(store.getTicket(t.key));
+      change(store.getTicket(t.key));
       const out = await sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'answer', body: 'Yes, buy it.', why: 'utils/net.py:40 says so; the playbook says reuse.' });
       const after = store.getDelegation(r.id);
       assert.ok(['superseded', 'invalidated'].includes(after.status), `${what}: ${after.status}`);
       assert.match(out, /nothing was applied/, what);
       assert.ok(!store.listComments(t.key).some((c) => c.author === 'manager'), `${what}: nothing posted as Morgan`);
-      assert.ok(store.listComments(t.key).length <= thread + 1, `${what}: no decision on the thread`);
       store.setSetting('ops_enabled', 'false'); store.setSetting('github_sync', sync); store.setSetting('open_draft_prs', prs);
       store.writeSetting('access_policy', savedPolicy ?? '');
     }

@@ -1448,6 +1448,21 @@ export function createDiscussion(ticketKey, question) {
   const d = getDiscussion(info.lastInsertRowid); announce({ type: 'discussion', data: d }); return d;
 }
 export const getDiscussion = (id) => q('SELECT * FROM owner_discussions WHERE id=?').get(id) || null;
+/**
+ * The rows a delegated decision's evidence fingerprint reads (src/delegation.js), every column as stored: the ticket,
+ * every message on its thread, and the kind's own records (a proposal's reviews of one generation, a design's
+ * discussion, a council and its members).
+ */
+export function evidenceRows(key, { generation = null, discussion = null, council = null } = {}) {
+  return {
+    tickets: q('SELECT * FROM tickets WHERE key=?').get(key) || null,
+    comments: q('SELECT * FROM comments WHERE ticket_key=? ORDER BY id').all(key),
+    research_reviews: generation == null ? [] : q('SELECT * FROM research_reviews WHERE ticket_key=? AND generation=? ORDER BY id').all(key, generation),
+    owner_discussions: discussion == null ? [] : q('SELECT * FROM owner_discussions WHERE id=?').all(discussion),
+    councils: council == null ? [] : q('SELECT * FROM councils WHERE id=?').all(council),
+    council_members: council == null ? [] : q('SELECT * FROM council_members WHERE council_id=? ORDER BY id').all(council),
+  };
+}
 export const pendingDiscussions = () => q("SELECT * FROM owner_discussions WHERE status IN ('queued','running') ORDER BY id").all();
 // Finished design recommendations still waiting for the owner (Inbox cards).
 export const pendingProposals = () => q("SELECT id, ticket_key FROM owner_discussions WHERE status='complete' ORDER BY id DESC LIMIT 50").all();

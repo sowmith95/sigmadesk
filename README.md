@@ -182,8 +182,10 @@ publish-guard holds; standing and renewal production access; package installs.
   classifies message text.
 - **One record per decision and evidence version** (`delegated_decisions`): the decision brief you see, the policy and
   delegation versions, the delegate, the actions it may take, attempts, spend and the outcome. The evidence version is
-  one fingerprint of every substantive ticket field, the whole thread, the changed files and the kind's own evidence (a
-  proposal and its reviews, a design's text): a new question, hold, message or revision is a new decision.
+  one fingerprint of every column of the ticket, of every message on its thread and of the kind's own records (a
+  proposal's reviews, a design's discussion, a council and its members), read as stored, plus the changed files. Only a
+  short, explicit list of bookkeeping columns is left out (timestamps, progress, counters, the GitHub mirror), so a
+  column added later counts as evidence by default: a new question, hold, message or revision is a new decision.
 - **The authority is yours: you write the rules a delegate may apply.** Only the list items under the playbook
   heading `## Standing rules the EM may apply alone` (configurable: `delegation.rulesSection`) count. You curate that
   section yourself; the desk and its seats never write it (the shipped playbooks and new projects start with it empty).
