@@ -206,18 +206,22 @@ test('owner rules (property): the rules are exactly the column-0 bullets of the 
     () => `${F}\n${O}\n- FAKE fenced section\n${F}`,
   ];
   let seed = 7;
-  const rand = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const rand = (n) => { seed = (seed * 48271) % 2147483647; return seed % n; }; // exact in a double, unlike a 2^31 LCG whose low bits went to zero
+  const used = new Array(noise.length).fill(0); // the generator really varies
   for (let k = 0; k < 300; k++) {
     const n = 1 + rand(5);
     const real = Array.from({ length: n }, (_, i) => `Real rule ${k}.${i}`);
-    const parts = [rand(2) ? noise[8]() : '', rand(2) ? `- FAKE outside\n  ${O}` : '', O];
-    for (const r of real) { parts.push(`- ${r}`); for (let j = rand(3); j > 0; j--) parts.push(noise[rand(noise.length - 1)]()); if (rand(2)) parts.push(''); }
+    const fenced = rand(2), outside = rand(2);
+    const parts = [fenced ? noise[8]() : '', outside ? `- FAKE outside\n  ${O}` : '', O];
+    used[8] += fenced;
+    for (const r of real) { parts.push(`- ${r}`); for (let j = rand(3); j > 0; j--) { const q = rand(noise.length - 1); used[q]++; parts.push(noise[q]()); } if (rand(2)) parts.push(''); }
     parts.push('## Next', '- FAKE outside the section');
     const doc = parts.join('\n');
     const got = model.standingRules(doc);
     assert.deepEqual(got.map((r) => r.split('\n')[0]), real, doc);
     assert.ok(!got.some((r) => /FAKE/.test(r)), `no nested, fenced, commented or indented text in any rule:\n${doc}`);
   }
+  used.forEach((count, q) => assert.ok(count >= 20, `noise ${q} was used only ${count} times`));
 });
 
 test('model: metrics count each decision once per kind; avoided excludes overrides and reopens; spend says what was estimated', () => {

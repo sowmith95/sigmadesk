@@ -484,7 +484,7 @@ test('steps are never paired: interleaved help and decision commands, delayed st
 test('steps (property): under any order of late reports, nothing a carried-out request started can take the run past its allowance', () => {
   fresh();
   let seed = 20261009;
-  const rand = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const rand = (n) => { seed = (seed * 48271) % 2147483647; return seed % n; }; // exact in a double, unlike a 2^31 LCG whose low bits went to zero
   const report = (ctx, id) => runner.applyEvents([{ type: 'cmd-start', id, cmd: 'ls' }], ctx);
   const made = []; // these runs are taken out again: they are not today's decision runs
   // A desk request carried out to completion (an admission that handed anything back would get it back here).
@@ -502,6 +502,7 @@ test('steps (property): under any order of late reports, nothing a carried-out r
     for (const id of ['d3', 'd2', 'd1']) report(ctx, id); // the withheld reports, reversed
   }
   let issuedFirst = 0;
+  const seen = { plain: 0, desk: 0, plainFirst: 0, mixed: 0, refused: 0, stopped: 0 }; // the generator really varies
   for (let k = 0; k < 400; k++) {
     const max = 8 + rand(33);
     const run = store.createRun({ agent_id: 'manager', kind: 'decide', token: `steps-prop-${k}-${Math.random()}`, model: 'codex:' });
@@ -514,6 +515,8 @@ test('steps (property): under any order of late reports, nothing a carried-out r
     const plan = Array.from({ length: 1 + rand(45) }, () => (rand(4) ? 'plain' : 'desk'));
     const plainFirst = rand(2) === 1; // then no new work follows any request: only withheld reports come later
     if (plainFirst) plan.sort((a, b) => (a === b ? 0 : a === 'plain' ? -1 : 1));
+    for (const what of plan) seen[what]++;
+    seen[plainFirst ? 'plainFirst' : 'mixed']++;
     const withheld = [];
     let issued = issuedFirst, requests = 0, applied = 0, stopped = null;
     const note = (cause) => { if (!stopped && store.getRun(run.id).status === 'killed') stopped = { cause, applied }; };
@@ -526,15 +529,17 @@ test('steps (property): under any order of late reports, nothing a carried-out r
         request(run); applied++;
         // Everything this request and the commands before it can ever add up to fits the allowance.
         assert.ok(issued + requests <= max, `plan ${k}: carried out at ${issued} commands and ${requests} requests, over ${max}`);
-      } catch { note('refusal'); }
+      } catch { note('refusal'); seen.refused++; }
     }
     while (withheld.length) { report(ctx, withheld.splice(rand(withheld.length), 1)[0]); note('report'); }
+    if (stopped) seen.stopped++;
     if (plainFirst && applied) {
       assert.notEqual(stopped?.cause === 'report' && stopped.applied > 0, true, `plan ${k}: a late report stopped the run after a request was carried out`);
       if (!stopped) assert.ok(store.getRun(run.id).steps <= max, `plan ${k}: final ${store.getRun(run.id).steps} over ${max}`);
     }
   }
   for (const id of made) store.handle().prepare('DELETE FROM runs WHERE id = ?').run(id);
+  for (const [what, count] of Object.entries(seen)) assert.ok(count >= 20, `the generator produced ${what} only ${count} times`);
 });
 
 test('steps end to end on a Codex stand-in that writes events in the real order: a 61st command that is desk decide is never applied', async () => {
