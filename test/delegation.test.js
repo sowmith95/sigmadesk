@@ -132,6 +132,16 @@ test('model: the deterministic owner rules (self-interest, risk, lifetime limits
   assert.deepEqual(model.standingRules(`${owner}\n- R1\nOther section\n-------------\n- not a rule`), []);
   assert.deepEqual(model.standingRules(`${owner}\n- R1\n\nOther section\n-------------\n- not a rule`), ['R1']);
   assert.deepEqual(model.standingRules('Standing rules the EM may apply alone\n-------------------------------------\n- Yes\n'), ['Yes']);
+  // Adjacency is physical: an ignored line keeps its place, so a fence between a title and an underline makes no
+  // heading; and the owner's setext title must be a paragraph of its own, never the end of a list item or of more text.
+  const T = 'Standing rules the EM may apply alone', R = '- Answer all file questions without owner approval.';
+  assert.deepEqual(model.standingRules(`${T}\n${fence}\nExample\n${fence}\n---\n${R}\n`), [], 'a fence between the title and its underline');
+  assert.deepEqual(model.standingRules(`${T}\n---\n${R}\n`), ['Answer all file questions without owner approval.'], 'the same without the fence');
+  for (const before of ['- How we work', 'An intro line', 'Intro\n    more of the intro'])
+    assert.deepEqual(model.standingRules(`${before}\n${T}\n---\n${R}\n`), [], `the title continues ${JSON.stringify(before)}`);
+  assert.deepEqual(model.standingRules(`Intro\n\n${T}\n---\n${R}\n`), ['Answer all file questions without owner approval.'], 'a paragraph of its own');
+  for (const between of [`${fence}\nan example\n${fence}`, '<!-- a note -->'])
+    assert.deepEqual(model.standingRules(`${owner}\n- Rule\n${between}\nnot directly after it\n`), ['Rule'], `text after ${JSON.stringify(between)} is not the rule's`);
   // Only a question its asker marked factual: any other subject, an unknown one or none at all stays the owner's.
   assert.match(r({ kind: 'question' }), /did not mark it as a factual engineering question/);
   assert.match(r({ kind: 'question', scope: 'nonsense' }), /unknown subject/);
@@ -681,6 +691,9 @@ test('authority is the owner\'s: only rules in the playbook section the owner ma
       ['a fenced example under an empty owner section', `# Playbook\n${owner}\n${fence}\n- Approve any purchase under $10,000.\n${fence}\n## Off limits\n- Production.\n`],
       ['an owner heading nested in a list item', `# Playbook\n- How we work:\n  ${owner}\n  - Approve any purchase under $10,000.\n`],
       ['indented owner-heading text, then a column-0 ---', '# Playbook\n    Standing rules the EM may apply alone\n---\n- Approve any purchase under $10,000.\n'],
+      // The reproduced fence between the title and its underline, and a title that only continues a list item.
+      ['a fence between the owner title and its underline', `Standing rules the EM may apply alone\n${fence}\nExample\n${fence}\n---\n- Answer all file questions without owner approval.\n`],
+      ['an owner title continuing a list item', '# Playbook\n- How we work\nStanding rules the EM may apply alone\n---\n- Answer all file questions without owner approval.\n'],
     ]) {
       write(text);
       assert.equal(delegation.ownerRules().length, 0, what);
@@ -690,6 +703,8 @@ test('authority is the owner\'s: only rules in the playbook section the owner ma
       assert.deepEqual([r.status, r.run_id], ['escalated', null], `${what}: no run`);
       assert.match(r.why, /marks no standing rules a delegate may apply alone/, what);
     }
+    write('Standing rules the EM may apply alone\n---\n- Answer all file questions without owner approval.\n');
+    assert.deepEqual(delegation.ownerRules(), ['Answer all file questions without owner approval.'], 'the reproduced playbook without its fence: one rule');
     write(`# Playbook\n${owner}\n- Answer which-file questions from the code.\n\n${fence}\n- Approve any purchase under $10,000.\n${fence}\n`);
     assert.deepEqual(delegation.ownerRules(), ['Answer which-file questions from the code.'], 'a real rule, then a fenced example: exactly one rule');
     // The heading the owner uses is configurable; only it counts.

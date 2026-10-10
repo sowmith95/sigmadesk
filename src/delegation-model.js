@@ -196,22 +196,26 @@ export function ownerReason(f, nameOf = (s) => s) {
  *  - Nothing at all: a line inside a fence (``` or ~~~ opened at indent 0-3, the rest of a ``` line holding no
  *    backtick; closed by the same character, as long or longer, at indent 0-3; an unclosed fence swallows the rest), an
  *    HTML comment (across lines too), a line indented four or more spaces (a tab counts four), and a # line that is not
- *    at column 0. None of these is a heading, a section boundary or rule text.
+ *    at column 0. None of these is a heading, a section boundary or rule text, and none is skipped either: each keeps
+ *    its place as a line of its own, so whatever it stands between is not adjacent.
  *  - A heading: a column-0 `#` … `######` line (then a space or nothing), or a column-0 text line that is not a list
- *    item, immediately followed by a column-0 `===` or `---` line.
+ *    item, immediately followed by a column-0 `===` or `---` line. Only one whose text line is a paragraph of its own
+ *    can be the owner's: a text line straight after a list item or another line of text continues that paragraph.
  *  - A rule: starts only at a column-0 list marker (`- `, `* `, `+ `, `1. `). Lines indented one to three spaces, text
  *    or list items, continue the rule above; so does a column-0 text line directly after its text (the same
  *    paragraph). A blank line and then column-0 text, a column-0 thematic break, or a heading end it; a rule whose
  *    paragraph a setext heading cut short is dropped (part of it became the heading).
- * → [{ t: 'h', level, text, cuts } | { t: 'item', text } | { t: 'more', text } | { t: 'text', text } | { t: 'break' } |
- *    { t: 'blank' }]
+ * One token per physical line, in order: → [{ t: 'h', level, text, cuts } | { t: 'item', text } | { t: 'more', text } |
+ *    { t: 'text', text } | { t: 'break' } | { t: 'blank' } | { t: 'nothing' } (fenced, commented) |
+ *    { t: 'deep' } (indented four or more) | { t: 'hash' } (an indented # line)]
  */
 function ownerGrammar(text = '') {
   const lines = [];
   let fence = null, comment = false;
   for (const raw of String(text || '').split(/\r?\n/)) {
     const src = raw.replace(/\t/g, '    ');
-    if (fence) { if (fence.test(src)) fence = null; continue; }
+    if (fence) { if (fence.test(src)) fence = null; lines.push({ t: 'nothing' }); continue; }
+    const commented = comment;
     let line = '', rest = src;
     while (rest) {
       if (comment) { const end = rest.indexOf('-->'); if (end < 0) break; comment = false; rest = rest.slice(end + 3); continue; }
@@ -220,11 +224,11 @@ function ownerGrammar(text = '') {
       line += rest.slice(0, at); rest = rest.slice(at + 4); comment = true;
     }
     const open = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (open && !(open[1][0] === '`' && open[2].includes('`'))) { fence = new RegExp(`^ {0,3}${open[1][0] === '`' ? '`' : '~'}{${open[1].length},}\\s*$`); continue; }
-    if (!line.trim()) { lines.push(src.trim() ? { t: 'nothing' } : { t: 'blank' }); continue; } // a line that was only a comment is nothing
+    if (open && !(open[1][0] === '`' && open[2].includes('`'))) { fence = new RegExp(`^ {0,3}${open[1][0] === '`' ? '`' : '~'}{${open[1].length},}\\s*$`); lines.push({ t: 'nothing' }); continue; }
+    if (!line.trim()) { lines.push(src.trim() || commented ? { t: 'nothing' } : { t: 'blank' }); continue; } // a comment, not a blank line
     const indent = line.match(/^ */)[0].length;
-    if (indent >= 4) { lines.push({ t: 'nothing' }); continue; }
-    if (indent > 0) { lines.push(/^ +#/.test(line) ? { t: 'nothing' } : { t: 'more', text: line.trim() }); continue; }
+    if (indent >= 4) { lines.push({ t: 'deep' }); continue; }
+    if (indent > 0) { lines.push(/^ +#/.test(line) ? { t: 'hash' } : { t: 'more', text: line.trim() }); continue; }
     const h = line.match(/^(#{1,6})(?:\s+(.*?))?\s*$/);
     if (h) { lines.push({ t: 'h', level: h[1].length, text: (h[2] || '').replace(/\s+#+\s*$/, '').trim() }); continue; }
     if (/^#/.test(line)) { lines.push({ t: 'text', text: line.trim() }); continue; } // #hashtag: plain text
@@ -234,18 +238,21 @@ function ownerGrammar(text = '') {
     if (item) { lines.push({ t: 'item', text: item[1].trim() }); continue; }
     lines.push({ t: 'text', text: line.trim() });
   }
-  // Setext: a column-0 text line immediately followed by a column-0 underline; any other underline is a break.
+  // Setext, on the physical lines: a column-0 text line and the column-0 underline on the very next line (anything in
+  // between, even an ignored line, and it is no heading). `cuts`: the line before it may be the same paragraph (a list
+  // item, text, or a line Markdown could read as more of it), so the heading may have taken a rule's last line, and its
+  // text may be only the end of its own title. Any other underline is a thematic break or text.
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     const a = lines[i], b = lines[i + 1];
     if (a.t === 'text' && b?.t === 'under') {
       const prev = out.at(-1);
-      out.push({ t: 'h', level: b.ch === '=' ? 1 : 2, text: a.text, cuts: !!prev && ['item', 'more', 'text'].includes(prev.t) });
+      out.push({ t: 'h', level: b.ch === '=' ? 1 : 2, text: a.text, cuts: !!prev && ['item', 'more', 'text', 'deep', 'hash'].includes(prev.t) }, { t: 'nothing' });
       i++; continue;
     }
     out.push(a.t === 'under' ? (a.ch === '-' && a.text.length >= 3 ? { t: 'break' } : { t: 'text', text: a.text }) : a);
   }
-  return out.filter((x) => x.t !== 'nothing');
+  return out;
 }
 /**
  * The standing rules a delegate may apply alone: the rules (see ownerGrammar) under the column-0 playbook heading the
@@ -255,7 +262,7 @@ function ownerGrammar(text = '') {
 export function standingRules(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
   const blocks = ownerGrammar(text);
-  const at = blocks.findIndex((b) => b.t === 'h' && norm(b.text) === norm(heading));
+  const at = blocks.findIndex((b) => b.t === 'h' && !b.cuts && norm(b.text) === norm(heading)); // a paragraph of its own
   if (at < 0) return [];
   const level = blocks[at].level;
   const rules = [];
@@ -267,7 +274,7 @@ export function standingRules(text = '', heading = RULES_SECTION) {
       cur = null; continue;
     }
     if (b.t === 'break') { cur = null; continue; }
-    if (b.t === 'blank') { blank = true; continue; }
+    if (b.t !== 'item' && b.t !== 'more' && b.t !== 'text') { blank = true; continue; } // a blank or ignored line: what follows is not directly after
     if (b.t === 'item') { cur = [b.text]; rules.push(cur); blank = false; continue; }
     if (b.t === 'more') { if (cur) cur.push(b.text); continue; } // indented one to three spaces: the rule above
     if (cur && !blank) { cur.push(b.text); continue; } // column-0 text directly after it: the same paragraph
