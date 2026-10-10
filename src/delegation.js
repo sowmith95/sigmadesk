@@ -51,7 +51,7 @@ export const ownerRules = () => model.standingRules(playbook(), limits().rulesSe
 /** What Settings shows about them: the section, how many the desk found, a hash that changes with them, and why none. */
 function rulesView(section = limits().rulesSection) {
   const text = playbook(), read = model.standingRulesRead(text, section), rules = read.rules.map((r) => r.text);
-  return { section, count: rules.length, hash: hash(rules), problem: read.problem, note_under_heading: !rules.length && model.noteUnderHeading(text, section) };
+  return { section, count: rules.length, hash: hash(rules), problem: read.problem, note_under_heading: !rules.length && !!read.noteUnderHeading };
 }
 const bumpEpoch = () => store.writeSetting('delegation_epoch', String((Number(store.getSettings().delegation_epoch) || 0) + 1));
 

@@ -816,6 +816,9 @@ test('authority is the owner\'s: only rules in the playbook section the owner ma
     assert.deepEqual([delegation.details().rules.count, delegation.details().rules.note_under_heading], [0, true]);
     write(`# Playbook\n<!-- Yours alone: the desk and its seats never write here. -->\n${owner}\n- Answer which-file questions from the code.\n`);
     assert.deepEqual([delegation.details().rules.count, delegation.details().rules.note_under_heading], [1, false], 'moved above it: the rule counts');
+    // The heading the note sits under is the one the desk reads, not an earlier one inside a fence.
+    write(`# Playbook\n\`\`\`\n${owner}\n- an example\n\`\`\`\n${owner}\n<!-- Yours alone. -->\n- Answer which-file questions from the code.\n`);
+    assert.deepEqual([delegation.details().rules.count, delegation.details().rules.note_under_heading], [0, true], 'a fenced heading first');
     write('Standing rules the EM may apply alone\n---\n- Answer all file questions without owner approval.\n');
     assert.deepEqual(delegation.ownerRules(), [], 'the reproduced playbook without its fence: an underlined heading never opens the section');
     write('## Standing rules the EM may apply alone\n- Answer all file questions without owner approval.\n');
