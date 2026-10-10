@@ -191,6 +191,11 @@ publish-guard holds; standing and renewal production access; package installs.
   yourself; the desk and its seats never write it (the shipped playbooks and new projects start with it empty). The
   desk reads it strictly, as a small part of Markdown it can check line by line:
   - The heading is a `##` heading at the start of its line (not `#` or `###`, not underlined with `---` or `===`).
+    Its words are matched ignoring case, extra spaces, a trailing `:` or `.` and closing `#`s, so
+    `## standing rules the EM may apply alone:` opens the section too. It must be the first heading anywhere in the
+    playbook with those words (compared by letters and digits only, at any level or underlined): a look-alike
+    earlier, such as `# Standing rules…` or `## *Standing* rules…`, leaves you with no standing rules, and a second
+    copy later never opens a section.
   - Each rule is a dash bullet (`- `) at the start of its line, right under the heading or under the rule before it.
   - A rule's conditions go on its bullet line, or on lines indented two spaces under it (sub-bullets included).
   - No code blocks, links, HTML or comments, numbered lists, lines indented four or more spaces, or other headings
@@ -199,9 +204,10 @@ publish-guard holds; standing and renewal production access; package installs.
 
   Anything else ends the section where it stands, and nothing after it is read; a rule the line may still belong to
   is dropped, since it may be missing a condition. Settings tells you how many rules the desk found, so a count lower
-  than you expect means a line ended the section early. Text before the heading must not leave Markdown room to read
-  it differently either: raw HTML at the start of a line, a fenced block it might end elsewhere, or another heading
-  with the same words leaves you with no standing rules. With no such section, or an empty one, no decision run
+  than you expect means a line ended the section early. The rest of the playbook must not leave Markdown room to
+  read it differently either: anywhere in the file, raw HTML at the start of a line, a fenced block or comment it
+  might end elsewhere, or any heading holding markup (`&`, `<`, `[`, `]`, `\`, a backtick) or a non-ASCII character
+  leaves you with no standing rules, and Settings says which. With no such section, or an empty one, no decision run
   starts: nothing is decided for you by judgment. Owner-task triage is the one exception, because it is decided by
   rule, not judgment: a step filed as a check or a package is routed back to the team (when that kind is delegated)
   whatever the section says. Write narrow rules. The desk checks that a decision cites one of your rules and evidence
