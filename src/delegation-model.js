@@ -191,13 +191,23 @@ export function ownerReason(f, nameOf = (s) => s) {
 
 // ---------------- what a decision may cite ----------------
 /**
- * The playbook's Markdown as a reader sees its blocks. Fenced code (``` or ~~~, closed by a matching fence), HTML comments
- * (across lines too) and everything inside them are dropped whole, so nothing in an example can be a heading or a rule;
- * an unclosed fence or comment swallows the rest. ATX and setext headings become headings, a thematic break a break.
- * → [{ t: 'h', level, text } | { t: 'break' } | { t: 'blank' } | { t: 'line', indent, text }], tabs as four spaces.
+ * The owner section's strict grammar, line by line (#9): deliberately narrower than Markdown, so that nothing nested,
+ * indented or quoted as an example can open the section, close it or become a rule.
+ *  - Nothing at all: a line inside a fence (``` or ~~~ opened at indent 0-3, the rest of a ``` line holding no
+ *    backtick; closed by the same character, as long or longer, at indent 0-3; an unclosed fence swallows the rest), an
+ *    HTML comment (across lines too), a line indented four or more spaces (a tab counts four), and a # line that is not
+ *    at column 0. None of these is a heading, a section boundary or rule text.
+ *  - A heading: a column-0 `#` … `######` line (then a space or nothing), or a column-0 text line that is not a list
+ *    item, immediately followed by a column-0 `===` or `---` line.
+ *  - A rule: starts only at a column-0 list marker (`- `, `* `, `+ `, `1. `). Lines indented one to three spaces, text
+ *    or list items, continue the rule above; so does a column-0 text line directly after its text (the same
+ *    paragraph). A blank line and then column-0 text, a column-0 thematic break, or a heading end it; a rule whose
+ *    paragraph a setext heading cut short is dropped (part of it became the heading).
+ * → [{ t: 'h', level, text, cuts } | { t: 'item', text } | { t: 'more', text } | { t: 'text', text } | { t: 'break' } |
+ *    { t: 'blank' }]
  */
-function markdownBlocks(text = '') {
-  const out = [];
+function ownerGrammar(text = '') {
+  const lines = [];
   let fence = null, comment = false;
   for (const raw of String(text || '').split(/\r?\n/)) {
     const src = raw.replace(/\t/g, '    ');
@@ -209,45 +219,61 @@ function markdownBlocks(text = '') {
       if (at < 0) { line += rest; break; }
       line += rest.slice(0, at); rest = rest.slice(at + 4); comment = true;
     }
-    const open = line.match(/^ {0,3}(`{3,}|~{3,})/);
-    if (open) { fence = new RegExp(`^ {0,3}${open[1][0] === '`' ? '`' : '~'}{${open[1].length},}\\s*$`); continue; }
-    if (!line.trim()) { if (!src.trim()) out.push({ t: 'blank' }); continue; } // a line that was only a comment is nothing
-    const h = line.match(/^ {0,3}(#{1,6})(?:\s+(.*?))?\s*(?:#+\s*)?$/);
-    if (h) { out.push({ t: 'h', level: h[1].length, text: (h[2] || '').trim() }); continue; }
-    const under = line.match(/^ {0,3}(=+|-+)\s*$/);
-    if (under && out.at(-1)?.t === 'line') { const prev = out.pop(); out.push({ t: 'h', level: under[1][0] === '=' ? 1 : 2, text: prev.text.trim() }); continue; }
-    if (/^ {0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})$/.test(line)) { out.push({ t: 'break' }); continue; }
-    out.push({ t: 'line', indent: line.match(/^ */)[0].length, text: line });
+    const open = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (open && !(open[1][0] === '`' && open[2].includes('`'))) { fence = new RegExp(`^ {0,3}${open[1][0] === '`' ? '`' : '~'}{${open[1].length},}\\s*$`); continue; }
+    if (!line.trim()) { lines.push(src.trim() ? { t: 'nothing' } : { t: 'blank' }); continue; } // a line that was only a comment is nothing
+    const indent = line.match(/^ */)[0].length;
+    if (indent >= 4) { lines.push({ t: 'nothing' }); continue; }
+    if (indent > 0) { lines.push(/^ +#/.test(line) ? { t: 'nothing' } : { t: 'more', text: line.trim() }); continue; }
+    const h = line.match(/^(#{1,6})(?:\s+(.*?))?\s*$/);
+    if (h) { lines.push({ t: 'h', level: h[1].length, text: (h[2] || '').replace(/\s+#+\s*$/, '').trim() }); continue; }
+    if (/^#/.test(line)) { lines.push({ t: 'text', text: line.trim() }); continue; } // #hashtag: plain text
+    if (/^(=+|-+)\s*$/.test(line)) { lines.push({ t: 'under', ch: line[0], text: line.trim() }); continue; }
+    if (/^((\*\s*){3,}|(_\s*){3,})$/.test(line)) { lines.push({ t: 'break' }); continue; }
+    const item = line.match(/^(?:[-*+]|\d{1,9}\.) +(\S.*)$/);
+    if (item) { lines.push({ t: 'item', text: item[1].trim() }); continue; }
+    lines.push({ t: 'text', text: line.trim() });
   }
-  return out;
+  // Setext: a column-0 text line immediately followed by a column-0 underline; any other underline is a break.
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const a = lines[i], b = lines[i + 1];
+    if (a.t === 'text' && b?.t === 'under') {
+      const prev = out.at(-1);
+      out.push({ t: 'h', level: b.ch === '=' ? 1 : 2, text: a.text, cuts: !!prev && ['item', 'more', 'text'].includes(prev.t) });
+      i++; continue;
+    }
+    out.push(a.t === 'under' ? (a.ch === '-' && a.text.length >= 3 ? { t: 'break' } : { t: 'text', text: a.text }) : a);
+  }
+  return out.filter((x) => x.t !== 'nothing');
 }
 /**
- * The standing rules a delegate may apply alone: the top-level list items under the playbook heading the OWNER marks
- * for them (delegation.rulesSection, any heading level), in order (R1, R2 …), each with its continuation lines and
- * nested items, until the next heading of the same or a higher level. Code (fenced or indented), HTML comments, text
- * outside list items and anything outside the section are not rules. No such heading, or no item under it → [] (then
- * nothing is decided for the owner by a model).
+ * The standing rules a delegate may apply alone: the rules (see ownerGrammar) under the column-0 playbook heading the
+ * OWNER marks for them (delegation.rulesSection, any level), in order (R1, R2 …), until the next heading of the same or
+ * a higher level. No such heading, or no rule under it → [] (then nothing is decided for the owner by a model).
  */
 export function standingRules(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
-  const blocks = markdownBlocks(text);
+  const blocks = ownerGrammar(text);
   const at = blocks.findIndex((b) => b.t === 'h' && norm(b.text) === norm(heading));
   if (at < 0) return [];
   const level = blocks[at].level;
   const rules = [];
   let cur = null, blank = false;
   for (const b of blocks.slice(at + 1)) {
-    if (b.t === 'h') { if (b.level <= level) break; cur = null; continue; } // the section ends at a heading of its level or higher
+    if (b.t === 'h') {
+      if (b.cuts && cur) rules.splice(rules.indexOf(cur), 1); // its paragraph was cut short: never a partial rule
+      if (b.level <= level) break; // the section ends at a heading of its level or higher
+      cur = null; continue;
+    }
     if (b.t === 'break') { cur = null; continue; }
     if (b.t === 'blank') { blank = true; continue; }
-    const item = b.text.match(/^( {0,3})([-*+]|\d{1,9}[.)])( +)(\S.*)$/);
-    if (item && !(cur && b.indent >= 2)) { cur = { lines: [item[4].trim()], content: item[1].length + item[2].length + Math.min(item[3].length, 4) }; rules.push(cur); blank = false; continue; }
-    if (cur && !blank) { cur.lines.push(b.text.trim()); continue; } // a lazy continuation of the rule's paragraph
-    if (cur && b.indent >= 2 && b.indent < cur.content + 4) { cur.lines.push(b.text.trim()); blank = false; continue; } // more of the item
-    if (cur && b.indent >= cur.content + 4) continue; // code indented inside the item: nothing
-    cur = null; blank = false; // a paragraph or indented code outside every item: not a rule
+    if (b.t === 'item') { cur = [b.text]; rules.push(cur); blank = false; continue; }
+    if (b.t === 'more') { if (cur) cur.push(b.text); continue; } // indented one to three spaces: the rule above
+    if (cur && !blank) { cur.push(b.text); continue; } // column-0 text directly after it: the same paragraph
+    cur = null; blank = false; // a paragraph between rules is not a rule
   }
-  return rules.map((r) => r.lines.join('\n').trim()).filter(Boolean).slice(0, 60);
+  return rules.map((r) => r.join('\n').trim()).filter(Boolean).slice(0, 60);
 }
 /** desk decide --cite "R2, E1, file:src/x.py:40": the ids, in order, each once. */
 export function parseCites(raw) {

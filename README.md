@@ -189,8 +189,11 @@ publish-guard holds; standing and renewal production access; package installs.
 - **The authority is yours: you write the rules a delegate may apply.** Only the list items under the playbook
   heading `## Standing rules the EM may apply alone` (configurable: `delegation.rulesSection`) count. You curate that
   section yourself; the desk and its seats never write it (the shipped playbooks and new projects start with it empty).
-  Each top-level bullet is one rule, its continuation lines and nested items included; code blocks (fenced or
-  indented), HTML comments and plain paragraphs are never rules, so an example in your playbook grants nothing. With
+  The section is read strictly, more narrowly than Markdown: the heading must start at column 0, and a rule starts only
+  at a column-0 bullet (`- `, `* `, `+ `, `1. `); lines indented one to three spaces (text or nested bullets) continue
+  the rule above. Fenced code, HTML comments, any line indented four or more spaces and any `#` line not at column 0
+  contribute nothing at all, so an example in your playbook grants nothing. Write a rule's conditions on its bullet or
+  indented one to three spaces. With
   no such section, or an empty one, no decision run starts: nothing is decided for you by judgment. Owner-task triage
   is the one exception, because it is decided by rule, not judgment: a step filed as a check or a package is routed
   back to the team (when that kind is delegated) whatever the section says. Write narrow rules. The desk checks that a
