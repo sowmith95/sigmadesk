@@ -129,6 +129,14 @@ for (const [status, title, assignee, priority, area, complexity] of tickets) {
   const c = store.addComment(d.key, 'manager', `💬 **Morgan answered Riley for you**\n\n${done.text}\n\n_Decided for the owner by Morgan under the delegation policy (engineers' questions → Morgan). The owner can override or reopen this in the Inbox._`);
   store.updateDelegation(done.id, { comment_id: c.id });
   store.updateTicket(d.key, { status: 'todo', resume_status: null });
+  // Long copy, for narrow screens: a long ticket title and a long answer must still fold into two lines.
+  const long = store.createTicket({ title: 'Normalize the broker fill timestamps across every venue adapter, the nightly reconciliation job and the audit export', status: 'needs_human', type: 'task', area: 'backend', complexity: 'S', assignee: 'senior-be', reporter: 'owner', description: 'Fills from three venues carry local timestamps; the audit export assumes UTC.' });
+  store.updateTicket(long.key, { resume_status: 'todo', risk: 'low' }); store.addComment(long.key, 'senior-be', '❓ **Question for the owner:** Which module converts venue timestamps today, and is it already used by the reconciliation job?');
+  const l = asked('Normalize the broker fill timestamps');
+  const lr = record(l, { status: 'applied', mode: 'em', action: 'answer', text: 'adapters/timefmt.py converts venue-local timestamps to UTC in to_utc(), and the nightly reconciliation job already calls it through recon/load.py, so the audit export should call to_utc() too instead of adding a second converter with its own daylight-saving rules.', why: 'adapters/timefmt.py:12 defines to_utc(); recon/load.py:88 calls it; the playbook says reuse the existing helper.' });
+  const lc = store.addComment(l.key, 'manager', `💬 **Morgan answered Jordan for you**\n\n${lr.text}\n\n_Decided for the owner by Morgan under the delegation policy (engineers' questions → Morgan). The owner can override or reopen this in the Inbox._`);
+  store.updateDelegation(lr.id, { comment_id: lc.id });
+  store.updateTicket(l.key, { status: 'todo', resume_status: null });
 }
 function agentByIdName(id) { return String((team.agentById[id] || {}).name || id).split(/\s+/)[0]; }
 store.logEvent({ kind: 'system', text: 'Isolated demo: all execution seats disabled. No production state or credentials are used.' });

@@ -314,10 +314,11 @@ test('delegation (#9): Decided for you with Override, the delegate\'s take on an
   const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 1280, height: 900 });
   const lane = page.locator('[data-lane="decided"]');
   await lane.waitFor();
-  const row = lane.locator('article[data-status="applied"]').first();
+  const row = lane.locator('article[data-status="applied"]', { hasText: 'Morgan answered Riley' }).first();
   const id = await row.getAttribute('data-decided');
   assert.match(await row.textContent(), /Morgan answered Riley: Only in utils\/net\.py/);
   assert.equal(await page.locator('[data-lane="unblock"] [data-decided]').count(), 0, 'decided rows are not in the lanes that need you');
+  await row.locator('button[aria-expanded]').click(); // Override and Reopen live in the expanded row
   await row.getByRole('button', { name: 'Override' }).click();
   await row.getByLabel('Your decision instead').fill('Wait for the count first.');
   await row.getByRole('button', { name: 'Post my decision' }).click();
@@ -344,6 +345,35 @@ test('delegation (#9): Decided for you with Override, the delegate\'s take on an
   await page.locator('[data-delegation-kind="question"]').getByRole('radio', { name: 'Shadow' }).click();
   await page.waitForSelector('[data-delegation-kind="question"][data-mode="shadow"]');
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('delegation (#9) on a phone: a decided row folds into two lines however long it is; Override and Reopen wait in the expanded row', { skip, timeout: 60_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 390, height: 844 });
+  const lane = page.locator('[data-lane="decided"]');
+  await lane.waitFor();
+  const row = lane.locator('article[data-decided]', { hasText: 'adapters/timefmt.py' }).first();
+  await row.waitFor();
+  // One truncated line each: the decision, then its status, kind, ticket and time.
+  const oneLine = (loc) => loc.evaluate((el) => {
+    const st = getComputedStyle(el);
+    return { nowrap: st.whiteSpace === 'nowrap', truncated: el.scrollWidth > el.clientWidth, single: el.getBoundingClientRect().height < 1.9 * parseFloat(st.fontSize) };
+  });
+  const title = await oneLine(row.locator('[data-decided-title]')), meta = await oneLine(row.locator('[data-decided-meta]'));
+  assert.deepEqual(title, { nowrap: true, truncated: true, single: true }, 'the long decision is one truncated line');
+  assert.deepEqual([meta.nowrap, meta.single], [true, true], 'the long ticket title stays on the second line');
+  assert.match(await row.locator('[data-decided-meta]').textContent(), /^(just now|\d+ ?\w+ ago) · Engineers' questions · /, 'the time is never the part that gets cut');
+  const box = await row.boundingBox();
+  assert.ok(box.height <= 64, `collapsed: two lines and padding, not ${box.height}px`);
+  assert.equal(await row.getByRole('button', { name: 'Override' }).count(), 0, 'no actions while collapsed');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no sideways scrolling');
+  await row.locator('button[aria-expanded]').click();
+  await row.getByRole('button', { name: 'Override' }).waitFor();
+  assert.equal(await row.getByRole('button', { name: 'Reopen' }).count(), 1);
+  assert.match(await row.locator('[data-decided-detail]').textContent(), /the audit export should call to_utc\(\) too/, 'the whole decision once expanded');
+  await row.locator('[data-based-on]').waitFor();
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'expanded: still no sideways scrolling');
   assert.deepEqual(errors, []);
   await page.close();
 });

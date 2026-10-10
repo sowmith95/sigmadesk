@@ -11,7 +11,6 @@ import { Textarea } from '@/components/ui/textarea';
 import { AsyncButton } from './AsyncButton';
 import { SwitchRow } from './Fields';
 import { ChoiceChips } from './Choices';
-import { Tag } from './Bits';
 import { cn } from '@/lib/utils';
 import type { BoardItem } from '@/types';
 
@@ -19,7 +18,7 @@ import type { BoardItem } from '@/types';
 type Rec = Record<string, any>;
 const first = (id?: string | null) => String(S.agents.find((a: { id: string }) => a.id === id)?.name || id || '').split(/\s+/)[0];
 const MODE_LABEL = (m: string) => ({ owner: 'You decide', shadow: 'Shadow', em: `${first('manager')} decides`, sre: `${first('sre')} decides` } as Record<string, string>)[m] || m;
-const STATUS: Record<string, [string, 'neutral' | 'needs' | 'shipped']> = { overridden: ['Overridden', 'needs'], reopened: ['Reopened', 'needs'], applied: ['Decided', 'shipped'] };
+const STATUS: Record<string, [string, string]> = { overridden: ['Overridden', 'text-needs'], reopened: ['Reopened', 'text-needs'], applied: ['Decided', 'text-shipped'] };
 
 /**
  * On an open decision: what the delegate would decide (shadow: you still decide) or why it is yours (an escalation, with
@@ -54,45 +53,54 @@ function BasedOn({ id }: { id: number }) {
       {b.you_decide && <p><span className="text-muted-foreground">The decision: </span>{b.you_decide}</p>}
       {b.gate?.headline && <p><span className="text-muted-foreground">Its gate then: </span>{b.gate.headline}</p>}
       {rec.why && <p className="[overflow-wrap:anywhere]"><span className="text-muted-foreground">{rec.seat_name}'s reason: </span>{clean(rec.why)}</p>}
+      {rec.cited?.length > 0 && <p className="[overflow-wrap:anywhere]" data-cited><span className="text-muted-foreground">It cited: </span>
+        {rec.cited.map((c: Rec) => `${c.id}${c.text ? ` (${clean(c.text).slice(0, 90)})` : ''}`).join('; ')}</p>}
       <p className="text-[13px] text-muted-foreground">Decided for you by {rec.seat_name}{p.deterministic ? ' by rule (no model run)' : p.model ? ` on ${p.model}` : ''}{rec.runs ? ` · ${rec.runs} run${rec.runs === 1 ? '' : 's'}, ${money(rec.spent_usd)}${rec.estimated_runs ? ' (estimated)' : ''}` : ''} · policy <span className="font-mono">{rec.policy_version}</span> · delegation <span className="font-mono">{rec.delegation_version}</span></p>
     </div>
   );
 }
 
+/**
+ * One decision in "Decided for you". Collapsed it is two lines at any width: what was decided (one truncated line) and
+ * its status, time, kind and ticket (one truncated line, the ticket last so a long title is what gets cut). Expanding
+ * shows the full text, the ticket, what it was based on, and Override / Reopen.
+ */
 function DecidedRow({ r }: { r: Rec }) {
   const [open, setOpen] = useState(false);
   const [overriding, setOverriding] = useState(false);
   const [text, setText] = useState('');
   const t = r.ticket;
   const done = r.status !== 'applied';
-  const [label, tone] = STATUS[r.status] || [r.status, 'neutral'];
+  const [label, tone] = STATUS[r.status] || [r.status, 'text-muted-foreground'];
   const refresh = () => loadSnapshot().catch(() => {});
+  const line = clean(r.line);
   return (
-    <article data-decided={r.id} data-status={r.status} className="grid grid-cols-[minmax(0,1fr)] gap-1.5 px-3 py-2.5">
-      <div className="flex items-center gap-2">
-        <button type="button" aria-expanded={open} aria-label={open ? 'Hide what it was based on' : 'Show what it was based on'} onClick={() => setOpen(!open)}
-          className="grid size-7 shrink-0 place-items-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground">{open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}</button>
-        <p className="line-clamp-2 min-w-0 flex-1 text-[15px] font-medium [overflow-wrap:anywhere]" title={clean(r.line)}>{clean(r.line)}</p>
-        {done && <Tag tone={tone}>{label}</Tag>}
-      </div>
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pl-9 text-[13px] text-muted-foreground">
-        <span>{r.kind_label}</span>
-        {t && <button type="button" className="max-w-[40ch] truncate text-foreground hover:underline" onClick={() => openTicket(t.key)}>{t.name || t.title}</button>}
-        <span>{ago(r.decided_at || r.created_at)}</span>
-      </div>
-      {open && <div className="pl-9"><BasedOn id={r.id} /></div>}
-      {!done && !overriding && <div className="flex flex-wrap gap-2 pl-9">
-        <Button variant="secondary" size="sm" onClick={() => setOverriding(true)}>Override</Button>
-        <AsyncButton variant="ghost" size="sm" confirm={`Reopen this decision? It comes back to you to decide again. Nothing that already happened is undone.`}
-          run={async () => { await api('POST', `/api/delegation/${r.id}/reopen`, {}); await refresh(); }} ok="Reopened: it is your decision again">Reopen</AsyncButton>
-      </div>}
-      {overriding && <div className="grid gap-2 pl-9">
-        <label htmlFor={`override-${r.id}`} className="text-sm font-medium">Your decision instead</label>
-        <Textarea id={`override-${r.id}`} value={text} onChange={(e) => setText(e.target.value)} rows={3} placeholder="What should the team do instead? It is posted on the ticket as yours." />
-        <div className="flex flex-wrap gap-2">
-          <AsyncButton size="sm" disabled={text.trim().length < 2} run={async () => { await api('POST', `/api/delegation/${r.id}/override`, { message: text }); setOverriding(false); setText(''); await refresh(); }} ok="Posted on the ticket as your decision">Post my decision</AsyncButton>
-          <Button variant="ghost" size="sm" onClick={() => { setOverriding(false); setText(''); }}>Cancel</Button>
-        </div>
+    <article data-decided={r.id} data-status={r.status} className="grid grid-cols-[minmax(0,1fr)] gap-2 px-3 py-2">
+      <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} title={line}
+        className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2 rounded text-left hover:bg-secondary/40">
+        <span className="row-span-2 grid size-5 place-items-center text-muted-foreground" aria-hidden>{open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}</span>
+        <span data-decided-title className="min-w-0 truncate text-[15px] font-medium">{line}</span>
+        <span data-decided-meta className="min-w-0 truncate whitespace-nowrap text-[13px] text-muted-foreground">
+          {done && <span className={cn('font-medium', tone)}>{label} · </span>}{[ago(r.decided_at || r.created_at), r.kind_label, t ? t.name || t.title : null].filter(Boolean).join(' · ')}
+        </span>
+      </button>
+      {open && <div className="grid gap-2 pl-7" data-decided-detail>
+        <p className="text-sm [overflow-wrap:anywhere]">{r.text ? <><span className="text-muted-foreground">{r.seat_name}'s {r.action === 'answer' ? 'answer' : r.action === 'route' ? 'routing' : 'decision'}: </span>{clean(r.text)}</> : line}</p>
+        {t && <button type="button" className="justify-self-start text-sm text-foreground underline-offset-2 hover:underline [overflow-wrap:anywhere]" onClick={() => openTicket(t.key)}>Open {t.key}: {t.name || t.title}</button>}
+        <BasedOn id={r.id} />
+        {!done && !overriding && <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" size="sm" onClick={() => setOverriding(true)}>Override</Button>
+          <AsyncButton variant="ghost" size="sm" confirm={`Reopen this decision? It comes back to you to decide again. Nothing that already happened is undone.`}
+            run={async () => { await api('POST', `/api/delegation/${r.id}/reopen`, {}); await refresh(); }} ok="Reopened: it is your decision again">Reopen</AsyncButton>
+        </div>}
+        {overriding && <div className="grid gap-2">
+          <label htmlFor={`override-${r.id}`} className="text-sm font-medium">Your decision instead</label>
+          <Textarea id={`override-${r.id}`} value={text} onChange={(e) => setText(e.target.value)} rows={3} placeholder="What should the team do instead? It is posted on the ticket as yours." />
+          <div className="flex flex-wrap gap-2">
+            <AsyncButton size="sm" disabled={text.trim().length < 2} run={async () => { await api('POST', `/api/delegation/${r.id}/override`, { message: text }); setOverriding(false); setText(''); await refresh(); }} ok="Posted on the ticket as your decision">Post my decision</AsyncButton>
+            <Button variant="ghost" size="sm" onClick={() => { setOverriding(false); setText(''); }}>Cancel</Button>
+          </div>
+        </div>}
       </div>}
     </article>
   );
