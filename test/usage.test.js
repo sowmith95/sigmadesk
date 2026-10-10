@@ -102,3 +102,27 @@ process.stdin.resume(); setInterval(() => {}, 1000);`); fs.chmodSync(cli, 0o755)
   assert.match(await pending, /exited before reporting limits/);
   assert.equal(await usage.stopAll(200), 0, 'nothing left to stop');
 });
+
+test('shutdown stops what a launcher started: the native process in the RPC\'s own process group is gone after stopAll', async () => {
+  const launcher = path.join(tmp, 'launcher.mjs'), launcherPid = path.join(tmp, 'launcher.pid'), nativePid = path.join(tmp, 'native.pid');
+  // Shaped like the npm package: a Node script that starts the native binary and waits on it. The native process ignores
+  // SIGTERM (the real one keeps writing into CODEX_HOME while it shuts down); the launcher does not, and dies first.
+  fs.writeFileSync(launcher, `#!/usr/bin/env node
+import fs from 'node:fs'; import { spawn } from 'node:child_process';
+fs.writeFileSync(${JSON.stringify(launcherPid)}, String(process.pid));
+const native = spawn('/bin/sh', ['-c', 'trap "" TERM; echo $$ > ' + ${JSON.stringify(JSON.stringify(nativePid))} + '; while :; do sleep 0.2; done'], { stdio: 'ignore' });
+native.on('exit', (code) => process.exit(code ?? 1));
+process.stdin.resume();`); fs.chmodSync(launcher, 0o755);
+  config.engines.codex.bin = launcher;
+  for (const f of [launcherPid, nativePid]) fs.rmSync(f, { force: true });
+  const pending = usage.readCodexLimits().then(() => 'answered', (e) => e.message);
+  for (let i = 0; i < 200 && !(fs.existsSync(nativePid) && fs.readFileSync(nativePid, 'utf8').trim()); i++) await new Promise((r) => setTimeout(r, 25));
+  const lpid = Number(fs.readFileSync(launcherPid, 'utf8')), npid = Number(fs.readFileSync(nativePid, 'utf8'));
+  assert.ok(lpid > 1 && npid > 1 && lpid !== npid);
+  assert.doesNotThrow(() => process.kill(npid, 0), 'the native process is running');
+  assert.equal(await usage.stopAll(200), 1, 'one RPC (one process group) was running');
+  assert.throws(() => process.kill(npid, 0), /ESRCH/, 'the native process the launcher started has exited too');
+  assert.throws(() => process.kill(lpid, 0), /ESRCH/, 'and the launcher');
+  assert.match(await pending, /exited before reporting limits/);
+  assert.equal(await usage.stopAll(200), 0, 'nothing of it is left to stop');
+});
