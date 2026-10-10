@@ -1154,3 +1154,45 @@ test('round 5: a parent-shape watch (retired_targets set, retired_resources NULL
   assert.equal(store.getWatch(w.id).hold, 0);
   config.ops.containers = ['alpaca-trader'];
 });
+
+test('watch steps are enforced across attempts: a plan-billed check stops past what is left of its checkpoint\'s steps', async () => {
+  const runner = await import('../src/runner.js');
+  reset();
+  const t = doneTicket();
+  const { w } = await deployed(t);
+  docker({ inspect: '/alpaca-trader\thealthy\t1\t2026-10-03T15:01:00Z\tfalse\timg' });
+  dw.clock.now = () => at(9);
+  await dw.sweep({ now: at(9) });
+  const cp = store.checkpointsOf(w.id).find((c) => c.name === 'smoke');
+  const plan = { id: 'sre', engine: 'codex', model: 'gpt' };
+  const tools = (ctx, n, from = 0) => runner.applyEvents(Array.from({ length: n }, (_, i) => ({ type: 'tool', text: `Probe ${from + i}` })), ctx);
+  // Attempt 1 is given the whole 40 steps, takes 25 and ends without a verdict: the checkpoint keeps the 25.
+  const a1 = dw.admit(store.getCheckpoint(cp.id), plan);
+  assert.equal(a1.limits.steps, 40);
+  const run1 = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t.key, token: `w${++seq}`, model: 'codex:gpt', job: { checkpoint: cp.id } });
+  const ctx1 = { run: run1, state: {}, presence: false, maxSteps: a1.limits.steps };
+  tools(ctx1, 25);
+  assert.equal(store.getRun(run1.id).status, 'running');
+  store.updateRun(run1.id, { status: 'success', token: null, ended_at: store.now() });
+  dw.chargeJob(cp.id, store.getRun(run1.id), ctx1.state.steps);
+  assert.equal(store.getCheckpoint(cp.id).steps_used, 25);
+  // Attempt 2 gets what is left (15). Its request after the 15th step is the 16th: refused before it is carried out.
+  const a2 = dw.admit(store.getCheckpoint(cp.id), plan);
+  assert.equal(a2.limits.steps, 15);
+  const run2 = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t.key, token: `w${++seq}`, model: 'codex:gpt', job: { checkpoint: cp.id } });
+  const ctx2 = { run: run2, state: {}, presence: false, maxSteps: a2.limits.steps };
+  tools(ctx2, 15);
+  assert.equal(store.getRun(run2.id).status, 'running', '15 steps: within what was left');
+  await assert.rejects(sched.deskAction(store.getRun(run2.id), 'watch', { action: 'verified', body: 'healthy after the deploy' }), /used its 15 steps/);
+  assert.deepEqual([store.getRun(run2.id).status, store.getRun(run2.id).result_text], ['killed', 'step limit (15)']);
+  assert.notEqual(store.getCheckpoint(cp.id).verdict, 'verified', 'no verdict past the allowance');
+  dw.chargeJob(cp.id, store.getRun(run2.id), 16);
+  const a3 = dw.admit(store.getCheckpoint(cp.id), plan);
+  assert.equal(a3.exhausted, true, 'nothing is left for a third attempt');
+  // A dollar-capped engine's allowance is dollars: its steps are counted, never stopped.
+  const run3 = store.createRun({ agent_id: 'sre', kind: 'watch', ticket_key: t.key, token: `w${++seq}`, model: 'claude:opus', job: { checkpoint: cp.id } });
+  const ctx3 = { run: run3, state: {}, presence: false };
+  tools(ctx3, 100);
+  assert.deepEqual([store.getRun(run3.id).status, ctx3.state.steps], ['running', 100]);
+  store.updateRun(run3.id, { status: 'success', token: null, ended_at: store.now() });
+});

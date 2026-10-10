@@ -49,7 +49,10 @@ export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
  * unmatched requests, and a request that would take the run past its allowance is refused, and the run stopped,
  * before the desk carries it out.
  */
-const STEP_BOUNDED = new Set(['mention', 'decide']);
+// Post-deploy checks (watch) are bounded too, by what is left of their checkpoint's steps when the engine cannot cap
+// dollars; with a dollar cap their allowance is dollars, so their steps are counted (the checkpoint keeps the total)
+// but never stop them.
+const STEP_BOUNDED = new Set(['mention', 'decide', 'watch']);
 export const isStepBounded = (kind) => STEP_BOUNDED.has(kind);
 const DESK_CALL = /(^|[\s;&|(){}`'"$])desk(\s|$)/; // a command line that runs the desk CLI somewhere in it
 // run id → { max, tools: tool calls, ids: stream command ids, inflight: desk-invoking commands not ended or matched,
@@ -62,14 +65,15 @@ function ledgerOf(run, max = null) {
   return l;
 }
 const ledgerSteps = (l) => l.tools + l.ids.size + l.pending;
-const ledgerMax = (run, l) => l.max ?? (run.kind === 'decide' ? Number(config.delegation?.maxSteps) || 30 : Number(config.mentions?.maxSteps) || 60);
+const ledgerMax = (run, l) => l.max ?? (run.kind === 'decide' ? Number(config.delegation?.maxSteps) || 30 : run.kind === 'mention' ? Number(config.mentions?.maxSteps) || 60 : Infinity);
+const LIMIT_OF = { decide: 'a delegated decision', mention: 'a tagged reply', watch: 'a post-deploy check' };
 /** The steps a run has taken so far (its ledger when it is step-bounded). */
 const stepsTaken = (ctx) => { const l = ledgers.get(ctx.run.id); return l ? ledgerSteps(l) : ctx.state.steps || 0; };
 function stopAtLimit(run, l) {
   const max = ledgerMax(run, l);
   if (ledgerSteps(l) <= max || l.stopped) return false;
   l.stopped = true;
-  store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for ${run.kind === 'decide' ? 'a delegated decision' : 'a tagged reply'})` });
+  store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for ${LIMIT_OF[run.kind] || 'this run'})` });
   killRun(run.id, `step limit (${max})`);
   return true;
 }
