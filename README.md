@@ -206,8 +206,13 @@ publish-guard holds; standing and renewal production access; package installs.
   is dropped, since it may be missing a condition. Settings tells you how many rules the desk found, so a count lower
   than you expect means a line ended the section early. The rest of the playbook must not leave Markdown room to
   read it differently either: anywhere in the file, raw HTML at the start of a line, a fenced block or comment it
-  might end elsewhere (one opened inside a list item or quote, or four spaces in, counts as that), or any heading holding markup (`&`, `<`, `[`, `]`, `\`, a backtick) or a non-ASCII character
-  leaves you with no standing rules, and Settings says which. With no such section, or an empty one, no decision run
+  might end elsewhere (one opened inside a list item or quote, or four spaces in, counts as that), or any heading
+  holding markup (`&`, `<`, `[`, `]`, `\`, a backtick) or a non-ASCII character leaves you with no standing rules,
+  and Settings says which. So does any mention of a raw-text element anywhere in the playbook: `<script`, `<style`,
+  `<textarea`, `<title`, `<iframe`, `<noscript` (and `<xmp`, `<noembed`, `<noframes`, `<plaintext`), even inside a
+  line and even inside inline code such as `` `<style>` ``, because opened in the page Markdown writes, such an
+  element hides everything after it. Only text inside a fenced code block or an HTML comment is exempt; write such
+  examples in a fenced block. With no such section, or an empty one, no decision run
   starts: nothing is decided for you by judgment. Owner-task triage is the one exception, because it is decided by
   rule, not judgment: a step filed as a check or a package is routed back to the team (when that kind is delegated)
   whatever the section says. Write narrow rules. The desk checks that a decision cites one of your rules and evidence
