@@ -253,6 +253,22 @@ export function ensureReadonlyWorkspace(seatId = 'scratch') {
   });
 }
 
+/**
+ * A repository file a delegated decision cites (#9): it must exist in the trusted base the read-only workspaces are
+ * copied from (the desk's own publisher repository, never a seat's clone, so nothing a run wrote can make a citation
+ * true). rel: a relative path inside the repository. → its number of lines, or null when there is no such file.
+ */
+export async function baseFileLines(rel) {
+  const p = String(rel || '');
+  if (!p || p.length > 300 || /^[/-]/.test(p) || /[\\\u0000-\u001f]/.test(p) || p.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return null;
+  const pub = await publisher();
+  const r = await git([...SAFE, '-C', pub, 'cat-file', 'blob', `refs/sigmadesk/scratch-base:${p}`], { maxBuffer: 64 << 20 }).catch(() => null);
+  if (!r) return null;
+  if (!r.stdout) return 0;
+  const n = r.stdout.split('\n').length;
+  return r.stdout.endsWith('\n') ? n - 1 : n;
+}
+
 // The scratch template: a checkout of the trusted base, built by the desk from its own publisher repo, never given to a
 // seat (it lives in the desk's data dir, which seats cannot read). Rebuilt when the base moves.
 const TEMPLATE_FETCH_MS = 10 * 60_000;

@@ -35,6 +35,15 @@ export const shadowSeat = (kind) => SEAT_OF[KINDS[kind]?.delegates?.[0]] || null
 // Structured hold kinds (tickets.hold_kind) each delegable kind covers. Anything else is never delegated.
 export const LOOP_HOLDS = ['qa_loops', 'review_loops', 'ci_loops', 'github_loops', 'review_disagree'];
 export const OWNER_ROUTES = { check: 'a read-only production check', package: 'a Python package the work needs' };
+/**
+ * What an asking seat says its question is about (desk needs-human --about). Only a factual engineering question, one a
+ * reader can settle from the repository or its documentation, can be answered for the owner; every other subject is
+ * the owner's by its nature, and so is a question that does not say.
+ */
+export const QUESTION_SCOPES = {
+  factual: null, money: 'money and budget are yours', credentials: 'credentials and accounts are yours', product: 'a product preference is yours',
+  trading: 'trading semantics and risk tolerance are yours', schema: 'a schema or data change is yours', other: 'it is not a factual engineering question',
+};
 const OWNER_KEEP = {
   write: 'a production write is yours', restart: 'a restart is yours', credential: 'credentials are yours', business: 'a business decision is yours',
   other: 'the step is not a production check or a package', probe: "the SRE's read-only probes could not answer it", owner: 'you took this task yourself',
@@ -129,6 +138,9 @@ export function ownerReason(f, nameOf = (s) => s) {
       return null;
     }
     case 'question':
+      if (!f.scope) return 'the asker did not mark it as a factual engineering question, so it stays yours';
+      if (!Object.hasOwn(QUESTION_SCOPES, f.scope)) return 'the asker gave it an unknown subject, so it stays yours';
+      if (QUESTION_SCOPES[f.scope]) return `the asker said it is about ${f.scope}: ${QUESTION_SCOPES[f.scope]}`;
       if (!positivelyLow(t)) return t?.risk === 'high' || t?.diff_risk === 'high' ? 'the ticket is high risk (trading, money or deploy paths)' : 'the ticket has no low-risk classification, so it counts as high risk';
       return null;
     case 'research':
@@ -145,6 +157,41 @@ export function ownerReason(f, nameOf = (s) => s) {
       return null;
     default: return 'this kind of decision is not delegable';
   }
+}
+
+// ---------------- what a decision may cite ----------------
+/** The owner's standing rules: each rule line (a bullet or a numbered item) of the project playbook, in order (R1, R2 …). */
+export function playbookRules(text = '') {
+  return String(text || '').split('\n').map((l) => l.match(/^\s*(?:[-*+]|\d+[.)])\s+(.*\S)\s*$/)?.[1]).filter(Boolean).slice(0, 80);
+}
+/** desk decide --cite "R2, E1, file:src/x.py:40": the ids, in order, each once. */
+export function parseCites(raw) {
+  if (raw == null || raw === true) return [];
+  return [...new Set(String(raw).split(/[\s,]+/).map((x) => x.trim()).filter(Boolean))].slice(0, 30);
+}
+/** file:<path>[:<line>[-<line>]] → { path, from, to } for a relative path inside the repository, else null. */
+export function parseFileCite(id) {
+  const m = String(id).match(/^file:([^:]+)(?::(\d+)(?:-(\d+))?)?$/);
+  if (!m) return null;
+  const p = m[1];
+  if (p.length > 300 || /^[/-]/.test(p) || /[\\\u0000-\u001f]/.test(p) || p.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return null;
+  const from = m[2] ? Number(m[2]) : null, to = m[3] ? Number(m[3]) : from;
+  if (from != null && (from < 1 || to < from)) return null;
+  return { path: p, from, to };
+}
+/**
+ * Why a decision's citations do not support it, or null. A decision that changes anything must cite at least one of
+ * the owner's standing rules (R) and at least one piece of evidence: from its brief (E) or a repository file (file:).
+ * Every id must be one its run was given, or a file that exists (badFiles: the cited files that do not).
+ */
+export function citationProblem(ids = [], { rules = new Set(), evidence = new Set(), badFiles = new Set() } = {}) {
+  if (!ids.length) return 'cites nothing from its brief';
+  const isFile = (id) => !!parseFileCite(id) && !badFiles.has(id);
+  const unknown = ids.filter((id) => !rules.has(id) && !evidence.has(id) && !isFile(id));
+  if (unknown.length) return `cites ${unknown.join(', ')}, which ${unknown.length === 1 ? 'is' : 'are'} not in its brief or the repository`;
+  if (!ids.some((id) => rules.has(id))) return 'cites none of your standing rules';
+  if (!ids.some((id) => evidence.has(id) || isFile(id))) return 'cites no evidence from its brief';
+  return null;
 }
 
 /** The plain-language line for a delegated decision ("Morgan answered Riley: …"). */

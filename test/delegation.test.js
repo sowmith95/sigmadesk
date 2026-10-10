@@ -17,29 +17,30 @@ const cfg = path.join(tmp, 'config.json');
 fs.writeFileSync(cfg, JSON.stringify({ project: { repoPath: repo, ticketPrefix: 'D' }, github: { sync: false, openDraftPrs: false }, pm: { enabled: false }, ops: { enabled: true, containers: [] } }));
 process.env.SIGMADESK_CONFIG = cfg; process.env.SIGMADESK_WORKSPACES = path.join(tmp, 'workspaces');
 
-let config, store, sched, delegation, model, attention, access, researchReview, team;
+let config, store, sched, delegation, model, attention, access, researchReview, team, runner;
 before(async () => {
   ({ config } = await import('../src/config.js')); config.root = tmp; config.dataDir = path.join(tmp, 'data');
   store = await import('../src/db.js'); store.openDb(':memory:');
   sched = await import('../src/scheduler.js'); delegation = await import('../src/delegation.js'); model = await import('../src/delegation-model.js');
   attention = await import('../public/attention.js'); access = await import('../src/access.js'); researchReview = await import('../src/research-review.js');
-  team = await import('../src/team.js');
+  team = await import('../src/team.js'); runner = await import('../src/runner.js');
   config.delegation.maxPerDay = 1000; // every test here binds runs; the daily allowance has its own test
 });
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 let n = 0;
-const ticket = (patch = {}) => { const t = store.createTicket({ title: `Delegation fixture ${++n}`, status: 'todo', area: 'backend', complexity: 'S', assignee: 'junior', reporter: 'owner' }); return store.updateTicket(t.key, { risk: 'low', ...patch }); };
-/** An engineer asks the owner through the real desk command (structured hold: question, asker, comment). */
-async function ask(t, seat = 'junior', q = 'Which test file covers the retry helper?') {
+const ticket = (patch = {}) => { const t = store.createTicket({ title: `Delegation fixture ${++n}`, description: 'Fix the retry helper in utils/net.py.', status: 'todo', area: 'backend', complexity: 'S', assignee: 'junior', reporter: 'owner' }); return store.updateTicket(t.key, { risk: 'low', ...patch }); };
+/** An engineer asks the owner through the real desk command (structured hold: question, asker, subject, comment). */
+async function ask(t, seat = 'junior', q = 'Which test file covers the retry helper?', about = 'factual') {
   store.updateTicket(t.key, { status: 'in_progress', assignee: seat });
   const run = store.createRun({ agent_id: seat, ticket_key: t.key, kind: 'implement', token: `i-${Math.random()}`, model: 'claude:opus' });
-  await sched.deskAction(run, 'needs-human', { body: q });
+  await sched.deskAction(run, 'needs-human', { body: q, ...(about ? { about } : {}) });
   store.updateRun(run.id, { status: 'success', token: null });
   return store.getTicket(t.key);
 }
-/** Bind a decide run to a queued record, the way delegation.launch does (server-owned job, run id on the record). */
+/** Bind a decide run to a queued record, the way delegation.launch does (what it may cite, the server-owned job, the run id). */
 function bind(r) {
+  delegation.seal(r);
   const run = store.createRun({ agent_id: r.seat, ticket_key: r.ticket_key, kind: 'decide', token: `d-${r.id}-${Math.random()}`, model: 'claude:opus', job: { delegation: r.id } });
   store.updateDelegation(r.id, { status: 'running', run_id: run.id, attempts: 1 });
   return run;
@@ -80,11 +81,16 @@ test('model: the deterministic owner rules (self-interest, risk, lifetime limits
   const L = model.settingsFrom({});
   const low = { status: 'needs_human', risk: 'low' };
   const r = (f) => model.ownerReason({ limits: L, delegate: 'manager', ticket: low, ...f });
-  assert.equal(r({ kind: 'question' }), null);
-  assert.match(r({ kind: 'question', interest: 'asked this question' }), /manager asked this question, so manager cannot decide it for you/);
-  assert.match(r({ kind: 'question', ticket: { ...low, risk: 'high' } }), /high risk/);
-  assert.match(r({ kind: 'question', ticket: { ...low, risk: null } }), /no low-risk classification/, 'unknown risk counts as high');
-  assert.match(r({ kind: 'question', ticket: { ...low, diff_risk: 'high' } }), /high risk/);
+  assert.equal(r({ kind: 'question', scope: 'factual' }), null);
+  assert.match(r({ kind: 'question', scope: 'factual', interest: 'asked this question' }), /manager asked this question, so manager cannot decide it for you/);
+  assert.match(r({ kind: 'question', scope: 'factual', ticket: { ...low, risk: 'high' } }), /high risk/);
+  assert.match(r({ kind: 'question', scope: 'factual', ticket: { ...low, risk: null } }), /no low-risk classification/, 'unknown risk counts as high');
+  assert.match(r({ kind: 'question', scope: 'factual', ticket: { ...low, diff_risk: 'high' } }), /high risk/);
+  // Only a question its asker marked factual: any other subject, an unknown one or none at all stays the owner's.
+  assert.match(r({ kind: 'question' }), /did not mark it as a factual engineering question/);
+  assert.match(r({ kind: 'question', scope: 'nonsense' }), /unknown subject/);
+  for (const [scope, re] of [['money', /about money: money and budget are yours/], ['credentials', /credentials and accounts/], ['product', /product preference/], ['trading', /trading semantics/], ['schema', /schema or data change/], ['other', /not a factual engineering question/]])
+    assert.match(r({ kind: 'question', scope }), re, scope);
   assert.match(r({ kind: 'research', interest: 'wrote the proposal' }), /wrote the proposal/);
   assert.match(r({ kind: 'research', lifetime: { count: 1, spend: 0 } }), /already sent this proposal back 1 time \(limit 1/);
   assert.match(r({ kind: 'research', lifetime: { count: 0, spend: 1.6 } }), /already cost \$1\.60/);
@@ -150,7 +156,7 @@ test('records: one per decision and evidence version; owner mode opens none; sha
   assert.equal(brief.id, `${t.key}:question`); assert.ok(brief.policy_version && brief.gate, 'audited with the brief the owner sees');
   assert.equal(JSON.parse(r.provenance).decided_for, 'owner');
   const run = bind(r);
-  const out = await sched.deskAction(run, 'decide', { action: 'answer', body: 'tests/test_net.py covers it.', why: 'tests/test_net.py:12 exercises retry(); playbook: answer from the code.' });
+  const out = await sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'answer', body: 'tests/test_net.py covers it.', why: 'tests/test_net.py:12 exercises retry(); playbook: answer from the code.' });
   assert.match(out, /shadow mode/);
   const after = store.getDelegation(r.id);
   assert.deepEqual([after.status, after.action], ['shadow', 'answer']);
@@ -184,7 +190,7 @@ test('apply (em): the answer is posted as Morgan\'s, decided for the owner, and 
   await assert.rejects(sched.deskAction(run, 'decide', { action: 'approve', body: 'x', why: 'not allowed here at all' }), /this decision allows answer, escalate/);
   await assert.rejects(sched.deskAction(run, 'decide', { action: 'answer', body: 'x', why: 'short' }), /say why/);
   await assert.rejects(sched.deskAction(run, 'submit', { body: 'x' }), /decision run reads the ticket/);
-  const out = await sched.deskAction(run, 'decide', { action: 'answer', body: 'Yes: utils/net.py:40.', why: 'utils/net.py:40 defines retry(); playbook says prefer the shared helper.' });
+  const out = await sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'answer', body: 'Yes: utils/net.py:40.', why: 'utils/net.py:40 defines retry(); playbook says prefer the shared helper.' });
   assert.match(out, /Decided for the owner and applied/);
   const after = store.getDelegation(r.id);
   assert.equal(after.status, 'applied');
@@ -194,7 +200,7 @@ test('apply (em): the answer is posted as Morgan\'s, decided for the owner, and 
   assert.equal(store.listComments(t.key).filter((x) => x.author === 'owner').length, owners, 'nothing was written as the owner');
   const now = store.getTicket(t.key);
   assert.deepEqual([now.status, now.hold_kind, now.resume_status], ['todo', null, null], 'resumed where the hold said (the builder picks it up again)');
-  await assert.rejects(sched.deskAction(run, 'decide', { action: 'answer', body: 'again', why: 'trying a second time here' }), /no longer open/);
+  await assert.rejects(sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'answer', body: 'again', why: 'trying a second time here' }), /no longer open/);
   const v = delegation.summary();
   assert.ok(v.decided.some((x) => x.id === r.id && /Morgan answered Riley: Yes/.test(x.line)), 'Decided for you (last 24 h)');
   assert.equal(v.metrics.kinds.question.avoided >= 1, true);
@@ -208,7 +214,7 @@ test('re-validation at apply: a changed decision is superseded, a policy change 
   delegation.sweep({ paused: false });
   const ra = recFor(`${a.key}:question`); const runA = bind(ra);
   sched.ownerReply(a.key, 'Use the shared helper.', 'answer', { mentions: [] });
-  const outA = await sched.deskAction(runA, 'decide', { action: 'answer', body: 'late answer', why: 'the evidence says so clearly' });
+  const outA = await sched.deskAction(runA, 'decide', { cite: 'R1,E1', action: 'answer', body: 'late answer', why: 'the evidence says so clearly' });
   assert.match(outA, /changed or was settled meanwhile: nothing was applied/);
   assert.equal(store.getDelegation(ra.id).status, 'superseded');
   assert.ok(!store.listComments(a.key).some((c) => /late answer/.test(c.body)));
@@ -218,7 +224,7 @@ test('re-validation at apply: a changed decision is superseded, a policy change 
   const rb = recFor(`${b.key}:question`); const runB = bind(rb);
   policy({ question: 'em', loop_limit: 'em' });
   assert.equal(store.getDelegation(rb.id).status, 'invalidated', 'invalidated at once by the policy change');
-  await assert.rejects(sched.deskAction(runB, 'decide', { action: 'answer', body: 'x', why: 'the evidence says so clearly' }), /no longer open/);
+  await assert.rejects(sched.deskAction(runB, 'decide', { cite: 'R1,E1', action: 'answer', body: 'x', why: 'the evidence says so clearly' }), /no longer open/);
   // 3. Escalate everything: in-flight authority ends and nothing new is delegated.
   const c = await ask(ticket());
   delegation.sweep({ paused: false });
@@ -236,7 +242,7 @@ test('re-validation at apply: a changed decision is superseded, a policy change 
   const re = recFor(`${e.key}:question`); const runE = bind(re);
   team.applyTeamOverrides({ manager: { enabled: false } });
   try {
-    const outE = await sched.deskAction(runE, 'decide', { action: 'answer', body: 'x', why: 'the evidence says so clearly' });
+    const outE = await sched.deskAction(runE, 'decide', { cite: 'R1,E1', action: 'answer', body: 'x', why: 'the evidence says so clearly' });
     assert.match(outE, /owner's: Morgan's seat is switched off/);
     assert.equal(store.getDelegation(re.id).status, 'escalated');
   } finally { team.applyTeamOverrides({}); }
@@ -269,7 +275,7 @@ test('evidence and policy at apply (property): any one substantive change after 
       const run = bind(r);
       const thread = store.listComments(t.key).length;
       mutate(store.getTicket(t.key));
-      const out = await sched.deskAction(run, 'decide', { action: 'answer', body: 'Yes, buy it.', why: 'utils/net.py:40 says so; the playbook says reuse.' });
+      const out = await sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'answer', body: 'Yes, buy it.', why: 'utils/net.py:40 says so; the playbook says reuse.' });
       const after = store.getDelegation(r.id);
       assert.ok(['superseded', 'invalidated'].includes(after.status), `${what}: ${after.status}`);
       assert.match(out, /nothing was applied/, what);
@@ -290,12 +296,72 @@ test('a failed final write rolls the whole decision back: no answer on the threa
   const thread = store.listComments(t.key).length;
   store.handle().exec("CREATE TRIGGER fail_apply BEFORE UPDATE OF status ON delegated_decisions WHEN NEW.status = 'applied' BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
   try {
-    await assert.rejects(sched.deskAction(run, 'decide', { action: 'answer', body: 'utils/net.py:40.', why: 'utils/net.py:40 defines retry(); the playbook says reuse.' }), /injected failure/);
+    await assert.rejects(sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'answer', body: 'utils/net.py:40.', why: 'utils/net.py:40 defines retry(); the playbook says reuse.' }), /injected failure/);
   } finally { store.handle().exec('DROP TRIGGER fail_apply'); }
   const now = store.getTicket(t.key);
   assert.deepEqual([now.status, now.hold_kind], ['needs_human', 'question'], 'the work did not resume');
   assert.equal(store.listComments(t.key).length, thread, 'the answer was rolled back with it');
   assert.equal(store.getDelegation(r.id).status, 'running', 'still open: the run ends without a decision and it goes to the owner');
+});
+
+test('authority: an answer must cite a standing rule and its evidence; "approve the $5,000 purchase" without them goes to the owner and nothing resumes', async () => {
+  reset();
+  policy({ question: 'em' });
+  const buy = 'Can I buy the $5,000 market-data vendor license for this?';
+  // 1. A question about money, or one whose asker did not say what it is about: the owner's by rule, before any run.
+  const money = await ask(ticket(), 'junior', buy, 'money');
+  const unmarked = await ask(ticket(), 'junior', buy, null);
+  delegation.sweep({ paused: false });
+  assert.match(recFor(`${money.key}:question`).why, /about money: money and budget are yours/);
+  assert.match(recFor(`${unmarked.key}:question`).why, /did not mark it as a factual engineering question/);
+  for (const t of [money, unmarked]) assert.deepEqual([recFor(`${t.key}:question`).status, recFor(`${t.key}:question`).run_id], ['escalated', null]);
+  await assert.rejects(ask(ticket(), 'junior', buy, 'cheap'), /--about must be one of factual, money/);
+  // 2. Mislabelled as factual, so a run starts: an approval that does not cite what it rests on is never applied.
+  await runner.scratchTemplate({ force: true }); // the trusted base that file: citations are checked against
+  const approve = 'Approved: buy the $5,000 license today.';
+  for (const [what, cite, re] of [
+    ['no citation at all', undefined, /cites nothing from its brief/],
+    ['a rule only', 'R1', /cites no evidence from its brief/],
+    ['evidence only', 'E1', /cites none of your standing rules/],
+    ['an evidence id it was never given', 'R1,E99', /cites E99, which is not in its brief or the repository/],
+    ['a rule id it was never given', 'R999,E1', /cites R999, which is not/],
+    ['a file outside the repository', 'R1,file:../../etc/passwd', /cites file:\.\.\/\.\.\/etc\/passwd, which is not/],
+    ['an absolute path', 'R1,file:/etc/passwd', /cites file:\/etc\/passwd, which is not/],
+    ['a file that does not exist', 'R1,file:no/such/file.py:3', /cites file:no\/such\/file\.py:3, which is not/],
+    ['a line past the end of a real file', 'R1,file:README.md:2', /cites file:README\.md:2, which is not/],
+    ['a made-up kind of id', 'R1,E1,ticket:42', /cites ticket:42, which is not/],
+  ]) {
+    const t = await ask(ticket(), 'junior', buy, 'factual');
+    delegation.sweep({ paused: false });
+    const r = recFor(`${t.key}:question`);
+    assert.equal(r.status, 'queued', what);
+    const out = await sched.deskAction(bind(r), 'decide', { action: 'answer', body: approve, why: 'The vendor is reliable and the team needs it now.', ...(cite ? { cite } : {}) });
+    assert.match(out, /Not applied: your decision/, what);
+    const after = store.getDelegation(r.id);
+    assert.equal(after.status, 'escalated', what); assert.match(after.why, re, what);
+    assert.equal(after.recommendation, approve, `${what}: the text reaches the owner only as a recommendation`);
+    const now = store.getTicket(t.key);
+    assert.deepEqual([now.status, now.hold_kind], ['needs_human', 'question'], `${what}: the work did not resume`);
+    assert.ok(!store.listComments(t.key).some((c) => c.author === 'manager'), `${what}: nothing was posted as Morgan's`);
+  }
+  // 3. Shadow shows it the same way: left to the owner, never as what Morgan would decide.
+  policy({ question: 'shadow' });
+  const s = await ask(ticket(), 'junior', buy, 'factual');
+  delegation.sweep({ paused: false });
+  const rs = recFor(`${s.key}:question`);
+  await sched.deskAction(bind(rs), 'decide', { action: 'answer', body: approve, why: 'Looks fine to me, really.' });
+  assert.equal(store.getDelegation(rs.id).status, 'escalated');
+  // 4. A factual answer that cites a rule, the brief and a real file is applied, and the audit says what it cited.
+  policy({ question: 'em' });
+  const ok = await ask(ticket(), 'junior', 'Which file defines the retry helper?', 'factual');
+  delegation.sweep({ paused: false });
+  const ro = recFor(`${ok.key}:question`);
+  const out = await sched.deskAction(bind(ro), 'decide', { action: 'answer', body: 'utils/net.py, retry().', why: 'The ticket names utils/net.py; the playbook says follow existing patterns.', cite: 'R1, E1 file:README.md:1' });
+  assert.match(out, /Decided for the owner and applied/);
+  const audit = delegation.get(ro.id);
+  assert.deepEqual(audit.cited.map((x) => x.id), ['R1', 'E1', 'file:README.md:1']);
+  assert.match(audit.cited[1].text, /the ticket description/);
+  assert.ok(JSON.parse(store.getDelegation(ro.id).citables).rules.length > 0, 'the rules its run was given are on the record');
 });
 
 test('self-interest and risk escalate by rule, before any run: the asker never answers itself; risky tickets stay yours', async () => {
@@ -363,7 +429,7 @@ test('research holds (em): Morgan coordinates a correction recorded as Morgan\'s
   assert.deepEqual([r.status, JSON.parse(r.allowed)], ['queued', ['changes', 'escalate']]);
   const run = bind(r);
   await assert.rejects(sched.deskAction(run, 'decide', { action: 'approve', body: 'ok', why: 'waive it, looks fine to me' }), /allows changes, escalate/);
-  await sched.deskAction(run, 'decide', { action: 'changes', body: 'Cite the vendor changelog and cut v1 to the alert only.', why: 'The reviewer found no source; the playbook needs cited evidence.' });
+  await sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'changes', body: 'Cite the vendor changelog and cut v1 to the alert only.', why: 'The reviewer found no source; the playbook needs cited evidence.' });
   const after = store.getTicket(t.key);
   assert.deepEqual([after.status, after.research_review, after.research_revisions], ['proposed', 'changes', 0]);
   assert.equal(store.kvGet(`research-notes:${t.key}`), 'Cite the vendor changelog and cut v1 to the alert only.');
@@ -388,8 +454,8 @@ test('loop limits (em): rescope or reassign, recorded as Morgan\'s; never a QA p
   assert.equal(r.status, 'queued');
   const run = bind(r);
   await assert.rejects(sched.deskAction(run, 'decide', { action: 'approve', body: 'ship it', why: 'QA is too strict here' }), /allows changes, escalate/);
-  await assert.rejects(sched.deskAction(run, 'decide', { action: 'changes', body: 'x', why: 'reassign to the qa seat', assign: 'qa' }), /--assign must be an enabled builder/);
-  await sched.deskAction(run, 'decide', { action: 'changes', body: 'Drop the cache layer; fix only the parser.', why: 'Three QA fails on the cache; playbook: smallest change.', assign: 'senior-be' });
+  await assert.rejects(sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'changes', body: 'x', why: 'reassign to the qa seat', assign: 'qa' }), /--assign must be an enabled builder/);
+  await sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'changes', body: 'Drop the cache layer; fix only the parser.', why: 'Three QA fails on the cache; playbook: smallest change.', assign: 'senior-be' });
   const after = store.getTicket(t.key);
   assert.deepEqual([after.status, after.assignee, after.assign_pinned], ['todo', 'senior-be', 1]);
   assert.match(store.listComments(t.key).at(-1).body, /^🔁 \*\*Morgan's direction, deciding for you\*\*[\s\S]*reassigned to Jordan[\s\S]*Drop the cache layer/);
@@ -460,7 +526,7 @@ test('self-interest (property): whoever holds, requested, built, reviews, design
   delegation.sweep({ paused: false });
   const rl = recFor(`${late.key}:stuck`); const run = bind(rl);
   store.updateTicket(late.key, { hold_seat: me });
-  const out = await sched.deskAction(run, 'decide', { action: 'changes', body: 'Narrow it to the parser.', why: 'Three rounds on the cache; playbook: smallest change.' });
+  const out = await sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'changes', body: 'Narrow it to the parser.', why: 'Three rounds on the cache; playbook: smallest change.' });
   assert.match(out, /nothing was applied/);
   assert.notEqual(store.getDelegation(rl.id).status, 'applied');
   assert.equal(store.getTicket(late.key).status, 'needs_human');
@@ -482,7 +548,7 @@ test('design (sre): Devon approves a positively low-risk recommendation; Morgan 
   const r2 = recFor(`${t.key}:design:${disc2.id}`);
   assert.deepEqual([r2.status, r2.seat], ['queued', 'sre']);
   const run = bind(r2);
-  await sched.deskAction(run, 'decide', { action: 'approve', body: 'One CSV per day is fine.', why: 'Low risk: no trading path; playbook allows read-only exports.' });
+  await sched.deskAction(run, 'decide', { cite: 'R1,E1', action: 'approve', body: 'One CSV per day is fine.', why: 'Low risk: no trading path; playbook allows read-only exports.' });
   assert.equal(store.getDiscussion(disc2.id).status, 'approved');
   assert.equal(store.listComments(t.key).at(-1).author, 'sre');
   assert.match(store.listComments(t.key).at(-1).body, /Design approved by Devon, deciding for you/);
@@ -500,7 +566,7 @@ test('override and reopen: the owner replaces or reconsiders a delegated decisio
   const t = await ask(ticket());
   delegation.sweep({ paused: false });
   const r = recFor(`${t.key}:question`);
-  await sched.deskAction(bind(r), 'decide', { action: 'answer', body: 'Use the cache.', why: 'utils/cache.py exists; playbook prefers reuse.' });
+  await sched.deskAction(bind(r), 'decide', { cite: 'R1,E1', action: 'answer', body: 'Use the cache.', why: 'utils/cache.py exists; playbook prefers reuse.' });
   store.updateTicket(t.key, { active_run: null, status: 'todo' });
   const o = delegation.ownerOverride(r.id, { message: 'Do not use the cache; call the API directly.' });
   assert.equal(o.status, 'overridden');
@@ -511,7 +577,7 @@ test('override and reopen: the owner replaces or reconsiders a delegated decisio
   const t2 = await ask(ticket());
   delegation.sweep({ paused: false });
   const r2 = recFor(`${t2.key}:question`);
-  await sched.deskAction(bind(r2), 'decide', { action: 'answer', body: 'Yes.', why: 'The code at a.py:1 says so.' });
+  await sched.deskAction(bind(r2), 'decide', { cite: 'R1,E1', action: 'answer', body: 'Yes.', why: 'The code at a.py:1 says so.' });
   store.updateTicket(t2.key, { active_run: 5 });
   assert.throws(() => delegation.ownerReopen(r2.id, {}), /working on it right now/);
   store.updateTicket(t2.key, { active_run: null });
@@ -647,13 +713,13 @@ test('overrides replace what the next run reads: a proposal\'s revision notes, a
   researchReview.complete(rv.id, { report: { verdict: 'reject', summary: 'No evidence', evidence_checked: [], findings: ['x'], conditions: ['y'] } });
   delegation.sweep({ paused: false });
   const r = recFor(`${t.key}:research:1`);
-  await sched.deskAction(bind(r), 'decide', { action: 'changes', body: 'Cite a source.', why: 'The reviewer found no source; the playbook needs one.' });
+  await sched.deskAction(bind(r), 'decide', { cite: 'R1,E1', action: 'changes', body: 'Cite a source.', why: 'The reviewer found no source; the playbook needs one.' });
   delegation.ownerOverride(r.id, { message: 'Narrow it to the alert only and cite the vendor docs.' });
   assert.equal(store.kvGet(`research-notes:${t.key}`), 'Narrow it to the alert only and cite the vendor docs.', 'the revision run reads the owner\'s notes');
   const l = ticket({ status: 'needs_human', assignee: 'junior', builder: 'junior', qa_loops: 3, resume_status: 'todo', hold_kind: 'qa_loops' });
   delegation.sweep({ paused: false });
   const rl = recFor(`${l.key}:stuck`);
-  await sched.deskAction(bind(rl), 'decide', { action: 'changes', body: 'Fix only the parser.', why: 'Three QA fails on the cache; smallest change.' });
+  await sched.deskAction(bind(rl), 'decide', { cite: 'R1,E1', action: 'changes', body: 'Fix only the parser.', why: 'Three QA fails on the cache; smallest change.' });
   delegation.ownerOverride(rl.id, { message: 'Keep the cache; fix its key.' });
   const notes = store.listComments(l.key).filter((c) => /^(❌|🔁)/.test(c.body));
   assert.match(notes.at(-1).body, /^🔁 \*\*The owner overrode Morgan's decision\*\*[\s\S]*Keep the cache; fix its key/, 'rework reads the owner\'s note, not Morgan\'s');

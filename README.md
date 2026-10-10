@@ -167,7 +167,7 @@ decides:
 | Kind | Delegate | What the delegate may do | Stays yours |
 |---|---|---|---|
 | Owner tasks | Morgan, by rule (no model run) | a read-only production check goes to Devon's probes; a missing package becomes a package request on the ticket | writes, restarts, credentials, business decisions, and any step filed without a kind |
-| Engineers' questions | Morgan | answer a factual engineering question on a positively low-risk ticket | money, credentials, product preference, trading semantics, schema effects, high or unknown risk, stale evidence, a missing standing rule, Morgan's own question |
+| Engineers' questions | Morgan | answer a question its asker marked factual (`desk needs-human "<q>" --about factual`) on a positively low-risk ticket | any other subject (money, credentials, product preference, trading semantics, schema effects) or none, high or unknown risk, stale evidence, a missing standing rule, Morgan's own question |
 | Research-review holds | Morgan | send the proposal back with corrections or a narrower scope (once per proposal, for its whole life) | approving it past the reviewer's dissent |
 | QA and review loop limits | Morgan | rescope, or reassign to another builder (once per ticket) | clearing a QA, CI or reviewer failure; a disagreement Morgan is a party to |
 | Design and plan reviews | Morgan or Devon | approve or reject a recommendation on a positively low-risk ticket (a backend change can alter trading without any UI change) | a design the delegate wrote; council corrections (they queue a paid council) |
@@ -175,15 +175,23 @@ decides:
 Never delegable in v1: budget, policies and this matrix; merges of high-risk work, revert merges and releasing holds;
 publish-guard holds; standing and renewal production access; package installs.
 
-- **Structured reasons only.** Every hold records why (`hold_kind`), who asked (`hold_seat`) and what it refers to
-  (`hold_ref`); owner tasks record their kind (`desk create-task --owner "<why>" --owner-kind
-  check|package|write|restart|credential|business|other`). Delegation never classifies message text.
+- **Structured reasons only.** Every hold records why (`hold_kind`), who asked (`hold_seat`), what it refers to
+  (`hold_ref`) and, for a question, what the asker says it is about (`hold_scope`, from `desk needs-human --about
+  factual|money|credentials|product|trading|schema|other`); owner tasks record their kind (`desk create-task --owner
+  "<why>" --owner-kind check|package|write|restart|credential|business|other`) and who filed them. Delegation never
+  classifies message text.
 - **One record per decision and evidence version** (`delegated_decisions`): the decision brief you see, the policy and
   delegation versions, the delegate, the actions it may take, attempts, spend and the outcome. The evidence version is
   one fingerprint of every substantive ticket field, the whole thread, the changed files and the kind's own evidence (a
   proposal and its reviews, a design's text): a new question, hold, message or revision is a new decision.
-- **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and answers with
-  `desk decide answer|approve|changes|reject|escalate "<text>" --why "<evidence and your standing rule>"`: up to $0.75 on
+- **Decisions cite what they rest on.** A decision run is given numbered standing rules (R1…, each rule line of your
+  playbook) and numbered evidence (E1…, the ticket description, the kind's own record and the thread's messages) and
+  answers with `desk decide answer|approve|changes|reject "<text>" --cite "R2,E1,file:<path>:<line>" --why "<how they
+  settle it>"`. The desk checks every id against what that run was given (and every file against the base branch); a
+  decision that cites no rule, no evidence or anything it was not given is not applied: it comes to you with its text as
+  the recommendation.
+- **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and ends with one
+  `desk decide` (or `desk decide escalate "<recommendation>" --why "<why it is yours>"`): up to $0.75 on
   an engine with a spending cap, or 6 minutes and 30 steps on a plan-billed one; an engine with neither is refused. A run
   that ends without deciding, or a decision not started within 30 minutes, comes to you with the reason. Escalations carry
   a one-line recommendation, so your tap is yes or no. At most 40 decision runs a day; one slot stays free for QA and

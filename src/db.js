@@ -545,6 +545,8 @@ CREATE TABLE IF NOT EXISTS delegated_decisions (
   spent_ms INTEGER DEFAULT 0,
   steps_used INTEGER DEFAULT 0,
   brief TEXT,                     -- JSON: the decision brief it was based on (audit)
+  citables TEXT,                  -- JSON: the rule (R) and evidence (E) ids its run was given, fixed when the run started
+  citations TEXT,                 -- JSON: the ids the delegate cited for its decision (checked against citables)
   provenance TEXT,                -- JSON: decided for the owner by whom, under which mode, policy and run
   comment_id INTEGER,             -- the ticket comment that announced an applied decision
   override_note TEXT,
@@ -623,7 +625,8 @@ function migrate() {
       // owner_task_kind: what kind of step an owner task is (check | package | write | restart | credential | business |
       // other | probe | owner), stated by whoever made it the owner's. null = unknown (never delegated).
       // owner_task_by: who made it the owner's (a seat, 'owner', or 'desk' when the desk parked a check with the owner).
-      hold_kind: 'TEXT', hold_seat: 'TEXT', hold_ref: 'TEXT', owner_task_kind: 'TEXT', owner_task_by: 'TEXT' },
+      // hold_scope: what a question is about, stated by the asker (desk needs-human --about): only 'factual' is delegable.
+      hold_kind: 'TEXT', hold_seat: 'TEXT', hold_ref: 'TEXT', hold_scope: 'TEXT', owner_task_kind: 'TEXT', owner_task_by: 'TEXT' },
     // health: an app probe that answered but reported the application unhealthy (HTTP 5xx) is not evidence of health
     ops_audit: { health: 'TEXT', resources: 'TEXT' }, // resources: what the call actually observed (containers, database, app)
     // a post-deploy checkpoint's run-bound grant names its checkpoint (re-checked at every probe)
@@ -633,6 +636,8 @@ function migrate() {
     // hold_kind: provisional (first hard failure, before confirmation) | regression (confirmed)
     deploy_watches: { hold_kind: 'TEXT', retired_targets: 'TEXT', retired_resources: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
+    // a database created by an earlier build of delegation (#9) gains the columns added since
+    delegated_decisions: { citables: 'TEXT', citations: 'TEXT' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     // prod_access 0: the owner chose "ask me in my Inbox" for this delivery, so its run never gets automatic access
     mention_deliveries: { spent_usd: 'REAL DEFAULT 0', spent_ms: 'INTEGER DEFAULT 0', steps_used: 'INTEGER DEFAULT 0', prod_access: 'INTEGER DEFAULT 1' },
@@ -832,8 +837,8 @@ const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', '
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
   'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base',
   'research_program', 'research_run', 'research_policy', 'research_review', 'research_generation', 'research_revisions', 'research_sources',
-  'prod_verify', 'prod_verify_by', 'owner_merge_only', 'hold_kind', 'hold_seat', 'hold_ref', 'owner_task_kind', 'owner_task_by']);
-export const HOLD_FIELDS = ['hold_kind', 'hold_seat', 'hold_ref'];
+  'prod_verify', 'prod_verify_by', 'owner_merge_only', 'hold_kind', 'hold_seat', 'hold_ref', 'hold_scope', 'owner_task_kind', 'owner_task_by']);
+export const HOLD_FIELDS = ['hold_kind', 'hold_seat', 'hold_ref', 'hold_scope'];
 
 export function updateTicket(key, patch) {
   // When it shipped, recorded once by whichever path finishes it (merge sync, epic roll-up, owner).
@@ -1399,7 +1404,7 @@ export function updateMention(id, patch) {
 // ---------- delegated decisions (#9) ----------
 const DD_INSERT = ['kind', 'decision_id', 'ticket_key', 'version', 'policy_version', 'delegation_version', 'mode', 'seat', 'asker', 'allowed', 'status', 'brief', 'provenance', 'outcome', 'action', 'text', 'why', 'decided_at', 'ended_at'];
 const DD_FIELDS = ['status', 'action', 'text', 'why', 'recommendation', 'outcome', 'assign', 'attempts', 'run_id', 'spent_usd', 'spent_ms', 'steps_used', 'brief', 'provenance',
-  'comment_id', 'override_note', 'override_at', 'started_at', 'decided_at', 'ended_at'];
+  'citables', 'citations', 'comment_id', 'override_note', 'override_at', 'started_at', 'decided_at', 'ended_at'];
 const ddVal = (v) => (v !== null && typeof v === 'object' ? JSON.stringify(v) : v ?? null);
 /** One record per (decision, evidence version): a repeat returns the existing row ({ row, created }). */
 export function createDelegation(d) {

@@ -30,6 +30,7 @@ import * as netfetch from './netfetch.js';
 import * as mentions from './mentions.js';
 import * as deploywatch from './deploywatch.js';
 import * as delegation from './delegation.js';
+import { QUESTION_SCOPES } from './delegation-model.js';
 import * as flow from '../public/flow.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
@@ -1376,9 +1377,13 @@ export async function deskAction(run, cmd, body = {}) {
     case 'needs-human': {
       ownTicket();
       need(body.body, 'question required');
+      // --about (#9): what the question is about, in the asker's own words. Only a factual engineering question can be
+      // answered for the owner by delegation; any other subject, or none, stays the owner's.
+      const about = body.about === undefined || body.about === true ? null : String(body.about);
+      need(!about || Object.hasOwn(QUESTION_SCOPES, about), `--about must be one of ${Object.keys(QUESTION_SCOPES).join(', ')}`);
       const asked = store.addComment(ticket.key, agentId, `❓ **Question for the owner:** ${body.body}`);
-      // Structured: a question, who asked it, and which comment it is (delegation answers exactly this, never a guess).
-      setStatus(ticket.key, 'needs_human', { resume_status: ticket.status === 'in_progress' ? 'todo' : ticket.status, hold_kind: 'question', hold_seat: agentId, hold_ref: String(asked.id) });
+      // Structured: a question, who asked it, what about, and which comment it is (delegation answers exactly this).
+      setStatus(ticket.key, 'needs_human', { resume_status: ticket.status === 'in_progress' ? 'todo' : ticket.status, hold_kind: 'question', hold_seat: agentId, hold_ref: String(asked.id), hold_scope: about });
       ev(`asked the owner: ${String(body.body).slice(0, 140)}`);
       github.flushComments();
       return 'Parked for the owner. Stop working on this ticket now and end your run.';

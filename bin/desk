@@ -11,7 +11,7 @@ const USAGE = `usage:
   desk show [KEY] | desk list [status]
   desk progress <0-100> "<msg>"
   desk comment [--key KEY] "<text>"            (or text on stdin)
-  desk needs-human "<question>"
+  desk needs-human "<question>" [--about factual|money|credentials|product|trading|schema|other]
   desk propose --title T [--area A] [--priority P] [--type T]   (body on stdin; research runs only)
   desk revise KEY [--title T]   (revised proposal body on stdin; the author's research revision run only)
   desk connector-propose --name N   (connector case on stdin; thinking seats; owner approval required)
@@ -52,7 +52,7 @@ const USAGE = `usage:
   desk watch verified|regression|inconclusive "<what production shows>"   (SRE post-deploy check runs)
   desk reply "<answer>"   (a run where the owner tagged you: your one answer in the thread)
   desk handoff implement|design|verify "<what>" | desk handoff task --title T "<what>" | desk handoff merge|deploy "<what was asked>"   (tagged runs: route real work into the normal jobs)
-  desk decide answer|approve|changes|reject "<what you decided>" --why "<evidence and the owner's standing rule>" [--assign SEAT]
+  desk decide answer|approve|changes|reject "<what you decided>" --cite "R<n>,E<n>[,file:<path>:<line>]" --why "<how they settle it>" [--assign SEAT]
   desk decide escalate "<one-line recommendation>" --why "<why the owner must decide>"   (EM/SRE decision runs: decide for the owner, or hand it back)`;
 
 const [cmd, ...rest] = process.argv.slice(2);
