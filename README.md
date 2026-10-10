@@ -205,14 +205,20 @@ publish-guard holds; standing and renewal production access; package installs.
   Anything else ends the section where it stands, and nothing after it is read; a rule the line may still belong to
   is dropped, since it may be missing a condition. Settings tells you how many rules the desk found, so a count lower
   than you expect means a line ended the section early. The rest of the playbook must not leave Markdown room to
-  read it differently either: anywhere in the file, raw HTML at the start of a line, a fenced block or comment it
-  might end elsewhere (one opened inside a list item or quote, or four spaces in, counts as that), or any heading
-  holding markup (`&`, `<`, `[`, `]`, `\`, a backtick) or a non-ASCII character leaves you with no standing rules,
-  and Settings says which. So does any mention of a raw-text element anywhere in the playbook: `<script`, `<style`,
-  `<textarea`, `<title`, `<iframe`, `<noscript` (and `<xmp`, `<noembed`, `<noframes`, `<plaintext`), even inside a
-  line and even inside inline code such as `` `<style>` ``, because opened in the page Markdown writes, such an
-  element hides everything after it. Only text inside a fenced code block or an HTML comment is exempt; write such
-  examples in a fenced block. With no such section, or an empty one, no decision run
+  read it differently either: anywhere in the file, a fenced block or comment it might end elsewhere (one opened
+  inside a list item or quote, or four spaces in, counts as that), or any heading holding markup (`&`, `<`, `[`, `]`,
+  `\`, a backtick) or a non-ASCII character leaves you with no standing rules, and Settings says which.
+  **No HTML-like text anywhere.** A `<` right before a letter, `/`, `!` or `?` anywhere in the playbook (a tag such as
+  `<div hidden>`, `<details>` or `<span style="display:none">`, an autolink such as `<https://example.com>`, or a
+  placeholder such as `<paths>`) leaves you with no standing rules, and Settings says so. Raw HTML in the page
+  Markdown writes can hide everything after it, the owner's heading and rules included, and the desk does not try to
+  work out what HTML shows. This holds inside inline code too: the desk does not decode inline syntax, so
+  `` `pytest <paths>` `` counts. Only text inside a fenced code block or an HTML comment block (a comment starting a
+  line) is exempt; on a comment's closing line, whatever follows the comment counts again. So write placeholders
+  spelled out (`pytest PATHS`, `desk fetch HTTPS-URL`), links bare (`https://example.com`), and any HTML example in
+  a fenced block. A `<` before a space, a digit, `=` or `-` (`1 < 2`, `x <= 3`) is fine outside the section. The
+  shipped playbooks follow this; a playbook written for an earlier version that mentions `<paths>`-style
+  placeholders in prose must spell them out or fence them. With no such section, or an empty one, no decision run
   starts: nothing is decided for you by judgment. Owner-task triage is the one exception, because it is decided by
   rule, not judgment: a step filed as a check or a package is routed back to the team (when that kind is delegated)
   whatever the section says. Write narrow rules. The desk checks that a decision cites one of your rules and evidence
