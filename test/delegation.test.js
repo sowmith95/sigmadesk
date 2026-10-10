@@ -423,6 +423,29 @@ test('policy (property): production access, sync and PR settings, the access pol
   }
 });
 
+test('a run stopped while its decision is still being checked applies nothing: cancelled, timed out or over its step allowance', async () => {
+  reset();
+  policy({ question: 'em' });
+  await runner.scratchTemplate({ force: true }); // the file citation below is checked against it, asynchronously
+  for (const [what, stop] of [
+    ['cancelled by the owner', (run) => runner.killRun(run.id, 'owner cancelled')],
+    ['timed out', (run) => runner.killRun(run.id, 'timeout')],
+    ['over its step allowance', (run) => runner.applyEvents(Array.from({ length: 31 }, (_, i) => ({ type: 'tool', text: `Reading f${i}` })), { run, state: {}, presence: false, maxSteps: 30 })],
+  ]) {
+    const t = await ask(ticket());
+    delegation.sweep({ paused: false });
+    const r = recFor(`${t.key}:question`); const run = bind(r);
+    // The decision waits on its citation check (a file at the trusted base) while the run is stopped.
+    const deciding = delegation.command(run, { action: 'answer', body: 'utils/net.py:40.', cite: 'R1,E1,file:README.md:1', why: 'utils/net.py:40 defines retry(); the marked rule says answer from the code.' });
+    stop(run);
+    await assert.rejects(deciding, /this decision run was stopped, so nothing was applied/, what);
+    assert.equal(store.getRun(run.id).status, 'killed', what);
+    assert.notEqual(store.getDelegation(r.id).status, 'applied', what);
+    assert.deepEqual([store.getTicket(t.key).status, store.getTicket(t.key).hold_kind], ['needs_human', 'question'], `${what}: nothing resumed`);
+    assert.ok(!store.listComments(t.key).some((c) => c.author === 'manager'), `${what}: nothing posted`);
+  }
+});
+
 test('a failed final write rolls the whole decision back: no answer on the thread, the ticket still waits for the owner', async () => {
   reset();
   policy({ question: 'em' });

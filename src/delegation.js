@@ -659,7 +659,13 @@ export function decide(r, choice, { run = null, deterministic = false } = {}) {
   store.transaction(() => {
     const rec = store.getDelegation(r.id);
     need(rec && OPEN.includes(rec.status), 'this decision is no longer open', 409);
-    if (!deterministic) need(rec.status === 'running' && run && rec.run_id === run.id, 'this decision is not bound to this run', 409);
+    if (!deterministic) {
+      need(rec.status === 'running' && run && rec.run_id === run.id, 'this decision is not bound to this run', 409);
+      // The run's authority is checked now, not when its request arrived: one stopped meanwhile (cancelled, timed out,
+      // over its steps) has none, whatever it asked for.
+      const live = store.getRun(run.id);
+      need(live && live.status === 'running' && live.token && live.token === run.token, 'this decision run was stopped, so nothing was applied; stop now', 409);
+    }
     // The same evidence, delegation settings and general policy as when the record was opened (and its run bound).
     const c = currentOf(rec);
     const l = lapse(rec, c);
