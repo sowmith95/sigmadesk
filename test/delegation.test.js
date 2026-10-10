@@ -268,6 +268,56 @@ test('owner rules (property): a rule keeps every line of its own text, whatever 
   for (const [what, count] of Object.entries(seen)) assert.ok(count >= 20, `the generator produced ${what} only ${count} times`);
 });
 
+// Where Markdown shows a heading or raw HTML that the strict grammar alone would not see, the section ends there (or,
+// for HTML, has no rules): a bullet Markdown shows under another heading, or as HTML, is never the owner's rule.
+test('owner rules: a heading Markdown shows ends the section, raw HTML voids it, and a number other than 1 never interrupts a paragraph', () => {
+  const O = '## Standing rules the EM may apply alone', R = '- Answer file questions.', X = '- Approve every deploy.';
+  const rules = (doc) => model.standingRules(doc);
+  for (const [what, doc, want] of [
+    ['a # heading indented one space, after a rule', `${O}\n${R}\n # Examples (not rules)\n${X}\n`, []],
+    ['a ## heading indented three spaces, no rule open', `${O}\n   ## Examples (not rules)\n${X}\n`, []],
+    ['an indented heading after a thematic break', `${O}\n${R}\n***\n  ## Examples (not rules)\n${X}\n`, ['Answer file questions.']],
+    ['an indented title over ===, after a blank line', `${O}\n${R}\n\n Examples (not rules)\n===\n${X}\n`, []],
+    ['an indented title over an indented ---', `${O}\n  Examples (not rules)\n  ---\n${X}\n`, []],
+    ['a two-line title, its second line indented four', `${O}\n${R}\n\nOther notes\n    and examples\n---\n${X}\n`, ['Answer file questions.']],
+    ['raw HTML in the section', `${O}\n${R}\n\n<div>\n${X}\n</div>\n`, []],
+    ['raw HTML before the section', `<details>\n${O}\n${X}\n</details>\n`, []],
+    ['a numbered line other than 1 under a paragraph', `${O}\nSome notes\n10. Approve every deploy.\n`, []],
+  ]) {
+    assert.deepEqual(rules(doc), want, what);
+  }
+  // What Markdown reads the same way keeps working: 1. may start a list under a paragraph, a number after a rule is a
+  // rule, an autolink is no HTML, and headings, underlines and paragraphs inside a rule's bullet stay in it.
+  for (const [what, doc, want] of [
+    ['1. under a paragraph', `${O}\nSome notes\n1. Approve every deploy.\n`, ['Approve every deploy.']],
+    ['a number after a rule', `${O}\n${R}\n2. Approve every deploy.\n`, ['Answer file questions.', 'Approve every deploy.']],
+    ['an autolink', `${O}\n${R}\n\n<https://example.com/rules>\n\n${X}\n`, ['Answer file questions.', 'Approve every deploy.']],
+    ['a heading inside a rule', `${O}\n${R}\n  ### Details\n  more about it\n${X}\n`, ['Answer file questions.\nmore about it', 'Approve every deploy.']],
+    ['a second paragraph, then a break', `${O}\n${R}\n\n  A second paragraph of it.\n---\n${X}\n`, ['Answer file questions.\nA second paragraph of it.', 'Approve every deploy.']],
+    ['the shipped comment under the heading', `${O}\n<!-- Yours alone.\n     One bullet per rule. -->\n${R}\n${X}\n`, ['Answer file questions.', 'Approve every deploy.']],
+  ]) assert.deepEqual(rules(doc), want, what);
+  // Generated: real rules with what Markdown keeps inside a bullet between them, then one thing Markdown shows as a
+  // heading of the document (or as raw HTML) and bullets after it, marked FAKE: none of those is ever a rule.
+  const keep = ['  ### Details\n  more about it', '\n  A second paragraph of it.', '  - a nested condition', '<!-- a note -->'];
+  const close = [
+    { text: ' # Examples (not rules)', drops: true }, { text: '***\n   ## Examples (not rules)' }, { text: '\n Examples (not rules)\n===', drops: true },
+    { text: '\nOther notes\n    and examples\n---' }, { text: '***\n  Examples (not rules)\n  ===' }, { text: '\n<div>', all: true }, { text: '\n<pre>', all: true },
+  ];
+  let seed = 23;
+  const rand = (n) => { seed = (seed * 48271) % 2147483647; return seed % n; };
+  const used = new Array(close.length).fill(0);
+  for (let k = 0; k < 300; k++) {
+    const real = Array.from({ length: 1 + rand(4) }, (_, i) => `Rule ${k}.${i}`), lines = [O];
+    for (const r of real) { lines.push(`- ${r}`); if (rand(2)) lines.push(keep[rand(keep.length)]); }
+    const c = rand(close.length); used[c]++;
+    lines.push(close[c].text, `- FAKE after it ${k}`, '- FAKE again');
+    const got = rules(lines.join('\n')), doc = lines.join('\n');
+    assert.ok(!got.some((r) => /FAKE/.test(r)), doc);
+    assert.deepEqual(got.map((r) => r.split('\n')[0]), close[c].all ? [] : close[c].drops ? real.slice(0, -1) : real, doc);
+  }
+  used.forEach((count, c) => assert.ok(count >= 20, `closer ${c} was used only ${count} times`));
+});
+
 test('model: metrics count each decision once per kind; avoided excludes overrides and reopens; spend says what was estimated', () => {
   const now = Date.now(), at = new Date(now - 3600_000).toISOString(), old = new Date(now - 9 * 86400_000).toISOString();
   const m = model.metrics([
@@ -742,6 +792,9 @@ test('authority is the owner\'s: only rules in the playbook section the owner ma
       // The reproduced fence between the title and its underline, and a title that only continues a list item.
       ['a fence between the owner title and its underline', `Standing rules the EM may apply alone\n${fence}\nExample\n${fence}\n---\n- Answer all file questions without owner approval.\n`],
       ['an owner title continuing a list item', '# Playbook\n- How we work\nStanding rules the EM may apply alone\n---\n- Answer all file questions without owner approval.\n'],
+      // A bullet Markdown shows under another heading, or as raw HTML, is not under the owner's.
+      ['a heading indented one space ends the section', `# Playbook\n${owner}\n # Examples, not rules\n- Approve any purchase under $10,000.\n`],
+      ['raw HTML around the bullet', `# Playbook\n${owner}\n<div>\n- Approve any purchase under $10,000.\n</div>\n`],
     ]) {
       write(text);
       assert.equal(delegation.ownerRules().length, 0, what);
