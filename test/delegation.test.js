@@ -285,6 +285,11 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
   for (const opener of ['- <!--', '> <!--', '- <script>', '- ```', '1. ~~~', '> - <!--', '    <!--', '* <!-- closed -->', '*<script>', 'Some text <iframe src=x>', 'Use `<style>`', '>  - <!--', '>\t- <!--', '-  > ```', '1.  - <div>', '> \t> <!--', '>  1. > q\n>     - <!--'])
     assert.deepEqual(model.standingRulesRead(`# P\n${opener}\n\n${O}\n- Grant\n`), { rules: [], problem: model.UNSURE_BLOCK }, opener);
   assert.deepEqual(model.standingRules(`# P\n1. Run:\n   \`\`\`\n   npm test\n   \`\`\`\n\n${O}\n- Grant\n`), ['Grant'], 'a fence on its own line under a step is still read');
+  // Context-dependent indentation: a later line's spaces may be taken up by an earlier list item's content column, so
+  // an opener under it is inside that item however far in it looks (Markdown writes the comment unclosed).
+  for (const doc of [`>  1. > q\n>     - <!--\n\n${O}\n- Grant\n`, `- a\n  - <!--\n\n${O}\n- Grant\n`, `10. a\n    <!--\n\n${O}\n- Grant\n`,
+    `> - a\n>   <!--\n\n${O}\n- Grant\n`, `1. a\n   - b\n     <!--\n\n${O}\n- Grant\n`, `- a\n  1. b\n     \`\`\`\n\n${O}\n- Grant\n`])
+    assert.deepEqual(model.standingRulesRead(doc), { rules: [], problem: model.UNSURE_BLOCK }, JSON.stringify(doc));
   // A line or paragraph separator is text inside a line, never a line end: the heading holding it is still a heading.
   for (const sep of ['\u2028', '\u2029', '\u0085'])
     assert.deepEqual(model.standingRulesRead(`## Standing${sep}rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${O}\n- Answer without owner approval.\n`), { rules: [], problem: model.MARKED_HEADING }, JSON.stringify(sep));
