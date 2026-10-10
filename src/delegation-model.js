@@ -200,14 +200,13 @@ const UNDERLINE = /^(?:=+|-+) *$/;
 const FENCE = /^(`{3,}|~{3,})(.*)$/;
 const fenceOpens = (s) => { const f = s.match(FENCE); return !!f && !(f[1][0] === '`' && f[2].includes('`')); };
 const strip = (s) => s.replace(/^[ \t]+|[ \t]+$/g, ''); // what Markdown strips from a line: spaces and tabs only
-/** Roughly the text Markdown shows for a line's inline content (marks dropped, links reduced to their text, character
- * references decoded): enough to spot a heading that reads like the owner's however it is written. */
-function shownText(s) {
-  const ch = (n) => (n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : '\ufffd');
-  return s.replace(/&#[xX]([0-9a-fA-F]{1,6});/g, (_, h) => ch(parseInt(h, 16))).replace(/&#([0-9]{1,7});/g, (_, d) => ch(Number(d)))
-    .replace(/&(amp|lt|gt|quot|apos|nbsp);/gi, (_, n) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' })[n.toLowerCase()])
-    .replace(/\]\([^)]*\)|\]\[[^\]]*\]/g, '').replace(/[*_`\\[\]!]/g, '');
-}
+// Headings are compared as plain text only: a heading anywhere in the playbook (ATX of any level, or a paragraph with
+// an underline) holding markup or a non-ASCII character could show the owner's words without spelling them, so then
+// the playbook has no standing rules at all, and Settings says why.
+const MARKED = /[&<[\]\\`]|[^\x00-\x7F]/;
+export const MARKED_HEADING = 'a heading uses markup or non-ASCII characters; headings must be plain text';
+export const EARLIER_HEADING = 'an earlier heading has the same words; the owner\'s section is the first, and it must be a plain "##" heading';
+const loose = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ''); // letters and digits only
 // What a rule's text may not hold, because Markdown would show it differently or not at all: `<` (HTML, comments,
 // autolinks), `[` and `]` (links, images and link definitions, whose targets are never shown), character references,
 // and invisible or direction-changing characters.
@@ -229,10 +228,11 @@ function interrupts(s) {
  * The standing rules a delegate may apply alone (#9), in order (R1, R2 …): the rules under the owner's heading
  * (delegation.rulesSection), read strictly, each with the playbook lines it was read from (0-based). No such heading,
  * or no rule under it → [] (then nothing is decided for the owner by a model).
- *  - The section opens only at a column-0 `## <heading>` line: no other level, no underlined heading. Before it,
- *    nothing may be read differently by Markdown: a line starting with raw HTML (a comment aside), an indented fence
- *    or comment that a less indented line interrupts, or an earlier heading (any level, underlined too, however
- *    marked up) that reads like the owner's leaves the playbook with no rules.
+ *  - The section opens only at a column-0 `## <heading>` line: no other level, no underlined heading, and it must
+ *    be the first heading anywhere with those words. Every heading is compared as plain text: one holding markup or
+ *    a non-ASCII character leaves the playbook with no rules. Before the owner's heading, nothing may be read
+ *    differently by Markdown: a line starting with raw HTML (a comment aside), or an indented fence or comment that a
+ *    less indented line interrupts, leaves the playbook with no rules.
  *  - Inside it, exactly these lines are read: blank lines; a rule, starting at a column-0 `- `, `* ` or `+ `; and its
  *    continuation, which is plain text at column 0 directly under a line of the rule, or plain text or a plain bullet
  *    indented two or three spaces (no less than where the rule's text starts), blank line before it or not.
@@ -242,32 +242,46 @@ function interrupts(s) {
  *    an underline. When Markdown would still count that line as part of the rule above it, the rule is dropped too:
  *    it may be missing a condition.
  */
-export function standingRuleLines(text = '', heading = RULES_SECTION) {
+export function standingRuleLines(text = '', heading = RULES_SECTION) { return standingRulesRead(text, heading).rules; }
+/** standingRuleLines, and why there are none when a heading stands in the way (MARKED_HEADING, EARLIER_HEADING). */
+export function standingRulesRead(text = '', heading = RULES_SECTION) {
   const norm = (x) => String(x).toLowerCase().replace(/[:.]+$/, '').replace(/\s+/g, ' ').trim();
-  const lines = String(text || '').split(/\r\n|\r|\n/);
-  const owner = norm(heading), like = (t) => norm(shownText(t)).includes(owner); // may read as the owner's heading
-  // 1. The heading: outside every fence and comment, with nothing before it Markdown could read otherwise, and no
-  // earlier heading that reads like it (Markdown may show that one as the owner's heading instead).
-  let at = -1, fence = null, comment = null, para = '';
-  for (let i = 0; i < lines.length && at < 0; i++) {
+  const lines = String(text || '').split(/\r\n|\r|\n/), none = { rules: [], problem: null };
+  const target = loose(heading), container = (b) => /^(?:[-*+](?: |$)|\d{1,9}[.)](?: |$)|>)/.test(b);
+  // 1. Every heading candidate in the whole playbook, outside fences and comments: each ATX line (any level) and each
+  // paragraph with an underline. Any with markup or non-ASCII: no rules. The first one with the owner's words (letters
+  // and digits compared) must be the exact column-0 `## <heading>` line; a later one never opens a section. Before
+  // the heading, nothing may be read differently by Markdown (raw HTML, a fence or comment a less indented line
+  // interrupts); after it, the scan just stops there.
+  let at = -1, fence = null, comment = null, run = [];
+  for (let i = 0; i < lines.length; i++) {
     const src = lines[i].replace(/\t/g, '    '), indent = src.match(/^ */)[0].length, body = src.slice(indent);
-    // In a fence or comment, a line less indented than its start may end the list item it was in (and so the block):
-    // Markdown would read on differently from here.
-    if ((fence || comment) && /[^ ]/.test(src) && indent < (fence || comment).indent) return [];
+    if ((fence || comment) && /[^ ]/.test(src) && indent < (fence || comment).indent) { if (at < 0) return none; break; }
     if (fence) { if (indent <= 3 && fence.close.test(src)) fence = null; continue; }
     if (comment) { if (src.includes('-->')) comment = null; continue; } // Markdown: the closing line is all comment
-    if (/^ *$/.test(src)) { para = ''; continue; }
-    if (indent <= 3 && body.startsWith('<!--')) { comment = body.slice(2).includes('-->') ? null : { indent }; para = ''; continue; } // a comment block
-    if (indent <= 3 && HTML_BLOCK.test(body)) return []; // a raw HTML block may run on past the heading
-    if (indent <= 3 && fenceOpens(body)) { const f = body.match(FENCE)[1]; fence = { indent, close: new RegExp(`^ {0,3}${f[0] === '`' ? '`' : '~'}{${f.length},} *$`) }; para = ''; continue; }
-    const h = src.match(/^##(?:[ ]+(.*?))?[ ]*$/);
-    if (h && norm((h[1] || '').replace(/(?:^|[ ]+)#+$/, '')) === owner) { at = i; break; }
-    const atx = indent <= 3 && body.match(/^#{1,6}(?: +(.*?))?[ ]*$/);
-    if ((atx && like((atx[1] || '').replace(/(?:^|[ ]+)#+$/, ''))) || (indent <= 3 && UNDERLINE.test(body) && like(para))) return [];
-    // The run of plain lines just before (a paragraph Markdown may underline): four or more in only continues one.
-    para = (indent <= 3 && plain(body)) || (indent > 3 && para) ? `${para} ${body}` : '';
+    if (/^ *$/.test(src)) { run = []; continue; }
+    if (indent <= 3 && body.startsWith('<!--')) { comment = body.slice(2).includes('-->') ? null : { indent }; run = []; continue; } // a comment block
+    if (indent <= 3 && HTML_BLOCK.test(body)) { if (at < 0) return none; break; } // a raw HTML block may run on past the heading
+    if (indent <= 3 && fenceOpens(body)) { const f = body.match(FENCE)[1]; fence = { indent, close: new RegExp(`^ {0,3}${f[0] === '`' ? '`' : '~'}{${f.length},} *$`) }; run = []; continue; }
+    const atx = indent <= 3 && body.match(/^(#{1,6})(?:[ ]+(.*?))?[ ]*$/);
+    if (atx) {
+      const t = (atx[2] || '').replace(/(?:^|[ ]+)#+$/, '');
+      if (MARKED.test(t)) return { rules: [], problem: MARKED_HEADING };
+      if (at < 0 && loose(t) === target) { if (indent === 0 && atx[1] === '##' && norm(t) === norm(heading)) at = i; else return { rules: [], problem: EARLIER_HEADING }; }
+      run = []; continue;
+    }
+    if (indent <= 3 && UNDERLINE.test(body) && run.length) {
+      // Markdown's paragraph is the run or a tail of it (a list item or quote may hold its first lines): every tail
+      // that does not start at a list item or quote is a candidate.
+      const starts = run.map((r, k) => k).filter((k) => !container(run[k].body));
+      if (starts.some((k) => MARKED.test(run.slice(k).map((r) => r.body).join(' ')))) return { rules: [], problem: MARKED_HEADING };
+      if (at < 0 && starts.some((k) => loose(run.slice(k).map((r) => r.body).join(' ')) === target)) return { rules: [], problem: EARLIER_HEADING };
+      run = []; continue;
+    }
+    if (indent <= 3 && BREAK.test(body)) { run = []; continue; }
+    if (indent <= 3 || run.length) run.push({ body, indent }); // four or more in only continues a paragraph (else code)
   }
-  if (at < 0) return [];
+  if (at < 0) return none;
   // 2. The section, line by line.
   const rules = [];
   let cur = null, gap = false; // gap: a blank line since the rule's last line
@@ -291,7 +305,7 @@ export function standingRuleLines(text = '', heading = RULES_SECTION) {
     if (cur && (own || indent >= cur.col)) rules.pop(); // indented four or more inside its bullet, or more of its paragraph
     break;
   }
-  return rules.slice(0, 60).map((r) => ({ text: r.text.join('\n'), lines: r.lines }));
+  return { rules: rules.slice(0, 60).map((r) => ({ text: r.text.join('\n'), lines: r.lines })), problem: null };
 }
 export const standingRules = (text = '', heading = RULES_SECTION) => standingRuleLines(text, heading).map((r) => r.text);
 /** desk decide --cite "R2, E1, file:src/x.py:40": the ids, in order, each once. */

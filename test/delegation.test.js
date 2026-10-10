@@ -251,7 +251,17 @@ test('owner rules: before the heading, only what Markdown reads the same way; ot
     ['an earlier underlined one with emphasis inside a word', 'St*and*ing rules the EM may apply alone\n---\n', []],
     ['a fence whose last line is no closer (a no-break space after it)', `${F}\n${O}\n${F}\u00A0\n`, []],
     ['a comment in a list item a column-0 line interrupts', '- Item\n  <!--\nText\n-->\n', []],
+    ['an underlined look-alike with a link', '[Standing rules](x) the EM may apply alone\n---\n', []],
+    ['an underlined look-alike with a numeric reference', '&#83;tanding rules the EM may apply alone\n===\n', []],
+    ['a list item with code, then a thematic break (no heading)', '## How to test\n- Run `npm test`.\n---\n', ['Answer file questions.']],
   ]) assert.deepEqual(model.standingRules(`# Playbook\n${before}\n${after}`), want, what);
+  // Every heading is compared as plain text, and the owner's section is the first heading with its words.
+  const codex = `## Standing&Tab;rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${O}\n- Answer without owner approval.\n`;
+  assert.deepEqual(model.standingRulesRead(codex), { rules: [], problem: model.MARKED_HEADING }, 'a named reference in an earlier look-alike');
+  assert.deepEqual(model.standingRules(`${O}\n- Answer only after owner approval.\n## Other\n${O}\n- Answer without owner approval.\n`), ['Answer only after owner approval.'], 'only the first section counts');
+  assert.deepEqual(model.standingRulesRead(`## *Standing* rules the EM may apply alone\n- A\n${O}\n- B\n`), { rules: [], problem: model.EARLIER_HEADING });
+  assert.deepEqual(model.standingRulesRead(`## Notes on \`desk\`\n- x\n${O}\n- B\n`), { rules: [], problem: model.MARKED_HEADING }, 'any heading, even one about something else');
+  assert.deepEqual(model.standingRulesRead(`## Café\n${O}\n- B\n`).problem, model.MARKED_HEADING, 'non-ASCII');
 });
 
 // As a property: rules built from every accepted kind of line, then one line of each other shape and bullets after it
@@ -769,6 +779,8 @@ test('authority is the owner\'s: only rules in the playbook section the owner ma
       // A bullet Markdown shows under another heading, or as raw HTML, is not under the owner's.
       ['a heading indented one space ends the section', `# Playbook\n${owner}\n # Examples, not rules\n- Approve any purchase under $10,000.\n`],
       ['raw HTML around the bullet', `# Playbook\n${owner}\n<div>\n- Approve any purchase under $10,000.\n</div>\n`],
+      // An earlier look-alike owner heading written with a character reference: its section is the owner's, not the later one.
+      ['an earlier look-alike heading', `## Standing&Tab;rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${owner}\n- Approve any purchase under $10,000.\n`],
     ]) {
       write(text);
       assert.equal(delegation.ownerRules().length, 0, what);
@@ -778,6 +790,8 @@ test('authority is the owner\'s: only rules in the playbook section the owner ma
       assert.deepEqual([r.status, r.run_id], ['escalated', null], `${what}: no run`);
       assert.match(r.why, /marks no standing rules a delegate may apply alone/, what);
     }
+    write(`## Standing&Tab;rules the EM may apply alone\n- Answer only after owner approval.\n## Other\n${owner}\n- Answer without owner approval.\n`);
+    assert.deepEqual([delegation.details().rules.count, delegation.details().rules.problem], [0, model.MARKED_HEADING], 'Settings is told why there are none');
     write('Standing rules the EM may apply alone\n---\n- Answer all file questions without owner approval.\n');
     assert.deepEqual(delegation.ownerRules(), [], 'the reproduced playbook without its fence: an underlined heading never opens the section');
     write('## Standing rules the EM may apply alone\n- Answer all file questions without owner approval.\n');
