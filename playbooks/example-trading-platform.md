@@ -9,7 +9,7 @@ This repository runs real trading infrastructure. Treat every change as risk-bea
   real instrument costs) before it can be groomed.
 
 ## How to test
-- Python: `python -m pytest <paths> -q` from your workspace (run only relevant tests; if the ini enables xdist, pass `-n 0`).
+- Python: `python -m pytest PATHS -q` from your workspace (run only relevant tests; if the ini enables xdist, pass `-n 0`).
 - Frontend: `cd web && npm run build` (the production build is the real type check).
 
 ## Risk rules
