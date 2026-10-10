@@ -659,7 +659,7 @@ const holdPreparation = () => {
   delegation.setWorkspacePreparer((seat) => new Promise((resolve) => { waiting.push(() => resolve(runner.ensureReadonlyWorkspace(seat))); }));
   return { release: () => { while (waiting.length) waiting.shift()(); } };
 };
-test('daily allowance: a decision whose workspace is being prepared holds its run, so a second one waits for the next day', async () => {
+test('daily allowance: a run reserved by a preparation makes a second decision wait; a run already started today sends a new one to the owner at once', async () => {
   fresh();
   delegation.setPolicy({ kinds: { question: 'em' } });
   const prev = { ...config.delegation };
@@ -686,6 +686,12 @@ test('daily allowance: a decision whose workspace is being prepared holds its ru
     assert.equal(await delegation.launch(store.getDelegation(r2.id)), null, 'nor once the first one ran');
     assert.equal(store.getDelegation(r2.id).status, 'queued');
     assert.equal(startedToday(), config.delegation.maxPerDay, 'exactly one decision run today');
+    // With today's run STARTED (not merely reserved), a new question cannot get a run today: it is the owner's at once.
+    const t3 = await held('Which test covers the broker client?');
+    delegation.sweep({ paused: false });
+    const r3 = open(t3);
+    assert.equal(r3.status, 'escalated', 'not left waiting');
+    assert.match(r3.why, new RegExp(`today's allowance of ${config.delegation.maxPerDay} decision runs is used up`));
     // The next day it runs (the sweep would have sent it to the owner had it waited longer than maxWaitMinutes).
     delegation.setWorkspacePreparer(null);
     plan([['show']]);

@@ -315,7 +315,7 @@ const runsToday = (now) => store.handle().prepare("SELECT COUNT(*) n FROM runs W
 const reservedRuns = (except = null) => store.delegationsByStatus('running').filter((x) => !model.KINDS[x.kind]?.deterministic && !x.run_id && x.id !== except).length;
 const runsUsed = (now = Date.now(), except = null) => runsToday(now) + reservedRuns(except);
 const allowanceUsed = (now = Date.now(), except = null) => runsUsed(now, except) >= limits().maxPerDay;
-const usedUpText = () => `today's allowance of ${limits().maxPerDay} delegated decision runs is used up`;
+const usedUpText = () => `today's allowance of ${limits().maxPerDay} decision runs is used up`;
 /**
  * Supersede records whose decision moved on, open records for new decisions, decide owner-task triage by rule, and send
  * a decision back to the owner when a rule says so or its delegate did not get to it in time. Applies nothing while the
@@ -358,10 +358,18 @@ function consider(c, { pol = policy(), out = { created: 0, applied: 0, escalated
   const L = limits();
   let r = store.delegationFor(c.decision_id, c.version);
   if (!r) {
-    // A day's allowance of decision runs bounds the cost (rule-decided triage costs nothing and is not counted). It is
-    // enforced where a run is taken (launch); a decision for the owner waits for it like any other, and comes to the
-    // owner if it does not start within maxWaitMinutes. Shadow over it opens nothing: the owner decides anyway.
-    if (mode === 'shadow' && !model.KINDS[c.kind].deterministic && runsUsed(now) + store.delegationsByStatus('queued').filter((x) => !model.KINDS[x.kind].deterministic).length >= L.maxPerDay) return null;
+    // A day's allowance of decision runs bounds the cost (rule-decided triage costs nothing and is not counted). Shadow
+    // over it opens nothing: the owner decides anyway. A decision for the owner when today's runs have all STARTED is
+    // the owner's at once: no run can free up today. One whose run is merely reserved by a preparation in flight is
+    // queued: that slot may come free (the preparation ends without a run), and launch takes it atomically; if it does
+    // not start within maxWaitMinutes the sweep hands it to the owner.
+    const costs = !model.KINDS[c.kind].deterministic;
+    if (mode === 'shadow' && costs && runsUsed(now) + store.delegationsByStatus('queued').filter((x) => !model.KINDS[x.kind].deterministic).length >= L.maxPerDay) return null;
+    if (mode !== 'shadow' && costs && runsToday(now) >= L.maxPerDay) {
+      r = create(c, mode, seat); out.created++;
+      if (escalate(r, usedUpText())) out.escalated++;
+      return store.getDelegation(r.id);
+    }
     r = create(c, mode, seat); out.created++;
   }
   if (r.status !== 'queued') return r;
