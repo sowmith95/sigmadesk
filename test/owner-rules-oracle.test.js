@@ -23,20 +23,25 @@ function bulletsShown(cm, text) {
   let h = doc.firstChild;
   while (h && !(h.type === 'heading' && norm(inline(h)) === norm(O))) h = h.next;
   if (!h) return [];
+  const line = h.sourcepos[0][0];
   const out = [];
   for (let s = h.next; s && !(s.type === 'heading' && s.level <= h.level); s = s.next)
     if (s.type === 'list') for (let i = s.firstChild; i; i = i.next) { const paras = []; out.push({ from: i.sourcepos[0][0] - 1, to: i.sourcepos[1][0] - 1, simple: simple(i, paras), paras }); }
+  out.headingLine = line;
   return out;
 }
 /** What is wrong with the desk's reading of one playbook: a rule Markdown does not show, not exactly the lines of its
  * bullet, a line of it Markdown hides, or text Markdown shows otherwise. */
-function problems(cm, text) {
-  const ours = model.standingRuleLines(text), shown = bulletsShown(cm, text), src = text.split(/\r\n|\r|\n/), bad = [];
+function problems(cm, text, ours = model.standingRuleLines(text)) {
+  const shown = bulletsShown(cm, text), src = text.split(/\r\n|\r|\n/), bad = [];
   // In the page Markdown writes, a comment or script left open hides what follows (as a browser reads it: "<!-->" is
-  // an empty comment): the owner's heading must survive.
+  // an empty comment).
   if (ours.length) {
-    const page = new cm.HtmlRenderer().render(new cm.Parser().parse(text)).replace(/<!--(?:-?>|[\s\S]*?(?:--!?>|$))/g, '').replace(/<(script|style|textarea|title|xmp|iframe|noembed|noframes|noscript)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, '').replace(/<plaintext\b[\s\S]*$/i, '');
-    if (!/<h2>\s*standing\s+rules\s+the\s+em\s+may\s+apply\s+alone/i.test(page)) bad.push(['a section the page hides', ours[0]]);
+    const page = new cm.HtmlRenderer({ sourcepos: true }).render(new cm.Parser().parse(text)).replace(/<!--(?:-?>|[\s\S]*?(?:--!?>|$))/g, '').replace(/<(script|style|textarea|title|xmp|iframe|noembed|noframes|noscript)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, '').replace(/<plaintext\b[\s\S]*$/i, '');
+    // The very heading the rules sit under (by its source line) and every rule's own bullet must survive, not merely
+    // some heading with the owner's words.
+    if (!shown.headingLine || !page.includes(`data-sourcepos="${shown.headingLine}:`)) bad.push(['a heading the page hides', ours[0]]);
+    for (const r of ours) if (!page.includes(`<li data-sourcepos="${r.lines[0] + 1}:`)) bad.push(['a rule the page hides', r]);
   }
   for (const r of ours) {
     const b = shown.find((x) => x.from === r.lines[0]);
@@ -129,6 +134,11 @@ function generator(seed, mode) {
 
 test('owner rules match what Markdown shows, line for line, over generated playbooks (with SIGMADESK_CM_ORACLE)', { skip: ORACLE ? false : 'set SIGMADESK_CM_ORACLE to a commonmark.js module to run it', timeout: 600_000 }, () => {
   const cm = createRequire(import.meta.url)(ORACLE);
+  // The oracle itself: a reading that keeps a rule under a heading the page hides (a comment left open in a list item
+  // before it) is flagged, even though a later heading with the same words survives; the grammar keeps nothing there.
+  const hidden = '>  - <!--\n\n## Standing rules the EM may apply alone\n- Grant\n\n## Next\nx <!-- closed -->\n\n## Standing rules the EM may apply alone\n- Visible\n';
+  assert.ok(problems(cm, hidden, [{ text: 'Grant', lines: [3] }]).bad.length, 'the oracle flags a rule the page hides');
+  assert.deepEqual(problems(cm, hidden).bad, []);
   for (const [mode, seed] of [['section', 7], ['prefix', 99], ['soup', 3], ['containers', 11], ['clean', 5]]) {
     const next = generator(seed, mode);
     let found = 0, shown = 0, first = null, count = 0;
