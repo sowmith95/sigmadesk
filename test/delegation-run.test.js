@@ -116,6 +116,8 @@ test('a decide run reads the owner\'s brief, answers once through the socket und
   assert.match(prompt, /<thread untrusted="true">\n--- \[E2\] senior-be @/, 'each message is labelled with its id');
   assert.doesNotMatch(prompt, /E\d+  Riley's message/, 'the question itself is not evidence for its answer');
   assert.deepEqual(delegation.get(after.id).cited.map((x) => x.id), ['R1', 'E1', 'file:README.md:1']);
+  const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  assert.equal(JSON.parse(store.getDelegation(r.id).citables).base, head, 'its evidence is pinned to the commit its workspace was copied from');
   assert.doesNotMatch(prompt, /desk decide approve/, 'only the allowed actions are offered');
   assert.match(store.listComments(t.key).at(-1).body, /Morgan answered Riley for you[\s\S]*utils\/net\.py:40/);
   assert.equal(store.getTicket(t.key).status, 'todo');

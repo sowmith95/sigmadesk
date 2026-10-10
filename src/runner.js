@@ -290,26 +290,39 @@ export function ensureReadonlyWorkspace(seatId = 'scratch') {
     // APFS: a copy-on-write clone (new inodes; a seat's write never reaches the template). Elsewhere a reflink or copy.
     await pexec('cp', os.platform() === 'darwin' ? ['-cR', tpl, dir] : ['-R', '--reflink=auto', tpl, dir], { timeout: 600_000 })
       .catch(() => pexec('cp', ['-R', tpl, dir], { timeout: 600_000 }));
+    workspaceBases.set(guardWorkspacePath(dir), templateCommit); // the trusted commit this copy is (still under the lock)
     return guardWorkspacePath(dir); // the template's stamp lives outside it, so nothing is written after the copy
   });
 }
+const workspaceBases = new Map(); // read-only workspace → the trusted base commit it was copied from
+/** The trusted base commit a read-only workspace was copied from (a decision run's evidence is pinned to it), or null. */
+export const workspaceBase = (dir) => workspaceBases.get(dir) || null;
+/** The trusted base as the desk last fetched it (the commit read-only workspaces are copied from), or null. */
+export async function trustedBase() {
+  const pub = await publisher();
+  const sha = await git([...SAFE, '-C', pub, 'rev-parse', '-q', '--verify', 'refs/sigmadesk/scratch-base^{commit}']).then((r) => r.stdout.trim(), () => '');
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
 
 /**
- * A repository file a delegated decision cites (#9): it must exist in the trusted base the read-only workspaces are
- * copied from (the desk's own publisher repository, never a seat's clone, so nothing a run wrote can make a citation
- * true). rel: a relative path inside the repository. → its number of lines, or null when there is no such file.
+ * A repository file a delegated decision cites (#9): it must exist at the trusted commit its run was pinned to, read
+ * from the desk's own publisher repository (never a seat's clone, so nothing a run wrote can make a citation true, and
+ * a later refresh of the base cannot change what the commit holds). rel: a relative path inside the repository; sha:
+ * the pinned commit. → its number of lines, or null when there is no such file there.
  */
-export async function baseFileLines(rel) {
+export async function baseFileLines(rel, sha) {
   const p = String(rel || '');
+  if (!/^[0-9a-f]{40}$/.test(String(sha || ''))) return null;
   if (!p || p.length > 300 || /^[/-]/.test(p) || /[\\\u0000-\u001f]/.test(p) || p.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return null;
   const pub = await publisher();
-  const r = await git([...SAFE, '-C', pub, 'cat-file', 'blob', `refs/sigmadesk/scratch-base:${p}`], { maxBuffer: 64 << 20 }).catch(() => null);
+  const r = await git([...SAFE, '-C', pub, 'cat-file', 'blob', `${sha}:${p}`], { maxBuffer: 64 << 20 }).catch(() => null);
   if (!r) return null;
   if (!r.stdout) return 0;
   const n = r.stdout.split('\n').length;
   return r.stdout.endsWith('\n') ? n - 1 : n;
 }
 
+let templateCommit = null; // the commit the scratch template was last built or verified at
 // The scratch template: a checkout of the trusted base, built by the desk from its own publisher repo, never given to a
 // seat (it lives in the desk's data dir, which seats cannot read). Rebuilt when the base moves.
 const TEMPLATE_FETCH_MS = 10 * 60_000;
@@ -342,6 +355,7 @@ export async function scratchTemplate({ force = false } = {}) {
     templateFetchedAt = Date.now();
   }
   const sha = (await git(['-C', pub, 'rev-parse', ref])).stdout.trim();
+  templateCommit = sha;
   const tpl = templateDir();
   // Trusted filter definitions are part of the template's identity: a filter change at the same commit rebuilds it.
   const { stdout: filters } = await git(['-C', config.project.repoPath, 'config', '--local', '--get-regexp', '^filter\\.']).catch(() => ({ stdout: '' }));

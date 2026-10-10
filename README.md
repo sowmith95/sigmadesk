@@ -198,6 +198,9 @@ publish-guard holds; standing and renewal production access; package installs.
   it>"`. The desk checks every id against what that run was given; a decision must cite at least one rule and one
   numbered piece of evidence (a file may be cited too, never instead of an E). One that does not is not applied: it
   comes to you with its text as the recommendation. Any edit to your playbook while a decision runs invalidates it.
+  File evidence is pinned: a run's read-only workspace is a copy of one trusted base commit, its file citations are
+  checked at that commit, and if the desk's base has moved on by the time it decides, nothing is applied. A run that
+  was stopped (cancelled, timed out, over its steps) never applies anything, even if its decision was already sent.
 - **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and ends with one
   `desk decide` (or `desk decide escalate "<recommendation>" --why "<why it is yours>"`): up to $0.75 on an engine with a
   spending cap, or 6 minutes and 30 steps on a plan-billed one; an engine with neither is refused. Steps count every tool

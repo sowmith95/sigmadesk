@@ -57,9 +57,12 @@ async function ask(t, seat = 'junior', q = 'Which test file covers the retry hel
   store.updateRun(run.id, { status: 'success', token: null });
   return store.getTicket(t.key);
 }
-/** Bind a decide run to a queued record, the way delegation.launch does (what it may cite, the server-owned job, the run id). */
-function bind(r) {
-  delegation.seal(r);
+/**
+ * Bind a decide run to a queued record, the way delegation.launch does (what it may cite, the server-owned job, the run
+ * id). base: the trusted commit its workspace would be a copy of (file citations are checked there; none: no file counts).
+ */
+function bind(r, { base = null } = {}) {
+  delegation.seal(r, undefined, { base });
   const run = store.createRun({ agent_id: r.seat, ticket_key: r.ticket_key, kind: 'decide', token: `d-${r.id}-${Math.random()}`, model: 'claude:opus', job: { delegation: r.id } });
   store.updateDelegation(r.id, { status: 'running', run_id: run.id, attempts: 1 });
   return run;
@@ -427,6 +430,7 @@ test('a run stopped while its decision is still being checked applies nothing: c
   reset();
   policy({ question: 'em' });
   await runner.scratchTemplate({ force: true }); // the file citation below is checked against it, asynchronously
+  const base = await runner.trustedBase();
   for (const [what, stop] of [
     ['cancelled by the owner', (run) => runner.killRun(run.id, 'owner cancelled')],
     ['timed out', (run) => runner.killRun(run.id, 'timeout')],
@@ -434,8 +438,8 @@ test('a run stopped while its decision is still being checked applies nothing: c
   ]) {
     const t = await ask(ticket());
     delegation.sweep({ paused: false });
-    const r = recFor(`${t.key}:question`); const run = bind(r);
-    // The decision waits on its citation check (a file at the trusted base) while the run is stopped.
+    const r = recFor(`${t.key}:question`); const run = bind(r, { base });
+    // The decision waits on its citation check (a file at the pinned base) while the run is stopped.
     const deciding = delegation.command(run, { action: 'answer', body: 'utils/net.py:40.', cite: 'R1,E1,file:README.md:1', why: 'utils/net.py:40 defines retry(); the marked rule says answer from the code.' });
     stop(run);
     await assert.rejects(deciding, /this decision run was stopped, so nothing was applied/, what);
@@ -444,6 +448,41 @@ test('a run stopped while its decision is still being checked applies nothing: c
     assert.deepEqual([store.getTicket(t.key).status, store.getTicket(t.key).hold_kind], ['needs_human', 'question'], `${what}: nothing resumed`);
     assert.ok(!store.listComments(t.key).some((c) => c.author === 'manager'), `${what}: nothing posted`);
   }
+});
+
+test('file evidence is pinned: a citation is checked at the commit its run read, and a base that moved on lapses the decision', async () => {
+  reset();
+  policy({ question: 'em' });
+  await runner.scratchTemplate({ force: true });
+  const A = await runner.trustedBase();
+  assert.match(A, /^[0-9a-f]{40}$/);
+  // The owner's repository gains a file; the desk has not fetched it yet.
+  fs.mkdirSync(path.join(repo, 'docs'), { recursive: true }); fs.writeFileSync(path.join(repo, 'docs', 'notes.md'), 'one\ntwo\nthree\n');
+  execFileSync('git', ['-C', repo, 'add', '.']); execFileSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'notes']);
+  const cite = (r, run, ids) => sched.deskAction(run, 'decide', { cite: ids, action: 'answer', body: 'docs/notes.md, line 2.', why: 'The notes say so; the marked rule says answer from the code.' });
+  // 1. Pinned at A: a file that only a newer commit has does not count, whatever the moving base holds later.
+  const t1 = await ask(ticket()); delegation.sweep({ paused: false });
+  const r1 = recFor(`${t1.key}:question`);
+  assert.match(await cite(r1, bind(r1, { base: A }), 'R1,E1,file:docs/notes.md:2'), /Not applied: your decision cites file:docs\/notes\.md:2, which is not/);
+  // 2. The base moves on while a decision pinned at A is deciding: nothing is applied, and it is the owner's.
+  const t2 = await ask(ticket()); delegation.sweep({ paused: false });
+  const r2 = recFor(`${t2.key}:question`); const run2 = bind(r2, { base: A });
+  await runner.scratchTemplate({ force: true });
+  const B = await runner.trustedBase();
+  assert.notEqual(B, A);
+  assert.deepEqual([await runner.baseFileLines('docs/notes.md', A), await runner.baseFileLines('docs/notes.md', B)], [null, 3], 'each commit answers for itself');
+  assert.match(await cite(r2, run2, 'R1,E1,file:README.md:1'), /The repository changed while you decided: nothing was applied/);
+  assert.equal(store.getDelegation(r2.id).status, 'invalidated');
+  assert.equal(store.getTicket(t2.key).status, 'needs_human');
+  // 3. Pinned at B, the base unmoved: the same file counts.
+  const t3 = await ask(ticket()); delegation.sweep({ paused: false });
+  const r3 = recFor(`${t3.key}:question`);
+  assert.match(await cite(r3, bind(r3, { base: B }), 'R1,E1,file:docs/notes.md:2'), /Decided for the owner and applied/);
+  assert.equal(JSON.parse(store.getDelegation(r3.id).citables).base, B, 'the record names the commit its evidence was read at');
+  // 4. No pinned commit: no file citation holds.
+  const t4 = await ask(ticket()); delegation.sweep({ paused: false });
+  const r4 = recFor(`${t4.key}:question`);
+  assert.match(await cite(r4, bind(r4), 'R1,E1,file:README.md:1'), /cites file:README\.md:1, which is not/);
 });
 
 test('a failed final write rolls the whole decision back: no answer on the thread, the ticket still waits for the owner', async () => {
@@ -477,6 +516,7 @@ test('authority: an answer must cite a standing rule and its evidence; "approve 
   await assert.rejects(ask(ticket(), 'junior', buy, 'cheap'), /--about must be one of factual, money/);
   // 2. Mislabelled as factual, so a run starts: an approval that does not cite what it rests on is never applied.
   await runner.scratchTemplate({ force: true }); // the trusted base that file: citations are checked against
+  const base = await runner.trustedBase();
   const approve = 'Approved: buy the $5,000 license today.';
   for (const [what, cite, re] of [
     ['no citation at all', undefined, /cites nothing from its brief/],
@@ -496,7 +536,7 @@ test('authority: an answer must cite a standing rule and its evidence; "approve 
     delegation.sweep({ paused: false });
     const r = recFor(`${t.key}:question`);
     assert.equal(r.status, 'queued', what);
-    const out = await sched.deskAction(bind(r), 'decide', { action: 'answer', body: approve, why: 'The vendor is reliable and the team needs it now.', ...(cite ? { cite } : {}) });
+    const out = await sched.deskAction(bind(r, { base }), 'decide', { action: 'answer', body: approve, why: 'The vendor is reliable and the team needs it now.', ...(cite ? { cite } : {}) });
     assert.match(out, /Not applied: your decision/, what);
     const after = store.getDelegation(r.id);
     assert.equal(after.status, 'escalated', what); assert.match(after.why, re, what);
@@ -517,7 +557,7 @@ test('authority: an answer must cite a standing rule and its evidence; "approve 
   const ok = await ask(ticket(), 'junior', 'Which file defines the retry helper?', 'factual');
   delegation.sweep({ paused: false });
   const ro = recFor(`${ok.key}:question`);
-  const out = await sched.deskAction(bind(ro), 'decide', { action: 'answer', body: 'utils/net.py, retry().', why: 'The ticket names utils/net.py; the marked rule says answer from the code.', cite: 'R1, E1 file:README.md:1' });
+  const out = await sched.deskAction(bind(ro, { base: await runner.trustedBase() }), 'decide', { action: 'answer', body: 'utils/net.py, retry().', why: 'The ticket names utils/net.py; the marked rule says answer from the code.', cite: 'R1, E1 file:README.md:1' });
   assert.match(out, /Decided for the owner and applied/);
   const audit = delegation.get(ro.id);
   assert.deepEqual(audit.cited.map((x) => x.id), ['R1', 'E1', 'file:README.md:1']);

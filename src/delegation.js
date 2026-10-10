@@ -464,7 +464,7 @@ export async function launch(r, fence = runner.currentEpoch()) {
     const rule = ownerReasonFor(now, seat);
     if (rule) { escalate(r, rule); return null; }
     let bound = null;
-    const given = seal(r, now); // what the run may cite, fixed now
+    const given = seal(r, now, { base: runner.workspaceBase(cwd) }); // what the run may cite, and the commit it reads, fixed now
     out = await runner.startRun({ fence, agentId: seat, kind: 'decide', ticketKey: r.ticket_key, cwd, job: { delegation: r.id }, prompt: prompt(store.getDelegation(r.id), now, given),
       admit: (agent) => {
         const b = boundFor(agent);
@@ -528,19 +528,24 @@ const playbookHash = () => hash(playbook());
  * Fix what a record's run is given to cite (stored on the record for the check and the audit, with the fingerprint of
  * the standing rules it was given), and return it in full.
  */
-export function seal(r, c = currentOf(r)) {
+export function seal(r, c = currentOf(r), { base = null } = {}) {
   const given = c ? citablesFor(r, c) : { rules: [], evidence: [] };
-  store.updateDelegation(r.id, { citables: { rules: given.rules.map((x) => ({ id: x.id, text: x.text.slice(0, 300) })), evidence: given.evidence.map((x) => ({ id: x.id, label: x.label })), playbook: playbookHash() } });
+  // base: the trusted commit the run's read-only workspace was copied from. Its file evidence is that commit's.
+  store.updateDelegation(r.id, { citables: { rules: given.rules.map((x) => ({ id: x.id, text: x.text.slice(0, 300) })), evidence: given.evidence.map((x) => ({ id: x.id, label: x.label })),
+    playbook: playbookHash(), base: /^[0-9a-f]{40}$/.test(String(base || '')) ? base : null } });
   return given;
 }
-/** Why the ids a delegate cited do not support its decision, or null (every id given to its run, or a file in the base). */
+/**
+ * Why the ids a delegate cited do not support its decision, or null: every id given to its run, and every file one that
+ * exists at the commit its run was pinned to (with no pinned commit, no file citation holds).
+ */
 async function unsupported(r, ids) {
   const given = json(r.citables, null) || { rules: [], evidence: [] };
   const badFiles = new Set();
   for (const id of ids) {
     const f = id.startsWith('file:') ? model.parseFileCite(id) : null;
     if (!f) continue;
-    const lines = await runner.baseFileLines(f.path).catch(() => null);
+    const lines = given.base ? await runner.baseFileLines(f.path, given.base).catch(() => null) : null;
     if (lines == null || (f.from != null && f.to > lines)) badFiles.add(id);
   }
   return model.citationProblem(ids, { rules: new Set(given.rules.map((x) => x.id)), evidence: new Set(given.evidence.map((x) => x.id)), badFiles });
@@ -641,7 +646,9 @@ export async function command(run, body = {}) {
   // never taken on trust. An unsupported decision is not applied: it goes to the owner as a recommendation.
   const cites = action === 'escalate' ? [] : model.parseCites(body.cite);
   const problem = action === 'escalate' ? null : await unsupported(r, cites);
-  const msg = decide(r, { action, text, why, assign, cites, unsupported: problem }, { run });
+  const sealedBase = json(r.citables, null)?.base || null;
+  const baseNow = sealedBase ? await runner.trustedBase() : null; // compared with the pinned commit inside the transaction
+  const msg = decide(r, { action, text, why, assign, cites, unsupported: problem, baseNow }, { run });
   store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: r.ticket_key, kind: 'action', text: `desk decide ${action}: ${text.slice(0, 140)}` });
   return msg;
 }
@@ -679,6 +686,12 @@ export function decide(r, choice, { run = null, deterministic = false } = {}) {
     if (!deterministic && sealed?.playbook && sealed.playbook !== playbookHash()) {
       endLapsed(rec, { status: 'invalidated', why: 'Your playbook (and so the standing rules it was given) changed before it was applied. The decision is yours.' });
       message = 'The owner changed the standing rules while you decided: nothing was applied. Stop now.';
+      return;
+    }
+    // Its run read the repository at a pinned commit: once the trusted base moved on, what it read may not hold.
+    if (!deterministic && sealed?.base && choice.baseNow !== sealed.base) {
+      endLapsed(rec, { status: 'invalidated', why: 'The repository moved on (a newer base commit) while it was decided, so what it read may no longer hold. The decision is yours.' });
+      message = 'The repository changed while you decided: nothing was applied. Stop now.';
       return;
     }
     const rule = ownerReasonFor(c, rec.seat);
