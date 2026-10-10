@@ -181,10 +181,10 @@ export const codex = {
     const model = seat.model || userModel();
     const common = ['--json', '--skip-git-repo-check', ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort=${effort}`] : []),
       ...(['council_review','product_review','feature_groom'].includes(kind) ? ['-c', 'default_permissions="sigmadesk_review"'] : []),
-      ...(kind === 'mention' ? ['-c', 'default_permissions="sigmadesk_tagged"'] : []),
+      ...(kind === 'mention' || kind === 'decide' ? ['-c', 'default_permissions="sigmadesk_tagged"'] : []), // read-only + its own mailbox
       ...(kind === 'council_review' ? ['-c', 'features.shell_tool=false'] : []),
       // Package stages (#8) only ever extend the build profile (sigmadesk_seat), and only for the granted run.
-      ...(extraRead.length && !['council_review', 'product_review', 'feature_groom', 'mention'].includes(kind) ? ['-c', seatFilesystemOverride(extraRead)] : [])];
+      ...(extraRead.length && !['council_review', 'product_review', 'feature_groom', 'mention', 'decide'].includes(kind) ? ['-c', seatFilesystemOverride(extraRead)] : [])];
     const args = resume
       ? ['exec', 'resume', ...common, resume, '-']
       : ['exec', ...common, '-C', cwd, '-'];
@@ -208,8 +208,10 @@ export const codex = {
       case 'thread.started': return [{ type: 'session', id: ev.thread_id }];
       case 'item.started':
         if (it.type === 'command_execution') {
+          // Counted as it starts (the step limit must see a command before it can act), desk calls included; the
+          // completion repeats the id and is not counted again.
           const cmd = unwrap(it.command);
-          return /^\s*desk\s/.test(cmd) ? [] : [{ type: 'tool', text: `$ ${short(cmd)}` }];
+          return [{ type: 'cmd-start', id: it.id, cmd }, ...(/^\s*desk\s/.test(cmd) ? [] : [{ type: 'tool', text: `$ ${short(cmd)}` }])];
         }
         return [];
       case 'item.completed':

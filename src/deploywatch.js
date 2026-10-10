@@ -774,10 +774,20 @@ function evidenceLines(ev) {
  * Record a checkpoint verdict and post it. A regression is held FIRST, in its own transaction (hold, page, verdict);
  * the publisher work for the revert plan and the incident/revert tickets come after (and are recovered by the sweep).
  */
-export async function finish(cp, verdict, { summary, evidence, limited = false, author = 'system', sre = null }) {
+/**
+ * Record a checkpoint's verdict and its effects (the ticket comment, a regression hold, the roll-up). expect: the SRE
+ * run giving it ({ id, token }); its authority is checked inside the same transaction, before anything is written, so
+ * a run stopped (cancelled, timed out, over its steps) or a checkpoint that moved on while the verdict was being
+ * checked records nothing.
+ */
+export async function finish(cp, verdict, { summary, evidence, limited = false, author = 'system', sre = null, expect = null }) {
   const ev = { ...(evidence || {}), ...(sre ? { sre } : {}) };
-  let held = null;
+  let held = null, stale = false;
   store.transaction(() => {
+    if (expect) {
+      const live = store.getRun(expect.id), now = store.getCheckpoint(cp.id);
+      if (!live || live.status !== 'running' || !live.token || live.token !== expect.token || !now || now.status !== 'sre_running' || now.run_id !== expect.id) { stale = true; return; }
+    }
     const fresh = store.getWatch(cp.watch_id);
     if (!fresh || fresh.status === 'superseded') { store.updateCheckpoint(cp.id, { status: 'superseded', completed_at: iso(clock.now()), evidence: JSON.stringify(ev) }); return; }
     const t = fresh.ticket_key ? store.getTicket(fresh.ticket_key) : null;
@@ -790,6 +800,7 @@ export async function finish(cp, verdict, { summary, evidence, limited = false, 
     if (verdict === 'regression') { holdRegression(fresh, cp, ev); held = store.getWatch(fresh.id); }
     else rollUp(fresh.id);
   });
+  if (stale) throw err('this run was stopped, or its checkpoint moved on, while its verdict was being checked, so nothing was recorded; stop now');
   if (held) await ensureRegressionTickets(held, cp, ev).catch((e) => store.logEvent({ kind: 'error', agent_id: 'system', ticket_key: held.ticket_key, text: `regression tickets: ${String(e.message).slice(0, 200)}` }));
   github.flushOutbox()?.catch?.(() => {});
   return { status: 'done', verdict };
@@ -876,6 +887,30 @@ export async function ensureRegressionTickets(w, cp = null, ev = null) {
   return store.getWatch(w.id);
 }
 
+/**
+ * The SRE suspects, from a log investigation (#9), that a recent deployment caused an incident: the same confirmed
+ * regression hold a failed checkpoint places (every deploying merge waits until the owner clears it), a page, and the
+ * incident and owner-only revert tickets. It only stops things: only the owner merges the revert and clears the hold.
+ * The deployment is the newest one deployed within `hours` that is not already a regression or superseded.
+ */
+export async function sreSuspects({ why, incidentId = null, hours = 24, now = clock.now() } = {}) {
+  const text = String(why || '').trim();
+  if (!text) throw err('say why a recent deployment caused it');
+  const since = now.getTime() - hours * 3600_000;
+  const w = store.recentWatches(30).find((x) => ['watching', 'verified', 'inconclusive'].includes(x.status) && Date.parse(x.deployed_at) >= since);
+  if (!w) throw err(`no deployment in the last ${hours} hours is on record, so there is nothing to hold or revert: page the owner instead (desk incident page --trading "<why>")`, 409);
+  const t = w.ticket_key ? store.getTicket(w.ticket_key) : null;
+  const page = `${agentById.sre?.name?.split(/\s+/)[0] || 'The SRE'} suspects deploying ${ticketName(t)} (${short(w.merge_sha)}) caused ${incidentId ? `incident #${incidentId}` : 'an incident'}: ${text.slice(0, 300)}. Deploying merges are on hold until you clear it.`;
+  store.transaction(() => {
+    store.updateWatch(w.id, { status: 'regression', hold: 1, hold_kind: 'regression', cleared_by: null, cleared_at: null, verdict_note: `SRE investigation${incidentId ? ` (incident #${incidentId})` : ''}: ${text.slice(0, 400)}` });
+    for (const c of store.checkpointsOf(w.id)) if (['pending', 'needs_sre', 'unschedulable'].includes(c.status)) store.updateCheckpoint(c.id, { status: 'superseded', completed_at: iso(clock.now()) });
+    if (t) say(t, `sre-regression:${w.id}`, `🚨 **${page}**\n\nAn incident ticket and a revert for you to merge are being prepared.`, w.merge_sha, 'sre');
+    store.logEvent({ kind: 'error', agent_id: 'sre', ticket_key: w.ticket_key, text: page });
+  });
+  notify('page', t, page);
+  const ev = { items: [{ criterion: 'SRE investigation', probe: 'logs', observed_at: iso(now), threshold: 'n/a', observed: text.slice(0, 300), result: 'fail' }], coverage: ['from the SRE\'s investigation of production logs, not a checkpoint'] };
+  return ensureRegressionTickets(store.getWatch(w.id), null, ev);
+}
 /** The suspected (provisional or confirmed) regression currently holding deploying merges (oldest first), or null. */
 export const regressionHold = () => store.heldWatches()[0] || null;
 /** The owner looked at it: deploying merges may continue. The watch keeps its verdict. */
@@ -998,7 +1033,8 @@ export async function command(run, body) {
     finalEv = { ...re, sre_settled: (re.items || []).filter((i) => i.result === 'anomaly').map(evKey) };
   }
   const limited = action === 'verified' && store.getWatch(cp.watch_id)?.criteria_source !== 'ticket';
-  await finish(cp, action, { summary: text, evidence: finalEv, limited, author: run.agent_id, sre: { seat: run.agent_id, verdict: action, text, run_id: run.id, fresh_probes: fresh, at: iso(clock.now()) } });
+  await finish(cp, action, { summary: text, evidence: finalEv, limited, author: run.agent_id, sre: { seat: run.agent_id, verdict: action, text, run_id: run.id, fresh_probes: fresh, at: iso(clock.now()) },
+    expect: { id: run.id, token: run.token } }); // the run's authority, rechecked when the verdict is written
   return 'Recorded. Stop now.';
 }
 

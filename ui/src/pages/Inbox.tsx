@@ -14,6 +14,7 @@ import { Lineage } from '@/components/desk/Epic';
 import { BriefLine, DecisionLead, briefOf } from '@/components/desk/DecisionBrief';
 import { ProgramUpdate } from '@/components/desk/Program';
 import { PackageRequestRow, type PkgRequest } from '@/components/desk/Packages';
+import { DecidedLane } from '@/components/desk/Delegation';
 import { LANES, reasons, snoozePresets } from '../../../public/inbox.js';
 import { cn } from '@/lib/utils';
 import type { Board, BoardItem } from '@/types';
@@ -81,6 +82,9 @@ function InboxRow({ it, hero = false }: { it: Row; hero?: boolean }) {
     tone: ev.state === 'stale' || ev.checks === 'failing' || ev.mergeable === 'CONFLICTING' ? 'text-blocked' : ev.state === 'current' && ev.checks === 'passing' ? 'text-shipped' : 'text-muted-foreground' } : null;
   const fact = it.lane === 'ship' && t ? <>{ci && <span className={ci.tone}>· {ci.text}</span>}{t.risk === 'high' && <span className="text-muted-foreground">· high risk</span>}</>
     : it.kind === 'question' && t?.assignee ? <span className="text-[13px] text-muted-foreground">from {firstName(t.assignee)}</span> : null;
+  // Delegation (#9): the delegate's take on this decision (shadow) or why it is yours (an escalation).
+  const dl = (it as BoardItem & { delegate?: { seat_name?: string }; escalation?: { seat_name?: string } });
+  const take = dl.delegate ? `${dl.delegate.seat_name} would decide` : dl.escalation ? `${dl.escalation.seat_name} left it for you` : null;
   return (
     <article data-key={it.id} data-kind={it.kind} data-ticket={t?.key} className={cn('grid grid-cols-[minmax(0,1fr)] gap-1.5 px-3 py-2.5', hero && 'gap-2 p-4', fresh(it) && 'animate-in fade-in duration-300')}>
       <div className="flex items-center gap-2">
@@ -98,6 +102,8 @@ function InboxRow({ it, hero = false }: { it: Row; hero?: boolean }) {
         {it.time_hint && <span className="text-muted-foreground">· {it.time_hint}</span>}
         {it.snoozed_until && <span className="text-muted-foreground">· back {when(it.snoozed_until)}</span>}
         {fact}
+        {/* A phone row stays two short lines: there the delegate's take shows when the row or the decision opens. */}
+        {take && <span data-take className="text-muted-foreground max-md:hidden">· {take}</span>}
         {!!it.waiting?.length && <span data-waiting={it.waiting.map((w) => w.key).join(',')} className="text-muted-foreground">· +{it.waiting.length} waiting question{it.waiting.length === 1 ? '' : 's'}</span>}
       </div>
       {!open && <BriefLine it={it} />}
@@ -149,6 +155,7 @@ export function InboxPage() {
             <div className="overflow-hidden rounded-lg border border-l-[3px] border-l-needs bg-card"><InboxRow key={first.id} it={first} hero /></div></div>}
           {LANES.map((l) => <Lane key={l.id} {...l} rows={rest.filter((r) => r.lane === l.id)} open={!!lanes[l.id]} onToggle={() => toggle(l.id)} />)}
         </div> : <Empty title={snoozed.length ? 'Nothing due now.' : 'Nothing needs you.'}>{snoozed.length ? `${snoozed.length} snoozed. ` : ''}{c.working} working, {c.queued} queued.</Empty>}
+        <div className="mt-5"><DecidedLane rows={(B as Board & { decided?: Record<string, unknown>[] }).decided || []} /></div>
         {snoozed.length > 0 && <div className="mt-5 grid gap-1.5" data-snoozed>
           <button type="button" aria-expanded={showSnoozed} onClick={() => setShowSnoozed(!showSnoozed)} className="flex items-center gap-2 text-left text-sm text-muted-foreground">
             {showSnoozed ? <ChevronDown className="size-4" aria-hidden /> : <ChevronRight className="size-4" aria-hidden />}Snoozed <span className="font-mono">{snoozed.length}</span></button>

@@ -234,8 +234,9 @@ test('engines: codex JSONL normalizes to desk events', async () => {
   const st = {};
   const p = (o) => ENGINES.codex.parse(JSON.stringify(o), '/w', st);
   assert.deepEqual(p({ type: 'thread.started', thread_id: 't1' }), [{ type: 'session', id: 't1' }]);
-  assert.deepEqual(p({ type: 'item.started', item: { type: 'command_execution', command: "/bin/bash -lc 'pytest -q'" } }), [{ type: 'tool', text: '$ pytest -q' }]);
-  assert.deepEqual(p({ type: 'item.started', item: { type: 'command_execution', command: "/bin/bash -lc 'desk progress 5 x'" } }), []);
+  // A command is counted as it starts (its id), desk calls included; only the other commands are displayed.
+  assert.deepEqual(p({ type: 'item.started', item: { id: 'i1', type: 'command_execution', command: "/bin/bash -lc 'pytest -q'" } }), [{ type: 'cmd-start', id: 'i1', cmd: 'pytest -q' }, { type: 'tool', text: '$ pytest -q' }]);
+  assert.deepEqual(p({ type: 'item.started', item: { id: 'i2', type: 'command_execution', command: "/bin/bash -lc 'desk progress 5 x'" } }), [{ type: 'cmd-start', id: 'i2', cmd: 'desk progress 5 x' }]);
   assert.equal(p({ type: 'item.completed', item: { type: 'file_change', changes: [{ path: '/w/a.py', kind: 'update' }] } })[0].text, 'Editing a.py');
   assert.equal(p({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } })[0].type, 'result');
 });

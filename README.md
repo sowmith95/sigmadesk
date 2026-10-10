@@ -152,6 +152,145 @@ same provider, budget and concurrency gates. This follows the compact approve/ed
 Completed design proposals have their own decision target: approval/rejection records the design decision; corrections
 queue a revised manager response. Those decisions preserve the underlying task state and its implementation/merge gates.
 
+## Delegation: Morgan and Devon decide for you
+
+Most owner decisions are routine. **Settings → Autonomy → Decisions made for you** sets, per kind of decision, who
+decides:
+
+- **You decide**: nothing runs; the decision waits for you.
+- **Shadow** (the default for every kind): Morgan (EM) or Devon (SRE) decides, the decision is recorded and shown on your
+  card ("Morgan would decide: …"), and you still decide. Compare for a while before switching a kind on.
+- **Morgan decides / Devon decides**: the decision is applied for you, posted on the ticket as theirs ("decided for the
+  owner"), and listed in the Inbox under **Decided for you** (last 24 hours) with **Override** (your decision replaces
+  theirs, posted as yours) and **Reopen** (the decision comes back to you; nothing that already happened is undone).
+
+| Kind | Delegate | What the delegate may do | Stays yours |
+|---|---|---|---|
+| Owner tasks | Morgan, by rule (no model run), the moment the task is filed | a step filed with `--owner-kind check` goes to Devon's probes; `--owner-kind package` becomes a package request on the ticket | writes, restarts, credentials, business decisions, any step filed without a kind, and any step Morgan filed |
+| Engineers' questions | Morgan | answer a question its asker marked factual (`desk needs-human "<q>" --about factual`) on a positively low-risk ticket, under a standing rule you wrote | any other subject (money, credentials, product preference, trading semantics, schema effects) or none, high or unknown risk, stale evidence, a missing standing rule, Morgan's own question |
+| Research-review holds | Morgan | send the proposal back with corrections or a narrower scope (once per proposal, for its whole life) | approving it past the reviewer's dissent |
+| QA and review loop limits | Morgan | rescope, or reassign to another builder (once per ticket) | clearing a QA, CI or reviewer failure; a disagreement Morgan is a party to |
+| Design and plan reviews | Morgan or Devon | approve or reject a recommendation on a positively low-risk ticket (a backend change can alter trading without any UI change) | a design the delegate wrote; council corrections (they queue a paid council) |
+
+Never delegable in v1: budget, policies and this matrix; merges of high-risk work, revert merges and releasing holds;
+publish-guard holds; standing and renewal production access; package installs.
+
+- **Structured reasons only.** Every hold records why (`hold_kind`), who asked (`hold_seat`), what it refers to
+  (`hold_ref`) and, for a question, what the asker says it is about (`hold_scope`, from `desk needs-human --about
+  factual|money|credentials|product|trading|schema|other`); owner tasks record their kind (`desk create-task --owner
+  "<why>" --owner-kind check|package|write|restart|credential|business|other`) and who filed them. Delegation never
+  classifies message text.
+- **One record per decision and evidence version** (`delegated_decisions`): the decision brief you see, the policy and
+  delegation versions, the delegate, the actions it may take, attempts, spend and the outcome. The evidence version is
+  one fingerprint of every column of the ticket, of every message on its thread and of the kind's own records (a
+  proposal's reviews, a design's discussion, a council and its members), read as stored, plus the changed files. Only a
+  short, explicit list of bookkeeping columns is left out (timestamps, progress, counters, the GitHub mirror), so a
+  column added later counts as evidence by default: a new question, hold, message or revision is a new decision.
+- **The authority is yours: you write the rules a delegate may apply.** Only the bullets under the playbook heading
+  `## Standing rules the EM may apply alone` (configurable: `delegation.rulesSection`) count. You curate that section
+  yourself; the desk and its seats never write it (the shipped playbooks and new projects start with it empty). The
+  desk reads it strictly, as a small part of Markdown it can check line by line:
+  - The heading is a `##` heading at the start of its line (not `#` or `###`, not underlined with `---` or `===`).
+    Its words are matched ignoring case, extra spaces, a trailing `:` or `.` and closing `#`s, so
+    `## standing rules the EM may apply alone:` opens the section too. It must be the first heading anywhere in the
+    playbook with those words (compared by letters and digits only, at any level or underlined): a look-alike
+    earlier, such as `# Standing rules…` or `## *Standing* rules…`, leaves you with no standing rules, and a second
+    copy later never opens a section.
+  - Each rule is a dash bullet (`- `) at the start of its line, right under the heading or under the rule before it.
+  - A rule's conditions go on its bullet line, or on lines indented two spaces under it (sub-bullets included).
+  - No code blocks, links, HTML or comments, numbered lists, lines indented four or more spaces, or other headings
+    inside the section; and in a rule no `<`, `[` or `]`, no character reference such as `&amp;`, and no invisible
+    character. The desk reads only what Markdown shows as written, so nothing in a rule can be hidden from you.
+
+  Anything else ends the section where it stands, and nothing after it is read; a rule the line may still belong to
+  is dropped, since it may be missing a condition. Settings tells you how many rules the desk found, so a count lower
+  than you expect means a line ended the section early. The rest of the playbook must not leave Markdown room to
+  read it differently either: anywhere in the file, a fenced block or comment it might end elsewhere (one opened
+  inside a list item or quote, or four spaces in, counts as that), or any heading holding markup (`&`, `<`, `[`, `]`,
+  `\`, a backtick) or a non-ASCII character leaves you with no standing rules, and Settings says which.
+  **No HTML-like text anywhere.** A `<` right before a letter, `/`, `!` or `?` anywhere in the playbook (a tag such as
+  `<div hidden>`, `<details>` or `<span style="display:none">`, an autolink such as `<https://example.com>`, or a
+  placeholder such as `<paths>`) leaves you with no standing rules, and Settings says so. Raw HTML in the page
+  Markdown writes can hide everything after it, the owner's heading and rules included, and the desk does not try to
+  work out what HTML shows. This holds inside inline code too: the desk does not decode inline syntax, so
+  `` `pytest <paths>` `` counts. Only text inside a fenced code block or an HTML comment block (a comment starting a
+  line) is exempt; on a comment's closing line, whatever follows the comment counts again, apart from further
+  complete comments. So write placeholders spelled out (`pytest PATHS`, `desk fetch HTTPS-URL`), links bare
+  (`https://example.com`), and any HTML example in a fenced block. A `<` before a space, a digit, `=` or `-` (`1 < 2`, `x <= 3`) is fine outside the section. The
+  shipped playbooks follow this; a playbook written for an earlier version that mentions `<paths>`-style
+  placeholders in prose must spell them out or fence them. With no such section, or an empty one, no decision run
+  starts: nothing is decided for you by judgment. Owner-task triage is the one exception, because it is decided by
+  rule, not judgment: a step filed as a check or a package is routed back to the team (when that kind is delegated)
+  whatever the section says. Write narrow rules. The desk checks that a decision cites one of your rules and evidence
+  from its brief; whether the rule fits the decision is the delegate's judgment, which you review in the Inbox.
+  Override and Reopen let you decide again, but they cannot undo what the team already did after a decision.
+- **Upgrading a playbook from an earlier version.** Earlier shipped playbooks and project templates put a note (an
+  HTML comment) right under `## Standing rules the EM may apply alone`. A comment now ends the section, so with that
+  note in place no rule after it counts and the desk finds none. Move the note above the heading (or delete it) and
+  put your rules directly under the heading; Settings says so when it sees the old note there.
+- **Decisions cite what they rest on.** A decision run is given your rules from that section, numbered (R1…), and
+  numbered evidence (E1…: the ticket description, the kind's own record and the thread's messages), and answers with
+  `desk decide answer|approve|changes|reject "<text>" --cite "R2,E1[,file:<path>:<line>]" --why "<how they settle
+  it>"`. The desk checks every id against what that run was given; a decision must cite at least one rule and one
+  numbered piece of evidence (a file may be cited too, never instead of an E). One that does not is not applied: it
+  comes to you with its text as the recommendation. Any edit to your playbook while a decision runs invalidates it.
+  File evidence is pinned: a run's read-only workspace is a copy of one trusted base commit, its file citations are
+  checked at that commit, and if the desk's base has moved on by the time it decides, nothing is applied (the base is
+  read, and the decision applied, under the lock the base's writers hold). That base is the desk's cached copy of your
+  base branch, not a live read: it is refreshed when a read-only workspace is prepared, at most every 10 minutes from
+  your remote (a checkout with no remote is read every time); when the remote cannot be reached it is your checkout's
+  last fetched copy of the base branch, or your local base branch. Nothing is fetched when a decision is applied. A run that was stopped (cancelled,
+  timed out, over its steps) never applies anything, even if its decision was already sent.
+- **One bounded attempt.** A decision run reads the same brief and the thread (as untrusted data) and ends with one
+  `desk decide` (or `desk decide escalate "<recommendation>" --why "<why it is yours>"`): up to $0.75 on an engine with a
+  spending cap, or 6 minutes and 60 steps on a plan-billed one (`delegation.maxSteps`); an engine with neither is
+  refused. A step is every command or tool call the engine reports, counted as it starts, and every desk request,
+  counted apart: the desk never guesses which command sent a request, so **a desk command costs two steps**. Admission
+  assumes the worst order of reports: a request is carried out only if the steps reported so far plus two for every
+  request so far (this one included) fit, as if no command that sent a request had been reported yet. Otherwise it is
+  refused and the run stopped before it can apply anything. That keeps room for the command behind each request, not
+  for a plain command (one that sent no request) whose report arrives late: such a report can still take the run past
+  its allowance after a decision applied, and stop it then. Stopping only takes away the run's authority; the decision
+  it already applied stands. The same counting applies to tagged replies (`mentions.maxSteps`) and
+  post-deploy checks (`watch.maxSteps`) on a plan-billed engine; admitted on an engine with a dollar cap, those are
+  bounded by the dollars instead, and their steps are recorded but never stop them. A decision run keeps its own steps
+  on either kind of engine. The bound is reserved for the engine the run
+  actually gets (a fallback included). A research proposal's delegated runs share a $1.50 lifetime allowance: each run
+  is capped at what is left of it, and an engine that cannot cap dollars only starts when its whole reservation fits.
+  Every dollar is reserved or charged, never neither: a run's reservation stands, whatever its decision did, until the
+  run's cost is charged, and after a restart every ended run is charged to its record. A run that ends without
+  deciding, or a decision not started within 30 minutes, comes to you with the reason. Escalations carry a one-line
+  recommendation, so your tap is yes or no. At most 40 decision runs a day (`delegation.maxPerDay`): a decision takes
+  one of them as it leaves the queue, holds it while its workspace is prepared and gives it back only if no run starts,
+  and the count is kept in the desk's database, so a restart or two decisions at once cannot exceed it. When the day's
+  runs have all started, a new decision comes to you at once ("today's allowance of 40 decision runs is used up"); one
+  that finds the last run only reserved by a decision still being prepared waits for it (that run may come free), and
+  comes to you if it has not started within 30 minutes. In shadow, nothing is opened over the allowance. One slot
+  stays free for QA and incidents.
+- **Rules before the run and again at apply**, with no model call: a delegate never decides anything it is a party to.
+  One list of interested seats serves every kind: whoever put the hold (the asker, the requester, QA, a disagreeing
+  reviewer), built, is assigned, designed or worked on the ticket, reviews the change, wrote or reviewed the proposal,
+  wrote the recommendation or chaired the council, or filed the owner task. Questions and designs only on positively
+  low-risk tickets; lifetime limits that survive revisions. A decision is applied in one transaction after re-checking
+  its evidence fingerprint, the delegation settings, the desk's general policy (production access, merge and sync
+  settings) and the standing rules its run was given (your playbook); if any of them changed, nothing is applied.
+- **Notices.** While a delegate holds a decision for you, the hold's push notice waits. It is owed on the hold itself,
+  not on a version of the decision: when the decision comes back to you for any reason (an escalation, a failed run,
+  a halted desk, a policy change, the kind switched to shadow or back to you, a hold no delegate may decide) you are
+  told once, however its evidence changed in between. A decision the delegate applies is listed under Decided for you
+  instead.
+- **Escalate everything** (Settings) makes every decision yours at once and stops decisions in progress; so does any
+  change to the matrix for the decisions in flight. `delegation.enabled: false` in the config (or
+  `SIGMADESK_DELEGATION=off`) turns delegation off whatever is saved.
+- **Peer access** (off by default): Morgan and Devon may grant each other production read access for one ticket, within
+  your access policy. Renewals and standing grants stay yours.
+- **Incidents.** From a log investigation Devon can hold every deploying merge and prepare an owner-only revert
+  (`desk incident regression "<why>"`), and pages you at P0 when trading may be affected (`desk incident page "<why>"
+  --trading`). Only you merge the revert and clear the hold.
+- **What it saved.** `/api/state` (`meta.delegation`) and `GET /api/delegation` report, per kind over 7 days, the owner
+  interventions avoided (each decision counted once; overrides and reopens excluded), escalations, shadow decisions and
+  the spend; `GET /api/delegation/<id>` is the audit record with the brief it was based on.
+
 ## Architecture Review Board and model selection
 
 Open a ticket → **Architecture review** → **Desktop / API review**. Choose a design reviewer and an independent challenger from a different model
@@ -378,8 +517,9 @@ as do the desk's state, credential stores and pgpass/service/verifier files. Sti
 home folder that the OS lets any user read (system files, `/opt/homebrew`, `/tmp`), the toolchain trees above, and the
 seat's own clone — keep secrets out of the repository and out of `readOnlyPaths`. `project.env` entries must be
 plain names and values: anything that looks like a credential (URL with a password, DSN, key, token) is withheld. A manager task that only needs a
-production *read* (`desk create-task --verify`, or an `--owner` step that is plainly a check) goes to the SRE, who
-answers it with probes under a ticket-scoped grant; it comes to you only if no probe can answer it.
+production *read* (`desk create-task --verify`) goes to the SRE, who answers it with probes under a ticket-scoped grant;
+it comes to you only if no probe can answer it. An `--owner` step is yours: the desk never reads its text to reroute it,
+and only delegation's owner-task triage can hand a stated `--owner-kind check` back to the SRE.
 
 **Setup (owner, once):**
 1. Provision the read-only role on each database — **dry run first** (does everything, self-checks the function as
@@ -649,6 +789,7 @@ Everything lives in `sigmadesk.config.json` (gitignored). See `sigmadesk.config.
 | `pm.*` | PM persona, competitors to study, cadence. |
 | `sandbox.*` | Extra allowed domains (e.g. a package registry) and paths to keep unreadable. |
 | `notify.*` | A Discord/Slack webhook or ntfy.sh topic: get pinged when a ticket needs you, a PR is ready, or the SRE pages. |
+| `delegation.*` | Who decides each kind of owner decision (`kinds`: owner, shadow, em or sre), peer access, and the bounds of a decision run. Settings → Autonomy edits win; `SIGMADESK_DELEGATION=off` and `SIGMADESK_DELEGATION_<KIND>=<mode>` override the file. |
 
 Live knobs (concurrency, budget, PM cadence, GitHub sync, draft PRs) are also editable in the UI under **Limits**.
 
@@ -656,7 +797,7 @@ Live knobs (concurrency, budget, PM cadence, GitHub sync, draft PRs) are also ed
 
 Agents talk to the desk only through `bin/desk` over the socket: `desk progress 40 "writing tests"`, `desk comment`,
 `desk needs-human "<question>"`, `desk propose`, `desk groom`, `desk consult`, `desk submit`, `desk qa pass|fail`,
-`desk accept pass|changes`, `desk incident file|mute|page`, `desk context-file <path>` (Perplexity seats). Run `bin/desk --help` for the full list.
+`desk accept pass|changes`, `desk incident file|mute|page|regression`, `desk decide …` (decision runs), `desk context-file <path>` (Perplexity seats). Run `bin/desk --help` for the full list.
 Every subcommand also accepts `--help` or `-h`; help never submits a desk action.
 
 ## How it compares

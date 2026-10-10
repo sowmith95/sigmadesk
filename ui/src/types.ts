@@ -10,9 +10,11 @@ export interface DeskEvent { id: number; ts: string; kind: string; text: string;
 export interface Comment { id: number; ticket_key: string; author: string; body: string; ts: string }
 export interface BoardItem { id: string; key: string; name: string; bucket: string; kind?: string; stage?: string | null; verb?: string; reason?: string; action?: string; ticket?: Ticket;
   worker?: string | null; epic?: boolean; live?: boolean; proposal_id?: number; council_id?: number; incident?: { last_seen?: string; [k: string]: unknown }; code?: string;
-  waiting?: { key: string; name: string; id: string }[] }
+  waiting?: { key: string; name: string; id: string }[];
+  // Delegation (#9): what the EM or SRE would decide (shadow), or why they left it to you (an escalation).
+  delegate?: Record<string, unknown>; escalation?: Record<string, unknown> }
 export interface Board { needs_you: BoardItem[]; decisions?: BoardItem[]; snoozed?: BoardItem[]; do_first?: string | null; blocked: BoardItem[]; working: BoardItem[]; queued: BoardItem[]; shipped: BoardItem[]; closed: BoardItem[]; epics: BoardItem[];
-  counts: Record<string, number>; byKey: Record<string, BoardItem> }
+  counts: Record<string, number>; byKey: Record<string, BoardItem>; decided?: Record<string, unknown>[] }
 export interface Program { id: string; label: string; seat: string; enabled: boolean; intervalMinutes: number; window: string; focus: string; sources: string[];
   tools: { web: boolean; connectors: string[] }; maxProposals: number; review: { minReviewers: number; reviewers: string[] };
   ok?: boolean; code?: string; reason?: string; last_run_at?: string | null; next_eligible_at?: string | null }

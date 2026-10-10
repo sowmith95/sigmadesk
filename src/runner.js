@@ -40,19 +40,72 @@ const evidence = new Map(); // runId -> { pending: Map(id -> cmd), done: [{cmd, 
 export function evidenceFor(runId) { return evidence.get(runId)?.done || []; }
 
 /**
- * A tagged run (@mention) stops after its step allowance: every tool call and every command (desk calls too), each
- * counted once whatever the engine chooses to display. The desk-side bound when dollars cannot be capped.
+ * Step-bounded runs (tagged replies, delegated decisions #9, post-deploy checks) stop after their step allowance, the
+ * desk-side bound when dollars cannot be capped. Two kinds of step, counted apart and never matched to each other (the
+ * desk cannot know which command sent a request, so it does not guess): every command or tool call the engine reports
+ * (a command once, by its id, when it starts) and every desk request that reaches the desk. A desk command therefore
+ * costs two steps. Admission assumes the worst order of reports for requests: that the command carrying every request
+ * so far is still unreported. A request is carried out only while the reported steps plus two for every request so
+ * far, this one included, fit in the allowance; otherwise it is refused, and the run stopped, before anything it asked
+ * for happens. That keeps room for each request's own command and for nothing else: a plain command (one that sent no
+ * request) that started before a request and is reported after it can still take the run past its allowance, and stop
+ * it, after the request was carried out. Stopping only takes away the run's authority; what a request applied stands.
  */
-function stepLimit(ctx, id) {
-  if (ctx.run.kind !== 'mention') return;
-  if (id != null) { const seen = (ctx.state.stepIds ||= new Set()); if (seen.has(id)) return; seen.add(id); }
-  ctx.state.steps = (ctx.state.steps || 0) + 1;
-  store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the tag's steps from it
-  const max = ctx.maxSteps ?? (Number(config.mentions?.maxSteps) || 60);
-  if (ctx.state.steps === max + 1) {
-    store.logEvent({ run_id: ctx.run.id, agent_id: ctx.run.agent_id, ticket_key: ctx.run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for a tagged reply)` });
-    killRun(ctx.run.id, `step limit (${max})`);
-  }
+// Post-deploy checks (watch) and tagged replies are bounded by what is left of their steps when the engine cannot cap
+// dollars; admitted on dollars, their allowance is dollars, so their steps are counted (the checkpoint or tag keeps
+// the total) but never stop them. A decision run carries its own steps whatever its bound.
+const STEP_BOUNDED = new Set(['mention', 'decide', 'watch']);
+export const isStepBounded = (kind) => STEP_BOUNDED.has(kind);
+// run id → { max, tools: tool calls, ids: reported command ids, requests: desk requests, stopped }
+const ledgers = new Map();
+function ledgerOf(run, max = null) {
+  let l = ledgers.get(run.id);
+  if (!l) { l = { max: null, tools: 0, ids: new Set(), requests: 0, stopped: false }; ledgers.set(run.id, l); }
+  if (max != null) l.max = max;
+  return l;
+}
+const ledgerSteps = (l) => l.tools + l.ids.size + l.requests;
+// Only the steps a run's admission gave it bound it (a plan-billed engine's time-and-steps bound, or a decision's own
+// steps). A run admitted on dollars is bounded by its dollar cap: its steps are still counted and recorded, never enforced.
+const ledgerMax = (run, l) => l.max ?? Infinity;
+const LIMIT_OF = { decide: 'a delegated decision', mention: 'a tagged reply', watch: 'a post-deploy check' };
+/** Give a step-bounded run its allowance before anything is counted (its admission's steps; none: unlimited). */
+export function boundSteps(run, max = null) { if (STEP_BOUNDED.has(run.kind)) ledgerOf(run, max); }
+/** The steps a run has taken so far (its ledger when it is step-bounded). */
+const stepsTaken = (ctx) => { const l = ledgers.get(ctx.run.id); return l ? ledgerSteps(l) : ctx.state.steps || 0; };
+function stopRun(run, l, max) {
+  if (l.stopped) return;
+  l.stopped = true;
+  store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, kind: 'error', text: `stopped after ${max} steps (the limit for ${LIMIT_OF[run.kind] || 'this run'})` });
+  killRun(run.id, `step limit (${max})`);
+}
+/** A step the engine reported: a tool call (id null) or a command as it starts (once by its id). */
+function stepLimit(ctx, id = null) {
+  if (!STEP_BOUNDED.has(ctx.run.kind)) return;
+  const l = ledgerOf(ctx.run, ctx.maxSteps ?? null);
+  if (id == null) l.tools++;
+  else if (l.ids.has(id)) return;
+  else l.ids.add(id);
+  ctx.state.steps = ledgerSteps(l);
+  store.setRunSteps(ctx.run.id, ctx.state.steps); // persisted as it happens: a restart rebuilds the run's steps from it
+  if (ctx.state.steps > ledgerMax(ctx.run, l)) stopRun(ctx.run, l, ledgerMax(ctx.run, l));
+}
+const refusedFor = (max) => Object.assign(new Error(`this desk command could take the run past its ${max} steps (a desk command counts twice: as a command and as a request), so the run was stopped and nothing it asked for was carried out`), { status: 409 });
+/**
+ * A desk request from a step-bounded run, BEFORE the desk carries it out: admitted only while the reported steps plus
+ * two for every request so far, this one included, fit in the allowance (the worst case: every request's carrying
+ * command still unreported). Nothing is ever given back. A refused request stops the run.
+ */
+export function admitDeskCall(run) {
+  if (!STEP_BOUNDED.has(run.kind)) return;
+  const l = ledgerOf(run);
+  const max = ledgerMax(run, l);
+  if (l.stopped) throw refusedFor(max);
+  if (store.getRun(run.id)?.status !== 'running') throw Object.assign(new Error('this run is no longer open (it was stopped), so this desk command was not carried out; stop now'), { status: 409 });
+  const fits = l.tools + l.ids.size + 2 * (l.requests + 1) <= max;
+  l.requests++;
+  store.setRunSteps(run.id, ledgerSteps(l));
+  if (!fits) { stopRun(run, l, max); throw refusedFor(max); }
 }
 
 // Apply an engine's normalized events to the desk (activity log, presence, progress, result).
@@ -248,10 +301,42 @@ export function ensureReadonlyWorkspace(seatId = 'scratch') {
     // APFS: a copy-on-write clone (new inodes; a seat's write never reaches the template). Elsewhere a reflink or copy.
     await pexec('cp', os.platform() === 'darwin' ? ['-cR', tpl, dir] : ['-R', '--reflink=auto', tpl, dir], { timeout: 600_000 })
       .catch(() => pexec('cp', ['-R', tpl, dir], { timeout: 600_000 }));
+    workspaceBases.set(guardWorkspacePath(dir), templateCommit); // the trusted commit this copy is (still under the lock)
     return guardWorkspacePath(dir); // the template's stamp lives outside it, so nothing is written after the copy
   });
 }
+const workspaceBases = new Map(); // read-only workspace → the trusted base commit it was copied from
+/** The trusted base commit a read-only workspace was copied from (a decision run's evidence is pinned to it), or null. */
+export const workspaceBase = (dir) => workspaceBases.get(dir) || null;
+/**
+ * The trusted base as the desk last fetched it (the commit read-only workspaces are copied from), or null. Only a
+ * workspace refresh, under withGitLock, moves it: read it under that lock to rely on it staying put.
+ */
+export async function trustedBase() {
+  const pub = await publisher();
+  const sha = await git([...SAFE, '-C', pub, 'rev-parse', '-q', '--verify', 'refs/sigmadesk/scratch-base^{commit}']).then((r) => r.stdout.trim(), () => '');
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
 
+/**
+ * A repository file a delegated decision cites (#9): it must exist at the trusted commit its run was pinned to, read
+ * from the desk's own publisher repository (never a seat's clone, so nothing a run wrote can make a citation true, and
+ * a later refresh of the base cannot change what the commit holds). rel: a relative path inside the repository; sha:
+ * the pinned commit. → its number of lines, or null when there is no such file there.
+ */
+export async function baseFileLines(rel, sha) {
+  const p = String(rel || '');
+  if (!/^[0-9a-f]{40}$/.test(String(sha || ''))) return null;
+  if (!p || p.length > 300 || /^[/-]/.test(p) || /[\\\u0000-\u001f]/.test(p) || p.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return null;
+  const pub = await publisher();
+  const r = await git([...SAFE, '-C', pub, 'cat-file', 'blob', `${sha}:${p}`], { maxBuffer: 64 << 20 }).catch(() => null);
+  if (!r) return null;
+  if (!r.stdout) return 0;
+  const n = r.stdout.split('\n').length;
+  return r.stdout.endsWith('\n') ? n - 1 : n;
+}
+
+let templateCommit = null; // the commit the scratch template was last built or verified at
 // The scratch template: a checkout of the trusted base, built by the desk from its own publisher repo, never given to a
 // seat (it lives in the desk's data dir, which seats cannot read). Rebuilt when the base moves.
 const TEMPLATE_FETCH_MS = 10 * 60_000;
@@ -284,6 +369,7 @@ export async function scratchTemplate({ force = false } = {}) {
     templateFetchedAt = Date.now();
   }
   const sha = (await git(['-C', pub, 'rev-parse', ref])).stdout.trim();
+  templateCommit = sha;
   const tpl = templateDir();
   // Trusted filter definitions are part of the template's identity: a filter change at the same commit rebuilds it.
   const { stdout: filters } = await git(['-C', config.project.repoPath, 'config', '--local', '--get-regexp', '^filter\\.']).catch(() => ({ stdout: '' }));
@@ -571,9 +657,13 @@ export function buildCommand(agent, kind, cwd, { resume = null, fork = false, ex
 export function kindCap(kind) {
   if (kind === 'resolve') return Number(config.resolve?.budgetUsd) || 1.5;
   if (kind === 'mention') return Number(config.mentions?.budgetUsd) || 2;
+  if (kind === 'decide') return Number(config.delegation?.budgetUsd) || 0.75;
   return null;
 }
 const capped = (kind, usd) => (kindCap(kind) ? Math.min(usd, kindCap(kind)) : usd);
+/** What a run reserves, and is charged when its engine reports no cost: the engine's per-run budget under the kind's cap
+ *  and the job's own dollar cap (usd: the admitted limit, null: none). One formula for admission and accounting. */
+export const runReserve = (agent, kind, usd = null) => Math.min(capped(kind, engineOf(agent).budgetUsd(agent)), usd ?? Infinity);
 
 // Provenance: which charter/playbook/engine/model produced this run, so scorecards can be split by version.
 const engineVersions = {};
@@ -678,10 +768,10 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   packages.recordLaunch(run.id, pkg.ids);
   // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
   if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
-  store.updateRun(run.id, { reserve_usd: Math.min(capped(kind, engineOf(agent).budgetUsd(agent)), limits?.usd ?? Infinity) });
+  store.updateRun(run.id, { reserve_usd: runReserve(agent, kind, limits?.usd ?? null) });
   // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
   // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
-  if (kind !== 'mention') access.bindRun(agentId, ticketKey, run.id);
+  if (kind !== 'mention' && kind !== 'decide') access.bindRun(agentId, ticketKey, run.id); // a decision run (#9) is not the ticket's work either
   onStart?.(run);
   const ctx = { run, cwd, result: null, state: {}, presence: track };
   if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
@@ -700,6 +790,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0));
   const deadlineAt = Date.now() + timeoutMin * 60_000;
   if (limits?.steps != null) ctx.maxSteps = limits.steps;
+  boundSteps(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
   // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
   if (store.getRun(run.id)?.status !== 'running') return Promise.resolve(endBeforeSpawn('killed', store.getRun(run.id)?.result_text || 'refused before start'));
   if (!pplx) return spawnChild();
@@ -727,6 +818,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
 
   function endBeforeSpawn(status, text) {
     context.release(run.id);
+    ledgers.delete(run.id);
     store.updateRun(run.id, { status, token: null, ended_at: store.now(), result_text: text, cost_usd: 0 });
     store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text });
     if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
@@ -745,6 +837,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   } catch (err) {
     sock?.close();
     mailboxes.delete(run.id);
+    ledgers.delete(run.id);
     store.updateRun(run.id, { status: 'error', token: null, ended_at: store.now(), result_text: `Run setup failed: ${store.redact(err.message)}` });
     if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null });
     throw err;
@@ -819,14 +912,14 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (failure) holdProvider(engine.id, failure, r?.result || stderr || ctx.state.lastError);
       // No terminal result (killed, crashed, timed out): charge the full per-run cap so the risk limit stays honest.
       const knownCost = r?.cost_known !== false && r && (r.total_cost_usd || !r.is_error);
-      const cost = knownCost ? (r.total_cost_usd ?? 0) : Math.min(capped(kind, engine.budgetUsd(agent)), limits?.usd ?? Infinity);
+      const cost = knownCost ? (r.total_cost_usd ?? 0) : runReserve(agent, kind, limits?.usd ?? null);
       // The run's final record and the job's own accounting (onEnd: e.g. a tag's cumulative allowance) commit together.
       store.transaction(() => {
         store.updateRun(run.id, {
           status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
           result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
         });
-        onEnd?.(store.getRun(run.id), { steps: ctx.state.steps || 0 });
+        onEnd?.(store.getRun(run.id), { steps: stepsTaken(ctx) });
       });
       const estimated = !knownCost;
       const costTxt = cost ? ` · $${cost.toFixed(2)}${estimated ? ' estimated charge (provider cost unreported)' : ''}` : '';
@@ -835,7 +928,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: status !== 'success' ? 'error' : blocked ? 'system' : 'done',
         text: `${outcome}${r?.subtype && r.subtype !== 'success' ? ` (${r.subtype})` : ''}${costTxt}${status !== 'success' && stderr ? ` — ${short(stderr, 200)}` : ''}` });
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
-      resolve({ run: store.getRun(run.id), result: r, failure, steps: ctx.state.steps || 0 });
+      resolve({ run: store.getRun(run.id), result: r, failure, steps: stepsTaken(ctx) });
+      ledgers.delete(run.id);
     };
     child.on('close', finish);
     child.on('error', (err) => {

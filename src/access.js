@@ -16,6 +16,7 @@ import { agentById } from './team.js';
 import { notify } from './notify.js';
 import * as ops from './ops.js';
 import * as packages from './packages.js';
+import { fromSettings as delegationPolicy } from './delegation-model.js';
 
 const nowIso = () => new Date().toISOString();
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
@@ -232,8 +233,10 @@ export function violations({ seat, probes, minutes, ticketScoped }, approver = n
   const v = [];
   if (approver && !pol.approvers.includes(approver)) v.push(`${nameOf(approver)} is not an approver`);
   if (approver && approver === seat) v.push('nobody approves their own access');
-  // Approver seats never get access from each other (no EM↔SRE reciprocity), and renewals are the owner's call.
-  if (pol.approvers.includes(seat) || ['manager', 'sre'].includes(seat)) v.push(`${nameOf(seat)} approves access, so their own access is the owner's decision`);
+  // Approver seats never get access from each other (no EM↔SRE reciprocity), and renewals are the owner's call. The owner
+  // may switch on delegation.peerAccess (#9): then the OTHER approver may grant a ticket-bound grant within this policy.
+  const peer = ticketScoped && peerAccess() && ['manager', 'sre'].includes(seat) && approver !== seat;
+  if (!peer && (pol.approvers.includes(seat) || ['manager', 'sre'].includes(seat))) v.push(`${nameOf(seat)} approves access, so their own access is the owner's decision${!ticketScoped && peerAccess() ? ' (peer access covers ticket-bound grants only)' : ''}`);
   if (recentAccess(seat)) v.push(`${nameOf(seat)} has or just had access: a renewal is the owner's decision`);
   if (!pol.seats.includes(seat)) v.push(`${nameOf(seat)} is not a seat the policy allows`);
   if (!pol.probes.includes('*') && (probes.includes('*') || probes.some((p) => !pol.probes.includes(p)))) v.push(`probes beyond the policy (${pol.probes.join(', ')})`);
@@ -242,6 +245,8 @@ export function violations({ seat, probes, minutes, ticketScoped }, approver = n
   if (activeAgentGrants() >= pol.maxActive) v.push(`already ${activeAgentGrants()} active agent-approved grants (policy: ${pol.maxActive})`);
   return v;
 }
+/** EM↔SRE reciprocal access for one ticket (delegation.peerAccess): owner-configurable, off by default. */
+export const peerAccess = () => delegationPolicy(store.getSettings(), config.delegation || {}).peerAccess === true;
 export function approverFor(seat, pol = policy()) {
   return pol.approvers.find((id) => id !== seat && agentById[id] && agentById[id].enabled !== false) || null;
 }

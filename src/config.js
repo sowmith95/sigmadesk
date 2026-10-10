@@ -6,6 +6,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { deskPaths } from './app-paths.js';
+import { KINDS as DELEGATION_KINDS, validMode as validDelegationMode } from './delegation-model.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -48,7 +49,7 @@ const DEFAULTS = {
     busyWindow: { enabled: false, timezone: 'America/New_York', days: [1, 2, 3, 4, 5], start: '09:30', end: '16:15', maxConcurrent: 1 },
     dailyBudgetUsd: 150,
     runBudgetUsd: { fable: 8, opus: 5, sonnet: 3, haiku: 0.75 },
-    runTimeoutMin: { implement: 45, qa: 20, review: 20, pr_review: 25, respond: 45, resolve: 30, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, verify: 15, watch: 15, access_review: 5, design: 20, council_review: 5, feature_groom: 25, epic_review: 20, mention: 15 },
+    runTimeoutMin: { implement: 45, qa: 20, review: 20, pr_review: 25, respond: 45, resolve: 30, triage: 8, groom: 20, research: 30, consult: 10, investigate: 20, verify: 15, watch: 15, access_review: 5, design: 20, council_review: 5, feature_groom: 25, epic_review: 20, mention: 15, decide: 10 },
     maxQaLoops: 2,
     planHoldAt: 0.8, // hold new runs when the Claude plan's 5-hour window is this full (leave room for you)
     maxConsultsPerGroom: 1,
@@ -131,7 +132,7 @@ const DEFAULTS = {
     // Engines with no per-run dollar cap but billed to the owner's plan (engines.*.billing = 'plan'): the bound is
     // time and steps instead. The desk stops the run at either limit. API-billed engines without a cap are refused.
     maxMinutes: 10,
-    maxSteps: 60, // tool calls and commands in one tagged run
+    maxSteps: 60, // tool calls and commands in one tagged run, plus its desk requests (a desk command counts twice)
     maxActions: 30, // desk commands one tagged run may send (counted by the desk itself)
   },
   resolve: {
@@ -162,7 +163,7 @@ const DEFAULTS = {
     // for a plan-billed engine without a cap, these time and step limits.
     budgetUsd: 1,
     maxMinutes: 10,
-    maxSteps: 40,
+    maxSteps: 40, // commands and tool calls the engine reports, plus desk requests (a desk command counts twice)
   },
   // Push to your phone when the desk needs you (Discord/Slack webhook or an ntfy.sh topic URL).
   notify: {
@@ -292,6 +293,28 @@ const DEFAULTS = {
       postDeployAutoGrant: false,
     },
   },
+  // Delegation (#9): the Engineering Manager (Morgan) or the SRE (Devon) decides some owner decisions for the owner. Per
+  // kind a mode: owner (you decide; nothing runs), shadow (the delegate decides, it is recorded and shown, and you still
+  // decide), em / sre (that seat decides for you; you can override or reopen it). Saved Settings → Autonomy edits win
+  // over the kinds here; enabled: false (or SIGMADESK_DELEGATION=off) makes every kind yours whatever is saved.
+  // Budget, policies, merges, publish guards, reverts, hold releases, standing or renewal grants, packages and this
+  // matrix itself are never delegable.
+  delegation: {
+    enabled: true,
+    kinds: { owner_task: 'shadow', question: 'shadow', research: 'shadow', loop_limit: 'shadow', design: 'shadow' },
+    peerAccess: false, // the EM and the SRE may approve each other's ticket-bound production read access (renewals stay yours)
+    budgetUsd: 0.75, // hard spend cap per decision attempt on an engine that enforces one (Claude)
+    maxMinutes: 6, // plan-billed engines without a dollar cap (Codex): time and step bounds per attempt
+    maxSteps: 60, // every command and tool call the engine reports, plus every desk request (a desk command counts twice; see README)
+    maxActions: 12, // desk commands one decision run may send (counted by the desk itself)
+    maxWaitMinutes: 30, // a delegated decision not started within this comes to you, explained
+    maxPerDay: 40, // decision runs per day across every kind
+    research: { maxCorrections: 1, maxSpendUsd: 1.5 }, // per proposal over its whole life (survives revisions)
+    loopLimit: { maxRescopes: 1 }, // per ticket
+    // The playbook heading under which the OWNER lists the standing rules a delegate may apply alone. Only those rules
+    // can be cited; with no such section (or an empty one) every delegated decision stays the owner's.
+    rulesSection: 'Standing rules the EM may apply alone',
+  },
   // Per-agent overrides keyed by agent id, e.g. {"junior": {"model": "haiku"}, "pm": {"enabled": false}}
   team: {},
   // Agents' Bash tool snapshots this shell's aliases; a plain bash avoids personal aliases (grep→rg, find→fd, ...).
@@ -372,6 +395,12 @@ export function loadConfig(file = deskPaths({ home: homeOf(process.env), legacyR
   if (env.SIGMADESK_TOKEN) c.server.ownerToken = env.SIGMADESK_TOKEN;
   if (env.SIGMADESK_REPO_PATH) c.project.repoPath = env.SIGMADESK_REPO_PATH;
   if (env.SIGMADESK_GITHUB_REPO) c.project.githubRepo = env.SIGMADESK_GITHUB_REPO;
+  // Delegation (#9): SIGMADESK_DELEGATION=off|on, SIGMADESK_DELEGATION_<KIND>=owner|shadow|em|sre (e.g.
+  // SIGMADESK_DELEGATION_QUESTION=em), SIGMADESK_DELEGATION_PEER_ACCESS=true|false.
+  c.delegation = { ...c.delegation, kinds: { ...(c.delegation.kinds || {}) } }; // never mutate the shared defaults
+  if (env.SIGMADESK_DELEGATION) c.delegation.enabled = !/^(off|false|0|no)$/i.test(env.SIGMADESK_DELEGATION);
+  for (const k of Object.keys(c.delegation.kinds || {})) { const v = env[`SIGMADESK_DELEGATION_${k.toUpperCase()}`]; if (v) c.delegation.kinds[k] = v.trim().toLowerCase(); }
+  if (env.SIGMADESK_DELEGATION_PEER_ACCESS) c.delegation.peerAccess = /^(on|true|1|yes)$/i.test(env.SIGMADESK_DELEGATION_PEER_ACCESS);
 
   c.project.repoPath = expandHome(c.project.repoPath);
   const home = homeOf(env);
@@ -498,6 +527,16 @@ export function validateConfig(c = config) {
   if (dwc.holidays !== undefined && !(Array.isArray(dwc.holidays) && dwc.holidays.every(day))) problems.push('deployWatch.calendar.holidays must be a list of YYYY-MM-DD dates');
   if (dwc.earlyCloses !== undefined && !(dwc.earlyCloses && typeof dwc.earlyCloses === 'object' && Object.entries(dwc.earlyCloses).every(([d, t]) => day(d) && hhmm(t)))) problems.push('deployWatch.calendar.earlyCloses must map YYYY-MM-DD to HH:MM');
   if (dwc.years !== undefined && !(Array.isArray(dwc.years) && dwc.years.every((y) => Number.isInteger(y) && y >= 2000 && y < 2100))) problems.push('deployWatch.calendar.years must be a list of years');
+  // Delegation (#9): an unknown kind or a mode the kind cannot take is a mistake, never silently "the owner's".
+  const dlg = c.delegation || {};
+  for (const [k, m] of Object.entries(dlg.kinds || {})) {
+    if (!DELEGATION_KINDS[k]) problems.push(`delegation.kinds.${k}: unknown decision kind (${Object.keys(DELEGATION_KINDS).join(', ')})`);
+    else if (!validDelegationMode(k, m)) problems.push(`delegation.kinds.${k} must be owner, shadow or ${DELEGATION_KINDS[k].delegates.join(' or ')}`);
+  }
+  if (dlg.enabled !== undefined && typeof dlg.enabled !== 'boolean') problems.push('delegation.enabled must be true or false');
+  if (dlg.peerAccess !== undefined && typeof dlg.peerAccess !== 'boolean') problems.push('delegation.peerAccess must be true or false');
+  if (dlg.rulesSection !== undefined && !(typeof dlg.rulesSection === 'string' && dlg.rulesSection.trim() && dlg.rulesSection.length <= 120 && !/[\n#]/.test(dlg.rulesSection)))
+    problems.push('delegation.rulesSection must be a playbook heading (text without #, at most 120 characters)');
   const modelList = (v) => Array.isArray(v) && v.every((id) => typeof id === 'string' && /^[\w.:-]{1,80}$/.test(id));
   for (const id of ['claude', 'codex', 'perplexity']) if (!modelList(c.engines[id]?.models)) problems.push(`engines.${id}.models must be a list of model ids`);
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');

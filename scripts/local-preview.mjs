@@ -24,8 +24,11 @@ else {process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringi
 `); fs.chmodSync(cli, 0o755);
 const log = path.join(tmp, 'application.log'); fs.writeFileSync(log, 'INFO preview ready\n');
 const cfg = path.join(tmp, 'config.json');
+// The preview's own copy of the default playbook (a browser test may pass its own file to edit).
+const playbook = process.env.SIGMADESK_PREVIEW_PLAYBOOK || path.join(tmp, 'playbook.md');
+if (!process.env.SIGMADESK_PREVIEW_PLAYBOOK) fs.copyFileSync(path.join(root, 'playbooks/default.md'), playbook);
 fs.writeFileSync(cfg, JSON.stringify({ server: { port: Number(process.env.SIGMADESK_PORT || 8791), hosts: ['127.0.0.1'], preventIdleSleep: false, preview: true, ...(process.env.SIGMADESK_PREVIEW_TOKEN ? { ownerToken: process.env.SIGMADESK_PREVIEW_TOKEN } : {}) /* tests of the sign-in link */ },
-  project: { name: 'SigmaDesk · local preview', repoPath: repo, githubRepo: 'test/fixture', playbook: path.join(root, 'playbooks/default.md') },
+  project: { name: 'SigmaDesk · local preview', repoPath: repo, githubRepo: 'test/fixture', playbook },
   bins: { claude: cli }, engines: { codex: { bin: cli } }, github: { sync: false, openDraftPrs: false }, pm: { enabled: false },
   watch: { enabled: true, intervalSeconds: 5, sources: [{ type: 'file', path: log, label: 'Preview service' }] }, notify: { webhookUrl: '' },
   // Decision demo: one workflow mapped to a service (the brief names a target only from this), read-only probes configured.
@@ -102,6 +105,43 @@ for (const [status, title, assignee, priority, area, complexity] of tickets) {
   store.updateTicket(c.key, { resume_status: 'todo' }); store.addComment(c.key, 'dba', `❓ **Question for the owner:** Should I wait for ${v.key}, or draft the DDL now?`);
   store.createTicket({ title: 'Backfill the audit table', status: 'todo', type: 'task', area: 'backend', complexity: 'S', assignee: 'junior', parent_key: audit.key, description: `Blocked by ${c.key}; replay the last week.` });
 }
+// Delegation (#9) fixtures: what Morgan would answer (shadow), one question Morgan left to the owner, and one Morgan
+// answered for the owner ("Decided for you"). Records only: no decision run, no model call.
+{
+  const delegation = await import('../src/delegation.js');
+  const asked = (prefix) => {
+    const t = store.listTickets().find((x) => x.title.startsWith(prefix));
+    const q = store.listComments(t.key).find((c) => c.body.startsWith('❓'));
+    return store.updateTicket(t.key, { hold_kind: 'question', hold_seat: q.author, hold_ref: String(q.id) });
+  };
+  const record = (t, extra) => {
+    const c = delegation.candidates().find((x) => x.ticket.key === t.key);
+    return store.createDelegation({ kind: 'question', decision_id: c.decision_id, ticket_key: t.key, version: c.version, policy_version: 'demo', delegation_version: delegation.version(),
+      mode: 'shadow', seat: 'manager', asker: t.hold_seat, allowed: ['answer', 'escalate'], brief: { you_decide: `Answer ${agentByIdName(t.hold_seat)}`, gate: { headline: 'Ready for you.' } },
+      provenance: { decided_for: 'owner', by: 'manager', deterministic: false }, decided_at: store.now(), ended_at: store.now(), ...extra }).row;
+  };
+  record(asked('Normalize equity fills'), { status: 'shadow', action: 'answer', text: 'Skip odd lots, as the options journal does: the playbook says one journal contract.', why: 'docs/journal.md defines one row per round-lot fill; the options journal skips odd lots.' });
+  const v = asked('Verify fills on the production box');
+  const e = record(v, { status: 'shadow' });
+  store.updateDelegation(e.id, { status: 'escalated', action: 'escalate', why: 'it needs production access, which only you can grant', recommendation: `Grant ${agentByIdName('sre')} read access for this ticket.` });
+  // Its own ticket, so the other fixtures (and the tests that read them) keep their questions.
+  const own = store.createTicket({ title: 'Rename the retry helper', status: 'needs_human', type: 'task', area: 'backend', complexity: 'S', assignee: 'junior', reporter: 'owner', description: 'Give the shared retry helper a clearer name.' });
+  store.updateTicket(own.key, { resume_status: 'todo', risk: 'low' }); store.addComment(own.key, 'junior', '❓ **Question for the owner:** Is `retry_call` used outside utils/net.py?');
+  const d = asked('Rename the retry helper');
+  const done = record(d, { status: 'applied', mode: 'em', action: 'answer', text: 'Only in utils/net.py and its tests: rename it there and in tests/test_net.py.', why: 'A repository search finds retry_call in utils/net.py:40 and tests/test_net.py only; the playbook says keep renames in one change.' });
+  const c = store.addComment(d.key, 'manager', `💬 **Morgan answered Riley for you**\n\n${done.text}\n\n_Decided for the owner by Morgan under the delegation policy (engineers' questions → Morgan). The owner can override or reopen this in the Inbox._`);
+  store.updateDelegation(done.id, { comment_id: c.id });
+  store.updateTicket(d.key, { status: 'todo', resume_status: null });
+  // Long copy, for narrow screens: a long ticket title and a long answer must still fold into two lines.
+  const long = store.createTicket({ title: 'Normalize the broker fill timestamps across every venue adapter, the nightly reconciliation job and the audit export', status: 'needs_human', type: 'task', area: 'backend', complexity: 'S', assignee: 'senior-be', reporter: 'owner', description: 'Fills from three venues carry local timestamps; the audit export assumes UTC.' });
+  store.updateTicket(long.key, { resume_status: 'todo', risk: 'low' }); store.addComment(long.key, 'senior-be', '❓ **Question for the owner:** Which module converts venue timestamps today, and is it already used by the reconciliation job?');
+  const l = asked('Normalize the broker fill timestamps');
+  const lr = record(l, { status: 'applied', mode: 'em', action: 'answer', text: 'adapters/timefmt.py converts venue-local timestamps to UTC in to_utc(), and the nightly reconciliation job already calls it through recon/load.py, so the audit export should call to_utc() too instead of adding a second converter with its own daylight-saving rules.', why: 'adapters/timefmt.py:12 defines to_utc(); recon/load.py:88 calls it; the playbook says reuse the existing helper.' });
+  const lc = store.addComment(l.key, 'manager', `💬 **Morgan answered Jordan for you**\n\n${lr.text}\n\n_Decided for the owner by Morgan under the delegation policy (engineers' questions → Morgan). The owner can override or reopen this in the Inbox._`);
+  store.updateDelegation(lr.id, { comment_id: lc.id });
+  store.updateTicket(l.key, { status: 'todo', resume_status: null });
+}
+function agentByIdName(id) { return String((team.agentById[id] || {}).name || id).split(/\s+/)[0]; }
 store.logEvent({ kind: 'system', text: 'Isolated demo: all execution seats disabled. No production state or credentials are used.' });
 console.log(`Preview fixture: ${tmp}`);
 process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));

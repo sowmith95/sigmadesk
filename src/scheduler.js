@@ -29,6 +29,8 @@ import * as packages from './packages.js';
 import * as netfetch from './netfetch.js';
 import * as mentions from './mentions.js';
 import * as deploywatch from './deploywatch.js';
+import * as delegation from './delegation.js';
+import { QUESTION_SCOPES } from './delegation-model.js';
 import * as flow from '../public/flow.js';
 
 const prNumberOf = (url) => Number(String(url || '').match(/\/pull\/(\d+)/)?.[1]) || null;
@@ -188,7 +190,8 @@ export function setStatus(key, status, extra = {}) {
   const before = store.getTicket(key)?.status;
   const t = store.updateTicket(key, { status, ...extra });
   github.syncIssueState(key);
-  if (status !== before && status === 'needs_human') notify('needs_human', t, 'needs you');
+  // A hold whose kind is delegated (#9) is announced by the delegation only if it comes back to the owner.
+  if (status !== before && status === 'needs_human' && !delegation.deferNotice(t)) notify('needs_human', t, 'needs you');
   if (status !== before && status === 'ready_for_human') notify('ready_for_human', t, 'ready for your review');
   if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key); // clones are full copies now; free the disk
   if (['done', 'wontdo'].includes(status)) store.clearReservation(key);
@@ -303,7 +306,7 @@ function stall(ticket, reason) {
   const resume = ticket.status === 'in_progress' ? 'todo' : ticket.status;
   if (stalls >= 2) {
     store.addComment(ticket.key, 'system', `Stalled twice (${reason}). Parked for you: answer on the ticket to resume.`);
-    setStatus(ticket.key, 'needs_human', { stalls, active_run: null, resume_status: resume });
+    setStatus(ticket.key, 'needs_human', { stalls, active_run: null, resume_status: resume, hold_kind: 'stalled' });
   } else {
     store.logEvent({ ticket_key: ticket.key, kind: 'system', text: `no outcome (${reason}); will retry once` });
     store.updateTicket(ticket.key, { stalls, active_run: null, status: resume });
@@ -355,13 +358,10 @@ async function readonlyJob(agentId, ticket, kind) {
 }
 
 // ---------------- production verification (SRE + desk ops) ----------------
-/** A read-only production check (verify/confirm/check … in production), not a write, restart, credential or decision. */
-export function isVerifyAsk(text) {
-  const t = String(text || '');
-  return /\b(verify|verif\w*|confirm\w*|check\w*|establish\w*|inspect\w*|investigat\w*|diagnos\w*|look (at|into)|measure\w*|query|read)\b/i.test(t)
-    && /\b(prod|production|live|timescale\w*|database|db|postgres\w*|container\w*|logs?|ingest\w*|hypertable\w*|jobs?|incident|health|freshness)\b/i.test(t)
-    && !/\b(restart\w*|redeploy\w*|deploy\w*|writes?|insert\w*|updat\w*|delet\w*|drop\w*|truncat\w*|alter\w*|migrat\w*|grant\w*|revok\w*|credential\w*|password\w*|secret\w*|tokens?|api key|rotat\w*|vacuum|reindex\w*|kill\w*|terminat\w*|backfill\w*|account\w*|billing|business decision|approv\w*|purchas\w*)\b/i.test(t);
-}
+/** Owner-step kinds a seat may state with desk create-task --owner-kind (#9). check and package can be routed back to
+ * the team by delegation; the rest stay the owner's. The desk itself also records 'probe' (no probe could answer it)
+ * and 'owner' (the owner took the task). */
+export const OWNER_TASK_KINDS = ['check', 'package', 'write', 'restart', 'credential', 'business', 'other'];
 export const verifyReady = () => ops.enabled() && (config.ops.kinds || []).includes('verify') && agentById.sre?.enabled !== false;
 /** A verify task without a grant: ask once (ticket-scoped, reviewed by the EM within policy). False = keep waiting. */
 function verifyAccess(t) {
@@ -379,7 +379,7 @@ async function launchAccessReview(r, approver, fence) {
 }
 function verifyToOwner(t, why = 'a read-only production check, and production read access is off (Settings → Production read access).') {
   store.kvSet(`verify:${t.key}`, '');
-  store.updateTicket(t.key, { owner_task: 1, assignee: null });
+  store.updateTicket(t.key, { owner_task: 1, owner_task_kind: 'check', owner_task_by: 'desk', assignee: null }); // still a check: it is the owner's only while nobody can read production
   store.addComment(t.key, 'system', `🙋 **This is your task**: ${why}`);
 }
 async function launchVerify(t, fence) {
@@ -577,7 +577,7 @@ export async function launchMention(m, fence) {
 // A slice ordered after a sibling that was closed without merging would otherwise wait forever.
 function orphanedSlice(t) {
   store.addComment(t.key, 'system', `⚠️ This slice was waiting for ${t.after_key}, which was closed without merging. Decide: continue without it (reply), rescope, or close.`);
-  setStatus(t.key, 'needs_human', { after_key: null, resume_status: 'todo', progress_msg: `predecessor ${t.after_key} closed unmerged` });
+  setStatus(t.key, 'needs_human', { after_key: null, resume_status: 'todo', progress_msg: `predecessor ${t.after_key} closed unmerged`, hold_kind: 'orphaned' });
 }
 
 // Preparing a clone takes seconds; if the owner moved, rejected or reassigned the ticket meanwhile, do not start.
@@ -603,7 +603,7 @@ async function launchImplement(ticket, agentId, fence, reason = null) {
   } catch (err) {
     store.updateAgent(agentId, { status: 'idle', current_ticket: null });
     store.logEvent({ agent_id: agentId, ticket_key: ticket.key, kind: 'error', text: `workspace setup failed: ${err.message}` });
-    setStatus(ticket.key, 'needs_human', { active_run: null, resume_status: 'todo', progress_msg: 'workspace setup failed' });
+    setStatus(ticket.key, 'needs_human', { active_run: null, resume_status: 'todo', progress_msg: 'workspace setup failed', hold_kind: 'workspace' });
     return;
   }
   if (!stillWanted(ticket.key, 'in_progress', agentId)) return;
@@ -749,7 +749,7 @@ async function launchResolve(job, fence) {
     idle();
     store.updateConflictJob(j.id, { status: 'needs_owner', note: 'resolution attempts exhausted' });
     store.addComment(t.key, 'system', `🧭 ${agentById[seat].name} tried to resolve the conflict ${attempts - 1} times without finishing. Reply to let them try again, or resolve it yourself.`);
-    setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: 'conflict needs your call' });
+    setStatus(t.key, 'needs_human', { resume_status: 'review', progress_msg: 'conflict needs your call', hold_kind: 'conflict', hold_seat: seat });
     return;
   }
   const pack = await mergetrain.conflictPack(j, t, prepared.dir);
@@ -806,14 +806,14 @@ async function launchInvestigation(inc, fence) {
   }
 }
 
-function pageOwner(incidents, why) {
+function pageOwner(incidents, why, { trading = false } = {}) {
   const top = incidents.slice(0, 12);
   const t = store.createTicket({
-    title: incidents.length > 1 ? `Error storm: ${incidents.length} new error signatures` : `Needs you: ${incidents[0].normalized.slice(0, 90)}`,
+    title: incidents.length > 1 ? `Error storm: ${incidents.length} new error signatures` : `${trading ? 'Trading may be affected' : 'Needs you'}: ${incidents[0].normalized.slice(0, 90)}`,
     description: `${why}\n\n${top.map((i) => `- **${i.label}** (${i.count}×, last ${i.last_seen}): \`${i.normalized.slice(0, 160)}\``).join('\n')}`,
-    type: 'bug', status: 'needs_human', priority: incidents.length > 1 ? 'P0' : 'P1', reporter: 'sre', source: 'watch',
+    type: 'bug', status: 'needs_human', priority: incidents.length > 1 || trading ? 'P0' : 'P1', reporter: 'sre', source: 'watch',
   });
-  store.updateTicket(t.key, { resume_status: 'proposed' });
+  store.updateTicket(t.key, { resume_status: 'proposed', hold_kind: 'page', hold_seat: 'sre' });
   notify('page', t, 'SRE paged you');
   for (const i of incidents) store.updateIncident(i.id, { status: 'paged', ticket_key: t.key });
   store.logEvent({ agent_id: 'sre', ticket_key: t.key, kind: 'system', text: `paged the owner: ${t.title}` });
@@ -828,6 +828,7 @@ export function watchDecisions() {
   for (const inc of d.foreign) {
     const t = store.createTicket({ title: `[${inc.project}] ${inc.normalized.slice(0, 100)}`, type: 'bug', status: 'needs_human', priority: 'P2', reporter: 'sre', source: 'watch',
       description: `Recurring error from **${inc.project}** (${inc.label}), which this desk does not manage.\n\n${incidentEvidence(inc)}` });
+    store.updateTicket(t.key, { hold_kind: 'foreign', hold_seat: 'sre' });
     store.updateIncident(inc.id, { status: 'foreign', ticket_key: t.key });
   }
   for (const inc of d.regressions) {
@@ -936,6 +937,9 @@ export async function tick() {
   try {
     lastTick = store.now();
     const s = store.getSettings();
+    // Delegated decisions (#9): supersede what moved on, open records, triage owner tasks by rule, send late ones back.
+    // While halted it only expires and supersedes (nothing is applied or started).
+    try { delegation.sweep({ paused: s.paused === 'true' }); } catch (err) { store.logEvent({ kind: 'error', agent_id: 'system', text: `delegation: ${store.redact(err.message).slice(0, 240)}` }); }
     if (s.paused === 'true') return;
     let headroom = budgetHeadroom(s);
     // Seats are flipped to "working" synchronously when a job starts, so this counts jobs still in setup too.
@@ -1015,6 +1019,12 @@ export async function tick() {
     }
     const discussion = store.pendingDiscussions().find((d) => d.status === 'queued');
     if (discussion && slots > 0 && agentIdle('manager')) go('manager', (f) => launchDiscussion(discussion, f), null, 'owner_discussion');
+    // Delegated decisions (#9): one bounded decide run each, while a slot stays free for QA and incidents.
+    for (const r of delegation.nextJobs({ shadow: false })) {
+      if (slots <= (capacity(s) > 1 ? 1 : 0)) break;
+      if (!agentIdle(r.seat)) continue;
+      go(r.seat, (f) => delegation.launch(r, f), null, 'decide');
+    }
     // Owner-requested feature grooming (Codex) runs before ordinary grooming: the owner is waiting on it.
     const plan = features.next();
     if (plan && slots > 0 && agentIdle('manager')) go('manager', (f) => features.launch(plan, f), features.ENGINE, 'feature_groom');
@@ -1125,6 +1135,12 @@ export async function tick() {
     // 4. Manager grooms proposals (consulting principals inside the run); research proposals wait for their second review.
     const proposed = store.ticketsByStatus('proposed').find((t) => !t.active_run && !researchReview.blocks(t) && !features.holds(t));
     if (proposed && slots > 0 && agentIdle('manager')) go('manager', (f) => launchGroom(proposed, f), groomEngine(), 'groom');
+    // Shadow decisions (#9) only take a seat's idle time: the owner decides them anyway.
+    for (const r of delegation.nextJobs({ shadow: true })) {
+      if (slots <= (capacity(s) > 1 ? 1 : 0)) break;
+      if (!agentIdle(r.seat)) continue;
+      go(r.seat, (f) => delegation.launch(r, f), null, 'decide');
+    }
     // 5. Research programs on their own cadence and market window while the funnel is thin (oldest last run first).
     for (const p of research.due(s)) {
       if (slots <= 0 || researchAllowance(s) <= 0) break;
@@ -1187,6 +1203,7 @@ export function recoverOrphans() {
     else if ((m.attempts || 0) >= mentions.maxAttempts()) store.updateMention(m.id, { status: 'failed', run_id: null, reason: 'interrupted by desk restarts', ended_at: store.now() });
     else store.updateMention(m.id, { status: 'queued', run_id: null, reason: 'interrupted by a desk restart' });
   }
+  delegation.recover(); // an interrupted decision run is not retried: its decision goes to the owner, explained
   mergetrain.recover(); // interrupted conflict resolutions go back to pending (durable, keyed by PR/base/head)
   // Post-deploy checkpoints: spend is rebuilt from the run rows (never a fresh allowance after a crash), then an
   // interrupted desk check is due again and an interrupted SRE run is asked again (bounded by sreMaxAttempts).
@@ -1202,7 +1219,7 @@ export function recoverOrphans() {
   for (const a of store.listAgentStates()) store.updateAgent(a.id, { status: 'idle', current_ticket: null, current_run: null, current_kind: null, meeting: null });
   for (const t of store.listTickets()) {
     if (t.active_run) store.updateTicket(t.key, { active_run: null, ...(t.status === 'in_progress' ? { status: 'todo' } : {}) });
-    if (refresh.current(t.key)?.status === 'preparing') store.updateTicket(t.key, { status: 'needs_human', active_run: null, resume_status: 'todo', progress_msg: 'branch refresh interrupted — preserved recovery clone needs inspection' });
+    if (refresh.current(t.key)?.status === 'preparing') store.updateTicket(t.key, { status: 'needs_human', active_run: null, resume_status: 'todo', progress_msg: 'branch refresh interrupted — preserved recovery clone needs inspection', hold_kind: 'refresh_interrupted' });
   }
 }
 
@@ -1215,11 +1232,12 @@ const PERMS = {
   route: ['support'], submit: ENGINEERS, lesson: BUILDERS, qa: ['qa'], accept: ['pm', 'manager', 'sre'], incident: ['sre'],
   'discussion-result': ['manager'],
   review: ['manager', ...ENGINEERS], respond: ENGINEERS, resolve: ENGINEERS,
-  'continue-rebase': BUILDERS, verify: ['sre'], watch: ['sre'], access: ['manager', 'sre'],
+  'continue-rebase': BUILDERS, verify: ['sre'], watch: ['sre'], access: ['manager', 'sre'], decide: ['manager', 'sre'],
 };
 const PRIORITY = /^P[0-3]$/;
 const consultsByRun = new Map();
 const mentionActions = new Map(); // desk actions per tagged run (server-side allowance)
+const decideActions = new Map(); // desk actions per decision run (#9)
 const consultTargets = new Map();
 const peerReviewsByRun = new Set();
 
@@ -1256,10 +1274,27 @@ export async function deskAction(run, cmd, body = {}) {
     need(used <= mentions.maxActions(), `this tagged run used its ${mentions.maxActions()} desk actions; reply with what you have and stop`);
   } else need(!['reply', 'handoff'].includes(cmd), `desk ${cmd} only works in a run where the owner tagged you`);
   if (run.kind === 'access_review') need(['show', 'list', 'access'].includes(cmd), 'an access review decides one request: desk access approve|deny|owner');
+  // A decision run (#9) reads the brief and the ticket and answers with exactly one desk decide, within an action
+  // allowance the desk counts itself.
+  if (run.kind === 'decide') {
+    need(['show', 'list', 'decide', 'context-file'].includes(cmd), 'a decision run reads the ticket and finishes with desk decide');
+    need(!body.key || body.key === run.ticket_key, 'decide on the decision you were given');
+    const used = (decideActions.get(run.id) || 0) + 1;
+    decideActions.set(run.id, used);
+    need(used <= delegation.limits().maxActions, `this decision run used its ${delegation.limits().maxActions} desk actions; decide with what you have or escalate`);
+  } else need(cmd !== 'decide', 'desk decide only works inside a decision run');
   if (run.kind === 'verify') need(['show', 'list', 'comment', 'progress', 'ops', 'verify', 'context-file'].includes(cmd), 'a verify run reads production through desk ops and finishes with desk verify done|owner');
   // A post-deploy checkpoint run reads and decides; it never comments, submits, publishes or changes a ticket.
   if (run.kind === 'watch') need(['show', 'list', 'ops', 'watch', 'context-file'].includes(cmd), 'a post-deploy check reads production through desk ops and finishes with desk watch verified|regression|inconclusive');
   else need(cmd !== 'watch', 'desk watch only works inside a post-deploy check run');
+  // A step-bounded run's desk request (a tagged reply, a decision run, a post-deploy check) is a step of its own,
+  // admitted BEFORE it is carried out: past the allowance the run is stopped and nothing it asked for happens.
+  if (runner.isStepBounded(run.kind)) runner.admitDeskCall(run);
+  return carryOut(run, cmd, body);
+}
+/** What a desk command does, once the gates above let its run send it. */
+async function carryOut(run, cmd, body) {
+  const agentId = run.agent_id;
   if (PERMS[cmd]) need(PERMS[cmd].includes(agentId), `${agentById[agentId].role} cannot run "${cmd}"`);
   const key = body.key || run.ticket_key;
   const ticket = key ? store.getTicket(key) : null;
@@ -1343,8 +1378,13 @@ export async function deskAction(run, cmd, body = {}) {
     case 'needs-human': {
       ownTicket();
       need(body.body, 'question required');
-      store.addComment(ticket.key, agentId, `❓ **Question for the owner:** ${body.body}`);
-      setStatus(ticket.key, 'needs_human', { resume_status: ticket.status === 'in_progress' ? 'todo' : ticket.status });
+      // --about (#9): what the question is about, in the asker's own words. Only a factual engineering question can be
+      // answered for the owner by delegation; any other subject, or none, stays the owner's.
+      const about = body.about === undefined || body.about === true ? null : String(body.about);
+      need(!about || Object.hasOwn(QUESTION_SCOPES, about), `--about must be one of ${Object.keys(QUESTION_SCOPES).join(', ')}`);
+      const asked = store.addComment(ticket.key, agentId, `❓ **Question for the owner:** ${body.body}`);
+      // Structured: a question, who asked it, what about, and which comment it is (delegation answers exactly this).
+      setStatus(ticket.key, 'needs_human', { resume_status: ticket.status === 'in_progress' ? 'todo' : ticket.status, hold_kind: 'question', hold_seat: agentId, hold_ref: String(asked.id), hold_scope: about });
       ev(`asked the owner: ${String(body.body).slice(0, 140)}`);
       github.flushComments();
       return 'Parked for the owner. Stop working on this ticket now and end your run.';
@@ -1424,23 +1464,33 @@ export async function deskAction(run, cmd, body = {}) {
       if (body.after) { const host = store.getTicket(parentOf); const ix = flow.index(store.listTickets()); need(!host || ![host, ...flow.ancestors(host, ix)].some((a) => a.key === body.after), `--after ${body.after} contains this task; it would wait forever`); }
       // --owner "<why>": a step only the owner can do (access no seat has). It goes to the owner, never to a seat.
       const ownerWhy = typeof body.owner === 'string' && body.owner.trim() ? body.owner.trim().slice(0, 500) : body.owner === true ? 'Only the owner can do this step.' : null;
-      // --verify (or an --owner step that is really a read-only production check): the SRE answers it with desk ops
-      // probes; the owner only gets it when production read access is off or the probes cannot answer.
-      const verifyAsk = body.verify === true || (!!ownerWhy && isVerifyAsk(`${body.title}\n${ownerWhy}`));
-      const toSre = verifyAsk && verifyReady();
-      const ownerReason = ownerWhy || (verifyAsk ? 'Read-only production check, and production read access for the SRE is off (Settings → Production read access).' : null);
+      // --owner-kind (#9): what kind of owner step this is, stated by the seat that files it. It is the structured reason
+      // delegation routes on; without it the step is unknown and stays the owner's.
+      const ownerKind = body['owner-kind'] === undefined || body['owner-kind'] === true ? null : String(body['owner-kind']);
+      need(!ownerKind || OWNER_TASK_KINDS.includes(ownerKind), `--owner-kind must be one of ${OWNER_TASK_KINDS.join(', ')}`);
+      need(!ownerKind || ownerWhy, '--owner-kind goes with --owner "<why only the owner can do it>"');
+      // Two separate routes, never inferred from the text. --verify asks the SRE for a read-only production check (the
+      // desk's probes; the owner gets it only while production read access is off). --owner is a request to the owner:
+      // it is the owner's task, and only the delegation's mode-checked triage may route a stated kind back to the team.
+      need(!(body.verify === true && ownerWhy), 'use --verify for a read-only production check the SRE answers, or --owner for a step only the owner can do, not both');
+      const verify = body.verify === true;
+      const toSre = verify && verifyReady();
+      const ownerReason = ownerWhy || (verify ? 'Read-only production check, and production read access for the SRE is off (Settings → Production read access).' : null);
       const asOwnerTask = (k) => {
         if (toSre) {
           store.updateTicket(k, { owner_task: 0, assignee: 'sre', assign_pinned: 1 });
           store.kvSet(`verify:${k}`, '1');
-          store.addComment(k, 'system', `🔎 Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes${ownerWhy ? ` instead of the owner (asked: ${ownerWhy})` : ''}. It reaches the owner only if no probe can answer it.`);
+          store.addComment(k, 'system', `🔎 Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes. It reaches the owner only if no probe can answer it.`);
           return;
         }
         if (!ownerReason) return;
-        store.updateTicket(k, { owner_task: 1, assignee: null });
+        // A --verify the SRE cannot take yet is still a check; the desk parked it with the owner, not the filing seat.
+        store.updateTicket(k, { owner_task: 1, owner_task_kind: ownerWhy ? ownerKind : 'check', owner_task_by: ownerWhy ? agentId : 'desk', assignee: null });
         store.addComment(k, agentId, `🙋 **This is your task**: ${ownerReason}`);
+        delegation.triageOwnerTask(k);
       };
-      const whoFor = (seat) => (toSre ? 'sre (read-only production check)' : ownerReason ? 'the owner' : seat);
+      const whoFor = (k, seat) => { const t = store.getTicket(k); return t.owner_task ? 'the owner' : t.assignee === 'sre' && store.kvGet(`verify:${k}`) === '1' ? 'sre (read-only production check)' : t.assignee || seat; };
+      const roleFor = (k, seat) => { const t = store.getTicket(k); return t.owner_task ? 'the owner' : agentById[t.assignee || seat]?.role || seat; };
       if (PRINCIPALS.includes(agentId)) {
         // A principal's slices: small, built by cheaper seats, attached to the ticket being designed.
         need(run.kind === 'design' && run.ticket_key, 'slices are created during a design run');
@@ -1454,9 +1504,9 @@ export async function deskAction(run, cmd, body = {}) {
         // The slicer is the context reviewer later; slices inherit the parent's risk.
         store.updateTicket(slice.key, { designer: agentId, risk: parent.risk || null, assign_pinned: body.assign ? 1 : 0, ...(body.after ? { after_key: body.after } : {}) });
         asOwnerTask(slice.key);
-        ev(`sliced ${slice.key} (${body.complexity}) for ${toSre ? agentById.sre.role : ownerReason ? 'the owner' : agentById[slice.assignee].role}${body.after ? ` after ${body.after}` : ''}`, slice.key);
+        ev(`sliced ${slice.key} (${body.complexity}) for ${roleFor(slice.key, slice.assignee)}${body.after ? ` after ${body.after}` : ''}`, slice.key);
         github.createIssue(slice.key);
-        return `created ${slice.key} → ${whoFor(slice.assignee)}${gateNote}`;
+        return `created ${slice.key} → ${whoFor(slice.key, slice.assignee)}${gateNote}`;
       }
       const parentKey = body.parent || key;
       // The reroute decision uses the risk the task will actually carry (inherited from its parent when not given).
@@ -1471,9 +1521,9 @@ export async function deskAction(run, cmd, body = {}) {
       store.updateTicket(t.key, { origin_session: store.getRun(run.id)?.session_id || null, risk: ['high', 'low'].includes(body.risk) ? body.risk : parentRisk || null, assign_pinned: explicit?.pinned ? 1 : 0, ...(body.after ? { after_key: body.after } : {}) });
       if (explicit?.rerouted) store.addComment(t.key, 'system', `Principals design and slice; this ${body.complexity} task goes to ${agentById[assignee].name} instead of ${agentById[explicit.rerouted].name}.`);
       asOwnerTask(t.key);
-      ev(`created task ${t.key} for ${toSre ? agentById.sre.role : ownerReason ? 'the owner' : agentById[assignee].role}${body.after ? ` after ${body.after}` : ''}`, t.key);
+      ev(`created task ${t.key} for ${roleFor(t.key, assignee)}${body.after ? ` after ${body.after}` : ''}`, t.key);
       github.createIssue(t.key);
-      return `created ${t.key} assigned to ${whoFor(assignee)}${gateNote}`;
+      return `created ${t.key} assigned to ${whoFor(t.key, assignee)}${gateNote}`;
     }
     case 'design':
       need(ticket && ticket.key === run.ticket_key && run.kind === 'design', 'design only on the ticket you are designing');
@@ -1515,7 +1565,7 @@ export async function deskAction(run, cmd, body = {}) {
       if (['feature', 'bug', 'task', 'research'].includes(body.type)) patch.type = body.type;
       if (PRIORITY.test(body.priority)) patch.priority = body.priority;
       store.addComment(ticket.key, agentId, `Routed to ${body.to === 'pm' ? 'product' : body.to}: ${body.body || ''}`);
-      if (body.to === 'human') setStatus(ticket.key, 'needs_human', { ...patch, resume_status: 'proposed' });
+      if (body.to === 'human') setStatus(ticket.key, 'needs_human', { ...patch, resume_status: 'proposed', hold_kind: 'route', hold_seat: agentId });
       else setStatus(ticket.key, 'proposed', patch);
       ev(`routed ${ticket.key} → ${body.to}`);
       return 'ok';
@@ -1586,7 +1636,7 @@ export async function deskAction(run, cmd, body = {}) {
         store.transaction(() => {
           store.recordQaVerdict({ ...fact, verdict: 'fail', reason: body.reason, lesson_id: lesson?.id ?? null });
           store.addComment(ticket.key, agentId, `❌ **QA failed** (round ${loops}, ${body.reason}${lesson ? `, repeats lesson #${lesson.id}` : ''})\n\n${body.body || ''}`);
-          if (loops > config.limits.maxQaLoops) setStatus(ticket.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'QA failed repeatedly' });
+          if (loops > config.limits.maxQaLoops) setStatus(ticket.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'QA failed repeatedly', hold_kind: 'qa_loops', hold_seat: agentId });
           else setStatus(ticket.key, 'todo', { qa_loops: loops, progress: 50, progress_msg: 'fixing QA findings' });
           ev(`QA failed ${ticket.key}`);
         });
@@ -1646,7 +1696,7 @@ export async function deskAction(run, cmd, body = {}) {
       if (body.verdict === 'changes') {
         const loops = (ticket.qa_loops || 0) + 1;
         store.addComment(ticket.key, agentId, `🔁 **Changes requested by ${agentById[agentId].name}** (round ${loops})\n\n${body.body || ''}`);
-        if (loops > config.limits.maxQaLoops) setStatus(ticket.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'review loop limit hit' });
+        if (loops > config.limits.maxQaLoops) setStatus(ticket.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'review loop limit hit', hold_kind: 'review_loops', hold_seat: agentId });
         else setStatus(ticket.key, 'todo', { qa_loops: loops, progress: 50, progress_msg: 'addressing requester feedback' });
         ev(`requested changes on ${ticket.key}`);
         github.flushComments();
@@ -1724,7 +1774,7 @@ export async function deskAction(run, cmd, body = {}) {
         return 'Recorded; the tasks waiting on this check can start. Stop now.';
       }
       store.kvSet(`verify:${ticket.key}`, '');
-      store.updateTicket(ticket.key, { owner_task: 1, assignee: null, status: 'todo' });
+      store.updateTicket(ticket.key, { owner_task: 1, owner_task_kind: 'probe', owner_task_by: agentId, assignee: null, status: 'todo' }); // no probe answers it: never routed back
       store.addComment(ticket.key, agentId, `🙋 **This is your task**: ${body.body}\n\n_(The SRE's read-only production probes could not answer it.)_`);
       ev(`handed to the owner: ${String(body.body).slice(0, 140)}`);
       github.flushComments();
@@ -1732,6 +1782,8 @@ export async function deskAction(run, cmd, body = {}) {
     }
     case 'watch':
       return deploywatch.command(run, body);
+    case 'decide':
+      return delegation.command(run, body);
     case 'review':
       return reviews.reviewVerdict(run, ticket, body);
     case 'respond':
@@ -1742,7 +1794,16 @@ export async function deskAction(run, cmd, body = {}) {
       need(run.kind === 'investigate' && run.incident_id, 'incident commands only work inside an investigation');
       const inc = store.getIncident(run.incident_id);
       need(inc && inc.status === 'investigating', 'incident already decided');
-      need(['file', 'mute', 'page'].includes(body.action), 'desk incident file|mute|page');
+      need(['file', 'mute', 'page', 'regression'].includes(body.action), 'desk incident file|mute|page|regression');
+      // The SRE decides for the owner (#9): hold every deploying merge and prepare a revert. It only stops things; the
+      // owner merges the revert and clears the hold.
+      if (body.action === 'regression') {
+        need(body.body, 'say why a recent deployment caused it');
+        const w = await deploywatch.sreSuspects({ why: String(body.body), incidentId: inc.id });
+        store.updateIncident(inc.id, { status: 'paged', ticket_key: w.incident_key || null, note: String(body.body).slice(0, 500) });
+        store.logEvent({ run_id: run.id, agent_id: agentId, kind: 'action', text: `held deploying merges: suspected regression from ${w.ticket_key || w.merge_sha.slice(0, 7)} (incident #${inc.id})` });
+        return `Held every deploying merge and paged the owner; ${w.revert_key ? `a revert is being prepared in ${w.revert_key} (only the owner merges it)` : 'the revert ticket follows'}${w.incident_key ? `; incident ${w.incident_key}` : ''}. Stop now.`;
+      }
       if (body.action === 'mute') {
         need(body.body, 'say why it is noise');
         if (inc.count >= (config.watch.muteNeedsOwnerAbove ?? 20)) {
@@ -1755,7 +1816,7 @@ export async function deskAction(run, cmd, body = {}) {
       }
       if (body.action === 'page') {
         need(body.body, 'say why the owner must act');
-        const t = pageOwner([inc], body.body);
+        const t = pageOwner([inc], body.body, { trading: body.trading === true || body.trading === 'true' });
         return `Paged the owner (${t.key}). Stop now.`;
       }
       need(body.title && body.body, 'title and body (stdin) required');
@@ -1924,14 +1985,14 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     if (reasons.length) {
       store.kvSet(`guard-reasons:${key}`, JSON.stringify({ head: t.head_sha, reasons, lines, complexity: t.complexity || null }));
       store.addComment(key, 'system', `🛑 **Publish guard** — not pushed: ${reasons.join('; ')}.\nReview the branch locally (${runner.workspaceDir(key)}) and press "Approve publish" if it is safe.`);
-      setStatus(key, 'needs_human', { resume_status: reviews.enabled() && t.review_stage === 'reviewing' ? 'review' : 'ready_for_human', progress_msg: 'publish guard: needs owner approval' });
+      setStatus(key, 'needs_human', { resume_status: reviews.enabled() && t.review_stage === 'reviewing' ? 'review' : 'ready_for_human', progress_msg: 'publish guard: needs owner approval', hold_kind: 'guard' });
       store.kvSet(`guard:${key}`, t.head_sha);
       return;
     }
   }
   const freshQa = refresh.validationBlockers(key, t.head_sha, staged.baseSha);
   if (freshQa.length) {
-    setStatus(key, 'needs_human', { resume_status: 'todo', progress_msg: 'base changed — refresh and rerun QA' });
+    setStatus(key, 'needs_human', { resume_status: 'todo', progress_msg: 'base changed — refresh and rerun QA', hold_kind: 'base_changed' });
     store.addComment(key, 'system', `Publication held: ${freshQa.join('; ')}. Use Refresh branch to revalidate against the new base.`);
     return;
   }
@@ -1952,7 +2013,7 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
     else recordPublishError(t, key, 'GitHub did not open the pull request (see the activity log)');
   } catch (err) {
     if (refresh.current(key) && /stale info|\[rejected\]/i.test(String(err.stderr || err.message)))
-      setStatus(key, 'needs_human', { resume_status: 'todo', progress_msg: 'remote branch changed — reconcile before publishing' });
+      setStatus(key, 'needs_human', { resume_status: 'todo', progress_msg: 'remote branch changed — reconcile before publishing', hold_kind: 'remote_changed' });
     store.logEvent({ kind: 'error', ticket_key: key, text: `publish failed: ${err.message}` });
     recordPublishError(t, key, err.message);
   }
@@ -1962,7 +2023,7 @@ async function publishInner(t, key, { ownerApproved = false } = {}) {
 export function prChecksFailed(t, names) {
   const loops = (t.qa_loops || 0) + 1;
   store.addComment(t.key, 'system', `❌ **CI failed on the draft PR**: ${names}. Fix and resubmit.`);
-  if (loops > config.limits.maxQaLoops) setStatus(t.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'CI keeps failing' });
+  if (loops > config.limits.maxQaLoops) setStatus(t.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', progress_msg: 'CI keeps failing', hold_kind: 'ci_loops' });
   else setStatus(t.key, 'todo', { qa_loops: loops, pr_url: null, progress: 50, progress_msg: `CI failed: ${names}`.slice(0, 200) });
 }
 
@@ -2219,22 +2280,25 @@ export function ownerProdVerify(key, { text = '' } = {}) {
  * the record); handing it back routes it to a seat again. Completing it records the owner's notes and unblocks the
  * tasks that wait on it.
  */
-export function ownerTask(key, { owner_task, why = '', by = 'owner', verify = false } = {}) {
+export function ownerTask(key, { owner_task, why = '', by = 'owner', verify = false, kind = null } = {}) {
   const t = store.getTicket(key);
   need(t, 'no such ticket');
   need(!['done', 'wontdo'].includes(t.status), 'this ticket is closed');
   need(!(t.active_run > 0), 'wait for the current run on this ticket to finish');
   if (owner_task) {
     need(['triage', 'proposed', 'todo', 'needs_human'].includes(t.status), 'only work that has not started can become your task');
-    store.updateTicket(key, { owner_task: 1, assignee: null, status: 'todo', resume_status: null, progress_msg: 'your task' });
+    // The owner taking a task is the owner's choice ('owner'): delegation never routes it away. A manager's (epic review)
+    // states its kind when it knows it, else unknown.
+    store.updateTicket(key, { owner_task: 1, owner_task_kind: by === 'owner' ? 'owner' : OWNER_TASK_KINDS.includes(kind) ? kind : null, owner_task_by: by, assignee: null, status: 'todo', resume_status: null, progress_msg: 'your task' });
     if (by === 'manager') store.addComment(key, 'manager', `🙋 **This is your task**: no seat on the team can do it. ${String(why).trim().slice(0, 500)}`);
     else store.addComment(key, 'owner', `🙋 **I will do this one myself**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'}`);
+    if (by !== 'owner') delegation.triageOwnerTask(key); // the owner's own choice is never routed away
   } else {
     need(t.owner_task, 'this is not an owner task');
-    // A read-only production check goes to the SRE (desk ops probes) when production read access is on.
-    // verify:true is the owner's explicit call that this is a read-only check (the text classifier is conservative).
+    // A read-only production check goes to the SRE (desk ops probes) when production read access is on: the owner says
+    // so (verify), or the task is one by its structured kind. Its text is never classified.
     if (by === 'owner' && verify === true) need(verifyReady(), 'production read access is off (Settings → Production read access)');
-    if (((by === 'owner' && verify === true) || isVerifyAsk(`${t.title}\n${t.description || ''}`)) && verifyReady()) {
+    if (((by === 'owner' && verify === true) || t.owner_task_kind === 'check') && verifyReady()) {
       store.updateTicket(key, { owner_task: 0, assignee: 'sre', assign_pinned: 1, status: 'todo', progress_msg: null });
       store.kvSet(`verify:${key}`, '1');
       store.addComment(key, 'owner', `↩️ **Handed back to the team**${String(why).trim() ? `: ${String(why).trim().slice(0, 500)}` : '.'} Routed to ${agentById.sre.name} (SRE) to verify with read-only production probes.`);
@@ -2326,7 +2390,7 @@ function sendBack(t, comment, msg) {
   const loops = (t.qa_loops || 0) + 1;
   store.addComment(t.key, 'owner', comment);
   // pr_url is cleared so the reworked commit is published again (the existing PR is found by branch and updated).
-  if (loops > config.limits.maxQaLoops) setStatus(t.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', pr_url: null, progress_msg: `${msg} (review loop limit)` });
+  if (loops > config.limits.maxQaLoops) setStatus(t.key, 'needs_human', { qa_loops: loops, resume_status: 'todo', pr_url: null, progress_msg: `${msg} (review loop limit)`, hold_kind: 'github_loops' });
   else setStatus(t.key, 'todo', { qa_loops: loops, pr_url: null, progress: 50, progress_msg: msg });
 }
 

@@ -6,6 +6,7 @@ import { config } from './config.js';
 import { ENGINES } from './engines/index.js';
 import { providerHealth } from './dispatch.js';
 import * as store from './db.js';
+import { agentById } from './team.js';
 import * as runner from './runner.js';
 import * as advisors from './advisors.js';
 import * as sched from './scheduler.js';
@@ -270,9 +271,12 @@ export function retry(id) {
   }
   return queue(next.id);
 }
-export function decide(id, { decision, message = '' } = {}) {
+// `by`: the owner, or a delegate deciding for the owner (#9: approve or reject only; a correction queues a new paid
+// council, which is a budget decision and stays the owner's). A delegate's decision is recorded as the delegate's.
+export function decide(id, { decision, message = '' } = {}, { by = 'owner', footer = '' } = {}) {
   const c = current(id), note = store.redact(String(message).trim()).slice(0, 2000);
   if (!['approve','correction','reject'].includes(decision)) fail('Invalid decision', 400);
+  if (by !== 'owner' && decision === 'correction') fail('Only the owner asks for a council correction (it queues a new paid council)', 403);
   if (!['complete','partial'].includes(c.status) || c.stale || c.decision) fail('Council is incomplete, stale, or already decided');
   if (decision === 'approve' && c.status === 'partial') fail('Retry failed reviewers before approving a partial council');
   if (decision === 'correction' && !note) fail('Describe the correction', 400);
@@ -285,8 +289,9 @@ export function decide(id, { decision, message = '' } = {}) {
     followup = store.createCouncil(planned, planned.members); queue(followup.id);
   }
   store.updateCouncil(id, { decision, decision_note: note });
-  store.addComment(c.ticket_key, 'council', `Owner ${decision === 'approve' ? 'approved the design recommendation' : decision === 'reject' ? 'rejected the recommendation' : `requested corrections; council #${followup.id} queued`} · council #${id}${note ? `\n\n${note}` : ''}\n\nDesign decision only; QA and merge gates remain required.`);
-  return { council: current(id), followup: followup ? current(followup.id) : null };
+  const actor = by === 'owner' ? 'Owner' : `${String(agentById[by]?.name || by).split(/\s+/)[0]}, deciding for the owner,`;
+  const comment = store.addComment(c.ticket_key, by === 'owner' ? 'council' : by, `${actor} ${decision === 'approve' ? 'approved the design recommendation' : decision === 'reject' ? 'rejected the recommendation' : `requested corrections; council #${followup.id} queued`} · council #${id}${note ? `\n\n${note}` : ''}\n\nDesign decision only; QA and merge gates remain required.${footer}`);
+  return { council: current(id), followup: followup ? current(followup.id) : null, comment_id: comment.id };
 }
 export function status() {
   return { models: models(), lenses: LENSES, defaults: defaults(), automatic: false, max_parallel: 2, preserved_slots: 1,

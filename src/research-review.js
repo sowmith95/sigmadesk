@@ -90,7 +90,7 @@ function pass(t) {
 }
 function hold(t, reason) {
   store.updateTicket(t.key, { research_review: 'held' });
-  hooks.setStatus(t.key, 'needs_human', { resume_status: 'proposed', active_run: null, progress_msg: `Research review: ${reason}` });
+  hooks.setStatus(t.key, 'needs_human', { resume_status: 'proposed', active_run: null, progress_msg: `Research review: ${reason}`, hold_kind: 'research' });
 }
 const comment = (t, author, report) => store.addComment(t.key, author, `**Research review · ${report.verdict}** (second reviewer: ${agentById[author]?.name || author})\n\n${report.summary}\n\nEvidence checked: ${report.evidence_checked.join('; ') || 'none stated'}\nFindings: ${report.findings.join('; ') || 'none'}\nConditions: ${report.conditions.join('; ') || 'none'}`);
 
@@ -228,6 +228,24 @@ export function ownerDecide(t, decision, note = '') {
     return store.getTicket(t.key);
   }
   fail('invalid decision');
+}
+/**
+ * A delegate (#9) sends a held proposal back to its author with corrections or a narrower scope, recorded as the
+ * delegate's decision for the owner (never the owner's). It never waives the review: the revision gets a fresh second
+ * review, and approving past a dissenting reviewer stays the owner's. The author gets one bounded revision, as after an
+ * owner correction; how often a delegate may do this over the proposal's life is limited by src/delegation.js.
+ */
+export function delegatedCorrection(t, seat, note, footer = '') {
+  if (!held(t)) fail('this proposal is not held by a research review');
+  const text = String(note || '').trim();
+  if (!text) fail('Describe the correction so the author can revise');
+  const name = String(agentById[seat]?.name || seat).split(/\s+/)[0];
+  return store.transaction(() => {
+    store.kvSet(`research-notes:${t.key}`, text.slice(0, 4000));
+    store.updateTicket(t.key, { research_review: 'changes', research_revisions: 0 });
+    hooks.setStatus(t.key, 'proposed', { resume_status: null, active_run: null, progress_msg: `${name} sent the proposal back for revision` });
+    return store.addComment(t.key, seat, `🔁 **${name} sent the proposal back to ${agentById[t.reporter]?.name || t.reporter}, deciding for the owner**\n\n${text}${footer}`);
+  });
 }
 export function reasonFor(t) {
   if (!blocks(t)) return null;

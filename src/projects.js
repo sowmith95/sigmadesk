@@ -72,6 +72,12 @@ Describe what this project is, who uses it, and how to build and test it. Every 
 
 ## Never touch without the owner
 - (paths, systems or data that need a human decision)
+
+<!-- The next section is yours alone: the desk and its seats never write it. A delegate (Settings → Autonomy) decides for
+     you only under a rule listed under its heading, and must cite it; left empty, every delegated decision stays yours.
+     One dash bullet per rule, right under the heading, any condition on the same line or indented two spaces under it;
+     the desk stops reading at the first line of another kind (code, a link, HTML, a comment, a numbered list). -->
+## Standing rules the EM may apply alone
 `;
 
 const usedPorts = (reg) => new Set(reg.projects.map((p) => p.port));

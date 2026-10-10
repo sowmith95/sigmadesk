@@ -20,7 +20,9 @@ const SELF_CODES = new Set(['paused', 'dependency', 'seat_busy', 'tick', 'setup_
 const SELF_RESOLVING = /desk paused|seat busy|waiting for \S+ to (merge|finish)|capacity|concurrent|busy window|queued behind|next (scheduler )?tick|setup retry/i;
 const selfResolving = (w) => (w.code ? SELF_CODES.has(w.code) : SELF_RESOLVING.test(w.reason || ''));
 
-const isGuard = (t) => /publish guard/i.test(t.progress_msg || '');
+// Structured hold reasons (#9): the code that holds a ticket records why (ticket.hold_kind). Holds written before that
+// existed have none and fall back to the progress-message patterns.
+const isGuard = (t) => (t.hold_kind ? t.hold_kind === 'guard' : /publish guard/i.test(t.progress_msg || ''));
 // The desk merges these by itself (mergetrain.mergeState): not the owner's step.
 const AUTO_MERGE = { queued: 'Approved; the desk merges it when CI and the deploy allow', scheduled: 'Approved; the desk merges it after the busy hours',
   merging: 'Merging now', conflict: 'Resolving a conflict with the latest code' };
@@ -41,7 +43,10 @@ const HOLDS = [
 ];
 // A branch refresh the owner started: the desk holds the ticket while it rebases (no step for anyone).
 const REFRESHING = (t) => t.active_run === -1 && /desk refreshing remote base/i.test(t.progress_msg || '');
-const holdOf = (t) => HOLDS.find(([re]) => re.test(t.progress_msg || ''));
+// hold_kind → its HOLDS row. A structured kind not listed here (a question, a stall, a route to the owner) is a question.
+const HOLD_ROW = { conflict: 0, no_reviewer: 1, seat_off: 2, workspace: 3, base_changed: 4, remote_changed: 5, refresh_interrupted: 5, orphaned: 6,
+  review_disagree: 7, qa_loops: 8, review_loops: 8, ci_loops: 8, github_loops: 8 };
+const holdOf = (t) => (t.hold_kind ? (t.hold_kind in HOLD_ROW ? HOLDS[HOLD_ROW[t.hold_kind]] : null) : HOLDS.find(([re]) => re.test(t.progress_msg || '')));
 function guardWhy(g) {
   if (!g?.reasons?.length) return 'The change touches protected paths or is unusually large. Review the diff before it is pushed.';
   return `Held before pushing: ${g.reasons.join('; ')}. Approving pushes it; the reviewers then check this exact commit.`;
@@ -54,10 +59,27 @@ const DESK_HOLD = /^(the PR branch changed outside the desk|publish guard:)/i;
 const firstName = (agents, id) => (agents.find((a) => a.id === id)?.name || '').split(/\s+/)[0] || 'the engineer';
 
 /**
+ * Delegation (#9), server-owned (meta.delegation.open, keyed by decision id): while the EM or the SRE is deciding a
+ * decision for the owner (em/sre mode, desk open) it is the delegate's step, not the owner's; a shadow decision and an
+ * escalation stay the owner's and carry what the delegate decided or recommends.
+ */
+export const delegating = (rec, ctx = {}) => !!rec && ['queued', 'running'].includes(rec.status) && ['em', 'sre'].includes(rec.mode) && !ctx.paused;
+function withDelegation(list, ctx) {
+  const open = ctx.delegations || {};
+  return list.filter((d) => !delegating(open[d.id], ctx)).map((d) => {
+    const r = open[d.id];
+    if (r?.status === 'shadow') return { ...d, delegate: r };
+    if (r?.status === 'escalated') return { ...d, escalation: r };
+    return d;
+  });
+}
+
+/**
  * Every owner decision on one ticket, each its own item: the ticket's hold (question / guard / merge / publish),
  * each pending design proposal, each finished council. `id` is unique per decision; `key` stays the ticket key.
  */
-export function decisionsFor(t, ctx = {}) {
+export function decisionsFor(t, ctx = {}) { return withDelegation(ownerDecisionsFor(t, ctx), ctx); }
+function ownerDecisionsFor(t, ctx = {}) {
   const { agents = [], proposals = [], councils = [], productReviews = [], researchReviews = [], featurePlans = [], mergeStates = {}, mergeReasons = {}, guardReasons = {}, publishErrors = {} } = ctx;
   if (['done', 'wontdo'].includes(t.status)) return [];
   // A feature waiting on its plan: the owner reviews a ready plan, or retries a failed grooming round.
@@ -124,6 +146,10 @@ export function attend(t, ctx = {}) {
 
   const decisions = decisionsFor(t, ctx);
   if (decisions.length) return { ...decisions[0], epic: base.epic, worker: base.worker };
+  // The EM or the SRE is deciding it for the owner (#9): theirs to move, said plainly.
+  const dl = Object.values(ctx.delegations || {}).find((r) => r.ticket_key === t.key && delegating(r, ctx));
+  if (dl) return { ...base, bucket: worker ? 'working' : 'queued', stage: 'Deciding for you', verb: name, delegation: dl,
+    reason: `${dl.seat_name || 'The delegate'} is deciding this for you${dl.status === 'queued' ? ' (starts when they are free)' : ''}` };
 
   const fp = (ctx.featurePlans || []).find((p) => p.ticket_key === t.key);
   if (fp && ['queued', 'grooming', 'discarded'].includes(fp.status)) return { ...base, bucket: fp.status === 'grooming' ? 'working' : 'queued', stage: 'Planning',
@@ -169,6 +195,7 @@ export function humanReason(reason, tickets) {
 export function board(state, extra = {}) {
   const tickets = state.tickets || [];
   const ctx = { agents: state.agents || [], tickets, events: state.events || [], waiting: state.meta?.scheduler?.waiting || [],
+    delegations: state.meta?.delegation?.open || {}, paused: state.settings?.paused === 'true',
     proposals: extra.proposals || state.meta?.decisions?.proposals || [], councils: state.meta?.council?.councils || [], productReviews: state.meta?.product_reviews || [], researchReviews: state.meta?.research_reviews || [], featurePlans: state.meta?.feature_plans || [],
     mergeStates: state.meta?.merge_states || {}, mergeReasons: state.meta?.merge_reasons || {}, guardReasons: state.meta?.guard_reasons || {}, publishErrors: state.meta?.publish_errors || {} };
   const out = Object.fromEntries(BUCKETS.map((b) => [b, []]));
@@ -277,6 +304,9 @@ export function board(state, extra = {}) {
   out.snoozed = arranged.snoozed;
   out.do_first = arranged.doFirst;
   out.shipped.sort((a, b) => String(b.ticket?.updated_at).localeCompare(String(a.ticket?.updated_at)));
+  // "Decided for you" (#9): what the EM or the SRE decided for the owner in the last 24 h. Not counted as needing the
+  // owner; each row offers Override and Reopen.
+  out.decided = (state.meta?.delegation?.decided || []).map((r) => ({ ...r, ticket: tickets.find((x) => x.key === r.ticket_key) || null }));
   return { ...out, counts: { ...Object.fromEntries(BUCKETS.map((b) => [b, out[b].length])), snoozed: out.snoozed.length } };
 }
 

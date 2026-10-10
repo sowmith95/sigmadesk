@@ -41,6 +41,7 @@ import * as access from './access.js';
 import * as packages from './packages.js';
 import * as decision from './decision.js';
 import * as autonomy from './autonomy.js';
+import * as delegation from './delegation.js';
 
 const PUBLIC = path.join(config.root, 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -96,6 +97,9 @@ export function snapshot({ inbox = true } = {}) {
       groom: (() => { const sel = dispatch.pinnedSelection('manager', features.ENGINE, 'feature_groom'); return { engine: features.ENGINE, ready: !!sel.seat, reason: sel.reason || null, setting: settings.groom_engine || 'codex' }; })(),
       research: research.status(settings), research_reviews: researchReview.summaries(), ops: ops.describe(settings), access: access.summary(), packages: packages.summary(),
       decisions: { proposals: store.pendingProposals() }, engineers: ENGINEERS, statuses: STATUSES, last_event_id: store.recentEvents({ limit: 1 })[0]?.id || 0,
+      // Delegation (#9): the matrix, open delegated decisions (the board reads them), "Decided for you" and the weekly
+      // "owner interventions avoided" and spend.
+      delegation: delegation.summary(Date.now(), settings),
     },
   };
   // Inbox attention state: real waiting time per decision and the owner's snoozes (public/inbox.js applies them).
@@ -268,6 +272,17 @@ async function ownerRoute(req, res) {
     return send(res, 200, await decision.ticketBrief(mm[1], snap, snap.board, { decisionId: url.searchParams.get('decision') }));
   }
   if (req.method === 'GET' && p === '/api/autonomy') return send(res, 200, autonomy.matrix());
+  // ---- delegation (#9): the matrix, the emergency switch, the audit trail, and the owner's override / reopen ----
+  if (req.method === 'GET' && p === '/api/delegation') return send(res, 200, { ...delegation.details(), metrics: delegation.summary().metrics });
+  if (req.method === 'GET' && (mm = m('^/api/delegation/(\\d+)$'))) { const r = delegation.get(mm[1]); return r ? send(res, 200, r) : send(res, 404, { error: 'not found' }); }
+  if (req.method === 'POST' && p === '/api/delegation/policy') { const b = await readBody(req); return send(res, 200, delegation.setPolicy(b.policy)); }
+  if (req.method === 'POST' && p === '/api/delegation/escalate-all') { const b = await readBody(req); if (typeof b.on !== 'boolean') return send(res, 400, { error: 'on must be true or false' }); return send(res, 200, delegation.setEscalateAll(b.on)); }
+  if (req.method === 'POST' && (mm = m('^/api/delegation/(\\d+)/(override|reopen)$'))) {
+    const b = await readBody(req);
+    const out = mm[2] === 'override' ? delegation.ownerOverride(mm[1], { message: b.message }) : delegation.ownerReopen(mm[1], { note: b.note });
+    store.bus.emit('msg', { type: 'inbox', data: null });
+    return send(res, 200, out);
+  }
   if (req.method === 'POST' && (mm = m('^/api/tickets/KEY/verify-task$'))) { const b = await readBody(req); return send(res, 200, decision.verifyTask(mm[1], { what: b.what })); }
   if (req.method === 'POST' && p === '/api/inbox/snooze') {
     const body = await readBody(req); // read first: validate against the state after the request arrived
@@ -704,7 +719,8 @@ export async function main() {
   // Post-deploy watch on its own timer: monitoring production never depends on the merge train or reviews being on.
   setInterval(() => deploywatch.sweep({ lock: mergetrain.deployState() }).catch((err) => console.error('post-deploy watch:', err.message)), 60_000);
   setInterval(() => sched.retryPublications(), 5 * 60_000);
-  const shutdown = () => { council.cancelAll(); advisors.cancelAll(); runner.shutdownAll('desk shutdown').finally(() => process.exit(0)); };
+  // Seats' runs and the Codex usage RPC end before the desk does: nothing it started keeps writing into its data afterwards.
+  const shutdown = () => { council.cancelAll(); advisors.cancelAll(); Promise.allSettled([runner.shutdownAll('desk shutdown'), usage.stopAll()]).finally(() => process.exit(0)); };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }

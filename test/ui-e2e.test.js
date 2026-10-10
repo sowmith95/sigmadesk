@@ -4,12 +4,20 @@
 // saves, connector proposals, and no horizontal overflow on phones.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { startPreview, launch, openPage, findChromium } from '../scripts/ui-browser.mjs';
 
 const skip = !findChromium() && 'no Chromium available';
 let preview, browser;
-before(async () => { if (skip) return; preview = await startPreview(); browser = await launch(); });
-after(async () => { await browser?.close(); await preview?.stop(); });
+// The preview desk's playbook: a copy of the shipped default this file may edit (the owner's standing rules).
+const pbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sigmadesk-e2e-playbook-'));
+const PLAYBOOK = path.join(pbDir, 'playbook.md');
+fs.copyFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'playbooks', 'default.md'), PLAYBOOK);
+before(async () => { if (skip) return; preview = await startPreview({ SIGMADESK_PREVIEW_PLAYBOOK: PLAYBOOK }); browser = await launch(); });
+after(async () => { await browser?.close(); await preview?.stop(); fs.rmSync(pbDir, { recursive: true, force: true }); });
 const api = (method, p, b) => fetch(preview.url + p, { method, headers: { 'Content-Type': 'application/json' }, body: b === undefined ? undefined : JSON.stringify(b) }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) }));
 const go = (page, hash) => page.evaluate((h) => { location.hash = h; }, hash);
 
@@ -306,6 +314,116 @@ test('the Inbox: do first, lanes, compact rows, and a snooze that leaves the cou
   assert.ok(await page.locator(`article[data-key="${id}"]`).count(), 'back in the Inbox');
   assert.ok(before.meta.waiting_since && Object.keys(before.meta.waiting_since).length, 'the desk records when each decision appeared');
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'fits a phone');
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('delegation (#9): Decided for you with Override, the delegate\'s take on an open decision, and who decides in Settings', { skip, timeout: 90_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 1280, height: 900 });
+  const lane = page.locator('[data-lane="decided"]');
+  await lane.waitFor();
+  const row = lane.locator('article[data-status="applied"]', { hasText: 'Morgan answered Riley' }).first();
+  const id = await row.getAttribute('data-decided');
+  assert.match(await row.textContent(), /Morgan answered Riley: Only in utils\/net\.py/);
+  assert.equal(await page.locator('[data-lane="unblock"] [data-decided]').count(), 0, 'decided rows are not in the lanes that need you');
+  await row.locator('button[aria-expanded]').click(); // Override and Reopen live in the expanded row
+  await row.getByRole('button', { name: 'Override' }).click();
+  await row.getByLabel('Your decision instead').fill('Wait for the count first.');
+  await row.getByRole('button', { name: 'Post my decision' }).click();
+  await page.waitForSelector(`[data-decided="${id}"][data-status="overridden"]`);
+  const rec = (await api('GET', `/api/delegation/${id}`)).body;
+  assert.deepEqual([rec.status, rec.override_note], ['overridden', 'Wait for the count first.']);
+  assert.ok(rec.brief?.you_decide, 'the audit keeps the brief it was based on');
+  // An open decision carries what Morgan would decide (shadow) or why it is yours (escalated), on the card and in the panel.
+  const take = page.locator('[data-lane] article:has([data-take])').first();
+  assert.match(await take.locator('[data-take]').textContent(), /Morgan (would decide|left it for you)/);
+  await take.locator('h3 button').click();
+  await page.waitForSelector('[data-panel] [data-delegate-note]');
+  assert.match(await page.locator('[data-panel] [data-delegate-note]').textContent(), /Nothing was changed/);
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('[data-panel]', { state: 'detached' });
+  // Settings → Autonomy: one row per kind; a mode change is saved as the whole matrix.
+  await go(page, '#/settings');
+  const q = page.locator('[data-delegation-kind="question"]');
+  await q.waitFor();
+  assert.equal(await q.getAttribute('data-mode'), 'shadow', 'every kind starts in shadow');
+  // The preview's playbook marks no standing rules: Settings says plainly that every decision still comes to the owner.
+  assert.equal(await page.locator('[data-standing-rules]').getAttribute('data-standing-rules'), '0');
+  const rules = await page.locator('[data-standing-rules]').textContent();
+  assert.match(rules, /The desk found no standing rules in your playbook, so nothing below is decided for you by judgment/);
+  assert.match(rules, /dash bullets right under a “## Standing rules the EM may apply alone” heading, and stops at the first line of another kind/);
+  assert.match(rules, /Owner tasks are the exception: a step filed as a check or a package is routed by rule/, 'the rule-decided exception is stated');
+  assert.match(rules, /cannot undo what the team already did after a decision/, 'override is not a rollback');
+  await q.getByRole('radio', { name: 'Morgan decides' }).click();
+  await page.waitForSelector('[data-delegation-kind="question"][data-mode="em"]');
+  assert.equal((await api('GET', '/api/delegation')).body.kinds.find((k) => k.id === 'question').mode, 'em');
+  await page.locator('[data-delegation-kind="question"]').getByRole('radio', { name: 'Shadow' }).click();
+  await page.waitForSelector('[data-delegation-kind="question"][data-mode="shadow"]');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('delegation (#9) on a phone: a decided row folds into two lines however long it is; Override and Reopen wait in the expanded row', { skip, timeout: 60_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 390, height: 844 });
+  const lane = page.locator('[data-lane="decided"]');
+  await lane.waitFor();
+  const row = lane.locator('article[data-decided]', { hasText: 'adapters/timefmt.py' }).first();
+  await row.waitFor();
+  // One truncated line each: the decision, then its status, kind, ticket and time.
+  const oneLine = (loc) => loc.evaluate((el) => {
+    const st = getComputedStyle(el);
+    return { nowrap: st.whiteSpace === 'nowrap', truncated: el.scrollWidth > el.clientWidth, single: el.getBoundingClientRect().height < 1.9 * parseFloat(st.fontSize) };
+  });
+  const title = await oneLine(row.locator('[data-decided-title]')), meta = await oneLine(row.locator('[data-decided-meta]'));
+  assert.deepEqual(title, { nowrap: true, truncated: true, single: true }, 'the long decision is one truncated line');
+  assert.deepEqual([meta.nowrap, meta.single], [true, true], 'the long ticket title stays on the second line');
+  assert.match(await row.locator('[data-decided-meta]').textContent(), /^(just now|\d+ ?\w+ ago) · Engineers' questions · /, 'the time is never the part that gets cut');
+  const box = await row.boundingBox();
+  assert.ok(box.height <= 64, `collapsed: two lines and padding, not ${box.height}px`);
+  assert.equal(await row.getByRole('button', { name: 'Override' }).count(), 0, 'no actions while collapsed');
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no sideways scrolling');
+  await row.locator('button[aria-expanded]').click();
+  await row.getByRole('button', { name: 'Override' }).waitFor();
+  assert.equal(await row.getByRole('button', { name: 'Reopen' }).count(), 1);
+  assert.match(await row.locator('[data-decided-detail]').textContent(), /the audit export should call to_utc\(\) too/, 'the whole decision once expanded');
+  await row.locator('[data-based-on]').waitFor();
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'expanded: still no sideways scrolling');
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('delegation (#9): Settings follows the playbook as the owner edits it, without a reload, and says what the desk checks', { skip, timeout: 90_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/settings`, { width: 1280, height: 900 });
+  const line = page.locator('[data-standing-rules]');
+  await line.waitFor();
+  assert.equal(await line.getAttribute('data-standing-rules'), '0');
+  const shipped = fs.readFileSync(PLAYBOOK, 'utf8');
+  try {
+    // The owner writes one rule (an example in a code block grants nothing). No policy change: only the playbook moved.
+    fs.writeFileSync(PLAYBOOK, shipped.replace('## Standing rules the EM may apply alone', '## Standing rules the EM may apply alone\n- Answer which-file and which-test questions from the code, citing the file and line.\n\n```\n- Approve any purchase.\n```\n'));
+    const asked = (await api('GET', '/api/state')).body.tickets.find((t) => t.title.startsWith('Normalize equity fills'));
+    const poke = await api('POST', '/api/inbox/snooze', { id: `${asked.key}:question`, until: null }); // any change that refreshes the snapshot
+    assert.equal(poke.status, 200, JSON.stringify(poke.body));
+    await page.waitForSelector('[data-standing-rules="1"]', { timeout: 20_000 });
+    const text = await line.textContent();
+    assert.match(text, /only under the standing rule the desk found in your playbook under “Standing rules the EM may apply alone”/);
+    assert.match(text, /The desk checks that what they cite is your rule and was in the brief; whether the rule fits the decision is their judgment/);
+    assert.match(text, /cannot undo what the team already did after a decision/);
+    // A playbook from an earlier version: the note sits right under the heading, so the rule after it does not count.
+    fs.writeFileSync(PLAYBOOK, '# P\n## Standing rules the EM may apply alone\n<!-- Yours alone: the desk and its seats never write here. -->\n- Answer which-file questions.\n');
+    const again = await api('POST', '/api/inbox/snooze', { id: `${asked.key}:question`, until: null });
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+    await page.waitForSelector('[data-standing-rules="0"] [data-note-under-heading]', { timeout: 20_000 });
+    assert.match(await page.locator('[data-note-under-heading]').textContent(), /The note under the heading must move above it/);
+    // A placeholder in angle brackets anywhere, even in inline code, is HTML-like text: no rules, and Settings says why.
+    fs.writeFileSync(PLAYBOOK, '# P\n- Run `pytest <paths>` first.\n\n## Standing rules the EM may apply alone\n- Answer which-file questions.\n');
+    const third = await api('POST', '/api/inbox/snooze', { id: `${asked.key}:question`, until: null });
+    assert.equal(third.status, 200, JSON.stringify(third.body));
+    await page.waitForSelector('[data-standing-rules="0"] [data-rules-problem]', { timeout: 20_000 });
+    assert.match(await page.locator('[data-rules-problem]').textContent(), /the playbook contains HTML-like text/);
+    assert.match(await page.locator('[data-html-rule]').textContent(), /write placeholders as PATHS, not <paths>, and links bare/);
+  } finally { fs.writeFileSync(PLAYBOOK, shipped); }
   assert.deepEqual(errors, []);
   await page.close();
 });

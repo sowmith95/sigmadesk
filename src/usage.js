@@ -27,13 +27,26 @@ export function normalizeCodex(data, at = store.now()) {
     credits: selected?.credits ? { balance: selected.credits.balance, unlimited: selected.credits.unlimited, has_credits: selected.credits.hasCredits } : null };
 }
 
+// Account-usage RPCs still running. The Codex app-server writes into its CODEX_HOME (the desk's data directory), even after
+// its input closes, so the desk stops these and waits for them before it exits: nothing it started keeps writing there.
+// Each RPC is started as the leader of its own process group. A launcher (the npm package's Node script) starts the
+// native binary, which stays in that group: the desk signals and waits for the whole group it owns, never a process found
+// by name (another desk's RPCs are not its own).
+const live = new Map(); // process group id → the launcher's handle
+const groupAlive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch (err) { return err.code === 'EPERM'; } };
+function signalGroup(pgid, sig) { if (pgid > 1) { try { process.kill(-pgid, sig); } catch { /* the group is gone */ } } }
+const prune = () => { for (const pgid of live.keys()) if (!groupAlive(pgid)) live.delete(pgid); };
 export function readCodexLimits() {
   return new Promise((resolve, reject) => {
     const cli = codexInvocation();
-    const child = spawn(cli.bin, [...cli.prefix, 'app-server', '--stdio'], { env: { ...process.env, CODEX_HOME: codexHome() }, stdio: ['pipe', 'pipe', 'pipe'] });
+    prune();
+    const child = spawn(cli.bin, [...cli.prefix, 'app-server', '--stdio'], { env: { ...process.env, CODEX_HOME: codexHome() }, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    const pgid = child.pid;
+    if (pgid > 1) live.set(pgid, child);
     let buffer = '', settled = false;
     const finish = (err, result) => {
-      if (settled) return; settled = true; clearTimeout(timer); child.stdin.end(); child.kill('SIGTERM');
+      if (settled) return; settled = true; clearTimeout(timer); child.stdin.end();
+      signalGroup(pgid, 'SIGTERM'); // the launcher and the native process it started
       err ? reject(err) : resolve(result);
     };
     const timer = setTimeout(() => finish(new Error('Codex account usage request timed out')), 12000);
@@ -54,6 +67,28 @@ export function readCodexLimits() {
     });
     send({ method: 'initialize', id: 1, params: { clientInfo: { name: 'sigmadesk', title: 'SigmaDesk usage monitor', version: '0.1.0' } } });
   });
+}
+/** Wait until none of these process groups has a member left, or `ms` passes. → the groups still alive. */
+async function waitGone(groups, ms) {
+  const until = Date.now() + ms;
+  for (;;) {
+    const left = groups.filter(groupAlive);
+    if (!left.length || Date.now() >= until) return left;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+/**
+ * Stop every account-usage RPC still running and wait until each one's whole process group has exited: SIGTERM, then
+ * SIGKILL to what is left after `ms`, then a bounded wait. → how many groups were running.
+ */
+export async function stopAll(ms = 3000) {
+  const groups = [...live.keys()].filter(groupAlive);
+  for (const g of groups) signalGroup(g, 'SIGTERM');
+  const stubborn = await waitGone(groups, ms);
+  for (const g of stubborn) signalGroup(g, 'SIGKILL');
+  await waitGone(stubborn, 1000);
+  prune();
+  return groups.length;
 }
 let refreshing = null;
 export function refresh() {

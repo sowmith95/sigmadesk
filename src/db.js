@@ -514,6 +514,52 @@ CREATE TABLE IF NOT EXISTS watch_checkpoints (
   UNIQUE(watch_id, name)
 );
 CREATE INDEX IF NOT EXISTS watch_checkpoints_status ON watch_checkpoints(status, due_at);
+-- Delegated decisions (#9): one row per owner decision (board decision id) and evidence version that the EM or the SRE
+-- decides for the owner (or, in shadow, would have decided). Server-owned: created from the board's structured state,
+-- decided by a bounded decide run (or by rule, for owner-task triage), applied in one transaction after the desk
+-- re-checks the evidence, the policy and the rules. Never written through an owner path: what was applied is the
+-- delegate's, "decided for the owner". status: queued | running | applied | shadow | escalated | superseded |
+-- invalidated | failed | overridden | reopened.
+CREATE TABLE IF NOT EXISTS delegated_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,             -- owner_task | question | research | loop_limit | design
+  decision_id TEXT NOT NULL,      -- the board decision it is for (e.g. SD-12:question)
+  ticket_key TEXT,
+  version TEXT NOT NULL,          -- its evidence fingerprint (src/delegation.js evidenceFingerprint): new evidence = a new decision
+  policy_version TEXT,            -- the desk's general policy when it was opened (src/decision.js policyVersion)
+  delegation_version TEXT,        -- the delegation matrix in force when it was created (any change invalidates it)
+  mode TEXT NOT NULL,             -- shadow | em | sre
+  seat TEXT NOT NULL,             -- the delegate (manager | sre)
+  asker TEXT,                     -- who asked (a question's seat), when there is one
+  allowed TEXT NOT NULL,          -- JSON list of the actions the delegate may take
+  status TEXT NOT NULL DEFAULT 'queued',
+  action TEXT,                    -- answer | approve | changes | reject | route | escalate
+  text TEXT,                      -- the answer, direction or route, as the delegate gave it
+  why TEXT,                       -- the delegate's reason (cites the brief's evidence and the owner's standing rules)
+  recommendation TEXT,            -- an escalation's one-line recommendation (so the owner's tap is yes/no)
+  outcome TEXT,                   -- what happened, in plain words (applied, refused at apply and why, escalated …)
+  assign TEXT,                    -- a reassignment that came with a loop-limit decision
+  attempts INTEGER NOT NULL DEFAULT 0,
+  run_id INTEGER,
+  spent_usd REAL DEFAULT 0,
+  spent_ms INTEGER DEFAULT 0,
+  steps_used INTEGER DEFAULT 0,
+  reserved_usd REAL DEFAULT 0,    -- what its run holds of a lifetime allowance until it is charged (research proposals)
+  brief TEXT,                     -- JSON: the decision brief it was based on (audit)
+  citables TEXT,                  -- JSON: the rule (R) and evidence (E) ids its run was given, fixed when the run started
+  citations TEXT,                 -- JSON: the ids the delegate cited for its decision (checked against citables)
+  provenance TEXT,                -- JSON: decided for the owner by whom, under which mode, policy and run
+  comment_id INTEGER,             -- the ticket comment that announced an applied decision
+  override_note TEXT,
+  override_at TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  started_at TEXT,
+  decided_at TEXT,
+  ended_at TEXT,
+  UNIQUE(decision_id, version)
+);
+CREATE INDEX IF NOT EXISTS delegated_decisions_status ON delegated_decisions(status);
+CREATE INDEX IF NOT EXISTS delegated_decisions_ticket ON delegated_decisions(ticket_key, id);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -574,7 +620,14 @@ function migrate() {
       // "How to verify in production" (#7): the builder's criteria at submit (or the owner's), and who wrote them
       prod_verify: 'TEXT', prod_verify_by: 'TEXT',
       // a revert prepared after a suspected regression: only the owner merges it (never the merge train)
-      owner_merge_only: 'INTEGER DEFAULT 0' },
+      owner_merge_only: 'INTEGER DEFAULT 0',
+      // Structured hold reasons (#9): why a needs_human hold exists, who put it there (the asking seat) and what it refers
+      // to (the question's comment id), set by the code that holds the ticket. Delegation reads these, never message text.
+      // owner_task_kind: what kind of step an owner task is (check | package | write | restart | credential | business |
+      // other | probe | owner), stated by whoever made it the owner's. null = unknown (never delegated).
+      // owner_task_by: who made it the owner's (a seat, 'owner', or 'desk' when the desk parked a check with the owner).
+      // hold_scope: what a question is about, stated by the asker (desk needs-human --about): only 'factual' is delegable.
+      hold_kind: 'TEXT', hold_seat: 'TEXT', hold_ref: 'TEXT', hold_scope: 'TEXT', owner_task_kind: 'TEXT', owner_task_by: 'TEXT' },
     // health: an app probe that answered but reported the application unhealthy (HTTP 5xx) is not evidence of health
     ops_audit: { health: 'TEXT', resources: 'TEXT' }, // resources: what the call actually observed (containers, database, app)
     // a post-deploy checkpoint's run-bound grant names its checkpoint (re-checked at every probe)
@@ -584,6 +637,8 @@ function migrate() {
     // hold_kind: provisional (first hard failure, before confirmation) | regression (confirmed)
     deploy_watches: { hold_kind: 'TEXT', retired_targets: 'TEXT', retired_resources: 'TEXT' },
     agents: { current_kind: 'TEXT', meeting: 'TEXT' },
+    // a database created by an earlier build of delegation (#9) gains the columns added since
+    delegated_decisions: { citables: 'TEXT', citations: 'TEXT', reserved_usd: 'REAL DEFAULT 0' },
     owner_discussions: { attempts: 'INTEGER DEFAULT 0' },
     // prod_access 0: the owner chose "ask me in my Inbox" for this delivery, so its run never gets automatic access
     mention_deliveries: { spent_usd: 'REAL DEFAULT 0', spent_ms: 'INTEGER DEFAULT 0', steps_used: 'INTEGER DEFAULT 0', prod_access: 'INTEGER DEFAULT 1' },
@@ -714,6 +769,12 @@ export function settingDefaults() {
     ops_enabled: 'false',
     // Owner's access policy (JSON, '' = config access.policy). Edited through the Access sheet (validated as a whole).
     access_policy: '',
+    // Delegation (#9): the owner's matrix (JSON {kinds, peerAccess}, '' = config delegation.*), the emergency "Escalate
+    // everything" switch, and an epoch that every policy change bumps (in-flight delegated decisions then lapse).
+    // All three are written through /api/delegation only (validated, and in-flight authority invalidated).
+    delegation: '',
+    delegation_escalate_all: 'false',
+    delegation_epoch: '0',
   };
 }
 
@@ -724,6 +785,7 @@ export function setSetting(key, value) {
   if (!(key in settingDefaults())) throw Object.assign(new Error(`unknown setting ${key}`), { status: 400 });
   if (key === 'access_policy') throw Object.assign(new Error('the access policy is edited through the Access sheet (validated as a whole)'), { status: 400 });
   if (key === 'research_programs') throw Object.assign(new Error('research programs are edited through Settings → Research (validated as a whole)'), { status: 400 });
+  if (['delegation', 'delegation_escalate_all', 'delegation_epoch'].includes(key)) throw Object.assign(new Error('delegation is changed through Settings → Autonomy (validated as a whole; in-flight decisions are invalidated)'), { status: 400 });
   const ranges = { max_concurrent: [1, 20], daily_budget_usd: [0, 100000], pm_interval_min: [1, 525600], max_open_proposals: [1, 100] };
   if (ranges[key]) {
     const n = Number(value), [min, max] = ranges[key];
@@ -776,11 +838,19 @@ const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', '
   'risk', 'diff_risk', 'designer', 'qa_sha', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent',
   'builder', 'contributors', 'approved_at', 'merge_after', 'merge_hold', 'reconfirm_from', 'reconfirm_kind', 'reconfirm_base',
   'research_program', 'research_run', 'research_policy', 'research_review', 'research_generation', 'research_revisions', 'research_sources',
-  'prod_verify', 'prod_verify_by', 'owner_merge_only']);
+  'prod_verify', 'prod_verify_by', 'owner_merge_only', 'hold_kind', 'hold_seat', 'hold_ref', 'hold_scope', 'owner_task_kind', 'owner_task_by']);
+export const HOLD_FIELDS = ['hold_kind', 'hold_seat', 'hold_ref', 'hold_scope'];
 
 export function updateTicket(key, patch) {
   // When it shipped, recorded once by whichever path finishes it (merge sync, epic roll-up, owner).
   if (patch.status === 'done' && patch.done_at === undefined && getTicket(key)?.status !== 'done') patch = { ...patch, done_at: now() };
+  // A hold's structured reason belongs to that hold (#9): any status change clears it unless the writer names the new
+  // one, so a reason can never outlive its hold or be inherited by the next one. Same for an owner task's kind.
+  if (patch.status !== undefined && patch.status !== getTicket(key)?.status) {
+    const missing = HOLD_FIELDS.filter((f) => !(f in patch));
+    if (missing.length) patch = { ...patch, ...Object.fromEntries(missing.map((f) => [f, null])) };
+  }
+  if ('owner_task' in patch) for (const f of ['owner_task_kind', 'owner_task_by']) if (!(f in patch)) patch = { ...patch, [f]: null };
   const cols = Object.keys(patch).filter((k) => TICKET_FIELDS.has(k));
   if (!cols.length) return getTicket(key);
   const sql = `UPDATE tickets SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE key=?`;
@@ -1332,12 +1402,71 @@ export function updateMention(id, patch) {
   const m = getMention(id); announce({ type: 'mention', data: m }); return m;
 }
 
+// ---------- delegated decisions (#9) ----------
+const DD_INSERT = ['kind', 'decision_id', 'ticket_key', 'version', 'policy_version', 'delegation_version', 'mode', 'seat', 'asker', 'allowed', 'status', 'brief', 'provenance', 'outcome', 'action', 'text', 'why', 'decided_at', 'ended_at'];
+const DD_FIELDS = ['status', 'action', 'text', 'why', 'recommendation', 'outcome', 'assign', 'attempts', 'run_id', 'spent_usd', 'spent_ms', 'steps_used', 'reserved_usd', 'brief', 'provenance',
+  'citables', 'citations', 'comment_id', 'override_note', 'override_at', 'started_at', 'decided_at', 'ended_at'];
+const ddVal = (v) => (v !== null && typeof v === 'object' ? JSON.stringify(v) : v ?? null);
+/** One record per (decision, evidence version): a repeat returns the existing row ({ row, created }). */
+export function createDelegation(d) {
+  const info = q(`INSERT OR IGNORE INTO delegated_decisions(${DD_INSERT.join(',')}) VALUES (${DD_INSERT.map(() => '?').join(',')})`).run(...DD_INSERT.map((c) => ddVal(c === 'status' ? d.status || 'queued' : d[c])));
+  const row = q('SELECT * FROM delegated_decisions WHERE decision_id=? AND version=?').get(d.decision_id, d.version);
+  if (info.changes) announce({ type: 'delegation', data: { id: row.id } });
+  return { row, created: info.changes > 0 };
+}
+export const getDelegation = (id) => q('SELECT * FROM delegated_decisions WHERE id=?').get(id) || null;
+export const delegationFor = (decisionId, version) => q('SELECT * FROM delegated_decisions WHERE decision_id=? AND version=?').get(decisionId, version) || null;
+export const delegationsByStatus = (...statuses) => q(`SELECT * FROM delegated_decisions WHERE status IN (${statuses.map(() => '?').join(',')}) ORDER BY id`).all(...statuses);
+export const delegationsSince = (iso) => q('SELECT * FROM delegated_decisions WHERE created_at >= ? ORDER BY id').all(iso);
+export const delegationsByStatusSince = (iso, ...statuses) => q(`SELECT * FROM delegated_decisions WHERE created_at >= ? AND status IN (${statuses.map(() => '?').join(',')}) ORDER BY id`).all(iso, ...statuses);
+export const delegationsForTicket = (key) => q('SELECT * FROM delegated_decisions WHERE ticket_key=? ORDER BY id').all(key);
+export const recentDelegations = (limit = 50) => q('SELECT * FROM delegated_decisions ORDER BY id DESC LIMIT ?').all(limit);
+export const runsOfDelegation = (id) => q("SELECT * FROM runs WHERE kind='decide' AND json_extract(job, '$.delegation') = ? ORDER BY id").all(id);
+/** Records still holding a reservation for their run's spend. */
+export const reservedDelegations = () => q('SELECT * FROM delegated_decisions WHERE reserved_usd > 0 ORDER BY id').all();
+/** Decision runs that have ended (each is charged to its record exactly once: src/delegation.js recover). */
+export const endedDecisionRuns = () => q("SELECT * FROM runs WHERE kind='decide' AND status <> 'running' ORDER BY id").all();
+/** Decision runs per record since a time, in one pass: { [record id]: { runs, estimated } }. */
+export function delegationRunStats(sinceIso) {
+  const out = {};
+  for (const r of q("SELECT json_extract(job, '$.delegation') AS d, COUNT(*) AS n, SUM(cost_estimated) AS e FROM runs WHERE kind='decide' AND started_at >= ? GROUP BY d").all(sinceIso)) out[r.d] = { runs: r.n, estimated: r.e || 0 };
+  return out;
+}
+/** Move a record out of one of `from` (a later state is never overwritten by a late writer). Returns true if it moved. */
+export function transitionDelegation(id, from, patch) {
+  const keys = Object.keys(patch).filter((k) => DD_FIELDS.includes(k));
+  const n = q(`UPDATE delegated_decisions SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=? AND status IN (${from.map(() => '?').join(',')})`).run(...keys.map((k) => ddVal(patch[k])), id, ...from).changes;
+  if (n) announce({ type: 'delegation', data: { id } });
+  return n > 0;
+}
+export function updateDelegation(id, patch) {
+  const keys = Object.keys(patch).filter((k) => DD_FIELDS.includes(k));
+  if (keys.length) q(`UPDATE delegated_decisions SET ${keys.map((k) => `${k}=?`).join(',')} WHERE id=?`).run(...keys.map((k) => ddVal(patch[k])), id);
+  announce({ type: 'delegation', data: { id } });
+  return getDelegation(id);
+}
+
 // ---------- small durable key/value store (watch cursors etc.) ----------
 export function createDiscussion(ticketKey, question) {
   const info = q('INSERT INTO owner_discussions(ticket_key,question) VALUES(?,?)').run(ticketKey, question);
   const d = getDiscussion(info.lastInsertRowid); announce({ type: 'discussion', data: d }); return d;
 }
 export const getDiscussion = (id) => q('SELECT * FROM owner_discussions WHERE id=?').get(id) || null;
+/**
+ * The rows a delegated decision's evidence fingerprint reads (src/delegation.js), every column as stored: the ticket,
+ * every message on its thread, and the kind's own records (a proposal's reviews of one generation, a design's
+ * discussion, a council and its members).
+ */
+export function evidenceRows(key, { generation = null, discussion = null, council = null } = {}) {
+  return {
+    tickets: q('SELECT * FROM tickets WHERE key=?').get(key) || null,
+    comments: q('SELECT * FROM comments WHERE ticket_key=? ORDER BY id').all(key),
+    research_reviews: generation == null ? [] : q('SELECT * FROM research_reviews WHERE ticket_key=? AND generation=? ORDER BY id').all(key, generation),
+    owner_discussions: discussion == null ? [] : q('SELECT * FROM owner_discussions WHERE id=?').all(discussion),
+    councils: council == null ? [] : q('SELECT * FROM councils WHERE id=?').all(council),
+    council_members: council == null ? [] : q('SELECT * FROM council_members WHERE council_id=? ORDER BY id').all(council),
+  };
+}
 export const pendingDiscussions = () => q("SELECT * FROM owner_discussions WHERE status IN ('queued','running') ORDER BY id").all();
 // Finished design recommendations still waiting for the owner (Inbox cards).
 export const pendingProposals = () => q("SELECT id, ticket_key FROM owner_discussions WHERE status='complete' ORDER BY id DESC LIMIT 50").all();
@@ -1411,4 +1540,13 @@ export function kvGet(key) {
 export function kvSet(key, value) {
   db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
   q('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value));
+}
+export function kvDelete(key) {
+  db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
+  q('DELETE FROM kv WHERE key=?').run(key);
+}
+/** Every key that starts with `prefix` (a range scan on the primary key, so no LIKE wildcards apply), in key order. */
+export function kvByPrefix(prefix) {
+  db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
+  return q('SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key').all(prefix, `${prefix}\uffff`);
 }
