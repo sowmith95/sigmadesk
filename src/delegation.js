@@ -87,16 +87,29 @@ export function ticketDecision(t, { settled = true } = {}) {
   if (model.LOOP_HOLDS.includes(t.hold_kind)) { const bk = t.hold_kind === 'review_disagree' ? 'conflict' : 'stuck'; return { kind: 'loop_limit', decision_id: `${t.key}:${bk}`, board_kind: bk }; }
   return null;
 }
-/** The evidence a decision rests on: a new hold, question, revision or recommendation is a new decision. */
-function versionFor(kind, t, ref = null) {
-  switch (kind) {
-    case 'owner_task': return hash([kind, t.owner_task, t.owner_task_kind, t.status, t.title, t.description]);
-    case 'question': return hash([kind, t.status, t.hold_kind, t.hold_seat, t.hold_ref, t.resume_status, t.head_sha]);
-    case 'research': return hash([kind, t.status, t.research_review, t.research_generation, researchReview.hashOf(t)]);
-    case 'loop_limit': return hash([kind, t.status, t.hold_kind, t.hold_seat, t.qa_loops, t.review_round, t.head_sha, t.resume_status]);
-    case 'design': return hash([kind, ref?.type, ref?.id, ref?.status, ref?.text, t?.risk, t?.diff_risk]);
-    default: return null;
-  }
+/**
+ * Every ticket field a delegated decision rests on (#9). Bookkeeping is left out because it moves without the decision
+ * changing: the run in flight, progress text, stall counts, timestamps, GitHub issue numbers, assignment notes.
+ */
+export const EVIDENCE_FIELDS = ['key', 'title', 'description', 'type', 'status', 'area', 'complexity', 'priority', 'assignee', 'builder', 'designer', 'reporter',
+  'risk', 'diff_risk', 'head_sha', 'qa_sha', 'pr_url', 'branch', 'resume_status', 'after_key', 'parent_key', 'owner_task', 'owner_task_kind',
+  'hold_kind', 'hold_seat', 'hold_ref', 'qa_loops', 'review_round', 'review_stage', 'reviewer_context', 'reviewer_independent', 'contributors', 'assign_pinned',
+  'research_review', 'research_generation', 'research_revisions', 'research_policy', 'prod_verify', 'merge_hold', 'owner_merge_only'];
+/**
+ * The one fingerprint of what a delegated decision rests on: the ticket's substantive fields, its whole thread (every
+ * message, by id, author and text), the changed files, and the kind's own evidence (a proposal's text and the current
+ * reviews; a design's recommendation). A record keeps it as its version. The desk recomputes it when the record is
+ * swept, when its run starts and inside the applying transaction: anything different means the delegate decided on
+ * something else, so nothing is applied. A new hold, question, message or revision is therefore a new decision.
+ */
+export function evidenceFingerprint(kind, t, ref = null) {
+  if (!t) return null;
+  const thread = store.listComments(t.key).map((c) => [c.id, c.author, hash(c.body)]);
+  const own = kind === 'research' ? { proposal: researchReview.hashOf(t), reviews: store.listResearchReviews(t.key).filter((r) => r.generation === t.research_generation)
+    .map((r) => [r.id, r.reviewer, r.status, r.verdict ?? null, hash(r.report ?? null)]) }
+    : kind === 'design' ? { type: ref?.type ?? null, id: ref?.id ?? null, status: ref?.status ?? null, text: hash(ref?.text ?? ''), stale: !!ref?.stale, chair: ref?.chair ?? null, author: ref?.author ?? null }
+      : null;
+  return hash([kind, EVIDENCE_FIELDS.map((f) => t[f] ?? null), thread, store.kvGet(`diff-files:${t.key}`), own]);
 }
 function designRef(decisionId) {
   const m = String(decisionId).match(/^(.+):(design|council):(\d+)$/);
@@ -111,18 +124,18 @@ export function candidates() {
   const out = [];
   for (const t of store.listTickets()) {
     const d = ticketDecision(t);
-    if (d) out.push({ ...d, ticket: t, version: versionFor(d.kind, t) });
+    if (d) out.push({ ...d, ticket: t, version: evidenceFingerprint(d.kind, t) });
   }
   for (const p of store.pendingProposals()) {
     const ref = designRef(`${p.ticket_key}:design:${p.id}`);
     const t = ref && store.getTicket(ref.ticket_key);
-    if (ref && t && !CLOSED.includes(t.status)) out.push({ kind: 'design', decision_id: `${t.key}:design:${p.id}`, board_kind: 'design', ticket: t, ref, version: versionFor('design', t, ref) });
+    if (ref && t && !CLOSED.includes(t.status)) out.push({ kind: 'design', decision_id: `${t.key}:design:${p.id}`, board_kind: 'design', ticket: t, ref, version: evidenceFingerprint('design', t, ref) });
   }
   for (const c of store.listCouncils()) {
     if (!c || c.status !== 'complete' || c.decision) continue;
     const ref = designRef(`${c.ticket_key}:council:${c.id}`);
     const t = ref && store.getTicket(ref.ticket_key);
-    if (ref && t && !CLOSED.includes(t.status)) out.push({ kind: 'design', decision_id: `${t.key}:council:${c.id}`, board_kind: 'council', ticket: t, ref, version: versionFor('design', t, ref) });
+    if (ref && t && !CLOSED.includes(t.status)) out.push({ kind: 'design', decision_id: `${t.key}:council:${c.id}`, board_kind: 'council', ticket: t, ref, version: evidenceFingerprint('design', t, ref) });
   }
   return out;
 }
@@ -132,11 +145,31 @@ function currentOf(r) {
     const ref = designRef(r.decision_id);
     const t = ref && store.getTicket(ref.ticket_key);
     if (!ref || !t || CLOSED.includes(t.status) || !['complete'].includes(ref.status)) return null;
-    return { kind: 'design', decision_id: r.decision_id, ticket: t, ref, version: versionFor('design', t, ref) };
+    return { kind: 'design', decision_id: r.decision_id, ticket: t, ref, version: evidenceFingerprint('design', t, ref) };
   }
   const t = store.getTicket(r.ticket_key);
   const d = ticketDecision(t);
-  return d && d.decision_id === r.decision_id && d.kind === r.kind ? { ...d, ticket: t, version: versionFor(d.kind, t) } : null;
+  return d && d.decision_id === r.decision_id && d.kind === r.kind ? { ...d, ticket: t, version: evidenceFingerprint(d.kind, t) } : null;
+}
+/**
+ * Why an open record may no longer act, or null. One check, run when the record is swept, when its run starts and
+ * inside the applying transaction: the decision is settled or rests on other evidence now (superseded: a newer record
+ * takes it, or nobody needs to), or the delegation settings or the desk's general policy (production access, merges,
+ * sync: src/decision.js) changed since it was opened (invalidated: the decision is the owner's).
+ */
+function lapse(r, c, settings = store.getSettings()) {
+  if (!c) return { status: 'superseded', why: 'It was settled before it was applied (you or the team acted first).' };
+  if (c.version !== r.version) return { status: 'superseded', why: 'The decision changed before it was applied (new evidence: a field, message, hold or revision).' };
+  if (r.delegation_version !== version(settings) || policy(settings).kinds[r.kind] !== r.mode) return { status: 'invalidated', why: 'The delegation settings changed before it was applied. The decision is yours.' };
+  if (r.policy_version !== decision.policyVersion(settings)) return { status: 'invalidated', why: "The desk's policy changed before it was applied (production access, merge or sync settings). The decision is yours." };
+  return null;
+}
+/** Close a lapsed record (never deleted: it is the audit trail) and stop its run; an invalidated one is the owner's. */
+function endLapsed(r, l) {
+  if (!store.transitionDelegation(r.id, OPEN, { status: l.status, outcome: l.why, ended_at: isoNow() })) return false;
+  if (r.run_id && store.getRun(r.run_id)?.token) runner.killRun(r.run_id, `delegated decision ${l.status}: ${l.why}`);
+  if (l.status === 'invalidated') noticeOwner(store.getDelegation(r.id), `${first(r.seat)} no longer decides this: ${l.why.replace(/ The decision is yours\.$/, '')}`);
+  return true;
 }
 /** Delegated decisions on this ticket and kind over the ticket's whole life (they survive revision generations). */
 function lifetime(key, kind) {
@@ -185,7 +218,7 @@ const deferredKey = (decisionId, v) => `delegation:deferred:${decisionId}:${v}`;
 export function deferNotice(t, settings = store.getSettings()) {
   if (!takesNotice(t, settings)) return false;
   const d = ticketDecision(t, { settled: false });
-  store.kvSet(deferredKey(d.decision_id, versionFor(d.kind, t)), isoNow());
+  store.kvSet(deferredKey(d.decision_id, evidenceFingerprint(d.kind, t)), isoNow());
   return true;
 }
 function noticeOwner(r, text) {
@@ -207,15 +240,9 @@ function briefOf(c) {
 function create(c, mode, seat) {
   const settings = store.getSettings();
   const brief = briefOf(c);
-  return store.createDelegation({ kind: c.kind, decision_id: c.decision_id, ticket_key: c.ticket.key, version: c.version, policy_version: brief.policy_version || decision.policyVersion(settings),
+  return store.createDelegation({ kind: c.kind, decision_id: c.decision_id, ticket_key: c.ticket.key, version: c.version, policy_version: decision.policyVersion(settings),
     delegation_version: version(settings), mode, seat, asker: c.kind === 'question' ? c.ticket.hold_seat || null : null, allowed: actionsFor(c), status: 'queued', brief,
     provenance: { decided_for: 'owner', by: seat, mode, kind: c.kind, created_at: isoNow() } }).row;
-}
-/** Close a record that may no longer act, keeping what it was (never deleted: it is the audit trail). */
-function supersede(r, why) {
-  if (!store.transitionDelegation(r.id, OPEN, { status: 'superseded', outcome: why, ended_at: isoNow() })) return false;
-  if (r.run_id && store.getRun(r.run_id)?.token) runner.killRun(r.run_id, `the decision changed: ${why}`);
-  return true;
 }
 function escalate(r, why, { recommendation = null, by = null, from = OPEN } = {}) {
   const ok = store.transitionDelegation(r.id, from, { status: 'escalated', action: 'escalate', why: String(why).slice(0, 1000), recommendation: recommendation ? String(recommendation).slice(0, 300) : null,
@@ -244,9 +271,8 @@ export function sweep({ now = Date.now(), paused = store.getSettings().paused ==
   const open = store.delegationsByStatus(...OPEN);
   const live = delegated || open.length ? new Map(candidates().map((c) => [c.decision_id, c])) : new Map();
   for (const r of open) {
-    const c = live.get(r.decision_id);
-    if (!c || c.version !== r.version) { if (supersede(r, c ? 'The decision changed before it was applied (a newer question, hold or revision).' : 'It was settled before it was applied (you or the team acted first).')) out.superseded++; continue; }
-    if (r.delegation_version !== version(settings) || pol.kinds[r.kind] !== r.mode) { if (store.transitionDelegation(r.id, OPEN, { status: 'invalidated', outcome: 'The delegation settings changed before it was applied. The decision is yours.', ended_at: isoNow() })) { if (r.run_id && store.getRun(r.run_id)?.token) runner.killRun(r.run_id, 'delegation settings changed'); noticeOwner(store.getDelegation(r.id), `${first(r.seat)} no longer decides this: the delegation settings changed`); } continue; }
+    const l = lapse(r, live.get(r.decision_id) || null, settings);
+    if (l) { if (endLapsed(r, l) && l.status === 'superseded') out.superseded++; continue; }
     if (r.status === 'queued' && now - Date.parse(r.created_at) > limits().maxWaitMinutes * 60_000) {
       const late = `${first(r.seat)} did not get to it within ${limits().maxWaitMinutes} minutes${paused ? ' (the desk is halted)' : ''}`;
       // In shadow the owner decides anyway: a run that never happened is no decision to show, so it ends quietly.
@@ -289,7 +315,7 @@ function safetyNet() {
   for (const t of store.ticketsByStatus('needs_human')) {
     const d = ticketDecision(t);
     if (!d) continue;
-    const v = versionFor(d.kind, t);
+    const v = evidenceFingerprint(d.kind, t);
     if (!store.kvGet(deferredKey(d.decision_id, v))) continue;
     const r = store.delegationFor(d.decision_id, v);
     const handled = r && ['em', 'sre'].includes(r.mode) && ['queued', 'running', 'applied'].includes(r.status);
@@ -346,8 +372,8 @@ export async function launch(r, fence = runner.currentEpoch()) {
   let out = null, refused = null;
   try {
     const c = currentOf(r);
-    if (!c || c.version !== r.version) { supersede(r, 'It changed or was settled before the decision run started.'); return null; }
-    if (r.delegation_version !== version() || modeOf(r.kind) !== r.mode) { store.transitionDelegation(r.id, OPEN, { status: 'invalidated', outcome: 'The delegation settings changed before the run started. The decision is yours.', ended_at: isoNow() }); noticeOwner(store.getDelegation(r.id), 'needs you'); return null; }
+    const l = lapse(r, c);
+    if (l) { endLapsed(r, l); return null; }
     const why = ownerReasonFor(c, seat);
     if (why) { escalate(r, why); return null; }
     store.updateAgent(seat, { status: 'working', current_ticket: r.ticket_key, current_kind: 'decide', last_action: 'preparing a decision for the owner', last_action_at: store.now() });
@@ -473,8 +499,9 @@ export function command(run, body = {}) {
 const footerFor = (r, why) => `\n\n_Decided for the owner by ${first(r.seat)} under the delegation policy (${model.KINDS[r.kind].label.toLowerCase()} → ${first(r.seat)}). Why: ${why.replace(/\s+/g, ' ').slice(0, 600)} The owner can override or reopen this in the Inbox._`;
 /**
  * The one door through which a delegated decision takes effect. Everything is re-checked inside the transaction: the
- * record is still open, the decision is the same version, the policy and mode are the same, the rules still allow it,
- * and the action is one this decision allows. Then it is shadowed, escalated or applied as the delegate's.
+ * record is still open and bound to this run, the evidence fingerprint is the same, the delegation settings, mode and
+ * the desk's general policy are the ones it was opened under, the rules still allow it, and the action is one this
+ * decision allows. Then it is shadowed, escalated or applied as the delegate's; a failed write rolls all of it back.
  */
 export function decide(r, choice, { run = null, deterministic = false } = {}) {
   let after = null, message = null;
@@ -482,11 +509,13 @@ export function decide(r, choice, { run = null, deterministic = false } = {}) {
     const rec = store.getDelegation(r.id);
     need(rec && OPEN.includes(rec.status), 'this decision is no longer open', 409);
     if (!deterministic) need(rec.status === 'running' && run && rec.run_id === run.id, 'this decision is not bound to this run', 409);
+    // The same evidence, delegation settings and general policy as when the record was opened (and its run bound).
     const c = currentOf(rec);
-    if (!c || c.version !== rec.version) { supersede(rec, 'It changed or was settled while it was being decided (you or the team acted first).'); message = 'The decision changed or was settled meanwhile: nothing was applied. Stop now.'; return; }
-    if (rec.delegation_version !== version() || modeOf(rec.kind) !== rec.mode) {
-      store.transitionDelegation(rec.id, OPEN, { status: 'invalidated', outcome: 'The delegation settings changed while it was being decided. The decision is yours.', ended_at: isoNow() });
-      message = 'The owner changed the delegation settings: nothing was applied. Stop now.'; return;
+    const l = lapse(rec, c);
+    if (l) {
+      endLapsed(rec, l);
+      message = l.status === 'superseded' ? 'The decision changed or was settled meanwhile: nothing was applied. Stop now.' : `${l.why.replace(/ The decision is yours\.$/, '')}: nothing was applied. Stop now.`;
+      return;
     }
     const rule = ownerReasonFor(c, rec.seat);
     if (rule) { escalate(rec, rule); message = `This one is the owner's: ${rule}. Nothing was applied. Stop now.`; return; }
@@ -498,9 +527,10 @@ export function decide(r, choice, { run = null, deterministic = false } = {}) {
       message = 'Recorded in shadow mode: the owner sees your decision and still decides. Nothing was changed. Stop now.'; return;
     }
     const applied = apply(rec, c, choice);
-    store.transitionDelegation(rec.id, OPEN, { status: 'applied', action: choice.action, text: choice.text, why: choice.why, assign: choice.assign || null, comment_id: applied.comment_id || null,
+    need(store.transitionDelegation(rec.id, OPEN, { status: 'applied', action: choice.action, text: choice.text, why: choice.why, assign: choice.assign || null, comment_id: applied.comment_id || null,
       decided_at: isoNow(), ended_at: isoNow(), outcome: applied.outcome,
-      provenance: { ...json(rec.provenance, {}), applied_at: isoNow(), run_id: run?.id || null, model: run ? store.getRun(run.id)?.model : null, delegation_version: rec.delegation_version, policy_version: rec.policy_version, deterministic } });
+      provenance: { ...json(rec.provenance, {}), applied_at: isoNow(), run_id: run?.id || null, model: run ? store.getRun(run.id)?.model : null, delegation_version: rec.delegation_version, policy_version: rec.policy_version, deterministic } }),
+    'this decision changed while it was being applied', 409);
     message = `Decided for the owner and applied: ${applied.outcome} Stop now.`;
   });
   after = store.getDelegation(r.id);

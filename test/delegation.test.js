@@ -17,12 +17,14 @@ const cfg = path.join(tmp, 'config.json');
 fs.writeFileSync(cfg, JSON.stringify({ project: { repoPath: repo, ticketPrefix: 'D' }, github: { sync: false, openDraftPrs: false }, pm: { enabled: false }, ops: { enabled: true, containers: [] } }));
 process.env.SIGMADESK_CONFIG = cfg; process.env.SIGMADESK_WORKSPACES = path.join(tmp, 'workspaces');
 
-let config, store, sched, delegation, model, attention, access, researchReview;
+let config, store, sched, delegation, model, attention, access, researchReview, team;
 before(async () => {
   ({ config } = await import('../src/config.js')); config.root = tmp; config.dataDir = path.join(tmp, 'data');
   store = await import('../src/db.js'); store.openDb(':memory:');
   sched = await import('../src/scheduler.js'); delegation = await import('../src/delegation.js'); model = await import('../src/delegation-model.js');
   attention = await import('../public/attention.js'); access = await import('../src/access.js'); researchReview = await import('../src/research-review.js');
+  team = await import('../src/team.js');
+  config.delegation.maxPerDay = 1000; // every test here binds runs; the daily allowance has its own test
 });
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -228,15 +230,72 @@ test('re-validation at apply: a changed decision is superseded, a policy change 
   assert.equal(delegation.sweep({ paused: false }).created, 0, 'every decision is yours');
   assert.equal(recFor(`${d.key}:question`), null);
   delegation.setEscalateAll(false);
-  // 4. The ticket became high-risk after the record was opened: the rule escalates instead of applying.
+  // 4. A rule that is not evidence still wins at apply: the delegate's seat was switched off while it decided.
   const e = await ask(ticket());
   delegation.sweep({ paused: false });
   const re = recFor(`${e.key}:question`); const runE = bind(re);
-  store.updateTicket(e.key, { risk: 'high' });
-  // risk is not part of a question's version: the decision is the same, the rule decides at apply time
-  const outE = await sched.deskAction(runE, 'decide', { action: 'answer', body: 'x', why: 'the evidence says so clearly' });
-  assert.match(outE, /owner's: the ticket is high risk/);
-  assert.equal(store.getDelegation(re.id).status, 'escalated');
+  team.applyTeamOverrides({ manager: { enabled: false } });
+  try {
+    const outE = await sched.deskAction(runE, 'decide', { action: 'answer', body: 'x', why: 'the evidence says so clearly' });
+    assert.match(outE, /owner's: Morgan's seat is switched off/);
+    assert.equal(store.getDelegation(re.id).status, 'escalated');
+  } finally { team.applyTeamOverrides({}); }
+});
+
+// Values a fixture writes to change one field (anything different from what the ticket holds).
+const changed = (f, v) => (['qa_loops', 'review_round', 'owner_task', 'assign_pinned', 'research_generation', 'research_revisions', 'owner_merge_only'].includes(f) ? (Number(v) || 0) + 1
+  : f === 'contributors' ? JSON.stringify(['senior-be', 'manager']) : f === 'risk' ? 'high' : f === 'status' ? 'todo' : `${v ?? ''}~changed`);
+test('evidence and policy at apply (property): any one substantive change after the run started means nothing is applied', async () => {
+  reset();
+  policy({ question: 'em' });
+  const fields = delegation.EVIDENCE_FIELDS.filter((f) => !['key', 'reporter'].includes(f)); // set once, at creation
+  const savedPolicy = store.getSettings().access_policy;
+  const mutations = [
+    ...fields.map((f) => [`the ticket's ${f}`, (t) => { store.updateTicket(t.key, { [f]: changed(f, t[f]) }); assert.notEqual(String(store.getTicket(t.key)[f]), String(t[f]), `${f} changed`); }]),
+    ['a new message on the thread', (t) => store.addComment(t.key, 'senior-be', 'This now touches the broker order path.')],
+    ['the changed files', (t) => store.kvSet(`diff-files:${t.key}`, JSON.stringify(['broker/orders.py']))],
+    ['production read access', () => store.setSetting('ops_enabled', 'true')],
+    ['GitHub sync', () => store.setSetting('github_sync', store.getSettings().github_sync === 'true' ? 'false' : 'true')],
+    ['opening PRs', () => store.setSetting('open_draft_prs', store.getSettings().open_draft_prs === 'true' ? 'false' : 'true')],
+    ['the access policy', () => store.writeSetting('access_policy', JSON.stringify({ approvers: ['manager'], seats: ['sre'], probes: ['*'], maxMinutes: 30 }))],
+  ];
+  const sync = store.getSettings().github_sync, prs = store.getSettings().open_draft_prs;
+  try {
+    for (const [what, mutate] of mutations) {
+      const t = await ask(ticket({ description: 'Fix the retry helper in utils/net.py.' }));
+      delegation.sweep({ paused: false });
+      const r = recFor(`${t.key}:question`);
+      assert.equal(r?.status, 'queued', what);
+      const run = bind(r);
+      const thread = store.listComments(t.key).length;
+      mutate(store.getTicket(t.key));
+      const out = await sched.deskAction(run, 'decide', { action: 'answer', body: 'Yes, buy it.', why: 'utils/net.py:40 says so; the playbook says reuse.' });
+      const after = store.getDelegation(r.id);
+      assert.ok(['superseded', 'invalidated'].includes(after.status), `${what}: ${after.status}`);
+      assert.match(out, /nothing was applied/, what);
+      assert.ok(!store.listComments(t.key).some((c) => c.author === 'manager'), `${what}: nothing posted as Morgan`);
+      assert.ok(store.listComments(t.key).length <= thread + 1, `${what}: no decision on the thread`);
+      store.setSetting('ops_enabled', 'false'); store.setSetting('github_sync', sync); store.setSetting('open_draft_prs', prs);
+      store.writeSetting('access_policy', savedPolicy ?? '');
+    }
+  } finally { store.setSetting('ops_enabled', 'false'); store.setSetting('github_sync', sync); store.setSetting('open_draft_prs', prs); store.writeSetting('access_policy', savedPolicy ?? ''); }
+});
+
+test('a failed final write rolls the whole decision back: no answer on the thread, the ticket still waits for the owner', async () => {
+  reset();
+  policy({ question: 'em' });
+  const t = await ask(ticket());
+  delegation.sweep({ paused: false });
+  const r = recFor(`${t.key}:question`); const run = bind(r);
+  const thread = store.listComments(t.key).length;
+  store.handle().exec("CREATE TRIGGER fail_apply BEFORE UPDATE OF status ON delegated_decisions WHEN NEW.status = 'applied' BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
+  try {
+    await assert.rejects(sched.deskAction(run, 'decide', { action: 'answer', body: 'utils/net.py:40.', why: 'utils/net.py:40 defines retry(); the playbook says reuse.' }), /injected failure/);
+  } finally { store.handle().exec('DROP TRIGGER fail_apply'); }
+  const now = store.getTicket(t.key);
+  assert.deepEqual([now.status, now.hold_kind], ['needs_human', 'question'], 'the work did not resume');
+  assert.equal(store.listComments(t.key).length, thread, 'the answer was rolled back with it');
+  assert.equal(store.getDelegation(r.id).status, 'running', 'still open: the run ends without a decision and it goes to the owner');
 });
 
 test('self-interest and risk escalate by rule, before any run: the asker never answers itself; risky tickets stay yours', async () => {
