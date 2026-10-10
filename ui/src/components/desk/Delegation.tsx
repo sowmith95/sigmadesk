@@ -134,7 +134,9 @@ export function DelegationSettings() {
   const [d, setD] = useState<Rec | null>(null);
   const [busy, setBusy] = useState(false);
   const v = S.meta.delegation?.version;
-  const rulesNow = S.meta.delegation?.rules?.hash; // the playbook's rules, from every snapshot: an edit there refreshes this
+  // The playbook's rules and why there are none, from every snapshot: an edit to either refreshes this (a new reason
+  // with still no rules too).
+  const R = S.meta.delegation?.rules, rulesNow = `${R?.hash}|${R?.problem ?? ''}|${R?.note_under_heading ? 1 : 0}`;
   useEffect(() => { api('GET', '/api/delegation').then(setD).catch(() => setD(null)); }, [v, rulesNow]);
   if (!d) return <p className="text-muted-foreground">Loading delegation…</p>;
   const save = async (patch: { kinds?: Record<string, string>; peerAccess?: boolean }) => {
@@ -160,6 +162,7 @@ export function DelegationSettings() {
         {d.rules?.count
           ? <p>They decide for you only under the {d.rules.count === 1 ? 'standing rule' : `${d.rules.count} standing rules`} the desk found in your playbook under “{d.rules.section}”, and each decision must cite one, with evidence from the decision’s brief. The desk checks that what they cite is your rule and was in the brief; whether the rule fits the decision is their judgment, so keep rules narrow.</p>
           : <p>The desk found no standing rules in your playbook{d.rules?.problem ? <> (<b className="font-medium" data-rules-problem>{d.rules.problem}</b>)</> : null}, so nothing below is decided for you by judgment: those decisions all come to you. It reads them as dash bullets right under a “## {d.rules?.section || 'Standing rules the EM may apply alone'}” heading, and stops at the first line of another kind (code, a link, HTML, a comment, a numbered list or a new paragraph). Owner tasks are the exception: a step filed as a check or a package is routed by rule, without any standing rule.</p>}
+        <p className="text-muted-foreground" data-html-rule>Anywhere in the playbook, a “&lt;” right before a letter, “/”, “!” or “?” (a tag, a link in angle brackets, even inside inline code) leaves no standing rules, because Markdown may hide what follows it. Only a fenced code block or a comment is exempt: write placeholders as PATHS, not &lt;paths&gt;, and links bare.</p>
         {!d.rules?.count && d.rules?.note_under_heading ? <p data-note-under-heading>Your playbook has the note that earlier versions put right under that heading. The note under the heading must move above it: the desk stops reading at a comment, so no rule after it counts.</p> : null}
         <p className="text-muted-foreground">Override and Reopen let you decide again, but they cannot undo what the team already did after a decision.</p>
       </div>

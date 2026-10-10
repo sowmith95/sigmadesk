@@ -416,6 +416,13 @@ test('delegation (#9): Settings follows the playbook as the owner edits it, with
     assert.equal(again.status, 200, JSON.stringify(again.body));
     await page.waitForSelector('[data-standing-rules="0"] [data-note-under-heading]', { timeout: 20_000 });
     assert.match(await page.locator('[data-note-under-heading]').textContent(), /The note under the heading must move above it/);
+    // A placeholder in angle brackets anywhere, even in inline code, is HTML-like text: no rules, and Settings says why.
+    fs.writeFileSync(PLAYBOOK, '# P\n- Run `pytest <paths>` first.\n\n## Standing rules the EM may apply alone\n- Answer which-file questions.\n');
+    const third = await api('POST', '/api/inbox/snooze', { id: `${asked.key}:question`, until: null });
+    assert.equal(third.status, 200, JSON.stringify(third.body));
+    await page.waitForSelector('[data-standing-rules="0"] [data-rules-problem]', { timeout: 20_000 });
+    assert.match(await page.locator('[data-rules-problem]').textContent(), /the playbook contains HTML-like text/);
+    assert.match(await page.locator('[data-html-rule]').textContent(), /write placeholders as PATHS, not <paths>, and links bare/);
   } finally { fs.writeFileSync(PLAYBOOK, shipped); }
   assert.deepEqual(errors, []);
   await page.close();
