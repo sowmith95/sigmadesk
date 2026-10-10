@@ -525,8 +525,8 @@ CREATE TABLE IF NOT EXISTS delegated_decisions (
   kind TEXT NOT NULL,             -- owner_task | question | research | loop_limit | design
   decision_id TEXT NOT NULL,      -- the board decision it is for (e.g. SD-12:question)
   ticket_key TEXT,
-  version TEXT NOT NULL,          -- hash of the evidence the decision rests on (a new hold or revision = a new decision)
-  policy_version TEXT,            -- the decision brief's policy version (src/decision.js)
+  version TEXT NOT NULL,          -- its evidence fingerprint (src/delegation.js evidenceFingerprint): new evidence = a new decision
+  policy_version TEXT,            -- the desk's general policy when it was opened (src/decision.js policyVersion)
   delegation_version TEXT,        -- the delegation matrix in force when it was created (any change invalidates it)
   mode TEXT NOT NULL,             -- shadow | em | sre
   seat TEXT NOT NULL,             -- the delegate (manager | sre)

@@ -1,17 +1,20 @@
 // Delegation (sowmith95/sigmadesk#9): the Engineering Manager (Morgan) and the SRE (Devon) decide some owner decisions
 // FOR the owner. The rules are in src/delegation-model.js; this file owns the records and the runs.
 //
-// - Candidates come from STRUCTURED state only (tickets.hold_kind / hold_seat / hold_ref, owner_task_kind,
+// - Candidates come from STRUCTURED state only (tickets.hold_kind / hold_seat / hold_ref / hold_scope, owner_task_kind,
 //   research_review, pending design proposals and councils). No message text is ever classified.
-// - One server-owned record per (board decision, evidence version): what it was based on (the same decision brief the
-//   owner sees), the policy in force, the delegate, the actions it may take, attempts, spend and the outcome.
+// - One server-owned record per (board decision, evidence version). The version is ONE fingerprint of everything the
+//   decision rests on (evidenceFingerprint), with the delegation and general policy versions, the delegate, the actions
+//   it may take, attempts, the spend it reserved and was charged, and the outcome.
 // - Owner-task triage is decided by rule with no model call. Everything else gets ONE bounded `decide` run (a dollar cap
-//   on Claude, time and steps on a plan-billed engine), then an explained escalation to the owner.
-// - A decision is applied atomically after re-checking, at that moment, the evidence (same version), the policy (same
-//   delegation version, mode and seat) and the rules. It is written as the delegate's ("decided for the owner"), never
+//   on Claude, time and steps on a plan-billed engine, a lifetime allowance where one applies), then an explained
+//   escalation to the owner. Its decision must cite the standing rules and evidence its run was given, or it is not applied.
+// - One list of interested seats (interestedSeats) keeps every party to a decision from deciding it.
+// - A decision is applied atomically after re-checking, at that moment, the evidence fingerprint, both policy versions,
+//   the mode, the standing rules and the owner rules. It is written as the delegate's ("decided for the owner"), never
 //   through ownerReply or any owner path, and the owner can override it or reopen it (reconsider, never a rollback).
 // - Shadow mode records what the delegate would decide and shows it to the owner, who still decides; nothing reaches
-//   the ticket's thread (engineers read the thread).
+//   the ticket's thread (engineers read the thread). A hold's notice held back for a delegate is owed on the hold.
 import crypto from 'node:crypto';
 import { config } from './config.js';
 import * as store from './db.js';
@@ -41,7 +44,6 @@ const CLOSED = ['done', 'wontdo'];
 export const limits = () => model.settingsFrom(config.delegation || {});
 export const policy = (settings = store.getSettings()) => model.fromSettings(settings, config.delegation || {});
 export const version = (settings = store.getSettings()) => model.versionOf(policy(settings), settings.delegation_epoch);
-export const modeOf = (kind, settings = store.getSettings()) => policy(settings).kinds[kind] || 'owner';
 /** EM↔SRE reciprocal production read access (src/access.js): owner-configurable, default off. */
 export const peerAccess = (settings = store.getSettings()) => policy(settings).peerAccess === true;
 const bumpEpoch = () => store.writeSetting('delegation_epoch', String((Number(store.getSettings().delegation_epoch) || 0) + 1));
