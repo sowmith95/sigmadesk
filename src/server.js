@@ -398,6 +398,8 @@ async function ownerRoute(req, res) {
   // Institutional memory (#10): the outbox for Settings → Knowledge, and another try of a failed note.
   if (req.method === 'GET' && p === '/api/knowledge') return send(res, 200, { ...knowledge.describe(), notes: store.recentKnowledgeNotes(50) });
   if (req.method === 'POST' && (mm = m('^/api/knowledge/notes/(\\d+)/retry$'))) return send(res, 200, { ok: true, note: knowledgeNotes.retryNote(Number(mm[1])) });
+  // The owner checked a changed store target (collection, model, chunker) and accepts it: the next verified note pins it.
+  if (req.method === 'POST' && p === '/api/knowledge/target/reset') { knowledgeNotes.resetTarget(); store.logEvent({ kind: 'system', agent_id: 'owner', text: 'accepted a new knowledge store target' }); return send(res, 200, { ok: true }); }
   if (req.method === 'GET' && p === '/api/access') { access.sweep(); return send(res, 200, access.details()); }
   if (req.method === 'POST' && p === '/api/access/grant') {
     const b = await readBody(req);

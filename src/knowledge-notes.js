@@ -23,14 +23,20 @@ let autoFlush = true; // a new note is written right away (tests drive the worke
 export function setAutoFlush(on) { autoFlush = on !== false; }
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const json = (s, d = null) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
-const line = (s, n = 300) => { const t = String(s ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+// Every field is redacted WHOLE, then shortened (never inside a token or an open quote): a cut can never hide a secret
+// from redaction by removing its tail.
+const line = (s, n = 300) => kb.safeCut(clean(String(s ?? '')).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(), n);
 const short = (sha) => (sha ? String(sha).slice(0, 12) : '-');
 const SHA = /^[0-9a-f]{7,40}$/;
 
-/** A ticket qualifies once it is done AND its PR merged (done alone — owner tasks, verify checks, epics — does not). */
+const resolvedIncidents = (key) => store.listIncidents({ limit: 500 }).filter((i) => i.ticket_key === key && i.status === 'resolved');
+/**
+ * A ticket qualifies once it is done AND either its PR merged or closing it resolved a linked incident. Done alone —
+ * owner tasks, verify checks, epic roll-ups — does not.
+ */
 export function qualifies(key) {
   const t = store.getTicket(key);
-  return !!(t && t.status === 'done' && store.mergedEventOf(key));
+  return !!(t && t.status === 'done' && (store.mergedEventOf(key) || resolvedIncidents(key).length));
 }
 
 /**
@@ -39,24 +45,28 @@ export function qualifies(key) {
  */
 export function buildFacts(key) {
   const t = store.getTicket(key);
-  const merged = t ? store.mergedEventOf(key) : null;
-  if (!t || t.status !== 'done' || !merged) return null;
+  if (!t || !qualifies(key)) return null;
+  const merged = store.mergedEventOf(key);
   const out = [];
   const add = (...l) => out.push(...l);
-  const mergedAt = (String(merged.text).match(/at (\S+)$/) || [])[1] || merged.ts;
+  const mergedAt = merged ? (String(merged.text).match(/at (\S+)$/) || [])[1] || merged.ts : null;
   const deploys = store.deploysForTicket(key);
   const mergeSha = [...new Set([json(store.kvGet(`deploy:none:${key}`))?.merge_sha, ...deploys.map((d) => d.merge_sha)].filter((s) => SHA.test(String(s || ''))))];
   add(`# Facts: ${key} — ${line(t.title, 200)}`, '',
-    `Recorded by SigmaDesk from its own records when ${key} closed with a merged pull request. Attributable facts only: each section names the records it comes from. Seat-written narrative (submission notes, review summaries, replies, lessons, claimed root causes) is not included.`,
+    `Recorded by SigmaDesk from its own records when ${key} closed ${merged ? 'with a merged pull request' : 'and its incident was resolved'}. Attributable facts only: each section names the records it comes from. Seat-written narrative (submission notes, review summaries, replies, lessons, claimed root causes) is not included.`,
     `Format: ${FORMAT} · project ${config.projectId || config.project.name}`, '',
     '## Ticket  [ticket record]',
     `- ${key} · type ${t.type || '-'} · area ${t.area || '-'} · complexity ${t.complexity || '-'} · priority ${t.priority || '-'} · risk ${t.risk || 'unrecorded'}${t.parent_key ? ` · part of ${t.parent_key}` : ''}`,
-    `- Closed ${t.done_at || '-'} · pull request ${t.pr_url || '-'} merged ${mergedAt}  [GitHub PR sync event ${merged.id}]`,
+    `- Closed ${t.done_at || '-'}${merged ? ` · pull request ${t.pr_url || '-'} merged ${mergedAt}  [GitHub PR sync event ${merged.id}]` : ' · no merged pull request'}`,
     `- QA-passed commit ${t.qa_sha || '-'} · head ${t.head_sha || '-'}${mergeSha.length ? ` · merge commit ${mergeSha.join(', ')}  [merge/deploy record]` : ''}`,
     `- Builder ${t.builder || '-'}${json(t.contributors, []).length ? ` · contributors ${json(t.contributors, []).join(', ')}` : ''}`, '');
-  const acc = acceptanceOf(t.description);
-  add(`## Specification  [ticket description, sha256 ${sha256(`${t.title}\n${t.description || ''}`).slice(0, 12)}]`,
-    acc ? clip(acc, 3000) : clip(t.description || '(no description)', 3000), '');
+  // The spec as recorded when the ticket was created — never today's description (seats append to it), never comments.
+  const spec = store.getTicketSpec(key);
+  if (spec) {
+    const acc = acceptanceOf(spec.description);
+    add(`## Specification  [ticket at creation, written by ${line(spec.reporter || 'unknown', 40)} at ${spec.created_at}, sha256 ${sha256(`${spec.title}\n${spec.description}`).slice(0, 12)}]`,
+      clip(acc || spec.description || '(no description)', 3000), '');
+  } else add('## Specification  [ticket at creation]', '- not recorded (the ticket predates the frozen record)', '');
   const files = json(store.kvGet(`diff-files:${key}`), null);
   add(`## Files changed  [desk diff record at the QA-passed commit ${short(t.qa_sha)}]`);
   if (Array.isArray(files) && files.length) { add(...files.slice(0, 200).map((f) => `- ${line(f, 200)}`)); if (files.length > 200) add(`- …and ${files.length - 200} more`); }
@@ -96,8 +106,10 @@ export function buildFacts(key) {
   return { title: line(clean(`SigmaDesk facts: ${key} — ${t.title}`), 200), body };
 }
 function clip(text, n) {
-  const t = String(text ?? '').replace(/\r\n?/g, '\n').trim();
-  return t.length > n ? `${t.slice(0, n)}\n[cut: ${t.length - n} more characters]` : t;
+  const t = clean(String(text ?? '').replace(/\r\n?/g, '\n')).trim(); // redact the whole field first
+  if (t.length <= n) return t;
+  const at = t.lastIndexOf('\n', n);
+  return `${at > 0 ? t.slice(0, at) : kb.safeCut(t, n)}\n[cut: ${t.length - (at > 0 ? at : n)} more characters]`;
 }
 
 /** The immutable, content-versioned address of one note. */
@@ -131,10 +143,14 @@ export function reconcile() {
   if (config.knowledge?.enabled !== true) return 0;
   let since = store.kvGet('knowledge:since');
   if (!since) { since = store.now(); store.kvSet('knowledge:since', since); return 0; }
+  // By (ticket, current fact set): a ticket whose facts changed after a later transition (a post-deploy verdict, a
+  // regression hold) while writing was off gets its new version even though an older note exists.
+  const keys = new Set([...store.ticketsByStatus('done').filter((t) => t.done_at && t.done_at >= since).map((t) => t.key), ...store.resolvedIncidentTickets(since)]);
   let n = 0;
-  for (const t of store.ticketsByStatus('done')) {
-    if (!t.done_at || t.done_at < since || store.knowledgeNotesFor(t.key).length || !qualifies(t.key)) continue;
-    if (store.transaction(() => enqueueTicketFacts(t.key, { trigger: 'reconcile' }))) n += 1;
+  for (const key of keys) {
+    const facts = qualifies(key) ? buildFacts(key) : null;
+    if (!facts || store.knowledgeNoteByUrl(noteUrl(key, sha256(facts.body)))) continue;
+    if (store.transaction(() => enqueueTicketFacts(key, { trigger: 'reconcile' }))) n += 1;
   }
   return n;
 }
@@ -142,6 +158,20 @@ export function reconcile() {
 // ---------------- the outbox worker ----------------
 const backoffMs = (attempts) => Math.min(6 * 3600_000, 60_000 * 2 ** Math.max(0, attempts - 1));
 const targetOf = (j) => (j?.target && typeof j.target === 'object' ? j.target : null);
+/**
+ * Every answer must come from the same store target: the fingerprint the first verified note pinned, and the configured
+ * pin when there is one. A missing fingerprint counts as a change (fail closed).
+ */
+export function targetProblem(target) {
+  const fp = target?.fingerprint;
+  if (!fp) return 'the store reported no target fingerprint';
+  const pinned = store.kvGet('knowledge:target');
+  if (pinned && fp !== pinned) return `the store target changed (fingerprint ${fp}; the first verified note pinned ${pinned}). Check the collection, embedding model and chunk settings`;
+  if (config.knowledge.fingerprint && fp !== config.knowledge.fingerprint) return `the store target does not match knowledge.fingerprint (${fp}, configured ${config.knowledge.fingerprint})`;
+  return null;
+}
+/** The owner checked a changed target and accepts it: the next verified note pins the new one. */
+export function resetTarget() { store.kvDelete('knowledge:target'); }
 let flushing = null;
 /** Write due notes one at a time through the knowledge lane. Coalesced; never throws. */
 export function flush({ limit = 5 } = {}) {
@@ -176,15 +206,18 @@ export async function attempt(row) {
     const status = json(st.stdout.trim(), null);
     if (!status || typeof status !== 'object') return retry('checking the store: the answer was not JSON');
     const target = targetOf(status);
-    if (config.knowledge.fingerprint && target?.fingerprint !== config.knowledge.fingerprint) return final('failed', `the store target changed (fingerprint ${target?.fingerprint || 'none'}, pinned ${config.knowledge.fingerprint}); update knowledge.fingerprint after checking it`, target);
+    const drift = targetProblem(target);
+    if (drift) return final('failed', drift, target);
     if (status.exists && status.content_hash !== row.body_sha256) return final('refused', 'the store holds different content under this note\'s URL', target);
     // 2. Write (an already-verified copy is not re-embedded) and verify by exact read-back.
     const r = await kb.runCli(op, ['ingest-text', '--title', row.title, '--url', row.url, '--namespace', row.namespace, '--type', 'markdown', '--json'], { input: row.body, deadlineAt });
     if (r.reason) return retry(`writing: ${kb.cliErrorSummary(r)}`, target);
     const j = json(r.stdout.trim(), null);
-    const t2 = targetOf(j) || target;
+    const t2 = targetOf(j);
+    if (r.code === 0 && (targetProblem(t2) || t2.fingerprint !== target.fingerprint)) return final('failed', targetProblem(t2) || `the store target changed during the write (${t2.fingerprint}, checked ${target.fingerprint})`, t2 || target);
     if (r.code === 2) return final('refused', `the store refused the note: ${line(kb.cliErrorSummary(r), 200)}`, t2);
     if (r.code === 0 && j?.verified === true && j.url === row.url && j.content_hash === row.body_sha256) {
+      if (!store.kvGet('knowledge:target')) store.kvSet('knowledge:target', t2.fingerprint); // the first verified note pins the target
       store.updateKnowledgeNote(row.id, { status: 'verified', attempts, last_error: null, next_attempt_at: null, verified_at: store.now(), doc_id: String(j.doc_id || '').slice(0, 80) || null, chunk_count: Number.isInteger(j.chunk_count) ? j.chunk_count : null, target: t2 ? JSON.stringify(t2) : null });
       store.logEvent({ kind: 'action', agent_id: 'system', ticket_key: row.ticket_key, text: `wrote past-work note for ${row.ticket_key} (${row.trigger || 'facts'}, verified by exact read-back)` });
       return store.getKnowledgeNote(row.id);

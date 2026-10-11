@@ -190,7 +190,13 @@ export function buildDecision(t, { ctx = assignContext(), overlay = {}, taken = 
 
 export function setStatus(key, status, extra = {}) {
   const before = store.getTicket(key)?.status;
-  const t = store.updateTicket(key, { status, ...extra });
+  // Closing commits together with its frozen past-work note (#10) when it qualifies (a merged PR, or an incident the
+  // close resolved); the note never blocks the close.
+  const t = store.transaction(() => {
+    const row = store.updateTicket(key, { status, ...extra });
+    if (status === 'done' && before !== 'done') knowledgeNotes.enqueueTicketFacts(key, { trigger: store.mergedEventOf(key) ? 'merged' : 'incident resolved' });
+    return row;
+  });
   github.syncIssueState(key);
   // A hold whose kind is delegated (#9) is announced by the delegation only if it comes back to the owner.
   if (status !== before && status === 'needs_human' && !delegation.deferNotice(t)) notify('needs_human', t, 'needs you');
@@ -2458,8 +2464,7 @@ export const prActions = {
   merged(t, a) {
     store.addComment(t.key, 'system', `🎉 **Merged on GitHub**${a.at ? ` at ${a.at}` : ''}.`);
     store.logEvent({ kind: 'github', agent_id: 'github', ticket_key: t.key, text: `PR merged on GitHub${a.at ? ` at ${a.at}` : ''}` }); // team stats count it as shipped
-    // The qualifying transition and its frozen past-work note commit together (#10); the note never blocks it.
-    store.transaction(() => { setStatus(t.key, 'done', { progress: 100, progress_msg: 'merged' }); knowledgeNotes.enqueueTicketFacts(t.key, { trigger: 'merged' }); });
+    setStatus(t.key, 'done', { progress: 100, progress_msg: 'merged' });
     teamStats.invalidate();
   },
   closed(t, a) {

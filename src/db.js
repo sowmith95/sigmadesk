@@ -602,6 +602,15 @@ CREATE TABLE IF NOT EXISTS knowledge_citations (
   ts TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS knowledge_citations_ts ON knowledge_citations(ts);
+-- A ticket's specification exactly as recorded when it was created (#10): the facts note quotes this, never the current
+-- description (seats append to it) and never comments.
+CREATE TABLE IF NOT EXISTS ticket_specs (
+  ticket_key TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  reporter TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 -- Notes the desk writes back: enqueued in the transaction of the qualifying transition, body frozen (content-hash URL),
 -- written and verified by exact read-back by the outbox worker. status: pending | verified | failed | refused.
 CREATE TABLE IF NOT EXISTS knowledge_outbox (
@@ -902,6 +911,7 @@ export function createTicket(t) {
   const key = `${config.project.ticketPrefix}-${info.lastInsertRowid}`;
   q('UPDATE tickets SET key=? WHERE id=?').run(key, info.lastInsertRowid);
   const ticket = getTicket(key);
+  q('INSERT OR IGNORE INTO ticket_specs(ticket_key,title,description,reporter,created_at) VALUES (?,?,?,?,?)').run(key, ticket.title, ticket.description || '', ticket.reporter || null, ticket.created_at);
   announce({ type: 'ticket', data: ticket });
   logEvent({ ticket_key: key, agent_id: t.reporter, kind: 'created', text: `created “${ticket.title}” → ${ticket.status}` });
   return ticket;
@@ -1669,3 +1679,7 @@ export const runsStartedSince = (iso) => q('SELECT id, kind, agent_id FROM runs 
 /** The PR-merged event of a ticket (the qualifying "closed with a merged PR" fact), newest first. */
 export const mergedEventOf = (key) => q("SELECT id, ts, text FROM events WHERE ticket_key=? AND kind='github' AND text LIKE 'PR merged on GitHub%' ORDER BY id DESC LIMIT 1").get(key) || null;
 export const runsOfTicket = (key) => q('SELECT id, kind, agent_id, model, status, started_at, ended_at FROM runs WHERE ticket_key=? ORDER BY id').all(key);
+export const getTicketSpec = (key) => q('SELECT * FROM ticket_specs WHERE ticket_key=?').get(key) || null;
+/** Tickets whose linked incident was resolved at or after `iso` (an incident resolution is a qualifying transition). */
+export const resolvedIncidentTickets = (iso) => q("SELECT DISTINCT ticket_key FROM incidents WHERE status='resolved' AND ticket_key IS NOT NULL AND resolved_at >= ?").all(iso).map((r) => r.ticket_key);
+export const knowledgeNoteByUrl = (url) => q('SELECT * FROM knowledge_outbox WHERE url=?').get(url) || null;
