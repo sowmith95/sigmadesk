@@ -102,6 +102,8 @@ export function snapshot({ inbox = true } = {}) {
       // Delegation (#9): the matrix, open delegated decisions (the board reads them), "Decided for you" and the weekly
       // "owner interventions avoided" and spend.
       delegation: delegation.summary(Date.now(), settings),
+      // Institutional memory (#10): scope (with the hard deny list), per-run budget, outbox state and the weekly numbers.
+      knowledge: knowledge.describe(settings),
     },
   };
   // Inbox attention state: real waiting time per decision and the owner's snoozes (public/inbox.js applies them).
