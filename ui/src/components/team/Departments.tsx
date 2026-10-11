@@ -42,6 +42,7 @@ export function KpiRow({ k, wall }: { k: Kpi; wall?: boolean }) {
         <b className={cn('shrink-0 font-mono font-medium tabular', wall ? 'text-2xl' : 'text-base', k.unknown ? 'font-sans text-sm font-normal italic text-muted-foreground' : TONE[k.tone] || '')}>{k.unknown ? 'unknown' : k.value}</b>
       </div>
       <span className={cn('truncate text-muted-foreground/80', wall ? 'text-sm' : 'text-xs')}>{meta}</span>
+      {k.note && <span data-kpi-note className={cn('[overflow-wrap:anywhere]', TONE[k.tone] || 'text-foreground', wall ? 'text-base' : 'text-xs')}>{k.note}</span>}
     </div>
   );
 }

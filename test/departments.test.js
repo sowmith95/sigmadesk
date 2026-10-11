@@ -183,9 +183,10 @@ test('the research department says how full the research backlog is, and when ne
   const deps = departmentsFor(agents);
   const kpiOf = (backlog) => departmentKpis({ tickets: [], agents, meta: backlog === undefined ? {} : { research: { backlog } } }, deps, { now: NOW }).departments.research.kpis.find((k) => k.label === 'Research backlog');
   const full = kpiOf({ count: 12, max: 8, full: true, reason: '12 research items are waiting — research resumes when fewer than 8 are open', keys: [] });
-  assert.equal(full.value, '12 of 8 research items; new research waiting'); assert.equal(full.tone, 'needs');
-  assert.match(full.window, /resumes when fewer than 8 are open/);
+  assert.equal(full.value, '12 / 8', 'a short figure: the explanation is its own line'); assert.equal(full.tone, 'needs');
+  assert.equal(full.note, 'New research waits until fewer than 8 are open'); assert.equal(full.window, 'research items open / limit');
+  assert.equal(kpiOf({ count: 0, max: 0, full: true, reason: 'off', keys: [] }).note, 'New research is off (the limit is 0)');
   const open = kpiOf({ count: 3, max: 8, full: false, reason: null, keys: [] });
-  assert.equal(open.value, '3 of 8 research items'); assert.equal(open.tone, 'neutral'); assert.equal(open.window, 'new research waits at 8');
+  assert.equal(open.value, '3 / 8'); assert.equal(open.tone, 'neutral'); assert.equal(open.note, null);
   assert.match(kpiOf(undefined).unknown, /did not report/);
 });

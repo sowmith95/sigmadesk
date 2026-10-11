@@ -575,7 +575,32 @@ test('research tags follow the backlog while Research stays open: the cap is rea
     // Team status says it too.
     await go(page, '#/team');
     await page.locator('[data-kpi="Research backlog"]').first().waitFor();
-    assert.match(await page.locator('[data-kpi="Research backlog"]').first().textContent(), /2 of 3 research items/);
+    assert.match(await page.locator('[data-kpi="Research backlog"]').first().textContent(), /2 \/ 3/);
     assert.deepEqual(errors, []); await page.close();
+  } finally { await desk.stop(); }
+});
+
+test('a full research backlog fits its department card: Team on a desktop and a 390 px phone, and the wall', { skip, timeout: 90_000 }, async () => {
+  const desk = await startPreview({ SIGMADESK_PREVIEW_PLAYBOOK: PLAYBOOK, SIGMADESK_PREVIEW_RESEARCH_HELD: '12' });
+  try {
+    await fetch(`${desk.url}/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'research_backlog_max', value: '8' }) });
+    const fits = (page) => page.$eval('article[data-department="research"]', (card) => {
+      const k = card.querySelector('[data-kpi="Research backlog"]'), note = k.querySelector('[data-kpi-note]'), c = card.getBoundingClientRect();
+      const inside = [...k.querySelectorAll('*')].every((el) => { const r = el.getBoundingClientRect(); return !r.width || (r.left >= c.left - 0.5 && r.right <= c.right + 0.5); });
+      return { value: k.querySelector('b').textContent, note: note?.textContent, cardFits: card.scrollWidth <= card.clientWidth + 1, inside, noteFits: !!note && note.scrollWidth <= note.clientWidth + 1 };
+    });
+    const want = { value: '12 / 8', note: 'New research waits until fewer than 8 are open', cardFits: true, inside: true, noteFits: true };
+    for (const [w, h] of [[1280, 900], [390, 844]]) {
+      const { page, errors } = await openPage(browser, `${desk.url}/#/team`, { width: w, height: h });
+      await page.waitForSelector('article[data-department="research"] [data-kpi="Research backlog"]');
+      assert.deepEqual(await fits(page), want, `Team at ${w} px`);
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `no sideways scrolling at ${w} px`);
+      assert.deepEqual(errors, []); await page.close();
+    }
+    const wall = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
+    await wall.goto(`${desk.url}/?wall=1`);
+    await wall.waitForSelector('article[data-department="research"] [data-kpi="Research backlog"]');
+    assert.deepEqual(await fits(wall), want, 'the wall');
+    await wall.close();
   } finally { await desk.stop(); }
 });
