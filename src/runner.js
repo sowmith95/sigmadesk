@@ -765,31 +765,42 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const pkg = packages.readPathsFor(agentId, ticketKey, kind);
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job,
     profile_hash: (agent.engine || 'claude') === 'codex' ? ENGINES.codex.profileHash(pkg.paths) : null });
-  packages.recordLaunch(run.id, pkg.ids);
-  // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
-  if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
-  store.updateRun(run.id, { reserve_usd: runReserve(agent, kind, limits?.usd ?? null) });
-  // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
-  // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
-  if (kind !== 'mention' && kind !== 'decide') access.bindRun(agentId, ticketKey, run.id); // a decision run (#9) is not the ticket's work either
-  onStart?.(run);
-  const ctx = { run, cwd, result: null, state: {}, presence: track };
-  if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
-  store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'run',
-    text: `${agent.role} started ${kind} on ${agent.engine && agent.engine !== 'claude' ? `${agent.engine}${agent.model ? `/${agent.model}` : ''}` : agent.model}${agent.effort ? ` (${agent.effort})` : ''}${resume ? ` (${fork ? 'forked from' : 'continuing'} session ${resume.slice(0, 8)})` : ''}` });
-  if (selected.fallback) store.logEvent({ ...{ run_id: run.id, agent_id: agentId, ticket_key: ticketKey }, kind: 'system',
-    text: `Automatic fallback: ${agentById[agentId].engine || 'claude'} → ${agent.engine} (${selected.reason}). Saved seat preference retained.` });
+  // Everything between the run's row and its spawn: a failure here must not leave a "running" run with no process (it
+  // would hold its seat, budget and research room forever). The run ends as an error, the seat is free, and it rethrows.
+  let ctx, engine, pplx, px, timeoutMin, deadlineAt;
+  try {
+    packages.recordLaunch(run.id, pkg.ids);
+    // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
+    if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
+    store.updateRun(run.id, { reserve_usd: runReserve(agent, kind, limits?.usd ?? null) });
+    // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
+    // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
+    if (kind !== 'mention' && kind !== 'decide') access.bindRun(agentId, ticketKey, run.id); // a decision run (#9) is not the ticket's work either
+    onStart?.(run);
+    ctx = { run, cwd, result: null, state: {}, presence: track };
+    if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
+    store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'run',
+      text: `${agent.role} started ${kind} on ${agent.engine && agent.engine !== 'claude' ? `${agent.engine}${agent.model ? `/${agent.model}` : ''}` : agent.model}${agent.effort ? ` (${agent.effort})` : ''}${resume ? ` (${fork ? 'forked from' : 'continuing'} session ${resume.slice(0, 8)})` : ''}` });
+    if (selected.fallback) store.logEvent({ ...{ run_id: run.id, agent_id: agentId, ticket_key: ticketKey }, kind: 'system',
+      text: `Automatic fallback: ${agentById[agentId].engine || 'claude'} → ${agent.engine} (${selected.reason}). Saved seat preference retained.` });
 
-  const engine = engineOf(agent);
-  const pplx = engine.id === 'perplexity' && engine.supports?.(kind);
-  const px = context.packSettings();
-  // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
-  // Covers the first answer, follow-ups and every permitted page round (bounded by engines.perplexity.maxRunMinutes).
-  // A tagged run on a plan-billed engine without a dollar cap is bounded by time instead (mentions.maxMinutes).
-  const timeoutMin = limits?.minutes ?? (kind === 'mention' && !capsSpend(agent, 'mention') ? Number(config.mentions?.maxMinutes) || 10
-    : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0));
-  const deadlineAt = Date.now() + timeoutMin * 60_000;
-  if (limits?.steps != null) ctx.maxSteps = limits.steps;
+    engine = engineOf(agent);
+    pplx = engine.id === 'perplexity' && engine.supports?.(kind);
+    px = context.packSettings();
+    // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
+    // Covers the first answer, follow-ups and every permitted page round (bounded by engines.perplexity.maxRunMinutes).
+    // A tagged run on a plan-billed engine without a dollar cap is bounded by time instead (mentions.maxMinutes).
+    timeoutMin = limits?.minutes ?? (kind === 'mention' && !capsSpend(agent, 'mention') ? Number(config.mentions?.maxMinutes) || 10
+      : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0));
+    deadlineAt = Date.now() + timeoutMin * 60_000;
+    if (limits?.steps != null) ctx.maxSteps = limits.steps;
+  } catch (err) {
+    ledgers.delete(run.id);
+    try { context.release(run.id); } catch { /* nothing was prepared */ }
+    try { store.updateRun(run.id, { status: 'error', token: null, ended_at: store.now(), cost_usd: 0, result_text: `Run setup failed: ${store.redact(String(err?.message || err)).slice(0, 300)}` }); } catch { /* recovery ends it at the next start */ }
+    if (track) try { store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null }); } catch { /* as above */ }
+    throw err;
+  }
   boundSteps(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
   // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
   if (store.getRun(run.id)?.status !== 'running') return Promise.resolve(endBeforeSpawn('killed', store.getRun(run.id)?.result_text || 'refused before start'));

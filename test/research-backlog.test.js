@@ -203,3 +203,20 @@ test('a full backlog is the reason a program gives even before its next session 
   store.setSetting('research_backlog_max', '8');
   assert.equal(research.eligibility(research.get('product-discovery'), { settings: store.getSettings() }).code, 'cadence');
 });
+
+test('a run whose setup fails after its row exists ends as an error: it holds no research room and frees its seat', async () => {
+  await waitIdle(); atOneBelowTheLimit();
+  store.setSetting('paused', 'false');
+  const db = store.handle();
+  db.exec("CREATE TRIGGER fail_reserve BEFORE UPDATE OF reserve_usd ON runs BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;");
+  try { await assert.rejects(sched.launchResearch('', undefined, 'product-discovery'), /disk I\/O error/); }
+  finally { db.exec('DROP TRIGGER fail_reserve'); store.setSetting('paused', 'true'); }
+  const run = store.getRun(sessions()[0].id);
+  assert.deepEqual([run.status, !!run.ended_at, run.token, run.pid ?? null], ['error', true, null, null], 'the run ended: no "running" row without a process');
+  assert.match(run.result_text, /Run setup failed: disk I\/O error/);
+  assert.equal(store.unfinishedRuns().filter((r) => r.id === run.id).length, 0);
+  assert.equal(sched.preparingResearchRoom(), 0);
+  assert.equal(sched.researchAllowance(), 1, 'the room is free again');
+  assert.deepEqual([store.getAgentState('pm').status, store.getAgentState('pm').current_run ?? null], ['idle', null]);
+  store.setSetting('research_backlog_max', '8');
+});
