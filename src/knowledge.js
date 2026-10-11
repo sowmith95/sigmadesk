@@ -77,19 +77,23 @@ export function canonicalUrl(raw) {
 export function resultProblem(r, allowed = namespaces()) {
   if (!r || typeof r !== 'object' || typeof r.doc_id !== 'string' || !DOC_ID.test(r.doc_id)) return 'malformed result';
   if (typeof r.namespace !== 'string' || !allowed.includes(r.namespace) || namespaceProblem(r.namespace)) return `namespace ${r.namespace ?? '(none)'} is outside the filter`;
-  const url = canonicalUrl(r.url);
-  if (!url) return 'no URL';
-  // Fail closed rather than decode or normalize: no escapes, queries, fragments, backslashes, dot segments or
-  // anything outside printable ASCII can hide what a URL names.
-  if (/[^\x21-\x7e]/.test(url) || /[%?#\\]/.test(url)) return 'URL with escapes, queries, fragments or non-ASCII characters';
-  if (/(^|\/)\.\.?(\/|$)/.test(url)) return 'URL with dot segments';
+  // The RAW URL is judged before anything else, and fails closed rather than being decoded or normalized: only these
+  // characters, no absolute path, no "//" except right after a scheme, no dot segments.
+  const raw = typeof r.url === 'string' ? r.url : '';
+  if (!raw) return 'no URL';
+  if (/[^A-Za-z0-9._~:/@+=,-]/.test(raw)) return 'URL with characters outside the plain set';
+  if (raw.startsWith('/')) return 'absolute path';
+  if (raw.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, '').includes('//')) return 'URL with an empty segment';
+  if (/(^|\/)\.\.?(\/|$)/.test(raw)) return 'URL with dot segments';
+  if (credentialLike(raw)) return 'URL with credential-like text';
+  const url = canonicalUrl(raw);
   const scheme = (url.match(/^([a-z][a-z0-9+.-]*):/) || [])[1] || null;
   if (scheme && DENIED_SCHEMES.has(scheme)) return `denied scheme ${scheme}`;
   if (url.includes('://') && !URL_SCHEMES.has(scheme)) return `denied scheme ${scheme ?? '(none)'}`;
-  if (!url.includes('://')) {
-    const first = url.split(/[/:]/)[0].toLowerCase();
-    if (DENIED_FIRST.has(first) || first.includes('receipt')) return `denied path ${first}`;
-  }
+  // The first meaningful segment (after any scheme), with or without "://".
+  const first = (url.replace(/^[a-z][a-z0-9+.-]*:(\/\/)?/, '').split(/[/:]/).find(Boolean) || '').toLowerCase();
+  if (!url.includes('://') && DENIED_FIRST.has(url.split(/[/:]/)[0].toLowerCase())) return `denied path ${url.split(/[/:]/)[0].toLowerCase()}`;
+  if (DENIED_FIRST.has(first) || first.includes('receipt')) return `denied path ${first}`;
   // Receipt routes on the raw segments: a commit sha followed by a commit/push segment, wherever it sits.
   const segs = url.split('/').map((x) => x.toLowerCase());
   if (segs.some((x, i) => /^[0-9a-f]{7,40}$/.test(x) && ['commit', 'push'].includes(segs[i + 1])) || segs.some((x) => x.includes('receipt'))) return 'denied route';
@@ -280,31 +284,36 @@ function openQuoteAt(t) {
   return -1;
 }
 /**
- * A second pass after ops.js redaction, for credential-named fields written as text: "password": "…", password="…",
- * api_key='…' or token: … The value (quoted, escape-aware, or unquoted to the end of the line) becomes [redacted]; a
- * quoted value whose closing quote is missing takes the rest of the text with it (fail closed), however short.
+ * Credential-like text is WITHHELD, never edited: redaction leaked in three review rounds, so a passage that contains a
+ * credential-like key or value anywhere is not shown at all. Key-like form = a word (CRED_KEY or an alias) followed by
+ * an optional quote or emphasis and then ':' or '=', in any case, quoted or not, after escaped quotes are unescaped.
+ * Ordinary prose ("pass the tests", "the session layer") does not withhold; "password: >", "\"token\": {" and
+ * "Bearer abc…" do. Values: the provider formats ops.js knows, JWTs, credentials in URLs, long mixed-case or hex runs
+ * (a 40- or 64-character hex run is a commit or content hash and does not count).
  */
-const KEY_AT = /(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,79})\1\s*[:=]\s*/g;
-export function redactCredentialFields(text) {
-  const t = String(text ?? '');
-  let out = '', pos = 0, m;
-  KEY_AT.lastIndex = 0;
-  while ((m = KEY_AT.exec(t))) {
-    if (!CRED_KEY.test(m[2])) { KEY_AT.lastIndex = m.index + 1; continue; }
-    const vs = m.index + m[0].length;
-    if (t[vs] === '"' || t[vs] === "'") {
-      const j = closeOf(t, vs);
-      if (j < 0) return `${out}${t.slice(pos, m.index)}[redacted: an unterminated credential value]`;
-      out += `${t.slice(pos, vs + 1)}[redacted]`; pos = j; KEY_AT.lastIndex = j + 1; continue;
-    }
-    let end = t.indexOf('\n', vs);
-    if (end < 0) end = t.length;
-    out += `${t.slice(pos, vs)}[redacted]`; pos = end; KEY_AT.lastIndex = Math.max(end, vs + 1);
+const CRED_ALIAS = /(creds?|credentials?|bearer|authori[sz]ation|^auth$|cookies?|session|private[_-]?key|client[_-]?secret|[_-]key$|[_-]token$|[_-]secret$|pass)/i;
+const KEY_LIKE = /(?:^|[^A-Za-z0-9_])["'`*_]*([A-Za-z][A-Za-z0-9_.-]{0,60})["'`*_]*\s*[:=]/g;
+const SECRET_VALUES = [
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/, /\bsk-[A-Za-z0-9_-]{10,}/, /\bgh[pousr]_[A-Za-z0-9]{16,}/, /\bgithub_pat_\w{16,}/, /\bAKIA[0-9A-Z]{16}\b/,
+  /\bxox[baprs]-[\w-]{10,}/, /\bAIza[\w-]{30,}/, /\b(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{12,}/, /\bglpat-[\w-]{16,}/, /\bnpm_[A-Za-z0-9]{30,}/,
+  /\bSG\.[\w-]{16,}\.[\w-]{16,}/, /\bhf_[A-Za-z0-9]{30,}/, /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/, /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/i,
+  /[a-z][\w+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i,
+];
+const secretRun = (t) => {
+  for (const [v] of t.matchAll(/[A-Za-z0-9+_=-]{32,}/g)) {
+    if (/^[0-9a-f]+$/i.test(v)) { if (v.length !== 40 && v.length !== 64) return true; continue; }
+    if (/[A-Z]/.test(v) && /[a-z]/.test(v) && /\d/.test(v)) return true;
   }
-  return out + t.slice(pos);
+  return false;
+};
+export function credentialLike(text) {
+  const t = String(text ?? '').replace(/\\+(["'])/g, '$1');
+  for (const [, key] of t.matchAll(KEY_LIKE)) if (CRED_KEY.test(key) || CRED_ALIAS.test(key)) return true;
+  return SECRET_VALUES.some((re) => re.test(t)) || secretRun(t);
 }
-/** ops.js redaction, then the credential-field pass: every note field goes through this before any cut. */
-export const scrubText = (t) => redactCredentialFields(clean(String(t ?? '')));
+export const WITHHELD = 'excerpt withheld: it contains credential-like text';
+/** ops.js redaction (a first pass for text that is still shown; the withhold rule decides what is shown at all). */
+export const scrubText = (t) => clean(String(t ?? ''));
 /** Drop an incomplete UTF-8 sequence at the end of a byte buffer (so decoding never adds replacement bytes). */
 export function trimUtf8(buf) {
   let i = buf.length - 1, k = 0;
@@ -338,9 +347,10 @@ const day = (iso) => (/^\d{4}-\d{2}-\d{2}/.test(String(iso || '')) ? String(iso)
  */
 export function excerptOf(r, n) {
   if (r.truncated) return '(excerpt withheld: the store cut this passage short)';
+  if (credentialLike(r.excerpt)) return `(${WITHHELD})`;
   return neutral(safeCut(oneLine(scrubText(r.excerpt)), n));
 }
-export const titleOf = (r) => neutral(safeCut(oneLine(scrubText(r.title || '(untitled)')), 160));
+export const titleOf = (r) => (credentialLike(r.title) ? '(title withheld: it contains credential-like text)' : neutral(safeCut(oneLine(scrubText(r.title || '(untitled)')), 160)));
 export const urlOf = (r) => neutral(cutIdent(oneLine(clean(r.url || '')), 240));
 export function entryText(r, i, { excerptChars = config.knowledge.excerptChars } = {}) {
   const score = Number.isFinite(Number(r.score)) ? Number(r.score).toFixed(2) : '?';
@@ -415,7 +425,14 @@ export async function runSearch(run, { query: raw, k: rawK, source = 'search', m
       event(`${lead} → no notes`);
       return { outcome: 'empty', text, shown: [], ms, bytes: Buffer.byteLength(text), target, dropped, duplicates };
     }
-    const { text, shown } = renderBlock(query, kept, { maxBytes: cap, excerptChars });
+    let { text, shown } = renderBlock(query, kept, { maxBytes: cap, excerptChars });
+    if (!shown.length || Buffer.byteLength(text) > cap) {
+      // Not even one note (with the wrapper and its disclosure) fits the room this run has left: say so, within it.
+      const none = fitBytes(`Past work matched '${short}', but none of it fits this run's remaining budget.`, cap);
+      audit({ outcome: 'empty', counted: true, duration_ms: ms, bytes: Buffer.byteLength(none), detail: 'no room for a note' });
+      event(`${lead} → no room for a note`);
+      return { outcome: 'empty', text: none, shown: [], ms, bytes: Buffer.byteLength(none), target, dropped, duplicates };
+    }
     const bytes = Buffer.byteLength(text);
     // An explicit search is delivered as it returns; the launch block records its exposures only once it is delivered.
     if (expose) exposeNotes(run.id, shown, source);
@@ -445,14 +462,16 @@ export async function command(run, body = {}) {
   if (action === 'help' || action === 'list') {
     const used = store.knowledgeUsage(run.id);
     const no = baseDenial(run);
-    return [`Past-work search: desk kb search "<what you need to know>" [--k 1-${config.knowledge.maxK}]`,
+    return fitBytes([`Past-work search: desk kb search "<what you need to know>" [--k 1-${config.knowledge.maxK}]`,
       `Searches: ${nsLabel(ns()) || '(none allowed)'} · ${used.n} of ${perRun()} used in this run (the automatic Past work block counts)`,
-      no ? `Not available to you now: ${no}.` : 'Cite a note you rely on with --cite <doc id> on desk reply or desk decide (kb:<doc id>).'].join('\n');
+      no ? `Not available to you now: ${no}.` : 'Cite a note you rely on with --cite <doc id> on desk reply or desk decide (kb:<doc id>).'].join('\n'), MIN_ANSWER);
   }
   if (action !== 'search') throw refuse('desk kb search "<query>" [--k N]', 400);
   const r = await runSearch(run, { query: body.query ?? body.body, k: body.k, source: 'search' });
   if (r.outcome === 'ok' || r.outcome === 'empty') return r.text;
-  throw refuse(`${r.text}${r.outcome === 'refused' ? '' : '. Continue without past work.'}`, r.outcome === 'refused' ? 403 : 503);
+  // The whole thrown text, its suffix included, stays within the error allowance.
+  const suffix = r.outcome === 'refused' ? '' : '. Continue without past work.';
+  throw refuse(`${fitBytes(r.text, MIN_ANSWER - Buffer.byteLength(suffix))}${suffix}`, r.outcome === 'refused' ? 403 : 503);
 }
 
 // ---------------- the Past work block at launch ----------------
@@ -478,22 +497,26 @@ export async function preparePastWork(run, { ticketKey = null, incidentId = null
   const query = pastWorkQuery({ ticketKey, incidentId });
   const excerptChars = Math.min(240, config.knowledge.excerptChars);
   let r;
-  try { r = await runSearch(run, { query, source: 'auto', maxBytes: config.knowledge.pastWorkBytes, excerptChars, expose: false }); }
+  const HEAD = '## Past work that may be relevant (from the knowledge store)\n';
+  // The block's own heading is budgeted before the search renders: block = heading + answer ≤ pastWorkBytes.
+  try { r = await runSearch(run, { query, source: 'auto', maxBytes: config.knowledge.pastWorkBytes - Buffer.byteLength(HEAD), excerptChars, expose: false }); }
   catch (e) { r = { outcome: 'error', text: 'the knowledge store failed', shown: [], detail: String(e.message) }; }
   const status = r.outcome === 'ok' ? 'prepared' : r.outcome === 'empty' ? 'empty' : r.outcome === 'refused' ? 'omitted' : 'unavailable';
-  const block = r.outcome === 'ok' ? `## Past work that may be relevant (from the knowledge store)\n${r.text}`
-    : r.outcome === 'empty' ? `## Past work\nNo past work matched this task in the knowledge store.`
-      : `## Past work\nPast work unavailable (${neutral(r.text)}). Continue without it.`;
+  const block = fitBytes(r.outcome === 'ok' ? `${HEAD}${r.text}`
+    : r.outcome === 'empty' ? `## Past work\n${r.shown?.length === 0 && /fits this run/.test(r.text) ? neutral(r.text) : 'No past work matched this task in the knowledge store.'}`
+      : `## Past work\nPast work unavailable (${neutral(r.text)}). Continue without it.`, config.knowledge.pastWorkBytes);
   // What the seat is shown, as shown (redacted, bounded): the audit can be read without the store.
   const items = (r.shown || []).map((x) => { const excerpt = excerptOf(x, excerptChars); return { doc_id: x.doc_id, title: titleOf(x), url: urlOf(x), ingested_at: x.ingested_at ?? null, score: x.score ?? null, similarity: x.similarity ?? null, excerpt, excerpt_sha256: sha256(excerpt) }; });
   const meta = { v: 2, contract: CONTRACT, policy: policyVersion(), query: cut(neutral(clean(query)), 300), namespaces: ns(), reason: r.outcome === 'ok' || r.outcome === 'empty' ? null : neutral(r.text), items, target: r.target || null, bytes: Buffer.byteLength(block) };
   const hash = sha256(JSON.stringify([meta, block]));
   let selected = null; // Perplexity: did the pack carry the block (null: no pack involved)
-  const save = (st) => store.updateRun(run.id, { knowledge_hash: hash, knowledge_meta: JSON.stringify({ ...meta, status: st, selected, hash }) });
+  const save = (st, extra = {}) => store.updateRun(run.id, { knowledge_hash: hash, knowledge_meta: JSON.stringify({ ...meta, status: st, selected, ...extra, hash }) });
   save(status);
   let done = false;
   const select = (inPack) => { if (!done) { selected = !!inPack; save(status); } };
   const finalize = (outcome) => {
+    // A failed hand-off is recorded whatever came before (an empty or unavailable block too), and nothing stays citable.
+    if (outcome === 'not delivered') { done = true; save('not delivered', { prior: status }); store.deleteKnowledgeExposures(run.id, 'auto'); return; }
     if (done || status !== 'prepared') return;
     done = true;
     const final = outcome === 'included' && selected === false ? 'omitted' : outcome;
@@ -527,6 +550,8 @@ export function replyCitations(run, raw) {
 }
 
 // ---------------- owner view ----------------
+/** Closes whose past-work note could not be queued (written by knowledge-notes.js; shown in the outbox health). */
+const enqueueErrors = () => { try { return JSON.parse(store.kvGet('knowledge:enqueue-errors') || '[]'); } catch { return []; } };
 const weekAgo = (now) => new Date(now - 7 * 864e5).toISOString();
 /** Weekly numbers: searches per run, share of runs that searched, cited answers resolved without escalation, notes, failures. */
 export function metrics(now = Date.now()) {
@@ -547,6 +572,7 @@ export function metrics(now = Date.now()) {
     else if (c.kind === 'reply') { const m = c.ref ? store.getMention(c.ref) : null; if (m?.status === 'replied' && !m.routed) resolved += 1; else if (m) escalated += 1; }
   }
   const notes = store.knowledgeNotesSince(since);
+  const notQueued = enqueueErrors().filter((x) => x.at >= since).length;
   return {
     since, searches: counted.filter((a) => a.source === 'search').length, automatic: counted.filter((a) => a.source === 'auto').length,
     refused: audits.filter((a) => a.outcome === 'refused').length, failed: audits.filter((a) => ['error', 'timeout'].includes(a.outcome)).length,
@@ -554,7 +580,7 @@ export function metrics(now = Date.now()) {
     share_searched: runs.length ? Number((searched.size / runs.length).toFixed(2)) : 0,
     cited_resolved: resolved, cited_escalated: escalated,
     notes_written: notes.filter((n) => n.status === 'verified' && n.verified_at >= since).length,
-    outbox_failures: notes.filter((n) => n.status === 'failed' || n.status === 'refused' || (n.status === 'pending' && n.last_error)).length,
+    outbox_failures: notes.filter((n) => n.status === 'failed' || n.status === 'refused' || (n.status === 'pending' && n.last_error)).length + notQueued,
   };
 }
 /** For Settings → Knowledge and /api/state. */
@@ -564,7 +590,8 @@ export function describe(settings = store.getSettings(), now = Date.now()) {
     configured: k.enabled === true, on: settings.knowledge_enabled !== 'false', executable: k.executable || '', namespaces: ns(), refused_namespaces: refusedNamespaces(),
     deny: DENY_TEXT, write_namespace: writeNamespace(), per_run: perRun(), max_k: k.maxK, auto_kinds: autoKinds(), search_kinds: searchKinds(),
     lane: laneState(), target: store.kvGet('knowledge:target'), outbox: store.knowledgeOutboxCounts(), failures: store.recentKnowledgeNotes(50).filter((n) => n.status === 'failed' || n.status === 'refused' || (n.status === 'pending' && n.last_error)).slice(0, 10)
-      .map((n) => ({ id: n.id, ticket_key: n.ticket_key, status: n.status, attempts: n.attempts, last_error: n.last_error, next_attempt_at: n.next_attempt_at })),
+      .map((n) => ({ id: n.id, ticket_key: n.ticket_key, status: n.status, attempts: n.attempts, last_error: n.last_error, next_attempt_at: n.next_attempt_at }))
+      .concat(enqueueErrors().slice(-10).map((x) => ({ id: null, ticket_key: x.ticket_key, status: 'not queued', attempts: 0, last_error: x.error, next_attempt_at: null }))),
     metrics: metrics(now),
   };
 }
