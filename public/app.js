@@ -320,6 +320,8 @@ function renderTop() {
 }
 
 // ---------------- board ----------------
+/** How long ago a ticket was created, with the full time on hover and for screen readers (public/created.js). */
+const ageEl = (t) => (createdAge(t?.created_at) ? h('time', { class: 'age', 'data-created': true, datetime: t.created_at, title: createdTitle(t.created_at), 'aria-label': createdTitle(t.created_at) }, createdAge(t.created_at)) : null);
 function ticketCard(t) {
   const amap = agentMap();
   const live = t.active_run && amap[t.assignee]?.status === 'working' || S.agents.some((a) => a.current_ticket === t.key && a.status === 'working');
@@ -328,7 +330,7 @@ function ticketCard(t) {
   return h('button', { class: `card ${live ? 'live' : ''}`, type: 'button', onclick: () => openTicket(t.key) },
     h('div', { class: 'card-top' }, h('span', { class: `pri ${t.priority}` }, t.priority), h('span', {}, t.type),
       h('span', { class: 'spacer' }), t.issue_number ? h('span', { title: 'GitHub issue' }, `#${t.issue_number}`) : null, t.pr_url ? h('span', { title: 'draft PR' }, '⇡PR') : null,
-      createdAge(t.created_at) ? h('time', { class: 'age', 'data-created': true, datetime: t.created_at, title: createdTitle(t.created_at), 'aria-label': createdTitle(t.created_at) }, createdAge(t.created_at)) : null,
+      ageEl(t),
       h('span', { class: 'key' }, t.key)),
     h('div', { class: 'card-title' }, nameOf(t)),
     nameOf(t) !== t.title ? h('div', { class: 'card-sub' }, t.title) : null,
@@ -808,7 +810,7 @@ function renderSheet() {
   const repo = S.meta.repo;
 
   const head = [
-    h('div', { class: 'row' }, h('span', { class: 'mono' }, t.key), h('span', { class: `pri ${t.priority}` }, t.priority), h('span', { class: 'tag' }, STATUS_LABEL[t.status] || t.status),
+    h('div', { class: 'row' }, h('span', { class: 'mono' }, t.key), h('span', { class: `pri ${t.priority}` }, t.priority), h('span', { class: 'tag' }, STATUS_LABEL[t.status] || t.status), ageEl(t),
       worker ? h('span', { class: 'live-tag' }, avatar(worker.id), h('span', { class: 'typing' }), ` ${worker.name} is ${presenceOf(worker).text.toLowerCase()}`) : null,
       h('button', { class: 'close', type: 'button', 'aria-label': 'close', onclick: closeSheet }, '×')),
     h('h2', {}, nameOf(t), h('button', { class: 'linkish rename', type: 'button', title: 'Rename', 'aria-label': 'Rename ticket', onclick: act(async () => {
@@ -878,7 +880,7 @@ function renderSheet() {
       (() => {
         const kids = S.tickets.filter((x) => x.parent_key === t.key);
         return kids.length ? h('div', { class: 'mini-list' }, kids.map((k) => h('button', { class: 'mini-t', type: 'button', onclick: () => openTicket(k.key) },
-          h('span', { class: 'mono' }, k.key), avatar(k.assignee), h('span', { class: 'tag' }, STATUS_LABEL[k.status] || k.status), h('span', { class: 'tt' }, `${k.complexity || ''} · ${k.title}`)))) : null;
+          h('span', { class: 'mono' }, k.key), avatar(k.assignee), h('span', { class: 'tag' }, STATUS_LABEL[k.status] || k.status), h('span', { class: 'tt' }, `${k.complexity || ''} · ${k.title}`), ageEl(k)))) : null;
       })(),
       run ? h('div', { class: 'row-actions' }, h('span', { style: 'flex:1;color:var(--muted);font-size:12px' }, `run #${run.id} · ${run.kind} · ${run.model}`),
         h('button', { class: 'btn small danger', type: 'button', onclick: act(() => api('POST', `/api/runs/${run.id}/kill`, {}), 'stopping run') }, 'Stop run')) : null),
@@ -934,7 +936,7 @@ function renderSeatSheet() {
     st?.versions?.length > 1 ? [h('div', { class: 'section-title' }, 'By version (charter · model · engine)'), h('div', { class: 'mini-list' }, st.versions.map((v) => h('div', { class: 'mini-t' },
       h('span', { class: 'mono' }, v.provenance), h('span', { class: 'tag' }, `${v.n} runs`), h('span', { class: 'tt' }, `${Math.round((v.ok / v.n) * 100)}% ok · ${money(v.cost)}`))))] : null,
     tickets?.length ? [h('div', { class: 'section-title' }, 'Tickets'), h('div', { class: 'mini-list' }, tickets.map((t) => h('button', { class: 'mini-t', type: 'button', onclick: () => openTicket(t.key) },
-      h('span', { class: 'mono' }, t.key), h('span', { class: 'tag' }, STATUS_LABEL[t.status] || t.status), h('span', { class: 'tt' }, t.title))))] : null,
+      h('span', { class: 'mono' }, t.key), h('span', { class: 'tag' }, STATUS_LABEL[t.status] || t.status), h('span', { class: 'tt' }, t.title), ageEl(t))))] : null,
     h('div', { class: 'section-title' }, 'Live log'),
     evs ? h('div', { class: 'log', style: 'max-height:none' }, evs.length ? evs.slice(-300).map((e) => evRow(e, true)) : h('div', { class: 'empty' }, 'No activity yet.')) : h('div', { class: 'empty' }, 'Loading…'),
   ]);

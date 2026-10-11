@@ -474,7 +474,7 @@ test('creation age on a desktop: Inbox rows, Work cards and the ticket header, a
 // A second preview with tickets created days ago (the first one last year) and three research items held for the owner.
 const AGE = /^(now|\d+[mhd]|[A-Z][a-z]{2} \d{1,2}(, \d{4})?)$/, DATE = /^[A-Z][a-z]{2} \d{1,2}(, \d{4})?$/;
 const visibleAge = (loc) => loc.evaluate((el) => el.textContent.replace(/^·\s*/, '').replace(/^created\s+/i, ''));
-test('creation age with old dates: phone rows, Work, Features, the next step, search, a seat, the wall and the classic board', { skip, timeout: 120_000 }, async () => {
+test('creation age with old dates: phone rows, Work, Features, the next step, search, a seat, Details → Tasks, the wall and the classic board, its sheets included', { skip, timeout: 120_000 }, async () => {
   const aged = await startPreview({ SIGMADESK_PREVIEW_PLAYBOOK: PLAYBOOK, SIGMADESK_PREVIEW_AGED: '1' });
   try {
     const phone = await openPage(browser, `${aged.url}/#/inbox`, { width: 390, height: 844 });
@@ -511,6 +511,15 @@ test('creation age with old dates: phone rows, Work, Features, the next step, se
     await page.getByRole('button', { name: 'Jordan', exact: true }).first().click(); // the preview puts Jordan on a ticket
     const seatCard = page.locator('[role="dialog"] time[data-created]').first(); await seatCard.waitFor();
     assert.match(await visibleAge(seatCard), DATE, 'seat panel');
+    // An epic's Details → Tasks rows.
+    const epic = (await (await fetch(`${aged.url}/api/state`)).json()).tickets.find((t) => t.title === 'Fill audit');
+    await page.keyboard.press('Escape');
+    await go(page, `#/work/${epic.key}`);
+    await page.getByRole('tab', { name: 'Details' }).click();
+    const taskAges = page.locator('[role="tabpanel"] li time[data-created]');
+    await taskAges.first().waitFor();
+    assert.ok(await taskAges.count() >= 3, 'every task row');
+    for (const t of await taskAges.all()) assert.match(await visibleAge(t), DATE, 'Details → Tasks');
     assert.deepEqual(errors, []); await page.close();
 
     // The wall and the classic board have no app chrome: plain pages.
@@ -519,12 +528,26 @@ test('creation age with old dates: phone rows, Work, Features, the next step, se
     await wall.waitForSelector('[data-exception] time[data-created]');
     assert.match(await visibleAge(wall.locator('[data-exception] time[data-created]').first()), DATE, 'wall exception card');
     await wall.close();
-    const classic = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    let classic = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     await classic.goto(`${aged.url}/classic.html`);
     await classic.waitForSelector('.card time[data-created]');
     const c = classic.locator('.card time[data-created]').first();
     assert.match(await c.textContent(), DATE, 'classic board card');
     assert.match(await c.getAttribute('aria-label'), CREATED);
+    // A classic ticket sheet: its header and its child tasks.
+    await classic.close(); classic = await browser.newPage({ viewport: { width: 1440, height: 900 } }); // a hash change alone does not open a sheet
+    await classic.goto(`${aged.url}/classic.html#${epic.key}`);
+    await classic.waitForSelector('.mini-list .mini-t time[data-created]', { state: 'attached' });
+    assert.ok((await classic.locator('.mini-list .mini-t time[data-created]').first().boundingBox())?.width > 0, 'the age is laid out in the row');
+    assert.ok(await classic.locator('.mini-list .mini-t time[data-created]').count() >= 3, 'classic child rows');
+    assert.match(await classic.locator('.mini-list .mini-t time[data-created]').first().textContent(), DATE);
+    // A classic seat sheet: the tickets the seat worked on.
+    await classic.close(); classic = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    await classic.goto(`${aged.url}/classic.html`);
+    await classic.locator('#tabs [data-view="desk"]').click();
+    await classic.locator('.deskc', { hasText: 'Jordan' }).first().click();
+    await classic.waitForSelector('.mini-list .mini-t time[data-created]', { state: 'attached' });
+    assert.match(await classic.locator('.mini-list .mini-t time[data-created]').first().textContent(), DATE, 'classic seat ticket rows');
     await classic.close();
   } finally { await aged.stop(); }
 });
