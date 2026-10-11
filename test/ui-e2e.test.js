@@ -549,6 +549,10 @@ test('research tags follow the backlog while Research stays open: the cap is rea
     assert.equal((await call('POST', `/api/tickets/${held.key}/decision`, { decision: 'reject', message: 'not now' })).status, 200);
     await page.waitForFunction(() => !/Waiting for research items to finish/.test(document.querySelector('article[data-program="product-discovery"]')?.textContent || ''), null, { timeout: 5000 });
     await page.waitForFunction(() => /^2 research items open/.test(document.querySelector('[data-research-backlog]')?.textContent || ''), null, { timeout: 5000 });
+    // Team status says it too.
+    await go(page, '#/team');
+    await page.locator('[data-kpi="Research backlog"]').first().waitFor();
+    assert.match(await page.locator('[data-kpi="Research backlog"]').first().textContent(), /2 of 3 research items/);
     assert.deepEqual(errors, []); await page.close();
   } finally { await desk.stop(); }
 });

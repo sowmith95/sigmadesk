@@ -294,7 +294,11 @@ export function departmentKpis(state, deps, { now = Date.now(), board = null } =
       const held = (board?.needs_you || []).filter((it) => it.kind === 'research').length;
       const pending = (meta.research_reviews || []).filter((r) => ['pending', 'changes'].includes(r.state)).length;
       k.push(kpi('Evidence awaiting a decision', String(held), { source: 'research proposals held for you (Inbox)', at: nowIso, window: `${pending} more in second review`, tone: held ? 'needs' : 'neutral' }));
-      k.push(UNKNOWN('Reproducibility gaps', 'research reviews do not record reproducibility separately', 'research reviews'));
+      // New research waits while this many research-born items are still open (Settings → Research, src/scheduler.js).
+      const b = meta.research?.backlog;
+      k.push(b ? kpi('Research backlog', `${b.count} of ${b.max} research item${b.max === 1 ? '' : 's'}${b.full ? '; new research waiting' : ''}`, { source: 'research items under review, revision, grooming or your decision', at: nowIso,
+        window: b.full ? (b.reason || 'new research waits') : `new research waits at ${b.max}`, tone: b.full ? 'needs' : 'neutral' })
+        : UNKNOWN('Research backlog', 'the desk did not report its research backlog', 'research status'));
     } else {
       k.push(UNKNOWN('Domain KPI', 'no KPI is defined for this group', 'none'));
     }

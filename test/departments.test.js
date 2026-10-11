@@ -178,3 +178,14 @@ test('night on the wall wraps past midnight and can be switched off', () => {
   assert.equal(isNight(d(23)), true); assert.equal(isNight(d(3)), true); assert.equal(isNight(d(7)), false); assert.equal(isNight(d(12)), false);
   assert.equal(isNight(d(13), '12-14'), true); assert.equal(isNight(d(23), 'off'), false);
 });
+
+test('the research department says how full the research backlog is, and when new research waits', () => {
+  const deps = departmentsFor(agents);
+  const kpiOf = (backlog) => departmentKpis({ tickets: [], agents, meta: backlog === undefined ? {} : { research: { backlog } } }, deps, { now: NOW }).departments.research.kpis.find((k) => k.label === 'Research backlog');
+  const full = kpiOf({ count: 12, max: 8, full: true, reason: '12 research items are waiting — research resumes when fewer than 8 are open', keys: [] });
+  assert.equal(full.value, '12 of 8 research items; new research waiting'); assert.equal(full.tone, 'needs');
+  assert.match(full.window, /resumes when fewer than 8 are open/);
+  const open = kpiOf({ count: 3, max: 8, full: false, reason: null, keys: [] });
+  assert.equal(open.value, '3 of 8 research items'); assert.equal(open.tone, 'neutral'); assert.equal(open.window, 'new research waits at 8');
+  assert.match(kpiOf(undefined).unknown, /did not report/);
+});
