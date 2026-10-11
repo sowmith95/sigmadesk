@@ -25,7 +25,9 @@ const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex'
 const json = (s, d = null) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
 // Every field is redacted WHOLE, then shortened (never inside a token or an open quote): a cut can never hide a secret
 // from redaction by removing its tail.
-const line = (s, n = 300) => kb.safeCut(kb.scrubText(s).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(), n);
+// A field with credential-like text anywhere is withheld whole (never edited); others are redacted, then shortened.
+const WITHHELD_FIELD = '[withheld: credential-like text]';
+const line = (s, n = 300) => (kb.credentialLike(s) ? WITHHELD_FIELD : kb.safeCut(kb.scrubText(s).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(), n));
 const short = (sha) => (sha ? String(sha).slice(0, 12) : '-');
 const SHA = /^[0-9a-f]{7,40}$/;
 
@@ -106,6 +108,7 @@ export function buildFacts(key) {
   return { title: line(clean(`SigmaDesk facts: ${key} — ${t.title}`), 200), body };
 }
 function clip(text, n) {
+  if (kb.credentialLike(text)) return WITHHELD_FIELD;
   const t = kb.scrubText(String(text ?? '').replace(/\r\n?/g, '\n')).trim(); // redact the whole field first
   if (t.length <= n) return t;
   const at = t.lastIndexOf('\n', n);
@@ -129,14 +132,25 @@ export function enqueueTicketFacts(key, { trigger = 'merged' } = {}) {
     const bodySha = sha256(facts.body);
     const row = store.enqueueKnowledgeNote({ ticket_key: key, kind: 'facts', trigger, url: noteUrl(key, bodySha), namespace: ns, title: facts.title, body: facts.body, body_sha256: bodySha, format: FORMAT });
     if (autoFlush && row && !row.attempts && row.status === 'pending') setImmediate(() => { flush().catch(() => {}); });
+    if (row) clearEnqueueError(key);
     return row;
   } catch (err) {
-    try { store.logEvent({ kind: 'error', agent_id: 'system', ticket_key: key, text: `past-work note for ${key} was not queued: ${store.redact(err.message).slice(0, 200)} (reconciliation retries)` }); } catch { /* nothing more to do */ }
+    // The close goes ahead without its note (on purpose); the failure is visible as an event and in the outbox health.
+    const why = store.redact(String(err.message)).slice(0, 200);
+    try {
+      store.logEvent({ kind: 'error', agent_id: 'system', ticket_key: key, text: `past-work note for ${key} was not queued: ${why} (reconciliation retries)` });
+      const list = enqueueErrors().filter((x) => x.ticket_key !== key);
+      store.kvSet('knowledge:enqueue-errors', JSON.stringify([...list, { ticket_key: key, error: why, at: store.now() }].slice(-20)));
+    } catch { /* nothing more to do */ }
     return null;
   }
 }
 // Every close, whatever path sets the ticket done, runs inside the closing transaction.
 store.onTicketDone((key) => { enqueueTicketFacts(key, { trigger: store.mergedEventOf(key) ? 'merged' : 'incident resolved' }); });
+
+/** Closes whose note could not be queued (the outbox health shows them until a later attempt queues one). */
+export function enqueueErrors() { try { return JSON.parse(store.kvGet('knowledge:enqueue-errors') || '[]'); } catch { return []; } }
+function clearEnqueueError(key) { const list = enqueueErrors(); if (list.some((x) => x.ticket_key === key)) store.kvSet('knowledge:enqueue-errors', JSON.stringify(list.filter((x) => x.ticket_key !== key))); }
 
 /** A post-deploy watch concluded: a new version of the facts (now with its deploy evidence), if the ticket qualifies. */
 export function onWatchConcluded(key) { if (key && qualifies(key)) enqueueTicketFacts(key, { trigger: 'post-deploy watch' }); }
@@ -149,7 +163,8 @@ export function reconcile() {
   // Candidates are chosen by the time of their qualifying transitions (a merge, an incident resolution, a deploy record,
   // a concluded watch), not by when the ticket closed; each is compared by its current fact set, so a later transition
   // while writing was off gets its new version even when an older note exists.
-  const keys = new Set(store.knowledgeTransitionsSince(since));
+  // Union: qualifying closes since then (whatever the date of the merge they reference) and later evidence transitions.
+  const keys = new Set([...store.ticketsByStatus('done').filter((t) => t.done_at && t.done_at >= since).map((t) => t.key), ...store.knowledgeTransitionsSince(since)]);
   let n = 0;
   for (const key of keys) {
     const facts = qualifies(key) ? buildFacts(key) : null;

@@ -59,7 +59,7 @@ function backlogHint(b?: ResearchBacklog | null) {
   return b ? `${base} Open now: ${b.count}.` : base;
 }
 
-type KnowledgeFailure = { id: number; ticket_key: string; status: string; attempts: number; last_error: string | null };
+type KnowledgeFailure = { id: number | null; ticket_key: string; status: string; attempts: number; last_error: string | null };
 /** Past-work search and the notes the desk writes back (#10): scope, budget, what was written, and the week's numbers. */
 function KnowledgeSettings() {
   const k = S.meta.knowledge;
@@ -84,9 +84,9 @@ function KnowledgeSettings() {
       {(k.failures || []).length > 0 && <div className="grid gap-2 py-3">
         <b className="font-medium">Notes that did not write</b>
         {(k.failures as KnowledgeFailure[]).map((f) => (
-          <div key={f.id} className="flex items-center justify-between gap-3 text-[13px]">
-            <span className="min-w-0 text-muted-foreground"><span className="font-mono text-foreground">{f.ticket_key}</span> · {f.status === 'pending' ? `trying again (${f.attempts} tries so far)` : f.status} · {f.last_error || 'no reason recorded'}</span>
-            {f.status !== 'pending' && <Button variant="secondary" size="sm" onClick={() => retry(f.id)}>Try again</Button>}
+          <div key={f.id ?? `q-${f.ticket_key}`} className="flex items-center justify-between gap-3 text-[13px]">
+            <span className="min-w-0 text-muted-foreground"><span className="font-mono text-foreground">{f.ticket_key}</span> · {f.status === 'pending' ? `trying again (${f.attempts} tries so far)` : f.status === 'not queued' ? 'not queued (retried after a restart)' : f.status} · {f.last_error || 'no reason recorded'}</span>
+            {f.id != null && f.status !== 'pending' && <Button variant="secondary" size="sm" onClick={() => retry(f.id as number)}>Try again</Button>}
           </div>))}
       </div>}
     </Group>
