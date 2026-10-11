@@ -200,6 +200,7 @@ export function setStatus(key, status, extra = {}) {
 }
 researchReview.hooks.setStatus = setStatus; // holds, waivers and owner decisions on research proposals go through the same door
 features.hooks.setStatus = setStatus; // approving a feature plan starts the feature through the same door
+research.hooks.backlog = (settings) => researchBacklog(settings); // program eligibility and the Research page see the same backlog
 // An epic review changes order, priority and owner tasks through the owner's own doors (same checks, same events).
 Object.assign(epicReview.hooks, { ownerTask: (...a) => ownerTask(...a), ownerReply: (k, text, mode) => ownerReply(k, text, mode, { mentions: [] }) /* an epic answer never tags anyone */, ownerPatch: (k, p, o) => ownerPatch(k, p, o) });
 
@@ -841,12 +842,44 @@ export function watchDecisions() {
   return d;
 }
 
+/**
+ * A research-born ticket (research_program set) that research itself has not finished with: still `proposed` (under
+ * review, being revised, or passed but not yet groomed), or `needs_human` held on its research review, its revision or
+ * an owner research decision. Groomed into ordinary work (todo onwards) or closed (done, wontdo), it no longer counts.
+ */
+export function inResearchPipeline(t) {
+  if (!t?.research_program) return false;
+  if (t.status === 'proposed') return true;
+  return t.status === 'needs_human' && (t.research_review === 'held' || t.hold_kind === 'research' || t.resume_status === 'proposed');
+}
+/**
+ * The research backlog: research items still waiting on review, revision, grooming or an owner decision. While it
+ * holds `research_backlog_max` items or more, new research waits; the work that finishes those items (reviews,
+ * revisions, grooming, owner decisions) is never throttled by it, which is how the backlog drains.
+ */
+export function researchBacklog(settings = store.getSettings()) {
+  const parsed = Number(settings.research_backlog_max ?? config.research.backlogMax ?? 8);
+  const max = Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 8;
+  const keys = [...store.ticketsByStatus('proposed'), ...store.ticketsByStatus('needs_human')].filter(inResearchPipeline).map((t) => t.key);
+  const count = keys.length, full = count >= max;
+  const reason = !full ? null : max === 0 ? 'Research is off: the research backlog limit is 0 (Settings → Research)'
+    : `${count} research item${count === 1 ? ' is' : 's are'} waiting — research resumes when fewer than ${max} are open`;
+  return { count, max, full, keys, reason };
+}
 // One admission path for scheduled, manual and program-specific research: the program's seat, its engine fit, and a
 // proposal allowance reserved against the global room (net of allowances other running research jobs still hold).
-export function researchAllowance(settings = store.getSettings()) {
+// The allowance is also capped by the research backlog's free room, so it is ≤ 0 while the backlog is full.
+export function researchAdmission(settings = store.getSettings()) {
   const held = store.unfinishedRuns().filter((r) => r.kind === 'research' && r.job).reduce((n, r) => { try { const j = JSON.parse(r.job); return n + Math.max(0, (j.maxProposals || 0) - (j.proposals || 0)); } catch { return n; } }, 0);
-  return Number(settings.max_open_proposals) - store.ticketsByStatus('proposed').length - held;
+  const backlog = researchBacklog(settings);
+  const funnel = Number(settings.max_open_proposals) - store.ticketsByStatus('proposed').length - held;
+  const room = Math.min(funnel, backlog.max - backlog.count - held);
+  const reason = room > 0 ? null : backlog.full ? backlog.reason
+    : funnel <= 0 ? 'Enough proposals are waiting for grooming; research resumes when the funnel thins'
+      : 'Research already running holds the remaining room in the research backlog';
+  return { room, reason, backlog };
 }
+export const researchAllowance = (settings = store.getSettings()) => researchAdmission(settings).room;
 export async function launchResearch(focus = '', fence = runner.currentEpoch(), programId = research.DEFAULT_PROGRAM) {
   const s = store.getSettings();
   const p = research.get(programId, s);
@@ -855,8 +888,8 @@ export async function launchResearch(focus = '', fence = runner.currentEpoch(), 
   if (s.paused === 'true') throw Object.assign(new Error('Open the desk before starting research'), { status: 409 });
   const sel = selectionFor(p.seat, Date.now(), research.requirements(p));
   if (!sel.seat) throw Object.assign(new Error(`${agentById[p.seat]?.name || p.seat}: ${sel.reason}`), { status: 409 });
-  const room = researchAllowance(s);
-  if (room <= 0) throw Object.assign(new Error('Enough proposals are waiting for grooming; research resumes when the funnel thins'), { status: 409 });
+  const { room, reason } = researchAdmission(s);
+  if (room <= 0) throw Object.assign(new Error(reason), { status: 409 });
   const job = research.job(p, { focus, room });
   const extra = `Program "${p.label}" (${p.id}). ${job.focus ? `Focus: ${job.focus}. ` : ''}File at most ${job.maxProposals} proposal${job.maxProposals === 1 ? '' : 's'}; each one is reviewed by another seat before grooming.`;
   const { cwd } = await readonlyJob(p.seat, null);

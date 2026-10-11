@@ -479,7 +479,8 @@ async function ownerRoute(req, res) {
     if (store.getAgentState(prog.seat)?.status === 'working') return send(res, 409, { error: `${agentById[prog.seat]?.name || prog.seat} is busy` });
     if (sched.budgetHeadroom() < runner.runBudget(prog.seat)) return send(res, 409, { error: 'daily risk limit would be exceeded' });
     if (sched.workCount() >= sched.capacity()) return send(res, 409, { error: 'desk is at capacity — try again when a seat frees up' });
-    if (sched.researchAllowance() <= 0) return send(res, 409, { error: 'enough proposals are waiting for grooming' });
+    const admit = sched.researchAdmission();
+    if (admit.room <= 0) return send(res, 409, { error: admit.reason });
     sched.launchResearch(String(focus || '').slice(0, 500), undefined, prog.id).catch((err) => store.logEvent({ kind: 'error', agent_id: prog.seat, text: err.message }));
     return send(res, 202, { ok: true, program: prog.id });
   };

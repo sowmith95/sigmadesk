@@ -752,6 +752,7 @@ export function settingDefaults() {
     pm_enabled: String(config.pm.enabled),
     pm_interval_min: String(config.pm.intervalMinutes),
     max_open_proposals: String(config.pm.maxOpenProposals),
+    research_backlog_max: String(config.research.backlogMax ?? 8), // research waits while this many research items are open; 0 = never starts
     github_sync: String(config.github.sync),
     open_draft_prs: String(config.github.openDraftPrs), // open PRs at all (name kept for existing databases)
     draft_prs: String(config.github.draftPrs ?? false), // open them as drafts (default: normal open PRs)
@@ -786,7 +787,7 @@ export function setSetting(key, value) {
   if (key === 'access_policy') throw Object.assign(new Error('the access policy is edited through the Access sheet (validated as a whole)'), { status: 400 });
   if (key === 'research_programs') throw Object.assign(new Error('research programs are edited through Settings → Research (validated as a whole)'), { status: 400 });
   if (['delegation', 'delegation_escalate_all', 'delegation_epoch'].includes(key)) throw Object.assign(new Error('delegation is changed through Settings → Autonomy (validated as a whole; in-flight decisions are invalidated)'), { status: 400 });
-  const ranges = { max_concurrent: [1, 20], daily_budget_usd: [0, 100000], pm_interval_min: [1, 525600], max_open_proposals: [1, 100] };
+  const ranges = { max_concurrent: [1, 20], daily_budget_usd: [0, 100000], pm_interval_min: [1, 525600], max_open_proposals: [1, 100], research_backlog_max: [0, 100] };
   if (ranges[key]) {
     const n = Number(value), [min, max] = ranges[key];
     if (!String(value).trim() || !Number.isFinite(n) || n < min || n > max || (key !== 'daily_budget_usd' && !Number.isInteger(n)))

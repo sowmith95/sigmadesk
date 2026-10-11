@@ -18,8 +18,15 @@ list wins as a whole. `Reset to config` returns to the derived list.
 | `sources` | Approved sources (domains, journals, repositories, document ids). The prompt requires every Evidence bullet to cite one; cited URLs are extracted onto the ticket for the reviewer. |
 | `tools.web` | WebSearch/WebFetch. These run outside the OS sandbox, which is why only research kinds ever get them. |
 | `tools.connectors` | Names of **approved** connectors (below). Saving a program with an unapproved connector fails. |
-| `maxProposals` | Proposal allowance per session, also capped by the global `Max open proposals` net of allowances other running sessions still hold. Enforced on every `desk propose`. |
+| `maxProposals` | Proposal allowance per session, also capped by the global `Max open proposals` and by the free room in the research backlog (below), each net of allowances other running sessions still hold. Enforced on every `desk propose`. |
 | `review.minReviewers` / `review.reviewers` | The second-person gate: how many distinct seats, from which pool, must pass a proposal. The researching seat is never in its own pool. |
+
+**The research backlog.** A research-born ticket counts while research has not finished with it: it is `proposed`
+(under review, being revised, or passed but not yet groomed), or `needs_human` held on its review, its revision or your
+research decision. Once groomed into ordinary work (`todo` onwards) or closed, it no longer counts. While the backlog
+holds `research_backlog_max` items or more (Settings → Research, default 8, 0 = never), no program starts a session,
+scheduled or "Run now", and the program reads "Waiting for research items to finish". Reviews, revisions, grooming and
+owner decisions are never held back by it.
 
 Due programs run oldest-first so list order cannot starve one. Review and revision work is scheduled ahead of new
 discovery, and shares the two-seat review allowance with product reviews; one capacity slot stays free for QA/SRE.
@@ -62,7 +69,7 @@ drop a program's web or connectors is refused rather than silently degraded.
 
 ## Operations
 
-- `GET /api/research` shows programs with their eligibility (next session, window, funnel), market hours and connectors.
-- `PUT /api/research/programs` saves the whole list atomically; `POST /api/research/programs/<id>/run {focus}` starts one now (budget, capacity, engine fit and the allowance still apply).
+- `GET /api/research` shows programs with their eligibility (next session, window, research backlog, funnel), the backlog (`backlog: {count, max, full, reason, keys}`), market hours and connectors.
+- `PUT /api/research/programs` saves the whole list atomically; `POST /api/research/programs/<id>/run {focus}` starts one now (budget, capacity, engine fit, the research backlog and the allowance still apply).
 - `POST /api/tickets/<KEY>/research-review/waive {note}`; `GET/POST /api/connectors…` for the connector lifecycle.
 - A restart cancels in-flight reviews and assessments; the next tick assigns fresh ones. Completed verdicts are kept.

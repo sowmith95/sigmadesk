@@ -375,6 +375,12 @@ cite, whether it may use the web, which approved connectors it may call, how man
 which seats must review a proposal. The default `product-discovery` program is the PM's competitor research and is
 derived from `pm.*` and the legacy cadence settings until you save programs. Due programs run oldest-first while the
 funnel is thin; "Run now" skips cadence and window but never budget, capacity, engine fit or the proposal allowance.
+New research also **waits while its backlog is large**: research-born items still being reviewed, revised, groomed or
+decided by you count against **Research items open at most** (Settings → Research, `research_backlog_max`, default 8
+from `research.backlogMax`; 0 stops new research). At the limit, scheduled sessions do not start and "Run now" is refused
+with the count ("12 research items are waiting — research resumes when fewer than 8 are open"); a session below it may
+file only as many proposals as there is room for. Reviews, revisions, grooming and your decisions keep running, which
+is how the backlog drains. The Research page shows the count.
 
 Every proposal filed by a research run waits for an **independent second review** by a different seat (preferring a
 different model family) before the manager may groom it: `pass` unblocks it, `changes` gives the author one bounded
