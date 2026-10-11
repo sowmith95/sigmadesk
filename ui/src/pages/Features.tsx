@@ -14,7 +14,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { AsyncButton } from '@/components/desk/AsyncButton';
 import { ChoiceChips } from '@/components/desk/Choices';
 import { Field } from '@/components/desk/Fields';
-import { Tag, Key, Empty, Section, SeatAvatar, type Tone } from '@/components/desk/Bits';
+import { Tag, Key, CreatedAge, Empty, Section, SeatAvatar, type Tone } from '@/components/desk/Bits';
 import { Markdown } from '@/components/desk/Markdown';
 import { STAGE_LABEL } from '@/components/desk/Work';
 import { EpicTree, EpicProgress } from '@/components/desk/Epic';
@@ -46,7 +46,7 @@ function FeatureCard({ t }: { t: Ticket }) {
   return (
     <article data-feature={t.key} className={cn('grid content-start gap-3 rounded-lg border bg-card p-4', s.stand === 'review' && 'border-l-[3px] border-l-needs')}>
       <div className="flex flex-wrap items-center gap-2"><Tag tone={s.tone}>{s.stand === 'planning' && p?.status === 'grooming' && <Loader2 className="size-3.5 animate-spin" aria-hidden />}{s.label}</Tag>
-        {t.priority && t.priority !== 'P2' && <Tag>{t.priority}</Tag>}<Key k={t.key} /><span className="flex-1" />
+        {t.priority && t.priority !== 'P2' && <Tag>{t.priority}</Tag>}<Key k={t.key} /><CreatedAge at={t.created_at} /><span className="flex-1" />
         <span className="text-[13px] text-muted-foreground">{ago(t.updated_at)}</span></div>
       <h3 className="text-[17px] font-semibold leading-snug"><button type="button" className="text-left hover:underline" onClick={() => openFeature(t.key)}>{t.title}</button></h3>
       <p className="line-clamp-2 text-muted-foreground">{line.replace(/[#*`]/g, '')}</p>
@@ -136,7 +136,7 @@ function PlanTasks({ p, edits, setEdits, editable }: { p: FeaturePlan; edits: Re
                 : <Tag>{x.complexity === 'S' ? 'Small' : 'Medium'}</Tag>}
               <Tag>{x.area}</Tag>{x.risk === 'high' && <Tag tone="blocked">High risk</Tag>}
               {x.after && <span className="text-muted-foreground">after “{titleOf(x.after)}”</span>}
-              {k && <><span className="flex-1" />{k.assignee && <SeatAvatar id={k.assignee} />}<Tag tone={k.status === 'done' ? 'shipped' : k.status === 'needs_human' ? 'needs' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag><Key k={k.key} /></>}
+              {k && <><span className="flex-1" />{k.assignee && <SeatAvatar id={k.assignee} />}<Tag tone={k.status === 'done' ? 'shipped' : k.status === 'needs_human' ? 'needs' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag><CreatedAge at={k.created_at} /><Key k={k.key} /></>}
             </div>
             {k && S.tickets.some((c: Ticket) => c.parent_key === k.key) && <div className="pl-6"><EpicTree root={k.key} depth={1} /></div>}
             <details className="pl-8 text-[15px]"><summary className="cursor-pointer text-sm text-muted-foreground">What to build and how to check it</summary>
@@ -228,7 +228,7 @@ function FeatureDoc({ fkey }: { fkey: string }) {
     <div className="grid gap-6">
       <div className="grid gap-3">
         <Button variant="ghost" size="sm" className="-ml-2 justify-self-start" onClick={() => setView('features')}><ArrowLeft className="size-4" aria-hidden />All features</Button>
-        <div className="flex flex-wrap items-center gap-2"><Tag tone={s.tone}>{s.label}</Tag>{t.priority && <Tag>{t.priority}</Tag>}<Key k={t.key} />
+        <div className="flex flex-wrap items-center gap-2"><Tag tone={s.tone}>{s.label}</Tag>{t.priority && <Tag>{t.priority}</Tag>}<Key k={t.key} /><CreatedAge at={t.created_at} sentence />
           {t.issue_number && repo && <a className="inline-flex items-center gap-1 text-sm text-primary hover:underline" href={`https://github.com/${repo}/issues/${t.issue_number}`} target="_blank" rel="noopener noreferrer">GitHub #{t.issue_number}<ExternalLink className="size-3.5" aria-hidden /></a>}
           <span className="flex-1" /><Button variant="ghost" size="sm" onClick={() => openTicket(t.key)}>Conversation and details</Button></div>
         <h2 className="text-2xl font-semibold leading-tight md:text-[28px]">{t.title}</h2>
@@ -253,7 +253,7 @@ function FeatureDoc({ fkey }: { fkey: string }) {
           </>}
           {!plan && kids.length > 0 && <DocSection title="Tasks"><EpicTree root={t.key} /></DocSection>}
           {plan && extra.length > 0 && <DocSection title="Other tasks"><ul className="grid gap-1.5">{extra.map((k) => <li key={k.key} className="flex items-center gap-2"><button type="button" className="min-w-0 flex-1 text-left hover:underline" onClick={() => openTicket(k.key)}>{nameOf(k)}</button>
-            {k.after_key && <span className="text-xs text-muted-foreground">after {k.after_key}</span>}<Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag></li>)}</ul></DocSection>}
+            {k.after_key && <span className="text-xs text-muted-foreground">after {k.after_key}</span>}<Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag><CreatedAge at={k.created_at} /></li>)}</ul></DocSection>}
         </article>
         <div className={cn('grid content-start gap-4 lg:sticky lg:top-20', p && p.status !== 'approved' && !['done', 'wontdo'].includes(t.status) && 'max-lg:order-first')}>
           <Session t={t} p={p} history={(fd?.data?.history || []) as FeaturePlan[]} edits={edits} />

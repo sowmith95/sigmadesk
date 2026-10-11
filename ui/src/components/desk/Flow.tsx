@@ -9,7 +9,7 @@ import { S, api, openTicket, agentMap, draftKey, setDraft } from '@/store.js';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { AsyncButton } from './AsyncButton';
-import { Tag, SeatAvatar } from './Bits';
+import { Tag, SeatAvatar, CreatedAge } from './Bits';
 import { Markdown } from './Markdown';
 import { cn } from '@/lib/utils';
 import type { Ticket } from '@/types';
@@ -45,11 +45,11 @@ export function NextStep({ root, className }: { root: string; className?: string
         {owner ? <UserRound className="size-4 text-needs" aria-hidden /> : <Users className="size-4" aria-hidden />}
         <span>Next step{n.waiting.length ? `: ${plural(n.waiting.length, 'task')} wait on it` : ''}</span>
       </div>
-      <button type="button" onClick={() => openTicket(t.key)} className="text-left text-[17px] font-semibold leading-snug hover:underline">{nameOf(t)} <span className="font-mono text-xs font-normal text-muted-foreground">{t.key}</span></button>
+      <button type="button" onClick={() => openTicket(t.key)} className="text-left text-[17px] font-semibold leading-snug hover:underline">{nameOf(t)} <span className="font-mono text-xs font-normal text-muted-foreground">{t.key}</span> <CreatedAge at={t.created_at} className="text-xs font-normal" /></button>
       <p className="text-sm"><b className={owner ? 'text-needs' : undefined}>{d.who}:</b> {d.line}</p>
       {n.blockedEverywhere && <p className="text-sm text-muted-foreground">Every open task waits on something. This is the one that frees the most work.</p>}
       {n.waiting.length > 0 && <details className="text-sm"><summary className="cursor-pointer text-muted-foreground">What waits on it</summary>
-        <ul className="mt-1.5 grid gap-1">{n.waiting.map((w: Ticket) => <li key={w.key}><button type="button" className="text-left hover:underline" onClick={() => openTicket(w.key)}>{nameOf(w)}</button> <span className="font-mono text-xs text-muted-foreground">{w.key}</span></li>)}</ul></details>}
+        <ul className="mt-1.5 grid gap-1">{n.waiting.map((w: Ticket) => <li key={w.key}><button type="button" className="text-left hover:underline" onClick={() => openTicket(w.key)}>{nameOf(w)}</button> <span className="font-mono text-xs text-muted-foreground">{w.key}</span> <CreatedAge at={w.created_at} className="text-xs" /></li>)}</ul></details>}
       <Button size="sm" variant={owner ? 'default' : 'secondary'} className="justify-self-start" onClick={() => openTicket(t.key, owner && t.status !== 'todo' ? { focus: true } : {})}>{d.action}<ArrowRight className="size-4" aria-hidden /></Button>
     </section>
   );
@@ -68,7 +68,7 @@ export function GateSuggestions({ root }: { root: string }) {
         const replaces = t?.after_key && byKey(t.after_key)?.status !== 'done' ? byKey(t.after_key) : null;
         return (
           <li key={`${g.key}>${g.after}`} data-gate={`${g.key}>${g.after}`} className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-            <span className="min-w-0 flex-1 basis-60 text-sm"><button type="button" className="hover:underline" onClick={() => openTicket(g.key)}>{t ? nameOf(t) : g.key}</button> waits for <button type="button" className="hover:underline" onClick={() => openTicket(g.after)}>{a ? nameOf(a) : g.after}</button>
+            <span className="min-w-0 flex-1 basis-60 text-sm"><button type="button" className="hover:underline" onClick={() => openTicket(g.key)}>{t ? nameOf(t) : g.key}</button> <CreatedAge at={t?.created_at} className="text-xs" /> waits for <button type="button" className="hover:underline" onClick={() => openTicket(g.after)}>{a ? nameOf(a) : g.after}</button>
               {replaces && <span className="text-muted-foreground"> (it now waits for {nameOf(replaces)}; this replaces that)</span>}</span>
             <AsyncButton size="sm" variant="secondary" confirm={replaces ? `${g.key} can wait for only one task. Replace ${replaces.key} with ${g.after}?` : undefined}
               run={() => api('PATCH', `/api/tickets/${g.key}`, { after_key: g.after })} ok={`${g.key} now waits for ${g.after}`}>Make {g.key} wait for {g.after}</AsyncButton>

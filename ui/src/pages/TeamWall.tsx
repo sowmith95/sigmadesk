@@ -6,9 +6,10 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { AlertTriangle, CircleSlash, Rocket, Siren, TimerOff } from 'lucide-react';
 import { age, isNight, FLOW_KINDS } from '../../../public/departments.js';
 import { deskStatus } from '../../../public/attention.js';
-import { S, openTicket } from '@/store.js';
+import { S, openTicket, ticketByKey } from '@/store.js';
 import { hhmm } from '@/lib/format.js';
 import { cn } from '@/lib/utils';
+import { CreatedAge } from '@/components/desk/Bits';
 import { usePresenceClock } from '@/components/desk/Presence';
 import { Counts, KpiRow, WaitingPill, useSeatTap } from '@/components/team/Departments';
 import { teamOverview, openDecision, STATE_TEXT, type DeptFlow, type Exception, type TeamOverview } from '@/components/team/model';
@@ -20,12 +21,14 @@ const EX: Record<string, { label: string; icon: typeof Rocket; cls: string }> = 
 function ExceptionCard({ e, now, onSeat }: { e: Exception; now: number; onSeat: (id: string) => void }) {
   const k = EX[e.type];
   const open = () => (e.item ? openDecision(e.item) : e.seat ? onSeat(e.seat) : e.ticket ? openTicket(e.ticket) : undefined);
+  const tk = (e.item?.ticket || (e.ticket ? ticketByKey(e.ticket) : null)) as { created_at?: string } | null;
   return (
     <li><button type="button" onClick={open} data-exception={e.type} className={cn('grid w-full gap-1 rounded-xl border border-l-4 bg-card px-4 py-3 text-left hover:bg-secondary', k.cls)}>
       <span className="flex items-center gap-2 text-base font-semibold uppercase tracking-wide"><k.icon className="size-5" aria-hidden />{k.label}
         {e.since && <span className="ml-auto font-mono text-lg font-medium normal-case tracking-normal tabular">{age(now - Date.parse(e.since))}</span>}</span>
       <span className="line-clamp-2 text-2xl font-medium leading-snug text-foreground">{e.title}</span>
-      <span className="truncate text-base text-muted-foreground">{e.detail}{e.since ? `${e.detail ? ' · ' : ''}since ${hhmm(e.since)}` : ''}</span>
+      <span className="flex min-w-0 items-baseline gap-1.5 text-base text-muted-foreground"><span className="min-w-0 truncate">{e.detail}{e.since ? `${e.detail ? ' · ' : ''}since ${hhmm(e.since)}` : ''}</span>
+        {tk && <CreatedAge at={tk.created_at} prefix={e.detail || e.since ? '· created ' : 'created '} className="shrink-0 text-base" />}</span>
     </button></li>
   );
 }

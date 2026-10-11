@@ -6,7 +6,7 @@ import { ago } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ChoiceChips } from '@/components/desk/Choices';
-import { Tag, Key, SeatAvatar, Section } from '@/components/desk/Bits';
+import { Tag, Key, CreatedAge, SeatAvatar, Section } from '@/components/desk/Bits';
 import { KIND_LABEL, NowLine, cardFor, firstName, reasonText, Disclose } from '@/components/desk/Work';
 import { WritingMark } from '@/components/desk/Presence';
 import { Lineage, EpicTree, EpicProgress, childrenOf, isFeatureRoot, openEpic, leafStats } from '@/components/desk/Epic';
@@ -29,7 +29,7 @@ function WorkRow({ it }: { it: BoardItem }) {
         <div className="flex flex-wrap items-center gap-1.5">
           {it.bucket === 'needs_you' && <Tag tone="needs">{KIND_LABEL[it.kind || ''] || 'Needs you'}</Tag>}{it.bucket === 'blocked' && <Tag tone="blocked">Blocked</Tag>}
           {it.bucket === 'epic' ? <Tag>{it.live ? 'Epic, a slice is running' : 'Epic'}</Tag> : it.stage && it.bucket !== 'shipped' ? <Tag>{it.stage}</Tag> : null}
-          <span className="flex-1" /><Key k={t.key} />
+          <span className="flex-1" /><CreatedAge at={t.created_at} /><Key k={t.key} />
         </div>
         <b className="[overflow-wrap:anywhere]">{it.name}</b>
         {line && <p className="text-sm text-muted-foreground">{line.length > 170 ? `${line.slice(0, 169).replace(/\s+\S*$/, '')}…` : line}</p>}
@@ -60,7 +60,7 @@ function EpicBoard({ B, matches, closed }: { B: Board; matches: (it: BoardItem) 
               <Tag tone={isFeatureRoot(t) ? 'action' : 'neutral'}>{isFeatureRoot(t) ? 'Feature' : 'Epic'}</Tag>
               {['done', 'wontdo'].includes(t.status) && <Tag tone={t.status === 'done' ? 'shipped' : 'neutral'}>{t.status === 'done' ? 'Shipped' : 'Closed'}</Tag>}
               {s.needs > 0 && <Tag tone="needs">{s.needs} need{s.needs === 1 ? 's' : ''} you</Tag>}
-              <span className="flex-1" /><Key k={t.key} />
+              <span className="flex-1" /><CreatedAge at={t.created_at} /><Key k={t.key} />
             </div>
             <h3 className="text-[17px] font-semibold leading-snug"><button type="button" className="text-left hover:underline" onClick={() => openEpic(t)}>{t.title}</button></h3>
             <EpicProgress epic={t.key} />

@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { Play, Pause, Pencil } from 'lucide-react';
 import { S, api, agentMap, loadResearch, loadSnapshot } from '@/store.js';
 import { ago, until } from '@/lib/format.js';
-import { FREQUENCIES, WINDOWS, SOURCE_SUGGESTIONS, TEMPLATES, frequencyLabel, parseInterval, normalizeSource, sentence, fromProgram, listWith, listWithout, withSeat, problems, uniqueId } from '@/lib/programs.js';
+import { FREQUENCIES, WINDOWS, SOURCE_SUGGESTIONS, TEMPLATES, frequencyLabel, parseInterval, normalizeSource, sentence, fromProgram, listWith, listWithout, withSeat, problems, uniqueId, withLive } from '@/lib/programs.js';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -27,6 +27,7 @@ function status(p: Program): [string, Tone] {
   if (p.code === 'due') return ['Due now', 'shipped'];
   if (p.code === 'disabled') return ['Paused', 'neutral'];
   if (p.code === 'seat_disabled') return ['Researcher is off', 'needs'];
+  if (p.code === 'backlog') return ['Waiting for research items to finish', 'needs'];
   if (p.code === 'funnel') return ['Waiting for grooming', 'needs'];
   if (p.code === 'cadence') return [`Eligible ${until(p.next_eligible_at)}`, 'neutral'];
   if (p.code === 'window') return [p.window === 'market' ? 'Waits for market hours' : 'Waits for the close', 'neutral'];
@@ -34,9 +35,12 @@ function status(p: Program): [string, Tone] {
 }
 
 /** One program, written as a sentence. Every underlined part opens the editor at that question. */
-export function ProgramCard({ program, saved, editingRow, onEdit, onClose }: { program: Program; saved: Program[]; editingRow: string | null; onEdit: (row: string) => void; onClose: () => void }) {
+export function ProgramCard({ program, live, saved, editingRow, onEdit, onClose }: { program: Program; live?: Program | null; saved: Program[]; editingRow: string | null; onEdit: (row: string) => void; onClose: () => void }) {
   const d = fromProgram(program) as Draft;
-  const [label, tone] = status(program);
+  // Whether it is due or waiting comes from the live snapshot (it follows the backlog as items move); the editable
+  // settings stay those of the loaded list, so a live update never touches a draft.
+  const now = withLive(program, live);
+  const [label, tone] = status(now);
   const [runOpen, setRunOpen] = useState(false);
   const [focus, setFocus] = useState('');
   const editorId = useId();
@@ -50,7 +54,7 @@ export function ProgramCard({ program, saved, editingRow, onEdit, onClose }: { p
       </p>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm text-muted-foreground">
         <Tag tone={tone}>{label}</Tag><span className="text-foreground">{program.label}</span>
-        <span>{program.last_run_at ? `Last session ${ago(program.last_run_at)}` : 'Never run'}</span>
+        <span>{now.last_run_at ? `Last session ${ago(now.last_run_at)}` : 'Never run'}</span>
         <span>{program.maxProposals} proposal{program.maxProposals === 1 ? '' : 's'} per session</span>
         <span className="flex-1" />
         {!editingRow && <div className="flex flex-wrap gap-1.5">

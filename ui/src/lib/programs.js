@@ -150,3 +150,13 @@ function truncateWords(s, n) {
   // The topic follows "researches", so "Volatility papers" reads as "volatility papers"; acronyms (SEC, UI) keep their case.
   return /^[A-Z][a-z]/.test(text) ? text[0].toLowerCase() + text.slice(1) : text;
 }
+
+/**
+ * A loaded program with the live snapshot's eligibility for it: whether it is due or waiting (backlog, funnel, cadence)
+ * follows the desk as tickets move, while its settings (what the editor drafts from) stay those of the loaded list.
+ */
+export function withLive(p, live) {
+  if (!live || live.id !== p.id) return p;
+  const { ok, code, reason, last_run_at, next_eligible_at } = live;
+  return { ...p, ok, code, reason, last_run_at, next_eligible_at };
+}

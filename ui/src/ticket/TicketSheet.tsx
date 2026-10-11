@@ -10,7 +10,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Panel } from '@/components/desk/Panel';
 import { AsyncButton } from '@/components/desk/AsyncButton';
-import { Tag, Key, Named } from '@/components/desk/Bits';
+import { Tag, Key, Named, CreatedAge } from '@/components/desk/Bits';
 import { KIND_LABEL, BUCKET_LABEL, BUCKET_TONE, cardFor, RunCard, Reviews, prReviewsOf, firstName, DecisionButton } from '@/components/desk/Work';
 import { Conversation, Brief, PrSummary, ProductReview, ResearchReview, Details, Block, type ConvState } from './parts';
 import { Lineage, EpicTree, EpicProgress, childrenOf, isFeatureRoot } from '@/components/desk/Epic';
@@ -178,7 +178,7 @@ export function TicketSheet() {
     <Lineage t={t} />
     <div className="flex flex-wrap items-center gap-2">
       {dec ? <Tag tone="needs">{KIND_LABEL[dec.kind || ''] || 'Needs you'}</Tag> : it ? <Tag tone={BUCKET_TONE[it.bucket] || 'neutral'}>{BUCKET_LABEL[it.bucket] || it.bucket}</Tag> : null}
-      {it?.stage && <Tag>{it.stage}</Tag>}<Key k={t.key} />
+      {it?.stage && <Tag>{it.stage}</Tag>}<Key k={t.key} /><CreatedAge at={t.created_at} sentence />
       {kids.length > 0 && <Tag>Epic</Tag>}
       {nameOf(t) !== t.title && <span className="truncate text-sm text-muted-foreground">{t.title}</span>}
     </div>

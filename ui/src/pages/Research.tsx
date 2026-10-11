@@ -5,7 +5,7 @@ import { AsyncButton } from '@/components/desk/AsyncButton';
 import { Section } from '@/components/desk/Bits';
 import { ProgramCard, ProgramEditor } from '@/research/Programs';
 import { Connectors } from '@/research/Connectors';
-import type { Program } from '@/types';
+import type { Program, ResearchBacklog } from '@/types';
 
 export default function ResearchPage() {
   const [editing, setEditing] = useState<{ id?: string; row?: string; draft?: unknown } | null>(null);
@@ -15,11 +15,17 @@ export default function ResearchPage() {
   const saved: Program[] = data.programs;
   const opts = { takenIds: saved.map((p) => p.id), defaultReview: data.default_review, seats: S.agents.map((a: { id: string }) => a.id) };
   const market = data.market_hours;
+  // The live snapshot's count (it refreshes as items finish), else the one loaded with the programs.
+  const backlog: ResearchBacklog | null = S.meta.research?.backlog || data.backlog || null;
+  const live: Record<string, Program> = Object.fromEntries(((S.meta.research?.programs || []) as Program[]).map((p) => [p.id, p]));
   return (
     <div className="grid max-w-5xl gap-8">
       <div className="grid gap-1.5">
         <p className="max-w-[68ch] text-muted-foreground">Who researches, how often, and who checks their work before anything is built. Tap any underlined part of a program to change it.</p>
         <p className="inline-flex items-center gap-2 text-sm text-muted-foreground"><span aria-hidden className={`size-2 rounded-full ${market.open_now ? 'bg-shipped' : 'bg-muted-foreground'}`} />Market {market.open_now ? 'open' : 'closed'}, {market.start} to {market.end} {market.timezone.replace('_', ' ')}</p>
+        {backlog && <p data-research-backlog={backlog.full ? 'full' : 'open'} className={`max-w-[68ch] text-sm ${backlog.full ? 'text-needs' : 'text-muted-foreground'}`}>
+          {backlog.full ? `${backlog.reason}. Reviews, revisions and your decisions on them keep going.`
+            : `${backlog.count} research item${backlog.count === 1 ? '' : 's'} open; new research waits at ${backlog.max} (Settings → Research).`}</p>}
         {data.problems?.length > 0 && <p className="text-sm text-needs">{data.problems.join(' ')}</p>}
         {!data.configured && <p className="text-sm text-muted-foreground">These programs come from the configuration until you save one here.</p>}
       </div>
@@ -27,7 +33,7 @@ export default function ResearchPage() {
         actions={data.configured ? <AsyncButton variant="ghost" size="sm" confirm="Discard saved programs and return to the configuration defaults?"
           run={async () => { await api('POST', '/api/research/programs/reset', {}); setEditing(null); await Promise.all([loadResearch(), loadSnapshot().catch(() => {})]); }} ok="Programs reset to the configuration">Reset to configuration</AsyncButton> : null}>
         <div className="grid gap-3">
-          {saved.map((p) => <ProgramCard key={p.id} program={p} saved={saved} editingRow={editing?.id === p.id ? editing.row || 'label' : null} onEdit={(row) => setEditing({ id: p.id, row })} onClose={() => setEditing(null)} />)}
+          {saved.map((p) => <ProgramCard key={p.id} program={p} live={live[p.id]} saved={saved} editingRow={editing?.id === p.id ? editing.row || 'label' : null} onEdit={(row) => setEditing({ id: p.id, row })} onClose={() => setEditing(null)} />)}
           {editing?.draft ? <article className="grid gap-3 rounded-lg border bg-card p-5"><p className="text-xl">New program</p>
             <ProgramEditor isNew initial={editing.draft as never} saved={saved} onClose={() => setEditing(null)} /></article> : null}
         </div>

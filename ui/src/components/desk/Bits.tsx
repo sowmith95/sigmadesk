@@ -49,4 +49,4 @@ function NamedKeys({ text, self }: { text: string; self?: string }) {
     : <button key={i} type="button" title={p.key} onClick={(e) => { e.stopPropagation(); openTicket(p.key); }} className="rounded-md bg-secondary px-1.5 text-[0.95em] hover:bg-accent">{p.name}</button>));
 }
 
-export { Tag, Key, Empty, StatTile, Section, type Tone } from './Layout';
+export { Tag, Key, CreatedAge, Empty, StatTile, Section, type Tone } from './Layout';

@@ -233,7 +233,8 @@ export function age(ms) {
   const m = mins(ms);
   return m < 60 ? `${m} min` : m < 1440 ? `${Math.round(m / 60)} h` : `${Math.round(m / 1440)} d`;
 }
-const kpi = (label, value, { source, at = null, window = null, unknown = null, tone = 'neutral' } = {}) => ({ label, value: unknown ? null : value, unknown, source, at, window, tone });
+// `value` stays short (a number, a count over a limit, an age); `note` is an optional sentence shown on its own wrapping line.
+const kpi = (label, value, { source, at = null, window = null, unknown = null, tone = 'neutral', note = null } = {}) => ({ label, value: unknown ? null : value, unknown, source, at, window, tone, note });
 const UNKNOWN = (label, why, source) => kpi(label, null, { source, unknown: why });
 
 /**
@@ -294,7 +295,12 @@ export function departmentKpis(state, deps, { now = Date.now(), board = null } =
       const held = (board?.needs_you || []).filter((it) => it.kind === 'research').length;
       const pending = (meta.research_reviews || []).filter((r) => ['pending', 'changes'].includes(r.state)).length;
       k.push(kpi('Evidence awaiting a decision', String(held), { source: 'research proposals held for you (Inbox)', at: nowIso, window: `${pending} more in second review`, tone: held ? 'needs' : 'neutral' }));
-      k.push(UNKNOWN('Reproducibility gaps', 'research reviews do not record reproducibility separately', 'research reviews'));
+      // New research waits while this many research-born items are still open (Settings → Research, src/scheduler.js).
+      const b = meta.research?.backlog;
+      k.push(b ? kpi('Research backlog', `${b.count} / ${b.max}`, { source: 'research items under review, revision, grooming or your decision', at: nowIso,
+        window: 'research items open / limit', tone: b.full ? 'needs' : 'neutral',
+        note: !b.full ? null : b.max === 0 ? 'New research is off (the limit is 0)' : `New research waits until fewer than ${b.max} are open` })
+        : UNKNOWN('Research backlog', 'the desk did not report its research backlog', 'research status'));
     } else {
       k.push(UNKNOWN('Domain KPI', 'no KPI is defined for this group', 'none'));
     }

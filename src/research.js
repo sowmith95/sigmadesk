@@ -14,6 +14,8 @@ export const WINDOWS = ['any', 'market', 'off-market'];
 export const KINDS = ['research', 'research_revision', 'research_review', 'connector_assessment'];
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const fail = (message, status = 400) => { throw Object.assign(new Error(message), { status }); };
+// The scheduler installs its research backlog (src/scheduler.js researchBacklog); a plain import sees an empty one.
+export const hooks = { backlog: (_settings) => null };
 
 // ---------------- windows (launch-time only: a run that starts before the close may finish after it) ----------------
 export function localParts(d, tz) {
@@ -134,6 +136,9 @@ export function eligibility(p, { now = new Date(), settings = store.getSettings(
   const base = { last_run_at: last, next_eligible_at: next };
   if (!p.enabled) return { ...base, ok: false, code: 'disabled', reason: 'Program is off' };
   if (agentById[p.seat]?.enabled === false) return { ...base, ok: false, code: 'seat_disabled', reason: `${agentById[p.seat].name} is disabled` };
+  // Ahead of window and cadence: a full backlog holds every session back, however soon the next one is due.
+  const backlog = hooks.backlog(settings);
+  if (backlog?.full) return { ...base, ok: false, code: 'backlog', reason: backlog.reason };
   if (!windowSatisfied(p.window, now)) return { ...base, ok: false, code: 'window', reason: p.window === 'market' ? 'Runs during market hours only' : 'Runs outside market hours only' };
   if (next && Date.parse(next) > now.getTime()) return { ...base, ok: false, code: 'cadence', reason: `Next session after ${next}` };
   const room = Number(settings.max_open_proposals) - store.ticketsByStatus('proposed').length;
@@ -152,7 +157,8 @@ export function job(p, { focus = '', room = p.maxProposals } = {}) {
 }
 export function status(settings = store.getSettings(), now = new Date()) {
   const market = config.research.marketHours;
-  return { configured: configured(settings), revision: revision(settings), programs: programs(settings).map((p) => ({ ...p, ...eligibility(p, { now, settings }) })), windows: WINDOWS,
+  const backlog = hooks.backlog(settings);
+  return { configured: configured(settings), revision: revision(settings), backlog: backlog && { count: backlog.count, max: backlog.max, full: backlog.full, reason: backlog.reason, keys: backlog.keys }, programs: programs(settings).map((p) => ({ ...p, ...eligibility(p, { now, settings }) })), windows: WINDOWS,
     market_hours: { ...market, open_now: inWindow(now, market) }, problems: lastProblems, seats: Object.keys(agentById), connectors: connectors.summary(),
     case_sections: connectors.CASE_SECTIONS, sdlc_stages: connectors.SDLC_STAGES, default_review: config.research.review };
 }

@@ -36,3 +36,5 @@ export function outcome(text, max = 260) {
 }
 export const truncate = (s, n) => (s.length > n ? `${s.slice(0, n - 1).replace(/\s+\S*$/, '')}…` : s);
 export const firstWord = (s) => String(s || '').split(/\s+/)[0] || '';
+// A ticket's creation age and full creation time: shared with the classic board, so they live in public/.
+export { createdAge, createdTitle } from '../../../public/created.js';

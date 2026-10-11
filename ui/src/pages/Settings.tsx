@@ -7,8 +7,9 @@ import { SeatAvatar, Section } from '@/components/desk/Bits';
 import { ChoiceChips } from '@/components/desk/Choices';
 import { AutonomyMatrix } from '@/components/desk/Autonomy';
 import { DelegationSettings } from '@/components/desk/Delegation';
+import type { ResearchBacklog } from '@/types';
 
-function NumberSetting({ k, label, hint, step = 1 }: { k: string; label: string; hint: string; step?: number }) {
+function NumberSetting({ k, label, hint, step = 1, min = k === 'daily_budget_usd' ? 0 : 1 }: { k: string; label: string; hint: string; step?: number; min?: number }) {
   const [v, setV] = useState<string>(S.settings[k] ?? '');
   const seen = useRef(S.settings[k]);
   useEffect(() => { if (S.settings[k] !== seen.current) { seen.current = S.settings[k]; setV(S.settings[k] ?? ''); } });
@@ -19,7 +20,7 @@ function NumberSetting({ k, label, hint, step = 1 }: { k: string; label: string;
   return (
     <div className="flex items-center justify-between gap-4 py-3">
       <label htmlFor={`set-${k}`} className="grid gap-0.5"><b className="font-medium">{label}</b><span className="text-[13px] text-muted-foreground">{hint}</span></label>
-      <Input id={`set-${k}`} type="number" inputMode="decimal" min={k === 'daily_budget_usd' ? 0 : 1} step={step} value={v} onChange={(e) => setV(e.target.value)} onBlur={save} onKeyDown={(e) => { if (e.key === 'Enter') save(); }} className="w-28 shrink-0 text-right font-mono" />
+      <Input id={`set-${k}`} type="number" inputMode="decimal" min={min} step={step} value={v} onChange={(e) => setV(e.target.value)} onBlur={save} onKeyDown={(e) => { if (e.key === 'Enter') save(); }} className="w-28 shrink-0 text-right font-mono" />
     </div>
   );
 }
@@ -52,6 +53,12 @@ function RequiredChecks() {
   );
 }
 
+/** What the research backlog limit means, with how many research items are open now. */
+function backlogHint(b?: ResearchBacklog | null) {
+  const base = 'New research, Run now included, waits while this many research items are under review, revision or your decision, counting room that running sessions hold; 0 stops it.';
+  return b ? `${base} Open now: ${b.count}.` : base;
+}
+
 export default function SettingsPage() {
   const progs = S.meta.research?.programs || [];
   return (
@@ -75,6 +82,7 @@ export default function SettingsPage() {
         <div className="flex items-center justify-between gap-4 py-3"><div className="grid gap-0.5"><b className="font-medium">Research programs</b><span className="text-[13px] text-muted-foreground">{progs.length ? `${progs.filter((p: { enabled: boolean }) => p.enabled).length} of ${progs.length} running.` : 'None yet.'} Who researches, how often, and who checks their work.</span></div>
           <Button variant="secondary" onClick={() => setView('research')}>Open Research</Button></div>
         <NumberSetting k="max_open_proposals" label="Proposals waiting at most" hint="Research pauses while this many ideas wait for grooming." />
+        <NumberSetting k="research_backlog_max" min={0} label="Research items open at most" hint={backlogHint(S.meta.research?.backlog)} />
       </Group></Section>
       <Section title="GitHub"><Group>
         <Bool k="github_sync" label="Sync GitHub issues" hint={`Mirror tickets and comments to ${S.meta.repo || 'GitHub'}.`} />

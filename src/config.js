@@ -199,6 +199,9 @@ const DEFAULTS = {
     programs: [],
     // Default second-person review policy for research proposals (a program may override).
     review: { minReviewers: 1, reviewers: ['trading-advisor', 'quant-research', 'principal-be'] },
+    // New research waits while this many research-born items are still open in the research pipeline (proposed, or
+    // held on a review, revision or owner decision). 0 = research never starts. Settings → Research changes it live.
+    backlogMax: 8,
   },
   sandbox: {
     enabled: true,
@@ -519,6 +522,7 @@ export function validateConfig(c = config) {
   if (!Array.isArray(rs.programs) || !rs.programs.every((p) => p && typeof p.id === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(p.id))) problems.push('research.programs must be a list of programs with kebab-case ids');
   if (!rs.connectors || typeof rs.connectors !== 'object' || Array.isArray(rs.connectors) || !Object.keys(rs.connectors).every((k) => /^[a-z0-9][a-z0-9-]{0,39}$/.test(k))) problems.push('research.connectors must map kebab-case names to connector definitions');
   if (!(Number.isInteger(rs.review?.minReviewers) && rs.review.minReviewers >= 1 && rs.review.minReviewers <= 3) || !Array.isArray(rs.review?.reviewers)) problems.push('research.review needs minReviewers 1-3 and a reviewers list');
+  if (!(Number.isInteger(rs.backlogMax) && rs.backlogMax >= 0 && rs.backlogMax <= 100)) problems.push('research.backlogMax must be an integer from 0 to 100');
   // Post-deploy watch calendar (#7): a bad override must fail at load, never inside a deploy-lock release.
   const dwc = c.deployWatch?.calendar || {};
   const day = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v)) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`));

@@ -353,7 +353,8 @@ details.work summary .t { font: 11px var(--mono); color: var(--dim); }
 .tile b { font-size: 17px; }
 .mini-list { display: flex; flex-direction: column; gap: 6px; }
 .mini-t { display: flex; gap: 8px; align-items: center; text-align: left; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; }
-.mini-t .tt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mini-t .tt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mini-t .age { margin-left: auto; flex-shrink: 0; font: 11px var(--mono); color: var(--muted); }
 .linkish { background: none; border: 0; padding: 0; color: var(--info); }
 .av.md { width: 32px; height: 32px; }
 .av.xl { width: 72px; height: 72px; font-size: 16px; }

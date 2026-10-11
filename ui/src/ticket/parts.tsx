@@ -8,7 +8,7 @@ import { clean, hhmm, outcome, prNumber, questionText } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { AsyncButton } from '@/components/desk/AsyncButton';
-import { Tag, Named, SeatAvatar } from '@/components/desk/Bits';
+import { Tag, Named, SeatAvatar, CreatedAge } from '@/components/desk/Bits';
 import { Markdown, Inline } from '@/components/desk/Markdown';
 import { cardFor, EvidenceList, CiTag, Disclose, STAGE_LABEL } from '@/components/desk/Work';
 import { cn } from '@/lib/utils';
@@ -311,7 +311,7 @@ export function Details({ t, d }: { t: Ticket; d: Detail | null }) {
       {kids.length > 0 && t.status === 'wontdo' && kids.some((k: Ticket) => !['done', 'wontdo'].includes(k.status)) && <Block tone="needs" title="Closed with open tasks">
         <p>This ticket was closed while its tasks are still open. Reopen it as an epic: it tracks the tasks and closes itself when they are all done.</p>
         <AsyncButton className="justify-self-start" run={async () => { await api('PATCH', `/api/tickets/${t.key}`, { status: 'in_progress' }); await loadSnapshot(); }} ok="Reopened; it closes when its tasks are done">Reopen as an epic</AsyncButton></Block>}
-      {kids.length > 0 && <Block title="Tasks"><ul className="grid gap-1.5">{kids.map((k: Ticket) => <li key={k.key} className="flex items-center justify-between gap-2"><button type="button" className="text-left hover:underline max-md:min-h-11" onClick={() => openTicket(k.key)}>{nameOf(k)}</button><span className="flex items-center gap-2">{k.after_key && <span className="text-xs text-muted-foreground">after {k.after_key}</span>}<Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag></span></li>)}</ul></Block>}
+      {kids.length > 0 && <Block title="Tasks"><ul className="grid gap-1.5">{kids.map((k: Ticket) => <li key={k.key} className="flex items-center justify-between gap-2"><button type="button" className="text-left hover:underline max-md:min-h-11" onClick={() => openTicket(k.key)}>{nameOf(k)}</button><span className="flex items-center gap-2">{k.after_key && <span className="text-xs text-muted-foreground">after {k.after_key}</span>}<Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag><CreatedAge at={k.created_at} /></span></li>)}</ul></Block>}
       {(d?.discussions || []).length > 0 && <Block title="Design discussions">{[...d!.discussions].sort((a: Detail, b: Detail) => b.id - a.id).slice(0, 4).map((x: Detail) => <p key={x.id} className="text-sm">#{x.id}: {x.status.replaceAll('_', ' ')}{x.error ? `, ${x.error}` : ''}</p>)}</Block>}
       <div className="flex flex-wrap gap-2">
         <AsyncButton variant="secondary" run={async () => { const v = window.prompt('Short name for this ticket (2 to 5 words):', nameOf(t)); if (v == null) return false; await api('POST', `/api/tickets/${t.key}/name`, { name: v }); await loadSnapshot(); }} ok="Renamed">Rename</AsyncButton>

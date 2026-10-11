@@ -134,6 +134,7 @@ test('the gate holds in every path: owner patch, manager groom, legacy proposals
 
 test('proposal allowance: per-run and global caps are enforced server-side; research allowance nets out running jobs', async () => {
   store.setSetting('max_open_proposals', '50');
+  store.setSetting('research_backlog_max', '100'); // this test is about the proposal funnel; the backlog cap has its own tests
   for (const r of store.unfinishedRuns()) store.updateRun(r.id, { status: 'success', ended_at: store.now() }); // earlier fixture runs held allowances
   const open = store.ticketsByStatus('proposed').length;
   const run = fakeRun('pm', 'research', null, { program: 'product-discovery', job: job({ maxProposals: 2 }) });
@@ -146,7 +147,7 @@ test('proposal allowance: per-run and global caps are enforced server-side; rese
     store.setSetting('max_open_proposals', String(store.ticketsByStatus('proposed').length));
     const run2 = fakeRun('pm', 'research', null, { program: 'product-discovery', job: job({ maxProposals: 2 }) });
     await assert.rejects(sched.deskAction(run2, 'propose', { title: 'a4', body: BODY }), /enough proposals are waiting/);
-  } finally { store.setSetting('max_open_proposals', '50'); }
+  } finally { store.setSetting('max_open_proposals', '50'); store.setSetting('research_backlog_max', '8'); }
 });
 
 test('reviewer and assessor runs are read-only in permissions, sandbox and desk actions; reports are validated', async () => {

@@ -6,6 +6,7 @@ import { S, setPalette, setView, openTicket, openSheet, openFeature, currentBoar
 import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from '@/components/ui/command';
 import { NAV } from './Shell';
 import { STAGE_LABEL } from '@/components/desk/Work';
+import { CreatedAge } from '@/components/desk/Bits';
 import type { Board, Ticket } from '@/types';
 
 export function CommandPalette() {
@@ -24,14 +25,14 @@ export function CommandPalette() {
           <CommandItem onSelect={go(() => openSheet({ type: 'new' }))}><Plus />New ticket</CommandItem>
         </CommandGroup>
         {decisions.length > 0 && <CommandGroup heading="Needs you">
-          {decisions.map((it) => <CommandItem key={it.id} value={`${it.verb} ${it.key}`} onSelect={go(() => (it.kind === 'plan' ? openFeature(it.key) : openTicket(it.key, { decision: it.id })))}>{it.verb}<CommandShortcut>{it.key}</CommandShortcut></CommandItem>)}
+          {decisions.map((it) => <CommandItem key={it.id} value={`${it.verb} ${it.key}`} onSelect={go(() => (it.kind === 'plan' ? openFeature(it.key) : openTicket(it.key, { decision: it.id })))}>{it.verb}<CommandShortcut className="flex items-center gap-2"><CreatedAge at={it.ticket?.created_at} className="text-xs tracking-normal" />{it.key}</CommandShortcut></CommandItem>)}
         </CommandGroup>}
         <CommandGroup heading="Pages">
           {NAV.map(({ page, label, icon: Icon }) => <CommandItem key={page} value={`page ${label}`} onSelect={go(() => setView(page))}><Icon />{label}</CommandItem>)}
         </CommandGroup>
         <CommandGroup heading="Tickets">
           {tickets.map((t) => <CommandItem key={t.key} value={`${nameOf(t)} ${t.title} ${t.key}`} onSelect={go(() => (t.type === 'feature' && !t.parent_key ? openFeature(t.key) : openTicket(t.key)))}>
-            <span className="truncate">{nameOf(t)}</span><span className="ml-2 truncate text-muted-foreground">{STAGE_LABEL[t.status] || t.status}</span><CommandShortcut>{t.key}</CommandShortcut></CommandItem>)}
+            <span className="truncate">{nameOf(t)}</span><span className="ml-2 truncate text-muted-foreground">{STAGE_LABEL[t.status] || t.status}</span><CommandShortcut className="flex items-center gap-2"><CreatedAge at={t.created_at} className="text-xs tracking-normal" />{t.key}</CommandShortcut></CommandItem>)}
         </CommandGroup>
       </CommandList>
     </CommandDialog>

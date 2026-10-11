@@ -742,6 +742,50 @@ export const runBudget = (agentId, kind = null) => {
 export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: String(run?.model || '').split(':')[0] }).budgetUsd({ model: String(run?.model || '').split(':').slice(1).join(':') });
 
 /**
+ * The setup phase of one run, from its row's insertion until its process is fully wired up. It owns what the run holds
+ * in that window (the seat's working state, the step ledger, a prepared context pack, the preparation timer, the
+ * socket, mailbox, tool home, run timers and the spawned process) and one flag says who finalizes the run, exactly once:
+ *   'setup'   → abort(reason, status) claims it ('aborted'), or handOff() gives it to the process ('handed')
+ *   'handed'  → the close/exit handler claims it with finishing() ('finished')
+ * Whichever claims first finalizes; the other is a no-op. So a process exit after an abort never overwrites the setup
+ * reason or charges the cap, and an abort after the hand-off never touches the run. abort never downgrades a run that
+ * has already stopped: a run the owner, a stop-all or a timeout killed keeps its status and reason; only cleanup runs.
+ */
+function setupPhase({ run, agentId, ticketKey, track }) {
+  let state = 'setup';
+  const owned = [];
+  const quietly = (fn) => { try { fn(); } catch { /* keep releasing the rest */ } };
+  const result = () => ({ run: store.getRun(run.id), result: null, failure: null });
+  return {
+    own(release) { owned.push(release); },
+    /** The process is wired up: its close handler owns the run from now on. False if an abort already claimed it. */
+    handOff() { if (state !== 'setup') return false; state = 'handed'; owned.length = 0; return true; },
+    /** The close/exit handler's claim: true exactly once, and only for a run that was handed off. */
+    finishing() { if (state !== 'handed') return false; state = 'finished'; return true; },
+    abort(reason, status = 'error') {
+      if (state !== 'setup') return result();
+      state = 'aborted';
+      for (const release of owned.splice(0).reverse()) quietly(release);
+      quietly(() => ledgers.delete(run.id));
+      quietly(() => context.release(run.id));
+      quietly(() => mailboxes.delete(run.id));
+      quietly(() => ops.cancelRun(run.id));
+      quietly(() => evidence.delete(run.id));
+      quietly(() => fs.rm(path.join(toolHomeRoot(), `r${run.id}`), { recursive: true, force: true }, () => {}));
+      quietly(() => {
+        const now = store.getRun(run.id);
+        const stopped = now && now.status !== 'running';
+        store.updateRun(run.id, stopped ? { token: null, ended_at: now.ended_at || store.now(), cost_usd: 0 }
+          : { status, token: null, ended_at: store.now(), result_text: reason, cost_usd: 0 });
+      });
+      quietly(() => store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: reason }));
+      if (track) quietly(() => store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() }));
+      return result();
+    },
+  };
+}
+
+/**
  * Start one agent run. Resolves when the process exits with {run, result}.
  * The prompt goes over stdin so the variadic tool flags cannot swallow it.
  */
@@ -765,90 +809,93 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const pkg = packages.readPathsFor(agentId, ticketKey, kind);
   const run = store.createRun({ nonce, provenance: provenanceOf(agent, kind), agent_id: agentId, ticket_key: ticketKey, kind, token, model: `${agent.engine || 'claude'}:${agent.model || 'default'}`, cwd, resumed_from: resume, incident_id: incidentId, program: job?.program ?? null, job,
     profile_hash: (agent.engine || 'claude') === 'codex' ? ENGINES.codex.profileHash(pkg.paths) : null });
-  packages.recordLaunch(run.id, pkg.ids);
-  // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
-  if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
-  store.updateRun(run.id, { reserve_usd: runReserve(agent, kind, limits?.usd ?? null) });
-  // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
-  // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
-  if (kind !== 'mention' && kind !== 'decide') access.bindRun(agentId, ticketKey, run.id); // a decision run (#9) is not the ticket's work either
-  onStart?.(run);
-  const ctx = { run, cwd, result: null, state: {}, presence: track };
-  if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
-  store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'run',
-    text: `${agent.role} started ${kind} on ${agent.engine && agent.engine !== 'claude' ? `${agent.engine}${agent.model ? `/${agent.model}` : ''}` : agent.model}${agent.effort ? ` (${agent.effort})` : ''}${resume ? ` (${fork ? 'forked from' : 'continuing'} session ${resume.slice(0, 8)})` : ''}` });
-  if (selected.fallback) store.logEvent({ ...{ run_id: run.id, agent_id: agentId, ticket_key: ticketKey }, kind: 'system',
-    text: `Automatic fallback: ${agentById[agentId].engine || 'claude'} → ${agent.engine} (${selected.reason}). Saved seat preference retained.` });
-
-  const engine = engineOf(agent);
-  const pplx = engine.id === 'perplexity' && engine.supports?.(kind);
-  const px = context.packSettings();
-  // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
-  // Covers the first answer, follow-ups and every permitted page round (bounded by engines.perplexity.maxRunMinutes).
-  // A tagged run on a plan-billed engine without a dollar cap is bounded by time instead (mentions.maxMinutes).
-  const timeoutMin = limits?.minutes ?? (kind === 'mention' && !capsSpend(agent, 'mention') ? Number(config.mentions?.maxMinutes) || 10
-    : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0));
-  const deadlineAt = Date.now() + timeoutMin * 60_000;
-  if (limits?.steps != null) ctx.maxSteps = limits.steps;
-  boundSteps(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
-  // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
-  if (store.getRun(run.id)?.status !== 'running') return Promise.resolve(endBeforeSpawn('killed', store.getRun(run.id)?.result_text || 'refused before start'));
-  if (!pplx) return spawnChild();
-
-  // Perplexity thinking seats: the desk builds the context pack (not the relay) before the relay starts. Cancellation
-  // and the run timeout exist before any preparation work; a pack that cannot be built refuses the run (fail closed).
-  const abort = new AbortController();
-  preparing.set(run.id, abort);
-  const prepTimer = setTimeout(() => {
-    store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `timed out after ${timeoutMin} min — stopping` });
-    killRun(run.id, 'timeout');
-  }, timeoutMin * 60_000);
+  // Setup phase: from this row until the process exists, `setup` owns what the run holds (seat, ledger, prepared
+  // context, preparation timer, socket, mailbox). Every step of preparation, synchronous or not, runs in the one try
+  // below; any failure or refusal ends the run through setup.abort, and a successful spawn hands it over exactly once.
+  const setup = setupPhase({ run, agentId, ticketKey, track });
+  let ctx, engine, pplx, px, timeoutMin, deadlineAt;
   return (async () => {
-    let failed = null;
     try {
-      prompt = `${prompt}${await preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal: abort.signal })}`;
-    } catch (err) { failed = err; } finally { preparing.delete(run.id); clearTimeout(prepTimer); }
-    const now = store.getRun(run.id);
-    if (now.status === 'killed') return endBeforeSpawn('killed', now.result_text || 'stopped while preparing');
-    // The circuit breaker may have tripped while the pack was being built: re-check the fence right before spawning.
-    if (fence != null && fence !== epoch) return endBeforeSpawn('killed', 'stopped by stop-all while preparing');
-    if (failed) return endBeforeSpawn('error', `Run refused: the context pack could not be built — ${store.redact(failed.message).slice(0, 300)}`);
-    return spawnChild();
+      packages.recordLaunch(run.id, pkg.ids);
+      // Team lessons travel in the prompt (not the charter, so provenance and records are unchanged by them).
+      if (ticketKey) prompt = lessons.decorate({ kind, ticket: store.getTicket(ticketKey), prompt, runId: run.id, resumed: !!resume });
+      store.updateRun(run.id, { reserve_usd: runReserve(agent, kind, limits?.usd ?? null) });
+      // Dormant ticket-scoped production access becomes this run's. A tagged run (@mention) never takes it: it is not the
+      // ticket's work, and binding would end the grant the ticket's own verify/design run is waiting for.
+      if (kind !== 'mention' && kind !== 'decide') access.bindRun(agentId, ticketKey, run.id); // a decision run (#9) is not the ticket's work either
+      onStart?.(run);
+      ctx = { run, cwd, result: null, state: {}, presence: track };
+      if (track) store.updateAgent(agentId, { status: 'working', current_kind: kind, current_ticket: ticketKey, current_run: run.id, last_action: `started ${kind}`, last_action_at: store.now() });
+      store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'run',
+        text: `${agent.role} started ${kind} on ${agent.engine && agent.engine !== 'claude' ? `${agent.engine}${agent.model ? `/${agent.model}` : ''}` : agent.model}${agent.effort ? ` (${agent.effort})` : ''}${resume ? ` (${fork ? 'forked from' : 'continuing'} session ${resume.slice(0, 8)})` : ''}` });
+      if (selected.fallback) store.logEvent({ ...{ run_id: run.id, agent_id: agentId, ticket_key: ticketKey }, kind: 'system',
+        text: `Automatic fallback: ${agentById[agentId].engine || 'claude'} → ${agent.engine} (${selected.reason}). Saved seat preference retained.` });
+
+      engine = engineOf(agent);
+      pplx = engine.id === 'perplexity' && engine.supports?.(kind);
+      px = context.packSettings();
+      // A Computer call emits nothing while Perplexity thinks: the watchdogs must outlast the remote wait.
+      // Covers the first answer, follow-ups and every permitted page round (bounded by engines.perplexity.maxRunMinutes).
+      // A tagged run on a plan-billed engine without a dollar cap is bounded by time instead (mentions.maxMinutes).
+      timeoutMin = limits?.minutes ?? (kind === 'mention' && !capsSpend(agent, 'mention') ? Number(config.mentions?.maxMinutes) || 10
+        : Math.max(config.limits.runTimeoutMin[kind] ?? 30, pplx ? px.runMinutes : 0));
+      deadlineAt = Date.now() + timeoutMin * 60_000;
+      if (limits?.steps != null) ctx.maxSteps = limits.steps;
+      boundSteps(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
+      // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
+      if (store.getRun(run.id)?.status !== 'running') return setup.abort(store.getRun(run.id)?.result_text || 'refused before start', 'killed');
+      if (!pplx) return await spawnChild();
+
+      // Perplexity thinking seats: the desk builds the context pack (not the relay) before the relay starts. Cancellation
+      // and the run timeout exist before any preparation work; a pack that cannot be built refuses the run (fail closed).
+      const abort = new AbortController();
+      preparing.set(run.id, abort);
+      const prepTimer = setTimeout(() => {
+        store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `timed out after ${timeoutMin} min — stopping` });
+        killRun(run.id, 'timeout');
+      }, timeoutMin * 60_000);
+      setup.own(() => { preparing.delete(run.id); clearTimeout(prepTimer); });
+      let failed = null;
+      try {
+        prompt = `${prompt}${await preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal: abort.signal })}`;
+      } catch (err) { failed = err; } finally { preparing.delete(run.id); clearTimeout(prepTimer); }
+      const now = store.getRun(run.id);
+      if (now.status === 'killed') return setup.abort(now.result_text || 'stopped while preparing', 'killed');
+      // The circuit breaker may have tripped while the pack was being built: re-check the fence right before spawning.
+      if (fence != null && fence !== epoch) return setup.abort('stopped by stop-all while preparing', 'killed');
+      if (failed) return setup.abort(`Run refused: the context pack could not be built — ${store.redact(failed.message).slice(0, 300)}`, 'error');
+      return await spawnChild();
+    } catch (err) {
+      setup.abort(`Run setup failed: ${store.redact(String(err?.message || err)).slice(0, 300)}`, 'error');
+      throw err;
+    }
   })();
 
-  function endBeforeSpawn(status, text) {
-    context.release(run.id);
-    ledgers.delete(run.id);
-    store.updateRun(run.id, { status, token: null, ended_at: store.now(), result_text: text, cost_usd: 0 });
-    store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text });
-    if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
-    return { run: store.getRun(run.id), result: null, failure: null };
-  }
-
   function spawnChild() {
-  let sock, cmd, env;
-  try {
-    sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
-    cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job, capUsd: limits?.usd ?? null, extraRead: pkg.paths });
-    env = { ...childEnv(token, engine.id), ...cmd.env };
-    isolateTools(env, engine.id, toolHome(run.id));
-    if (kind === 'council_review') { delete env.DESK_RUN_TOKEN; delete env.DESK_SOCKET; }
-    if (cmd.mailbox) env.DESK_MAILBOX = openMailbox(run.id, cwd);
-  } catch (err) {
-    sock?.close();
-    mailboxes.delete(run.id);
-    ledgers.delete(run.id);
-    store.updateRun(run.id, { status: 'error', token: null, ended_at: store.now(), result_text: `Run setup failed: ${store.redact(err.message)}` });
-    if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null });
-    throw err;
-  }
+  // Command setup is still the setup phase: a throw here reaches its catch, which closes the socket and mailbox too.
+  const sock = kind !== 'council_review' && engine.usesSocket && socketFactory ? socketFactory(run.id) : null;
+  if (sock) setup.own(() => sock.close());
+  const cmd = buildCommand(agent, kind, cwd, { resume, fork: fork && engine.canFork, extraDirs, socketPath: sock?.path || config.socketPath, job, capUsd: limits?.usd ?? null, extraRead: pkg.paths });
+  const env = { ...childEnv(token, engine.id), ...cmd.env };
+  isolateTools(env, engine.id, toolHome(run.id));
+  if (kind === 'council_review') { delete env.DESK_RUN_TOKEN; delete env.DESK_SOCKET; }
+  if (cmd.mailbox) env.DESK_MAILBOX = openMailbox(run.id, cwd);
   if (sock) env.DESK_SOCKET = sock.path;
   else delete env.DESK_SOCKET;
   const child = spawn(cmd.bin, cmd.args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
+  // Until its exit handler is attached the process is the setup phase's too: an abort stops it. Should a listener below
+  // have failed to attach, the abort gives the child and its stdin one, so their errors cannot crash the desk.
+  const mute = (em) => { if (em && em.listenerCount('error') === 0) em.on('error', () => {}); };
+  setup.own(() => { children.delete(run.id); mute(child); mute(child.stdin); if (child.pid) killGroup(child.pid, { owner: run.id }); });
   children.set(run.id, child);
+  // Next, before anything else that can throw: a listener for the child's own error (a missing executable, a spawn
+  // with no pid). It only records the error for whichever owner ends the run (an abort during setup, or the exit
+  // handler after the hand-off); it never ends the run itself.
+  let spawnError = null;
+  child.on('error', (err) => { spawnError ||= `spawn failed: ${err.message}`; });
   store.updateRun(run.id, { pid: child.pid });
   // The process's start time identifies it after a restart (a recorded pid alone may have been reused meanwhile).
-  if (child.pid) processStart(child.pid).then((at) => { if (at) store.updateRun(run.id, { pid_start: at }); });
+  if (child.pid) processStart(child.pid).then((at) => { if (at) store.updateRun(run.id, { pid_start: at }); }).catch(() => {}); // best effort: never an unhandled rejection
   if (child.pid) lessons.delivered(run.id, ticketKey); // lessons count as given only once the prompt reaches a process
   child.stdin.on('error', () => {});
   child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt);
@@ -863,6 +910,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       clearInterval(idleTimer);
     }
   }, 30_000) : null;
+  if (idleTimer) setup.own(() => clearInterval(idleTimer));
   child.stdout.on('data', (d) => {
     lastOutput = Date.now();
     buf += d;
@@ -881,12 +929,14 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
     store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `timed out after ${timeoutMin} min — stopping` });
     killRun(run.id, 'timeout');
   }, Math.max(1000, deadlineAt - Date.now()));
+  setup.own(() => clearTimeout(timer));
 
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (code) => {
-      if (settled) return;
-      settled = true;
+  // Wiring stays synchronous (outside any Promise executor), so a throw here reaches the setup phase's catch.
+  let resolve;
+  const ended = new Promise((r) => { resolve = r; });
+  const finish = (code) => {
+      if (!setup.finishing()) return; // an abort already ended it, or it already finished
+      if (spawnError) store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: spawnError });
       clearTimeout(timer);
       if (idleTimer) clearInterval(idleTimer);
       children.delete(run.id);
@@ -917,7 +967,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       store.transaction(() => {
         store.updateRun(run.id, {
           status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
-          result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
+          result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || spawnError || `exit ${code}`)).slice(0, 8000), token: null,
         });
         onEnd?.(store.getRun(run.id), { steps: stepsTaken(ctx) });
       });
@@ -930,13 +980,10 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
       resolve({ run: store.getRun(run.id), result: r, failure, steps: stepsTaken(ctx) });
       ledgers.delete(run.id);
-    };
-    child.on('close', finish);
-    child.on('error', (err) => {
-      store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `spawn failed: ${err.message}` });
-      finish(-1);
-    });
-  });
+  };
+  child.on('close', (code) => finish(code)); // close(code, signal): a signal is not an error, and never one's text
+  setup.handOff(); // its close handler now ends the run and releases what it holds, exactly once
+  return ended;
   }
 }
 

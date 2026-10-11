@@ -92,6 +92,24 @@ test('the program sentence reads naturally', () => {
   assert.ok(P.sentence(d, agents).filter((p) => p.slot).length === 5);
 });
 
+test('creation age on ticket chips: whole units rounded down, a date after a week, the year only when it differs, the future is "now"', () => {
+  const now = Date.parse('2026-10-11T15:00:00Z'), back = (s) => new Date(now - s * 1000).toISOString(), UTC = { timeZone: 'UTC' };
+  const age = (s) => F.createdAge(back(s), now, UTC);
+  assert.equal(age(0), 'now'); assert.equal(age(59), 'now'); assert.equal(age(60), '1m');
+  assert.equal(age(12 * 60), '12m'); assert.equal(age(59 * 60 + 59), '59m'); assert.equal(age(3600), '1h');
+  assert.equal(age(23 * 3600), '23h'); assert.equal(age(24 * 3600 - 1), '23h'); assert.equal(age(24 * 3600), '1d');
+  assert.equal(age(6 * 86400 + 23 * 3600), '6d'); assert.equal(age(7 * 86400 - 1), '6d'); assert.equal(age(7 * 86400), 'Oct 4');
+  assert.equal(F.createdAge('2026-10-07T15:37:00Z', Date.parse('2026-10-20T09:00:00Z'), UTC), 'Oct 7');
+  assert.equal(F.createdAge('2025-12-20T12:00:00Z', Date.parse('2026-01-03T12:00:00Z'), UTC), 'Dec 20, 2025', 'last year says the year');
+  assert.equal(F.createdAge('2026-12-31T23:30:00Z', Date.parse('2027-01-01T00:10:00Z'), UTC), '40m', 'a recent ticket across New Year is still an age');
+  assert.equal(F.createdAge('2026-10-11T15:05:00Z', now, UTC), 'now', 'a creation time ahead of this clock (skew) is "now"');
+  assert.equal(F.createdAge('2026-11-11T15:00:00Z', now, UTC), 'now');
+  assert.equal(F.createdAge(null, now), ''); assert.equal(F.createdAge('not a date', now), '');
+  assert.equal(F.createdTitle('2026-10-07T19:37:00Z', { timeZone: 'America/New_York' }), 'Created Oct 7, 2026, 3:37 PM');
+  assert.equal(F.createdTitle('2026-10-07T09:05:00Z', UTC), 'Created Oct 7, 2026, 9:05 AM');
+  assert.equal(F.createdTitle(undefined), '');
+});
+
 test('formatting helpers and the stream contract', () => {
   const now = Date.parse('2026-10-04T12:00:00Z');
   assert.equal(F.ago('2026-10-04T11:58:00Z', now), '2 min ago'); assert.equal(F.until('2026-10-04T14:00:00Z', now), 'in 2 h'); assert.equal(F.waited('2026-10-04T11:59:40Z', now), 'waiting under a minute');
@@ -129,4 +147,20 @@ test('formatting helpers and the stream contract', () => {
   assert.equal(merged.product_reviews[0].revision, 2); assert.equal(merged.research_reviews[0].verdict, 'pass'); assert.equal(merged.refresh.status, 'rebased');
   const fresher = sync.mergeDetail({ discussions: [{ id: 7, status: 'running' }] }, { discussions: [{ id: 7, status: 'approved' }] }, sync.emptyPending());
   assert.equal(fresher.discussions[0].status, 'approved', 'a refetch beats what was shown');
+});
+
+test('the Research page follows the research backlog live: a research ticket moving refreshes the snapshot, and live eligibility never touches the saved settings', () => {
+  const S = { tickets: [{ key: 'R-1', title: 'idea', status: 'needs_human', research_program: 'product-discovery' }, { key: 'T-1', title: 'work', status: 'todo' }], agents: [], events: [], runs: [], settings: {}, incidents: [], councils: {}, questions: {}, detail: null };
+  assert.equal(sync.applyDelta(S, { type: 'ticket', data: { key: 'R-1', status: 'wontdo', research_program: 'product-discovery' } }).meta, true, 'a research item closing can drain the backlog');
+  assert.equal(sync.applyDelta(S, { type: 'ticket', data: { key: 'R-1', status: 'proposed' } }).meta, true, 'a partial delta of a known research ticket counts too');
+  assert.equal(sync.applyDelta(S, { type: 'ticket', data: { key: 'T-1', status: 'in_progress' } }).meta, false, 'ordinary work does not refetch');
+  S.settings = { team: '{}', research_backlog_max: '8', daily_budget_usd: '150' };
+  assert.equal(sync.applyDelta(S, { type: 'settings', data: { ...S.settings, research_backlog_max: '3' } }).meta, true, 'the backlog limit changed');
+  assert.equal(sync.applyDelta(S, { type: 'settings', data: { ...S.settings, daily_budget_usd: '200' } }).meta, false, 'an unrelated setting does not');
+  const saved = { id: 'p', label: 'P', seat: 'pm', enabled: true, intervalMinutes: 60, maxProposals: 3, code: 'backlog', ok: false, reason: 'full', last_run_at: null };
+  const live = { ...saved, label: 'Renamed elsewhere', maxProposals: 1, code: 'due', ok: true, reason: 'Due', last_run_at: '2026-10-11T10:00:00Z' };
+  const shown = P.withLive(saved, live);
+  assert.deepEqual([shown.code, shown.ok, shown.reason, shown.last_run_at], ['due', true, 'Due', '2026-10-11T10:00:00Z']);
+  assert.deepEqual([shown.label, shown.maxProposals], ['P', 3], 'settings stay those of the loaded list');
+  assert.equal(P.withLive(saved, { ...live, id: 'other' }), saved); assert.equal(P.withLive(saved, null), saved);
 });

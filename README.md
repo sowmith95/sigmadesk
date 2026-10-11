@@ -143,6 +143,11 @@ the pending task (or explicitly approves guarded draft publication); corrections
 to the engineer; rejection closes the ticket while retaining local work. Stale decisions are rejected. Draft approval
 does not merge a PR: use **Review draft PR** for the final owner-controlled merge.
 
+Every ticket row and card (Inbox, Work, Features, the ticket header, the wall's exception cards) says how long ago the
+ticket was created: "now", "12m", "3h", "2d", then the date ("Oct 7") after a week. Hover it (or read it with a screen
+reader) for the full local time, "Created Oct 7, 2026, 3:37 PM". On a phone the age sits at the right of a row's second
+line, and the other facts clip before it does.
+
 **Auto route** recognizes explicit requests to discuss with the manager/principals. These enter a durable read-only
 discussion queue and preserve the implementation blocker. The manager restates intent, consults up to two principals
 once each, and records a response on the same ticket. The composer also offers explicit discussion, answer and comment
@@ -375,6 +380,12 @@ cite, whether it may use the web, which approved connectors it may call, how man
 which seats must review a proposal. The default `product-discovery` program is the PM's competitor research and is
 derived from `pm.*` and the legacy cadence settings until you save programs. Due programs run oldest-first while the
 funnel is thin; "Run now" skips cadence and window but never budget, capacity, engine fit or the proposal allowance.
+New research also **waits while its backlog is large**: research-born items still being reviewed, revised, groomed or
+decided by you count against **Research items open at most** (Settings → Research, `research_backlog_max`, default 8
+from `research.backlogMax`; 0 stops new research). At the limit, scheduled sessions do not start and "Run now" is refused
+with the count ("12 research items are waiting — research resumes when fewer than 8 are open"); a session below it may
+file only as many proposals as there is room for. Reviews, revisions, grooming and your decisions keep running, which
+is how the backlog drains. The Research page shows the count.
 
 Every proposal filed by a research run waits for an **independent second review** by a different seat (preferring a
 different model family) before the manager may groom it: `pass` unblocks it, `changes` gives the author one bounded

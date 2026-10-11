@@ -18,6 +18,8 @@ export interface Board { needs_you: BoardItem[]; decisions?: BoardItem[]; snooze
 export interface Program { id: string; label: string; seat: string; enabled: boolean; intervalMinutes: number; window: string; focus: string; sources: string[];
   tools: { web: boolean; connectors: string[] }; maxProposals: number; review: { minReviewers: number; reviewers: string[] };
   ok?: boolean; code?: string; reason?: string; last_run_at?: string | null; next_eligible_at?: string | null }
+/** Research items still in the research pipeline; new research waits while `full` (count ≥ max). */
+export interface ResearchBacklog { count: number; max: number; full: boolean; reason: string | null; keys: string[] }
 export interface Connector { name: string; status: string; purpose: string; case_md: string; binding: { type: string; url?: string; command?: string; args?: string[] } | null; tools: string[];
   proposed_by: string; assessed_by?: string | null; assessment?: { verdict: string; benefit_score: number; sdlc_stage: string; risk: string; rationale: string; cost_estimate: string; time_estimate: string; data_leaving: string; conditions: string[] } | null;
   approved_at?: string | null; review_after?: string | null; decision_note?: string | null; due_for_review?: boolean; usage?: { runs: number; cost_usd: number; proposals: number; passed_review: number; last_used_at: string | null } }

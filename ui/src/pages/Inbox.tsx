@@ -8,7 +8,7 @@ import { S, api, currentBoard, openTicket, questionFor, openFeature, loadSnapsho
 import { clean } from '@/lib/format.js';
 import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
-import { Tag, Empty, Section } from '@/components/desk/Bits';
+import { Tag, Empty, Section, CreatedAge } from '@/components/desk/Bits';
 import { KIND_LABEL, NowLine, cardFor, Clamp, DecisionButton, firstName, reasonText, WorkerLine } from '@/components/desk/Work';
 import { Lineage } from '@/components/desk/Epic';
 import { BriefLine, DecisionLead, briefOf } from '@/components/desk/DecisionBrief';
@@ -26,7 +26,7 @@ export function WorkingRow({ it }: { it: BoardItem }) {
   return (
     <button type="button" data-key={it.id} onClick={() => openTicket(t.key)} className="grid w-full gap-1.5 rounded-lg border bg-card p-3 text-left hover:bg-secondary">
       <Lineage t={t} link={false} />
-      <div className="flex items-center gap-2"><b className="min-w-0 flex-1 truncate">{it.name}</b>{it.stage && <Tag>{it.stage}</Tag>}</div>
+      <div className="flex items-center gap-2"><b className="min-w-0 flex-1 truncate">{it.name}</b>{it.stage && <Tag>{it.stage}</Tag>}<CreatedAge at={t.created_at} /></div>
       <WorkerLine it={it} card={card} />
       <NowLine card={card} compact />
     </button>
@@ -95,9 +95,11 @@ function InboxRow({ it, hero = false }: { it: Row; hero?: boolean }) {
         {!hero && <DecisionButton it={it} size="sm" className={cn('shrink-0', it.kind !== 'page' && 'max-md:hidden')} />}
         {t && <RowMenu it={it} />}
       </div>
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pl-9 text-[13px]">
-        <span className="font-medium text-needs">{KIND_LABEL[it.kind || ''] || 'Needs you'}</span>
-        {t && <Lineage t={t} className="min-w-0 max-w-[45%] text-[13px] [&>button]:max-w-[16ch]" />}
+      {/* On a phone the facts stay on this one line and clip before the creation age does: it always shows, at the right edge. */}
+      <div data-row-meta className="flex min-w-0 items-center gap-x-2 gap-y-1 pl-9 text-[13px] max-md:whitespace-nowrap md:flex-wrap">
+        <span className="shrink-0 font-medium text-needs">{KIND_LABEL[it.kind || ''] || 'Needs you'}</span>
+        <div data-row-facts className="max-md:flex max-md:min-w-0 max-md:flex-1 max-md:items-center max-md:gap-x-2 max-md:overflow-hidden max-md:[mask-image:linear-gradient(to_right,#000_85%,transparent)] md:contents">
+        {t && <Lineage t={t} className="min-w-0 max-w-[45%] text-[13px] max-md:flex-nowrap max-md:overflow-hidden [&>button]:max-w-[16ch]" />}
         {why.map((w) => <span key={w} className={cn('text-muted-foreground', /^P[01]$/.test(w) && 'font-semibold text-needs')}>{w}</span>)}
         {it.time_hint && <span className="text-muted-foreground">· {it.time_hint}</span>}
         {it.snoozed_until && <span className="text-muted-foreground">· back {when(it.snoozed_until)}</span>}
@@ -105,6 +107,8 @@ function InboxRow({ it, hero = false }: { it: Row; hero?: boolean }) {
         {/* A phone row stays two short lines: there the delegate's take shows when the row or the decision opens. */}
         {take && <span data-take className="text-muted-foreground max-md:hidden">· {take}</span>}
         {!!it.waiting?.length && <span data-waiting={it.waiting.map((w) => w.key).join(',')} className="text-muted-foreground">· +{it.waiting.length} waiting question{it.waiting.length === 1 ? '' : 's'}</span>}
+        </div>
+        {t && <CreatedAge at={t.created_at} prefix={<span className="max-md:hidden">· </span>} className="shrink-0" />}
       </div>
       {!open && <BriefLine it={it} />}
       {open && <div className="grid gap-3 pl-9">
@@ -170,7 +174,7 @@ export function InboxPage() {
         <Section id="blocked" title="Blocked" count={c.blocked} tone="blocked">
           {c.blocked ? <div className="grid gap-2">{B.blocked.map((it) => (
             <button key={it.id} type="button" data-key={it.id} onClick={() => openTicket(it.ticket!.key)} className="grid gap-1 rounded-lg border border-l-[3px] border-l-blocked bg-card p-3 text-left hover:bg-secondary">
-              <b>{it.verb}</b><span className="text-sm text-muted-foreground">{reasonText(it.reason)}</span></button>))}</div>
+              <span className="flex items-baseline gap-2"><b className="min-w-0 flex-1">{it.verb}</b><CreatedAge at={it.ticket?.created_at} className="shrink-0" /></span><span className="text-sm text-muted-foreground">{reasonText(it.reason)}</span></button>))}</div>
             : <p className="text-muted-foreground">Nothing is blocked.</p>}
         </Section>
       </div>

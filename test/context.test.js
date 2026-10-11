@@ -631,3 +631,50 @@ test('overlapping reads: completion counts only from a read issued after the las
   assert.equal(ctx.acceptBlockers(live.meta), null);
   ctx.release(run.id);
 });
+
+// The setup phase (src/runner.js setupPhase) on the Perplexity path: whatever fails after the pack is built, the run
+// ends, its token is cleared, the seat is free and the prepared context is released. Faults are injected on the store
+// and the filesystem, never through a production seam.
+function failRunRead({ after, skip = 0 }) {
+  const db = store.handle(), prepare = db.prepare;
+  let armed = false, left = skip;
+  db.prepare = function (sql) {
+    if (!armed && after.test(sql)) armed = true;
+    else if (armed && /^SELECT \* FROM runs WHERE id=\?$/.test(sql) && left-- <= 0) { db.prepare = prepare; return { get() { throw new Error('injected read failure'); } }; }
+    return prepare.call(this, sql);
+  };
+  return () => { db.prepare = prepare; };
+}
+async function asPerplexity(fn) {
+  const dispatch = await import('../src/dispatch.js');
+  const team = await import('../src/team.js');
+  dispatch.setAvailability([{ id: 'perplexity', available: true }, { id: 'claude', available: true }, { id: 'codex', available: false }]);
+  const seat = team.agentById.pm, saved = { engine: seat.engine, model: seat.model };
+  Object.assign(seat, { engine: 'perplexity', model: 'pplx_asi_kimi_k3' });
+  try { return await fn(); } finally { Object.assign(seat, saved); }
+}
+const endedCleanly = (id, reason) => {
+  const run = store.getRun(id);
+  assert.deepEqual([run.status, run.token, !!run.ended_at, run.pid ?? null], ['error', null, true, null]);
+  assert.match(run.result_text, reason);
+  assert.equal(ctx.liveFor(id), null, 'the prepared context pack was released');
+  assert.deepEqual([store.getAgentState('pm').status, store.getAgentState('pm').current_run ?? null], ['idle', null]);
+};
+
+test('setup phase: a read failing after the Perplexity pack is built ends the run and releases the pack', () => asPerplexity(async () => {
+  const restore = failRunRead({ after: /^UPDATE runs SET job_hash=/, skip: 1 }); // skip the read that announces that write
+  try { await assert.rejects(runner.startRun({ agentId: 'pm', kind: 'groom', ticketKey: ticketFor().key, prompt: 'groom it', cwd: clone }), /injected read failure/); }
+  finally { restore(); }
+  endedCleanly(store.recentRuns(1)[0].id, /^Run setup failed: injected read failure/);
+}));
+
+test('setup phase: command setup failing after the Perplexity pack is built ends the run and releases the pack', () => asPerplexity(async () => {
+  const id = `fault-${process.pid}`, blocker = path.join(fs.realpathSync(os.tmpdir()), 'sigmadesk-tool-home', id);
+  fs.mkdirSync(path.dirname(blocker), { recursive: true }); fs.writeFileSync(blocker, 'a file where the tool home directory must go');
+  const saved = config.projectId; config.projectId = `${id}/desk`; // the per-run tool home cannot be created
+  try { await assert.rejects(runner.startRun({ agentId: 'pm', kind: 'groom', ticketKey: ticketFor().key, prompt: 'groom it', cwd: clone })); }
+  finally { config.projectId = saved; fs.rmSync(blocker, { force: true }); }
+  const run = store.recentRuns(1)[0];
+  assert.ok(store.getRun(run.id).context_hash, 'the pack had been built');
+  endedCleanly(run.id, /^Run setup failed: /);
+}));
