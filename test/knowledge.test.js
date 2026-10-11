@@ -9,6 +9,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { Readable } from 'node:stream';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'sigmadesk-kb-')));
@@ -347,6 +348,8 @@ test('one knowledge process desk-wide, a bounded queue, and a total deadline tha
   assert.ok(Date.now() - t0 < 4000, 'both answered within the deadline');
   assert.match(first.reason.message, /did not answer within/);
   assert.match(second.reason.message, /timed out waiting|did not answer/);
+  // The search settles at once; the group's SIGTERM reaches the process right after.
+  for (let i = 0; i < 20 && !calls().some((c) => c.killed === 'SIGTERM'); i++) await new Promise((r) => setTimeout(r, 50));
   assert.ok(calls().some((c) => c.killed === 'SIGTERM'), 'the slow process was stopped');
   assert.equal(kb.inflight(), 0);
 });
@@ -1174,4 +1177,148 @@ test('round 5 — a stale "not queued" failure clears when the current facts alr
     assert.equal(kb.describe().not_queued, before - 1, 'the count drops by exactly this one');
     assert.equal(store.knowledgeNotesFor(t.key).length, 1, 'no new version was needed');
   } finally { notes.setAutoFlush(true); store.kvSet('knowledge:since', store.now()); }
+});
+
+// ---------------- round 6 ----------------
+test('round 6 — every facts interpolation is converted to its final string and checked; other shapes are withheld', async () => {
+  const SECRET = 'syntheticcredential1234567890';
+  const W = '[withheld: credential-like text]';
+  for (const status of [[[SECRET]], { code: SECRET }, [SECRET]]) {
+    const t = mergedTicket(`Shaped status ${JSON.stringify(status).slice(0, 20)}`);
+    store.kvSet(`desk-test:${mkRun('qa', 'qa', t.key).id}`, JSON.stringify([{ args: ['pytest'], status, sha: 'a'.repeat(40), tests: { tests: [[SECRET]], failures: 0, errors: 0, skipped: 0 }, at: '2026-10-05T10:00:00.000Z' }]));
+    sched.prActions.merged(t, { at: '2026-10-05T12:00:00Z' });
+    const [row] = store.knowledgeNotesFor(t.key);
+    assert.ok(row && !row.body.includes(SECRET), JSON.stringify(status));
+  }
+  assert.equal(notes.V`a ${[1, 2]} b`, `a ${W} b`);
+  assert.equal(notes.V`${[[SECRET]]}`, W);
+  assert.equal(notes.V`${{ x: SECRET }}`, W);
+  assert.equal(notes.V`${Buffer.from(SECRET)}`, W);
+  assert.equal(notes.V`${Symbol('s')}`, W, 'a symbol never throws and never prints');
+  assert.equal(notes.V`${() => SECRET}`, W);
+  assert.equal(notes.V`${true}|${null}|${undefined}|${12}|${'ok'}`, 'true|||12|ok');
+  assert.equal(notes.V`${SECRET}`, W);
+});
+
+// Faults for the runner paths: a registration throw inside spawnChild, and a failing knowledge_meta write.
+function throwOnRegister(proto, event, nth = 0) {
+  const on = proto.on, own = Object.prototype.hasOwnProperty.call(proto, 'on');
+  const restore = () => { if (own) proto.on = on; else delete proto.on; };
+  let seen = 0;
+  proto.on = function (ev, fn) {
+    if (ev === event && /at spawnChild /.test(new Error().stack) && !/processStart/.test(new Error().stack) && seen++ === nth) { restore(); throw new Error(`injected wiring failure (${event})`); }
+    return on.call(this, ev, fn);
+  };
+  return restore;
+}
+function metaWrites({ failAt = 0 } = {}) {
+  const db = store.handle(), prepare = db.prepare;
+  const seen = { n: 0 };
+  db.prepare = function (sql) {
+    if (/knowledge_meta=/.test(sql)) { seen.n += 1; if (failAt && seen.n === failAt) throw new Error('injected knowledge_meta failure'); }
+    return prepare.call(this, sql);
+  };
+  return { seen, restore: () => { db.prepare = prepare; } };
+}
+async function withEngine(bin, fn) {
+  const savedClaude = config.bins.claude, savedRoot = config.root;
+  config.root = tmp;
+  fs.mkdirSync(path.join(tmp, 'bin'), { recursive: true });
+  fs.copyFileSync(path.join(ROOT, 'bin', 'desk'), path.join(tmp, 'bin', 'desk')); fs.chmodSync(path.join(tmp, 'bin', 'desk'), 0o755);
+  const sockDir = fs.mkdtempSync(path.join('/tmp', 'sdkb-'));
+  runner.setSocketFactory((id) => server.agentSocket(id, path.join(sockDir, `r${id}.sock`)));
+  config.bins.claude = bin;
+  dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: false }]);
+  team.applyTeamOverrides({ 'principal-be': { engine: 'claude', model: 'opus' } });
+  const uncaught = [], onUncaught = (e) => uncaught.push(e);
+  process.on('uncaughtException', onUncaught);
+  try { return await fn(uncaught); } finally {
+    process.off('uncaughtException', onUncaught);
+    config.bins.claude = savedClaude; config.root = savedRoot; runner.setSocketFactory(null); fs.rmSync(sockDir, { recursive: true, force: true }); team.applyTeamOverrides({});
+  }
+}
+const quitterBin = () => {
+  const f = path.join(tmp, 'quitter6.mjs');
+  fs.writeFileSync(f, `#!/usr/bin/env node\nconsole.log(${JSON.stringify(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0, num_turns: 1 }))});\nprocess.exit(0);\n`);
+  fs.chmodSync(f, 0o755);
+  return f;
+};
+const readerBin = () => {
+  const f = path.join(tmp, 'reader6.mjs');
+  fs.writeFileSync(f, `#!/usr/bin/env node\nprocess.stdin.on('data', () => {});\nprocess.stdin.on('end', () => { console.log(${JSON.stringify(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0, num_turns: 1 }))}); process.exit(0); });\n`);
+  fs.chmodSync(f, 0o755);
+  return f;
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('round 6 — one settle for the snapshot: an abort after the prompt write started, then EPIPE, writes the final state once', async () => {
+  setStore({ results: [note('a1')] });
+  await withEngine(quitterBin(), async (uncaught) => {
+    const t = store.createTicket({ title: 'Abort then EPIPE', area: 'backend', status: 'in_progress' });
+    const cwd = path.join(tmp, 'clone-n19'); fs.mkdirSync(cwd, { recursive: true });
+    const w = metaWrites();
+    let restore = () => {};
+    let runId = null;
+    try {
+      await assert.rejects(runner.startRun({ agentId: 'principal-be', kind: 'design', ticketKey: t.key, cwd, prompt: `Design.\n${'x'.repeat(4 << 20)}`,
+        onStart: (r) => { runId = r.id; restore = throwOnRegister(Readable.prototype, 'data', 0); } }), /injected wiring failure/);
+      await sleep(400); // the late EPIPE callback arrives after the abort
+    } finally { restore(); w.restore(); }
+    assert.deepEqual(uncaught.map((e) => e.message), []);
+    assert.equal(w.seen.n, 2, 'the prepared snapshot, then exactly one final write');
+    assert.equal(JSON.parse(store.getRun(runId).knowledge_meta).status, 'not delivered');
+    assert.equal(kb.exposedIds(runId).size, 0);
+  });
+});
+
+test('round 6 — knowledge bookkeeping failures are contained: in the write callback and on the close path the run ends once', async () => {
+  setStore({ results: [note('a1')] });
+  for (const [label, bin, prompt] of [['write callback', readerBin(), 'Design it.'], ['close path', quitterBin(), `Design.\n${'x'.repeat(4 << 20)}`]]) {
+    await withEngine(bin, async (uncaught) => {
+      const t = store.createTicket({ title: `Bookkeeping fails on the ${label}`, area: 'backend', status: 'in_progress' });
+      const cwd = path.join(tmp, `clone-n20-${label.replace(' ', '-')}`); fs.mkdirSync(cwd, { recursive: true });
+      const w = metaWrites({ failAt: 2 }); // the prepared save succeeds; the delivery save fails
+      let out;
+      try {
+        out = await Promise.race([runner.startRun({ agentId: 'principal-be', kind: 'design', ticketKey: t.key, cwd, prompt }), sleep(8000).then(() => 'hung')]);
+        await sleep(200);
+      } finally { w.restore(); }
+      assert.notEqual(out, 'hung', `${label}: the run ended`);
+      assert.deepEqual(uncaught.map((e) => e.message), [], `${label}: nothing reached the process`);
+      const run = store.getRun(out.run.id);
+      assert.ok(run.ended_at && run.token === null, label);
+      const events = store.recentEvents({ limit: 200 }).filter((e) => e.run_id === run.id);
+      assert.equal(events.filter((e) => /^design run (finished|error|killed)/.test(e.text)).length, 1, `${label}: finalized once`);
+      assert.ok(events.some((e) => /recording the past-work delivery failed: injected knowledge_meta failure/.test(e.text)), `${label}: the failure is an event`);
+      assert.equal(store.getAgentState('principal-be').status, 'idle', `${label}: seat idle`);
+    });
+  }
+});
+
+test('round 6 — a search settles at its deadline and its whole process group is killed, descendants holding the pipes included', async () => {
+  const sh = path.join(tmp, 'kh-descendants.sh');
+  fs.writeFileSync(sh, '#!/bin/sh\nsleep 37.25 &\nsleep 37.25\n');
+  fs.chmodSync(sh, 0o755);
+  const alive = () => execFileSync('ps', ['-A', '-o', 'command='], { encoding: 'utf8' }).split('\n').filter((l) => /^sleep 37\.25$/.test(l.trim())).length;
+  config.knowledge.executable = sh;
+  config.knowledge.deadlineSeconds = 1;
+  try {
+    const t0 = Date.now();
+    await rejects(search(mkRun(), 'descendants hold the pipes'), /did not answer within/);
+    assert.ok(Date.now() - t0 < 1000 + 500 + 400, `settled after ${Date.now() - t0} ms`);
+    // A run killed while its launch search waits is released at once too.
+    config.knowledge.deadlineSeconds = 15;
+    const tk = store.createTicket({ title: 'Killed while searching', area: 'db' });
+    let rid = null;
+    const p = runner.startRun({ agentId: 'dba', kind: 'implement', ticketKey: tk.key, cwd: tmp, prompt: 'x', track: false, onStart: (r) => { rid = r.id; } });
+    await sleep(300);
+    const t1 = Date.now();
+    runner.killRun(rid, 'owner stop');
+    const res = await Promise.race([p, sleep(5000).then(() => 'hung')]);
+    assert.notEqual(res, 'hung');
+    assert.ok(Date.now() - t1 < 1000, `the run was released after ${Date.now() - t1} ms`);
+    assert.equal(JSON.parse(store.getRun(rid).knowledge_meta || '{}').status, 'not delivered');
+    await sleep(900); // SIGTERM, then SIGKILL after the grace
+    assert.equal(alive(), 0, 'no descendant survived');
+  } finally { config.knowledge.executable = fake; config.knowledge.deadlineSeconds = 15; }
 });
