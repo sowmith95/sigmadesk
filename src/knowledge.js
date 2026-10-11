@@ -55,18 +55,22 @@ export function writeNamespace() {
   return w && !namespaceProblem(w) ? w : null;
 }
 // Results: the URL is canonicalized FIRST (control characters and whitespace removed, scheme lowercased), so a padded
-// " career-memory://…" is judged as what a seat would read. Only these schemes, never a git receipt route
+// " career-memory://…" is judged as what a seat would read. A URL with "://" must use one of these schemes; one without
+// (a hook note's repo path like docs/research/x.md, or a pseudo-scheme like pr:319 or commit:39a2a4f) is allowed unless
+// its prefix is a denied scheme (CAREER-MEMORY:…, journal:2026-10-04/x). Never a git receipt route
 // (kb://<repo>/commit/<sha>/commit|push/…; implementation notes under …/implementation/… stay allowed), only prose types.
 const URL_SCHEMES = new Set(['kb', 'text', 'https', 'complextrading']);
+const DENIED_SCHEMES = new Set(['career-memory', 'journal', 'code', 'file']);
 const RESULT_TYPES = new Set(['markdown', 'text']);
 const RECEIPT_ROUTE = /^kb:\/\/[^/]+\/commit\/[0-9a-f]{7,40}\/(commit|push)(\/|$)/i;
 const PRIVATE_ROUTE = /career-memory|(^|[/:])journal[:/]/i;
 const DOC_ID = /^[\w.:-]{1,80}$/;
-/** The URL as the policy (and the seat) sees it, or null when it has no scheme. */
+/** The URL as the policy (and the seat) sees it — a leading scheme lowercased — or null when nothing is left. */
 export function canonicalUrl(raw) {
   const t = String(raw ?? '').replace(/[\u0000-\u0020\u007f-\u00a0\u1680\u2000-\u200f\u2028-\u202f\u205f\u3000\ufeff]+/g, '');
+  if (!t) return null;
   const m = t.match(/^([A-Za-z][A-Za-z0-9+.-]*):/);
-  return m ? `${m[1].toLowerCase()}${t.slice(m[1].length)}` : null;
+  return m ? `${m[1].toLowerCase()}${t.slice(m[1].length)}` : t;
 }
 /** Why one search answer may not be shown, or null. */
 export function resultProblem(r, allowed = namespaces()) {
@@ -74,13 +78,14 @@ export function resultProblem(r, allowed = namespaces()) {
   if (typeof r.namespace !== 'string' || !allowed.includes(r.namespace) || namespaceProblem(r.namespace)) return `namespace ${r.namespace ?? '(none)'} is outside the filter`;
   const url = canonicalUrl(r.url);
   if (!url) return 'no URL';
-  const scheme = url.slice(0, url.indexOf(':'));
-  if (!URL_SCHEMES.has(scheme)) return `denied scheme ${scheme}`;
+  const scheme = (url.match(/^([a-z][a-z0-9+.-]*):/) || [])[1] || null;
+  if (scheme && DENIED_SCHEMES.has(scheme)) return `denied scheme ${scheme}`;
+  if (url.includes('://') && !URL_SCHEMES.has(scheme)) return `denied scheme ${scheme ?? '(none)'}`;
   if (RECEIPT_ROUTE.test(url) || PRIVATE_ROUTE.test(url)) return 'denied route';
   if (!RESULT_TYPES.has(r.source_type)) return `denied type ${r.source_type ?? '(none)'}`;
   return null;
 }
-export const POLICY = { v: 2, deny: DENY_TEXT, schemes: [...URL_SCHEMES], types: [...RESULT_TYPES], routes: [String(RECEIPT_ROUTE), String(PRIVATE_ROUTE)], dedupe: 'doc_id+content_hash', disclosure: DISCLOSURE };
+export const POLICY = { v: 3, deny: DENY_TEXT, schemes: [...URL_SCHEMES], deniedSchemes: [...DENIED_SCHEMES], schemeless: 'allowed unless a denied prefix', types: [...RESULT_TYPES], routes: [String(RECEIPT_ROUTE), String(PRIVATE_ROUTE)], dedupe: 'doc_id+content_hash', disclosure: DISCLOSURE };
 export const policyVersion = () => sha256(JSON.stringify({ ...POLICY, ns: namespaces(), maxBytes: config.knowledge.maxBytes, excerpt: config.knowledge.excerptChars })).slice(0, 12);
 // Run kinds and the per-run ceiling: fixed maxima in code, the configuration may only narrow them.
 const narrowed = (max, list) => max.filter((k) => (Array.isArray(list) ? list : max).includes(k));

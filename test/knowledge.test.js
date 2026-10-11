@@ -159,6 +159,37 @@ test('defence in depth: a store that ignores the filter cannot leak personal not
   assert.match(await search(mkRun(), 'only personal'), /No past work matched 'only personal' in complextrading, sigmadesk \(1 result\(s\) outside this desk's scope were dropped\)/);
 });
 
+test('scheme-less hook notes (repo paths, pr:/commit: pseudo-schemes) are returned; denied prefixes still are not', async () => {
+  const keep = [
+    note('h1', { url: 'alpaca_trader/tests/test_chunk_exclusion_bounds.py', title: 'Feature: TimescaleDB OOM — timestamp::date defeats chunk exclusion' }),
+    note('h2', { url: 'pr:319', title: 'PR 319 note' }),
+    note('h3', { url: 'commit:39a2a4f', title: 'Commit note' }),
+    note('h4', { url: '.claude/plans/plan-x.md', title: 'Plan note', namespace: 'sigmadesk', source_type: 'text' }),
+    note('h5', { url: 'docs/research/burst.md', title: 'Research note' }),
+  ];
+  const refuse = [
+    note('x1', { url: ' career-memory://fact/1', title: 'padded career' }),
+    note('x2', { url: 'CAREER-MEMORY:fact/2', title: 'upper career' }),
+    note('x3', { url: 'journal:2026-10-04/x', title: 'diary entry' }),
+    note('x4', { url: 'FILE:/etc/passwd', title: 'a file' }),
+    note('x5', { url: 'code:src/x.js', title: 'code prefix' }),
+    note('x6', { url: 'ftp://host/x', title: 'other scheme' }),
+    note('x7', { url: 'docs/career-memory/x.md', title: 'career path' }),
+    note('x8', { url: 'alpaca_trader/x.py', title: 'wrong namespace', namespace: 'personal' }),
+    note('x9', { url: 'alpaca_trader/y.py', title: 'wrong type', source_type: 'code' }),
+    note('x0', { url: '   ', title: 'empty url' }),
+  ];
+  setStore({ ignoreFilter: true, results: [...refuse, ...keep] });
+  const run = mkRun();
+  const out = await search(run, 'chunk exclusion bounds', { k: '5' });
+  assert.deepEqual([...kb.exposedIds(run.id)].sort(), ['h1', 'h2', 'h3', 'h4', 'h5']);
+  assert.match(out, /Feature: TimescaleDB OOM — timestamp::date defeats chunk exclusion\n {4}ingested 2026-09-30 · alpaca_trader\/tests\/test_chunk_exclusion_bounds\.py · doc h1/);
+  assert.match(out, / · pr:319 · doc h2 /);
+  for (const t of ['padded career', 'upper career', 'diary entry', 'a file', 'code prefix', 'other scheme', 'career path', 'wrong namespace', 'wrong type', 'empty url']) assert.ok(!out.includes(t), t);
+  for (const u of [' career-memory://fact/1', 'CAREER-MEMORY:fact/2', 'journal:2026-10-04/x', 'FILE:/etc/passwd', 'code:src/x.js', 'ftp://host/x']) assert.ok(kb.resultProblem({ ...note('q'), source_type: 'markdown', url: u }), u);
+  for (const u of ['alpaca_trader/tests/test_chunk_exclusion_bounds.py', 'pr:319', 'commit:39a2a4f', 'kb://x/y', 'https://example.com/a']) assert.equal(kb.resultProblem({ ...note('q'), source_type: 'markdown', url: u }), null, u);
+});
+
 test('dedupe by document id and content hash (never by title); redaction before truncation; caps', async () => {
   const secret = 'password=hunter2SuperSecret';
   setStore({ results: [
@@ -524,6 +555,50 @@ test('every engine: Past work in the launch prompt, desk kb search over the sock
     assert.ok(!fs.readFileSync(path.join(tmp, 'claude-prompt.txt'), 'utf8').includes('Past work'));
     assert.equal(calls().length, 0);
   } finally { runner.setSocketFactory(null); fs.rmSync(sockDir2, { recursive: true, force: true }); team.applyTeamOverrides({}); }
+});
+
+test('Perplexity: a pack too small for the past-work block records it as omitted, and none of its notes can be cited', async () => {
+  const ctx = await import('../src/context.js');
+  setStore({ results: [note('a1'), note('b2')] });
+  const savedPx = { ...config.engines.perplexity };
+  const seat = team.agentById.pm;
+  const savedSeat = { engine: seat.engine, model: seat.model };
+  fs.mkdirSync(path.join(tmp, 'bin'), { recursive: true });
+  const savedRoot = config.root;
+  config.root = tmp;
+  fs.copyFileSync(path.join(ROOT, 'bin', 'desk'), path.join(tmp, 'bin', 'desk')); fs.chmodSync(path.join(tmp, 'bin', 'desk'), 0o755);
+  const sockDir = fs.mkdtempSync(path.join('/tmp', 'sdkb-'));
+  runner.setSocketFactory((id) => server.agentSocket(id, path.join(sockDir, `r${id}.sock`)));
+  config.bins.claude = fixtureCli('claude', JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0, num_turns: 1 }));
+  fs.writeFileSync(path.join(tmp, 'plan.json'), JSON.stringify([]));
+  dispatch.setAvailability([{ id: 'perplexity', available: true }, { id: 'claude', available: true }, { id: 'codex', available: false }]);
+  Object.assign(seat, { engine: 'perplexity', model: 'pplx_asi_kimi_k3' });
+  const cwd = path.join(tmp, 'clone-pplx'); fs.mkdirSync(cwd, { recursive: true });
+  try {
+    // How big is this ticket's pack without past work? Size the cap so the required context fits and the block does not.
+    const t = store.createTicket({ title: 'Groom the cache plan', area: 'backend', status: 'proposed' });
+    const probe = mkRun('pm', 'groom', t.key);
+    const plain = await ctx.prepareRun({ runId: probe.id, kind: 'groom', cwd, ticketKey: t.key });
+    ctx.release(probe.id);
+    Object.assign(config.engines.perplexity, { relayReserveChars: 1, contextMaxChars: plain.text.length + 4700 + 1 + 100 });
+    const tight = await runner.startRun({ agentId: 'pm', kind: 'groom', ticketKey: t.key, cwd, prompt: 'Groom it.', track: false });
+    const meta = JSON.parse(store.getRun(tight.run.id).knowledge_meta);
+    assert.equal(JSON.parse(store.getRun(tight.run.id).context_meta).pastWork, 'omitted: over budget');
+    assert.equal(meta.status, 'omitted');
+    assert.deepEqual(meta.items.map((i) => i.doc_id), ['a1', 'b2'], 'the snapshot still says what was searched');
+    assert.equal(kb.exposedIds(tight.run.id).size, 0, 'nothing was shown, so nothing is citable');
+    assert.throws(() => kb.replyCitations(tight.run, 'a1'), /--cite a1: not a past-work note shown to this run/);
+    assert.match(model.citationProblem(['R1', 'E1', 'kb:a1'], { rules: new Set(['R1']), evidence: new Set(['E1']), kb: kb.exposedIds(tight.run.id) }), /cites kb:a1/);
+    // With room, the same block rides inside the pack and its notes become citable.
+    Object.assign(config.engines.perplexity, { contextMaxChars: plain.text.length + 4700 + 1 + 4000 });
+    const roomy = await runner.startRun({ agentId: 'pm', kind: 'groom', ticketKey: t.key, cwd, prompt: 'Groom it again.', track: false });
+    assert.equal(JSON.parse(store.getRun(roomy.run.id).knowledge_meta).status, 'included');
+    assert.deepEqual([...kb.exposedIds(roomy.run.id)].sort(), ['a1', 'b2']);
+    assert.deepEqual(kb.replyCitations(roomy.run, 'a1').ids, ['a1']);
+  } finally {
+    Object.assign(config.engines.perplexity, savedPx); Object.assign(seat, savedSeat);
+    config.root = savedRoot; runner.setSocketFactory(null); fs.rmSync(sockDir, { recursive: true, force: true });
+  }
 });
 
 // ---------------- write side ----------------

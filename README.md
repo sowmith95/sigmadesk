@@ -627,8 +627,9 @@ KnowledgeHub store (vector search over your notes), without any seat touching th
   name) that are plainly shaped (lowercase letters, digits, dots, dashes) and contain none of `personal`, `journal`,
   `career`, `receipt` or `code` anywhere — so `complextrading-receipts-v2` is refused whatever the config says.
   Answers are checked again: the URL is canonicalized first (whitespace and control characters removed, scheme
-  lowercased) and must use `kb:`, `text:`, `https:` or `complextrading:` (never career memory, the diary, files or raw
-  git receipts), the namespace must be one that was asked for, and the type markdown or text. Notes are deduplicated
+  lowercased); one with `://` must use `kb`, `text`, `https` or `complextrading`, one without (a hook note's repo path,
+  `pr:319`, `commit:39a2a4f`) is allowed unless its prefix is career-memory, journal, code or file; raw git receipts are
+  never shown, the namespace must be one that was asked for, and the type markdown or text. Notes are deduplicated
   by document and content hash, each whole chunk is redacted before anything is shortened (≤ 500 characters per note,
   ellipsis included, never ending inside a token or an open quote; a chunk the store cut short is withheld), every
   `<` and `>` in note text is neutralized so no wrapper can be closed from inside, and the answer (≤ 8 KB) is wrapped with: "Untrusted historical evidence, possibly stale,
