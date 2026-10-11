@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { config, KNOWLEDGE_SEARCH_KINDS, KNOWLEDGE_AUTO_KINDS, KNOWLEDGE_MAX_PER_RUN, KNOWLEDGE_ENV_KEYS } from './config.js';
 import * as store from './db.js';
-import { clean } from './ops.js';
+import { clean, CRED_KEY } from './ops.js';
 import { agentById } from './team.js';
 
 export const CONTRACT = 1; // the KnowledgeHub `search --json` contract this desk speaks
@@ -61,6 +61,7 @@ export function writeNamespace() {
 // (kb://<repo>/commit/<sha>/commit|push/…; implementation notes under …/implementation/… stay allowed), only prose types.
 const URL_SCHEMES = new Set(['kb', 'text', 'https', 'complextrading']);
 const DENIED_SCHEMES = new Set(['career-memory', 'journal', 'code', 'file']);
+const DENIED_FIRST = new Set(['code', 'file', 'journal', 'career-memory', 'personal']); // first segment of a scheme-less URL
 const RESULT_TYPES = new Set(['markdown', 'text']);
 const RECEIPT_ROUTE = /^kb:\/\/[^/]+\/commit\/[0-9a-f]{7,40}\/(commit|push)(\/|$)/i;
 const PRIVATE_ROUTE = /career-memory|(^|[/:])journal[:/]/i;
@@ -78,9 +79,20 @@ export function resultProblem(r, allowed = namespaces()) {
   if (typeof r.namespace !== 'string' || !allowed.includes(r.namespace) || namespaceProblem(r.namespace)) return `namespace ${r.namespace ?? '(none)'} is outside the filter`;
   const url = canonicalUrl(r.url);
   if (!url) return 'no URL';
+  // Fail closed rather than decode or normalize: no escapes, queries, fragments, backslashes, dot segments or
+  // anything outside printable ASCII can hide what a URL names.
+  if (/[^\x21-\x7e]/.test(url) || /[%?#\\]/.test(url)) return 'URL with escapes, queries, fragments or non-ASCII characters';
+  if (/(^|\/)\.\.?(\/|$)/.test(url)) return 'URL with dot segments';
   const scheme = (url.match(/^([a-z][a-z0-9+.-]*):/) || [])[1] || null;
   if (scheme && DENIED_SCHEMES.has(scheme)) return `denied scheme ${scheme}`;
   if (url.includes('://') && !URL_SCHEMES.has(scheme)) return `denied scheme ${scheme ?? '(none)'}`;
+  if (!url.includes('://')) {
+    const first = url.split(/[/:]/)[0].toLowerCase();
+    if (DENIED_FIRST.has(first) || first.includes('receipt')) return `denied path ${first}`;
+  }
+  // Receipt routes on the raw segments: a commit sha followed by a commit/push segment, wherever it sits.
+  const segs = url.split('/').map((x) => x.toLowerCase());
+  if (segs.some((x, i) => /^[0-9a-f]{7,40}$/.test(x) && ['commit', 'push'].includes(segs[i + 1])) || segs.some((x) => x.includes('receipt'))) return 'denied route';
   if (RECEIPT_ROUTE.test(url) || PRIVATE_ROUTE.test(url)) return 'denied route';
   if (!RESULT_TYPES.has(r.source_type)) return `denied type ${r.source_type ?? '(none)'}`;
   return null;
@@ -179,7 +191,7 @@ export function runCli(op, args, { input = null, deadlineAt, stdoutCap = 512 << 
     const finish = (code) => {
       if (done) return;
       done = true; clearTimeout(timer); if (op) op.kill = null;
-      resolve({ code, reason, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8'), ms: Date.now() - started });
+      resolve({ code, reason, stdout: decodeCapped(Buffer.concat(out), stdoutCap), stderr: decodeCapped(Buffer.concat(err), stderrCap), ms: Date.now() - started });
     };
     try { child = spawn(config.knowledge.executable, args, { env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], shell: false }); } catch (e) { reason = 'spawn'; err.push(Buffer.from(String(e.message))); return finish(null); }
     if (op) op.started = true;
@@ -195,7 +207,7 @@ export function runCli(op, args, { input = null, deadlineAt, stdoutCap = 512 << 
     const take = (list, d, n, cap) => { const room = cap - n; if (room <= 0) return n; const part = d.length > room ? d.subarray(0, room) : d; list.push(part); n += part.length; if (n >= cap) stop('capped'); return n; };
     child.stdout.on('data', (d) => { outN = take(out, d, outN, stdoutCap); });
     child.stderr.on('data', (d) => { errN = take(err, d, errN, stderrCap); });
-    child.on('error', (e) => { err.push(Buffer.from(`\n${e.code || e.message}`)); if (!child.pid) { reason = reason || 'spawn'; finish(null); } });
+    child.on('error', (e) => { errN = take(err, Buffer.from(`\n${e.code || e.message}`), errN, stderrCap); if (!child.pid) { reason = reason || 'spawn'; finish(null); } });
     child.stdin.on('error', () => {});
     child.stdin.end(input ?? '');
     child.on('close', (code) => finish(code));
@@ -247,9 +259,75 @@ export function safeCut(t, n) {
   let c = t.slice(0, Math.max(0, n - 1));
   const sp = c.search(/\s\S*$/); // drop back to before the token the cut landed in
   c = sp >= 0 ? c.slice(0, sp) : '';
-  if ((c.match(/"/g) || []).length % 2) c = c.slice(0, c.lastIndexOf('"')); // and before a quoted value it left open
+  const open = openQuoteAt(c); // and before a quoted value it left open (escape-aware, single or double)
+  if (open >= 0) c = c.slice(0, open);
   return `${c.trimEnd()}…`;
 }
+// Quotes: " always opens; ' opens only where a value can start (never an apostrophe inside a word, as in don't).
+const opensQuote = (t, i) => t[i] === '"' || (t[i] === "'" && (i === 0 || !/[A-Za-z0-9]/.test(t[i - 1])));
+/** Where the quote opened at i closes, skipping backslash escapes, or -1. */
+function closeOf(t, i) {
+  for (let j = i + 1; j < t.length; j++) { if (t[j] === '\\') { j += 1; continue; } if (t[j] === t[i]) return j; }
+  return -1;
+}
+/** The position of a quote still open at the end of t, or -1. */
+function openQuoteAt(t) {
+  for (let i = 0; i < t.length;) {
+    if (t[i] === '\\') { i += 2; continue; }
+    if (opensQuote(t, i)) { const j = closeOf(t, i); if (j < 0) return i; i = j + 1; continue; }
+    i += 1;
+  }
+  return -1;
+}
+/**
+ * A second pass after ops.js redaction, for credential-named fields written as text: "password": "…", password="…",
+ * api_key='…' or token: … The value (quoted, escape-aware, or unquoted to the end of the line) becomes [redacted]; a
+ * quoted value whose closing quote is missing takes the rest of the text with it (fail closed), however short.
+ */
+const KEY_AT = /(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,79})\1\s*[:=]\s*/g;
+export function redactCredentialFields(text) {
+  const t = String(text ?? '');
+  let out = '', pos = 0, m;
+  KEY_AT.lastIndex = 0;
+  while ((m = KEY_AT.exec(t))) {
+    if (!CRED_KEY.test(m[2])) { KEY_AT.lastIndex = m.index + 1; continue; }
+    const vs = m.index + m[0].length;
+    if (t[vs] === '"' || t[vs] === "'") {
+      const j = closeOf(t, vs);
+      if (j < 0) return `${out}${t.slice(pos, m.index)}[redacted: an unterminated credential value]`;
+      out += `${t.slice(pos, vs + 1)}[redacted]`; pos = j; KEY_AT.lastIndex = j + 1; continue;
+    }
+    let end = t.indexOf('\n', vs);
+    if (end < 0) end = t.length;
+    out += `${t.slice(pos, vs)}[redacted]`; pos = end; KEY_AT.lastIndex = Math.max(end, vs + 1);
+  }
+  return out + t.slice(pos);
+}
+/** ops.js redaction, then the credential-field pass: every note field goes through this before any cut. */
+export const scrubText = (t) => redactCredentialFields(clean(String(t ?? '')));
+/** Drop an incomplete UTF-8 sequence at the end of a byte buffer (so decoding never adds replacement bytes). */
+export function trimUtf8(buf) {
+  let i = buf.length - 1, k = 0;
+  while (i >= 0 && k < 3 && (buf[i] & 0xc0) === 0x80) { i -= 1; k += 1; }
+  if (i < 0) return buf.subarray(0, 0);
+  const lead = buf[i];
+  const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+  return buf.length - i < need ? buf.subarray(0, i) : buf;
+}
+/** Decode at most `cap` bytes into a string of at most `cap` bytes. */
+export function decodeCapped(buf, cap) {
+  let s = trimUtf8(buf.length > cap ? buf.subarray(0, cap) : buf).toString('utf8');
+  while (Buffer.byteLength(s) > cap) s = s.slice(0, -1); // invalid bytes inside decode wider: shorten until it fits
+  return s;
+}
+/** Any response text, at most `cap` bytes (ellipsis included). */
+export function fitBytes(text, cap) {
+  const t = String(text ?? '');
+  if (Buffer.byteLength(t) <= cap) return t;
+  return `${decodeCapped(Buffer.from(t), Math.max(0, cap - 3))}…`;
+}
+/** A namespace list short enough for any answer. */
+export const nsLabel = (list) => (list.length <= 3 ? list.join(', ') : `${list.length} namespaces`);
 // Identifiers (URLs, doc ids) have no spaces: after full redaction they are shortened at a separator instead.
 const cutIdent = (t, n) => { t = String(t ?? ''); if (t.length <= n) return t; const c = t.slice(0, n - 1); const at = Math.max(c.lastIndexOf('/'), c.lastIndexOf('?'), c.lastIndexOf('#')); return `${at > 0 ? c.slice(0, at + 1) : ''}…`; };
 const FULL_CHUNK = 5000; // KnowledgeHub's chunk ceiling: excerpts arrive whole, so redaction always sees complete values
@@ -260,9 +338,9 @@ const day = (iso) => (/^\d{4}-\d{2}-\d{2}/.test(String(iso || '')) ? String(iso)
  */
 export function excerptOf(r, n) {
   if (r.truncated) return '(excerpt withheld: the store cut this passage short)';
-  return neutral(safeCut(oneLine(clean(String(r.excerpt ?? ''))), n));
+  return neutral(safeCut(oneLine(scrubText(r.excerpt)), n));
 }
-export const titleOf = (r) => neutral(safeCut(oneLine(clean(r.title || '(untitled)')), 160));
+export const titleOf = (r) => neutral(safeCut(oneLine(scrubText(r.title || '(untitled)')), 160));
 export const urlOf = (r) => neutral(cutIdent(oneLine(clean(r.url || '')), 240));
 export function entryText(r, i, { excerptChars = config.knowledge.excerptChars } = {}) {
   const score = Number.isFinite(Number(r.score)) ? Number(r.score).toFixed(2) : '?';
@@ -300,7 +378,10 @@ export async function runSearch(run, { query: raw, k: rawK, source = 'search', m
   const event = (text) => store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key || null, kind: 'action', text });
   const who = nameOf(run.agent_id);
   const lead = source === 'auto' ? `Past work for ${who}'s ${String(run.kind).replaceAll('_', ' ')} run: '${short}'` : `${who} searched past work: '${short}'`;
-  const no = (outcome, detail, counted = false) => {
+  // Every answer, refusals included, fits the room this run has (refusals: at most MIN_ANSWER, never the whole budget).
+  let cap = MIN_ANSWER;
+  const no = (outcome, raw, counted = false) => {
+    const detail = fitBytes(raw, Math.min(cap, MIN_ANSWER));
     audit({ outcome, detail, counted, duration_ms: Date.now() - started });
     event(`${lead} → ${outcome === 'refused' ? `refused: ${detail}` : outcome === 'cancelled' ? (/^cancelled/.test(detail) ? detail : `cancelled: ${detail}`) : `unavailable: ${detail}`}`);
     return { outcome, text: detail, shown: [], ms: Date.now() - started, bytes: 0, detail };
@@ -309,7 +390,7 @@ export async function runSearch(run, { query: raw, k: rawK, source = 'search', m
   const denied = baseDenial(run, { source }) || budgetProblem(run.id);
   if (denied) return no('refused', denied);
   // Reserve one search and this answer's bytes now (at most the room left), before any wait in the queue.
-  const cap = Math.min(maxBytes, remainingBytes(run.id));
+  cap = Math.min(maxBytes, remainingBytes(run.id));
   bump(reserved, run.id, 1); bump(reservedBytes, run.id, cap);
   const op = newOp({ runId: run.id, kind: 'search' });
   const deadlineAt = started + config.knowledge.deadlineSeconds * 1000;
@@ -329,7 +410,7 @@ export async function runSearch(run, { query: raw, k: rawK, source = 'search', m
     const target = j.target && typeof j.target === 'object' ? { fingerprint: String(j.target.fingerprint || '').slice(0, 64), collection: j.target.collection ?? null, embedding_model: j.target.embedding_model ?? null } : null;
     const ms = Date.now() - started;
     if (!kept.length) {
-      const text = `No past work matched '${short}' in ${ns.join(', ')}${dropped ? ` (${dropped} result(s) outside this desk's scope were dropped)` : ''}.`;
+      const text = fitBytes(`No past work matched '${short}' in ${nsLabel(ns)}${dropped ? ` (${dropped} result(s) outside this desk's scope were dropped)` : ''}.`, cap);
       audit({ outcome: 'empty', counted: true, duration_ms: ms, bytes: Buffer.byteLength(text), detail: dropped ? `${dropped} dropped by policy` : null });
       event(`${lead} → no notes`);
       return { outcome: 'empty', text, shown: [], ms, bytes: Buffer.byteLength(text), target, dropped, duplicates };
@@ -365,7 +446,7 @@ export async function command(run, body = {}) {
     const used = store.knowledgeUsage(run.id);
     const no = baseDenial(run);
     return [`Past-work search: desk kb search "<what you need to know>" [--k 1-${config.knowledge.maxK}]`,
-      `Searches: ${ns().join(', ') || '(none allowed)'} · ${used.n} of ${perRun()} used in this run (the automatic Past work block counts)`,
+      `Searches: ${nsLabel(ns()) || '(none allowed)'} · ${used.n} of ${perRun()} used in this run (the automatic Past work block counts)`,
       no ? `Not available to you now: ${no}.` : 'Cite a note you rely on with --cite <doc id> on desk reply or desk decide (kb:<doc id>).'].join('\n');
   }
   if (action !== 'search') throw refuse('desk kb search "<query>" [--k N]', 400);
@@ -388,9 +469,10 @@ export function pastWorkQuery({ ticketKey = null, incidentId = null } = {}) {
 }
 /**
  * Retrieve once for an eligible launch. Never throws and never fails the launch: an outage gives an explicit "past
- * work unavailable" line. → { text (for the task), block, hash, meta, finalize(status) }. The snapshot is stored now as
- * 'prepared'; finalize records what reached the seat — 'included' (its notes become citable), 'omitted' (a Perplexity
- * pack left it out: nothing citable) or 'not delivered' (the run never started).
+ * work unavailable" line. → { text (for the task), block, hash, meta, select(inPack), finalize(outcome) }. The snapshot
+ * is stored now as 'prepared'. select() records whether a Perplexity pack carried the block (selection is not
+ * delivery). finalize() runs once the run's prompt was handed to the engine ('included'; 'omitted' when the pack left
+ * the block out) or when startup failed ('not delivered'); only 'included' makes its notes citable.
  */
 export async function preparePastWork(run, { ticketKey = null, incidentId = null } = {}) {
   const query = pastWorkQuery({ ticketKey, incidentId });
@@ -406,16 +488,20 @@ export async function preparePastWork(run, { ticketKey = null, incidentId = null
   const items = (r.shown || []).map((x) => { const excerpt = excerptOf(x, excerptChars); return { doc_id: x.doc_id, title: titleOf(x), url: urlOf(x), ingested_at: x.ingested_at ?? null, score: x.score ?? null, similarity: x.similarity ?? null, excerpt, excerpt_sha256: sha256(excerpt) }; });
   const meta = { v: 2, contract: CONTRACT, policy: policyVersion(), query: cut(neutral(clean(query)), 300), namespaces: ns(), reason: r.outcome === 'ok' || r.outcome === 'empty' ? null : neutral(r.text), items, target: r.target || null, bytes: Buffer.byteLength(block) };
   const hash = sha256(JSON.stringify([meta, block]));
-  const save = (st) => store.updateRun(run.id, { knowledge_hash: hash, knowledge_meta: JSON.stringify({ ...meta, status: st, hash }) });
+  let selected = null; // Perplexity: did the pack carry the block (null: no pack involved)
+  const save = (st) => store.updateRun(run.id, { knowledge_hash: hash, knowledge_meta: JSON.stringify({ ...meta, status: st, selected, hash }) });
   save(status);
   let done = false;
+  const select = (inPack) => { if (!done) { selected = !!inPack; save(status); } };
   const finalize = (outcome) => {
     if (done || status !== 'prepared') return;
     done = true;
-    save(outcome);
-    if (outcome === 'included') exposeNotes(run.id, r.shown, 'auto');
+    const final = outcome === 'included' && selected === false ? 'omitted' : outcome;
+    save(final);
+    if (final === 'included') exposeNotes(run.id, r.shown, 'auto');
+    else store.deleteKnowledgeExposures(run.id, 'auto'); // never citable unless delivered
   };
-  return { text: `\n\n${block}\n`, block, hash, meta: { ...meta, status }, finalize };
+  return { text: `\n\n${block}\n`, block, hash, meta: { ...meta, status }, select, finalize };
 }
 
 // ---------------- citations ----------------

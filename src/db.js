@@ -925,9 +925,17 @@ const TICKET_FIELDS = new Set(['owner_task', 'assign_pinned', 'assign_reason', '
   'prod_verify', 'prod_verify_by', 'owner_merge_only', 'hold_kind', 'hold_seat', 'hold_ref', 'hold_scope', 'owner_task_kind', 'owner_task_by']);
 export const HOLD_FIELDS = ['hold_kind', 'hold_seat', 'hold_ref', 'hold_scope'];
 
+// Called inside the closing transaction of EVERY path that sets a ticket done (merge sync, epic roll-up, owner task,
+// verify), after its incidents are resolved: the past-work note (#10) commits with the close. Hooks must not throw.
+const doneHooks = [];
+export function onTicketDone(fn) { doneHooks.push(fn); }
 export function updateTicket(key, patch) {
+  const closing = patch.status === 'done' && getTicket(key)?.status !== 'done';
+  return closing ? transaction(() => applyTicketPatch(key, patch, true)) : applyTicketPatch(key, patch, false);
+}
+function applyTicketPatch(key, patch, closing) {
   // When it shipped, recorded once by whichever path finishes it (merge sync, epic roll-up, owner).
-  if (patch.status === 'done' && patch.done_at === undefined && getTicket(key)?.status !== 'done') patch = { ...patch, done_at: now() };
+  if (closing && patch.done_at === undefined) patch = { ...patch, done_at: now() };
   // A hold's structured reason belongs to that hold (#9): any status change clears it unless the writer names the new
   // one, so a reason can never outlive its hold or be inherited by the next one. Same for an owner task's kind.
   if (patch.status !== undefined && patch.status !== getTicket(key)?.status) {
@@ -942,6 +950,7 @@ export function updateTicket(key, patch) {
   if (patch.status === 'done') {
     for (const inc of q("SELECT id FROM incidents WHERE ticket_key=? AND status='ticketed'").all(key)) updateIncident(inc.id, { status: 'resolved', resolved_at: now() });
   }
+  if (closing) for (const fn of doneHooks) fn(key);
   const ticket = getTicket(key);
   announce({ type: 'ticket', data: ticket });
   return ticket;
@@ -1683,3 +1692,15 @@ export const getTicketSpec = (key) => q('SELECT * FROM ticket_specs WHERE ticket
 /** Tickets whose linked incident was resolved at or after `iso` (an incident resolution is a qualifying transition). */
 export const resolvedIncidentTickets = (iso) => q("SELECT DISTINCT ticket_key FROM incidents WHERE status='resolved' AND ticket_key IS NOT NULL AND resolved_at >= ?").all(iso).map((r) => r.ticket_key);
 export const knowledgeNoteByUrl = (url) => q('SELECT * FROM knowledge_outbox WHERE url=?').get(url) || null;
+/** Every incident linked to a ticket (no global window). */
+export const incidentsOfTicket = (key) => q('SELECT * FROM incidents WHERE ticket_key=? ORDER BY id').all(key);
+/** Qualifying transitions since `iso`, as ticket keys: PR merges, incident resolutions, concluded watches, deploy records. */
+export function knowledgeTransitionsSince(iso) {
+  const keys = new Set();
+  for (const r of q("SELECT DISTINCT ticket_key FROM events WHERE kind='github' AND text LIKE 'PR merged on GitHub%' AND ticket_key IS NOT NULL AND ts >= ?").all(iso)) keys.add(r.ticket_key);
+  for (const k of resolvedIncidentTickets(iso)) keys.add(k);
+  for (const r of q("SELECT DISTINCT ticket_key FROM deploy_watches WHERE ticket_key IS NOT NULL AND status IN ('verified','inconclusive','regression') AND updated_at >= ?").all(iso)) keys.add(r.ticket_key);
+  for (const r of q('SELECT DISTINCT ticket_key FROM deploy_history WHERE ticket_key IS NOT NULL AND COALESCE(completed_at, recorded_at) >= ?').all(iso)) keys.add(r.ticket_key);
+  return [...keys];
+}
+export function deleteKnowledgeExposures(runId, source) { q('DELETE FROM knowledge_exposures WHERE run_id=? AND source=?').run(runId, source); }

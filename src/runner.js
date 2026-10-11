@@ -1009,8 +1009,8 @@ async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, in
   const secrets = [token, nonce].filter(Boolean);
   const pack = await context.prepareRun({ runId: run.id, kind, cwd, ticketKey, incidentId, secrets, signal, pastWork: past?.block || null });
   const live = context.liveFor(run.id);
-  // Only a block the pack actually carries is shown (and citable); one left out for size is recorded as omitted.
-  past?.finalize(pack.meta.pastWork === 'included' ? 'included' : 'omitted');
+  // Selection only: the block counts as shown (and citable) once the prompt reaches the relay, and only if the pack carries it.
+  past?.select(pack.meta.pastWork === 'included');
   const jobHash = context.jobIdentity({ provenance: provenanceOf(agent, kind), agentId, kind, ticketKey, incidentId, prompt, packHash: pack.hash, secrets, pastWorkHash: past?.hash || null });
   const prev = store.lastThreadRun({ job_hash: jobHash });
   const prevMeta = context.metaFor(prev);
