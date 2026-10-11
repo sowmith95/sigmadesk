@@ -1054,3 +1054,64 @@ test('round 3 — a facts-note field with credential-like text is withheld whole
   assert.match(body, /## Specification {2}\[ticket at creation[^\n]*\n\[withheld: credential-like text\]/);
   assert.match(body, /- src\/scan\.py/, 'other fields are kept');
 });
+
+test('round 4 — the broad detector: any credential-ish key of any length, Basic/Bearer, URL userinfo, mixed runs; ordinary notes still show', async () => {
+  const show = async (text) => { setStore({ results: [note('c1', { text })] }); return search(mkRun(), 'broad detector'); };
+  for (const t of [`cfg "${'Z'.repeat(70)}_token"="first\nSYNTHSECOND`, 'Authorization header: Basic dTpw', 'use Bearer x', 'clone ssh://git@host/repo', 'id a1b2c3d4e5f6g7h8i9j0k1l2m3',
+    'my.private.thing = 1', 'SessionCookie: x', 'apikeyvalue=3']) {
+    const out = await show(t);
+    assert.match(out, /excerpt withheld: it contains credential-like text/, t);
+    for (const leak of ['SYNTHSECOND', 'dTpw', 'git@host', 'a1b2c3d4e5']) assert.ok(!out.includes(leak), leak);
+  }
+  // The ordinary fixture notes and live-style hook notes are shown.
+  setStore({ results: [note('a1'), note('a2'), note('h1', { url: 'alpaca_trader/tests/test_chunk_exclusion_bounds.py', title: 'Feature: TimescaleDB OOM — timestamp::date defeats chunk exclusion',
+    text: 'Problem: a timestamp::date cast defeated chunk exclusion and the scan read every chunk. Fix: half-open window. Tests: test_chunk_exclusion_bounds.py pins it; commit 4d40be7b54cd8037288c81f0a1b2c3d4e5f60718.' })] });
+  const out = await search(mkRun(), 'ordinary notes', { k: '5' });
+  assert.ok(!out.includes('withheld'), out);
+  assert.equal((out.match(/^\[\d\]/gm) || []).length, 3);
+});
+
+test('round 4 — URL paths are checked after the scheme; userinfo is refused outright', () => {
+  const probe = (url) => kb.resultProblem({ ...note('q'), source_type: 'markdown', url });
+  for (const u of ['kb:../code/x', 'kb:./personal/x', 'kb://u@code/x', 'kb:/code/x', 'text://x/../y', 'https://u@example.com/a']) assert.ok(probe(u), u);
+  for (const u of ['kb://ComplexTrading/feature/a1', 'pr:319', 'commit:39a2a4f', 'docs/research/x.md']) assert.equal(probe(u), null, u);
+});
+
+test('round 4 — every facts source field is checked before formatting (area, builder, pr_url …)', async () => {
+  const t = mergedTicket('Metadata secrets', { builder: 'creds: synth123', pr_url: 'https://user:pass@host/pr/1' });
+  store.updateTicket(t.key, { area: 'creds: synth123' });
+  sched.prActions.merged(store.getTicket(t.key), { at: '2026-10-05T12:00:00Z' });
+  const body = store.knowledgeNotesFor(t.key)[0].body;
+  for (const leak of ['synth123', 'user:pass', 'pass@host']) assert.ok(!body.includes(leak), leak);
+  assert.match(body, /area \[withheld: credential-like text\]/);
+  assert.match(body, /Builder \[withheld: credential-like text\]/);
+  assert.match(body, /pull request \[withheld: credential-like text\]/);
+});
+
+test('round 4 — reconciliation isolates each candidate; unresolved failures are durable and all counted', async () => {
+  try { store.handle().exec('DELETE FROM knowledge_enqueue_failures'); } catch { /* older schema */ }
+  config.knowledge.enabled = false;
+  const bad = mergedTicket('Malformed record');
+  const br = mkRun('qa', 'qa', bad.key);
+  store.kvSet(`desk-test:${br.id}`, JSON.stringify([{ args: 'not-a-list', status: 0 }]));
+  sched.prActions.merged(bad, { at: '2026-10-05T12:00:00Z' });
+  const good = mergedTicket('Healthy record');
+  sched.prActions.merged(good, { at: '2026-10-05T12:00:00Z' });
+  config.knowledge.enabled = true;
+  store.kvSet('knowledge:since', '2000-01-01T00:00:00Z');
+  notes.reconcile();
+  assert.equal(store.knowledgeNotesFor(good.key).length, 1, 'the healthy candidate after the malformed one is queued');
+  assert.ok(kb.describe().failures.some((f) => f.ticket_key === bad.key && f.status === 'not queued'), 'the reconciliation-only failure is shown');
+  // 21 unresolved failures: all counted, the list shows 20.
+  try { store.handle().exec('DELETE FROM knowledge_enqueue_failures'); } catch { /* older schema */ }
+  for (let i = 0; i < 21; i++) {
+    const b = mergedTicket(`Failing ${i}`);
+    store.kvSet(`desk-test:${mkRun('qa', 'qa', b.key).id}`, JSON.stringify([{ args: 'not-a-list', status: 0 }]));
+    sched.prActions.merged(b, { at: '2026-10-05T12:00:00Z' });
+  }
+  const d = kb.describe();
+  assert.equal(d.not_queued, 21);
+  assert.ok(d.metrics.outbox_failures >= 21);
+  assert.equal(d.failures.filter((f) => f.status === 'not queued').length, 20);
+  store.kvSet('knowledge:since', store.now());
+});
