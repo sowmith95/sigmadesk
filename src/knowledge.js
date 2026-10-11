@@ -185,8 +185,13 @@ export function release() {
   if (next) { clearTimeout(next.timer); next.op.onCancel = null; next.resolve(); } else lane.busy = false;
 }
 export const laneState = () => ({ busy: lane.busy, queued: lane.queue.length });
+const KILL_GRACE_MS = 500; // SIGTERM to the CLI's process group, then SIGKILL after this
 
-/** Spawn the CLI (fixed argv, no shell) with the explicit env; stdout/stderr capped while streaming; hard deadline. */
+/**
+ * Spawn the CLI (fixed argv, no shell) with the explicit env; stdout/stderr capped while streaming; hard deadline. It runs
+ * in its own process group: a timeout, a cancellation or a cap ends the call AT ONCE (streams destroyed, whatever
+ * descendants still hold the pipes) and the whole group gets SIGTERM, then SIGKILL after a short grace.
+ */
 export function runCli(op, args, { input = null, deadlineAt, stdoutCap = 512 << 10, stderrCap = 16 << 10 } = {}) {
   return new Promise((resolve) => {
     if (op?.cancelled) return resolve({ code: null, reason: 'cancelled', stdout: '', stderr: '', ms: 0 });
@@ -199,13 +204,17 @@ export function runCli(op, args, { input = null, deadlineAt, stdoutCap = 512 << 
       done = true; clearTimeout(timer); if (op) op.kill = null;
       resolve({ code, reason, stdout: decodeCapped(Buffer.concat(out), stdoutCap), stderr: decodeCapped(Buffer.concat(err), stderrCap), ms: Date.now() - started });
     };
-    try { child = spawn(config.knowledge.executable, args, { env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], shell: false }); } catch (e) { reason = 'spawn'; err.push(Buffer.from(String(e.message))); return finish(null); }
+    try { child = spawn(config.knowledge.executable, args, { env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], shell: false, detached: true }); } catch (e) { reason = 'spawn'; err.push(Buffer.from(String(e.message))); return finish(null); }
     if (op) op.started = true;
+    const killGroup = (sig) => { if (!child.pid) return; try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch { /* gone */ } } };
     const stop = (why) => {
       if (done || reason) return;
       reason = why;
-      try { child.kill('SIGTERM'); } catch { /* gone */ }
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 1500).unref();
+      killGroup('SIGTERM');
+      setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS).unref();
+      // Settle now: a descendant holding the pipes must not hold the search (or the run's preparation) open.
+      for (const st of [child.stdout, child.stderr, child.stdin]) { try { st.destroy(); } catch { /* gone */ } }
+      finish(null);
     };
     if (op) op.kill = () => stop('cancelled');
     timer = setTimeout(() => stop('timeout'), Math.max(1, deadlineAt - Date.now()));
@@ -522,10 +531,12 @@ export async function preparePastWork(run, { ticketKey = null, incidentId = null
   save(status);
   let done = false;
   const select = (inPack) => { if (!done) { selected = !!inPack; save(status); } };
+  // Settled once: the first outcome wins, whichever path reports it (abort cleanup, write callback, stdin error, close).
   const finalize = (outcome) => {
+    if (done) return;
     // A failed hand-off is recorded whatever came before (an empty or unavailable block too), and nothing stays citable.
     if (outcome === 'not delivered') { done = true; save('not delivered', { prior: status }); store.deleteKnowledgeExposures(run.id, 'auto'); return; }
-    if (done || status !== 'prepared') return;
+    if (status !== 'prepared') return;
     done = true;
     const final = outcome === 'included' && selected === false ? 'omitted' : outcome;
     save(final);

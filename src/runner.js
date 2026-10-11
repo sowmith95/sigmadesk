@@ -817,6 +817,16 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   const setup = setupPhase({ run, agentId, ticketKey, track });
   let ctx, engine, pplx, px, timeoutMin, deadlineAt;
   let past = null; // the past-work snapshot (#10): finalized as delivered only when the prompt write completes
+  // Knowledge bookkeeping never throws into the run's paths (an async callback, the close handler, an abort cleanup): a
+  // failure is logged as an event and the run carries on.
+  const contain = (what, fn) => {
+    try { fn(); } catch (err) {
+      try { store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `${what} failed: ${store.redact(String(err?.message || err)).slice(0, 200)}` }); } catch { /* nothing more to do */ }
+    }
+  };
+  // The ONE way the snapshot is settled: the first caller wins (abort cleanup, completed write, stdin error, close).
+  let pastSettled = false;
+  const settlePast = (outcome) => { if (pastSettled || !past) return; pastSettled = true; contain('recording the past-work delivery', () => past.finalize(outcome)); };
   return (async () => {
     try {
       packages.recordLaunch(run.id, pkg.ids);
@@ -867,7 +877,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       try {
         past = pastWork ? await knowledge.preparePastWork(run, { ticketKey, incidentId }) : null;
         // Every abort path, from here until the hand-off, records the block as not delivered and revokes its exposures.
-        if (past) setup.own(() => past.finalize('not delivered'));
+        if (past) setup.own(() => settlePast('not delivered'));
         if (pplx) prompt = `${prompt}${await preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal: abort.signal, past })}`;
         else if (past) prompt = `${prompt}${past.text}`;
       } catch (err) { failed = err; } finally { preparing.delete(run.id); clearTimeout(prepTimer); }
@@ -911,10 +921,8 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   if (child.pid) lessons.delivered(run.id, ticketKey); // lessons count as given only once the prompt reaches a process
   // The past-work block counts as delivered only when the prompt write completes (this callback may run after the
   // hand-off): an EPIPE, a write error or an engine that exits first records it as not delivered.
-  let promptSettled = false;
-  const promptDone = (ok) => { if (promptSettled) return; promptSettled = true; past?.finalize(ok ? 'included' : 'not delivered'); };
-  child.stdin.on('error', () => promptDone(false));
-  child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt, (err) => promptDone(!err));
+  child.stdin.on('error', () => settlePast('not delivered'));
+  child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt, (err) => settlePast(err ? 'not delivered' : 'included'));
 
   let buf = '';
   let lastOutput = Date.now();
@@ -958,7 +966,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       children.delete(run.id);
       mailboxes.delete(run.id);
       ops.cancelRun(run.id); // production probes never outlive their run
-      knowledge.cancelRun(run.id);
+      contain('stopping past-work searches', () => knowledge.cancelRun(run.id));
       fs.rm(path.join(toolHomeRoot(), `r${run.id}`), { recursive: true, force: true }, () => {});
       setTimeout(() => evidence.delete(run.id), 60_000).unref();
       sock?.close();
@@ -998,7 +1006,9 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       resolve({ run: store.getRun(run.id), result: r, failure, steps: stepsTaken(ctx) });
       ledgers.delete(run.id);
   };
-  child.on('close', (code) => { promptDone(false); finish(code); }); // close(code, signal): a signal is not an error, and never one's text (promptDone: no-op once the write completed)
+  // close(code, signal): a signal is not an error, and never one's text. The run is finished FIRST; a prompt write that
+  // never completed is then settled as not delivered (a no-op once the write completed).
+  child.on('close', (code) => { try { finish(code); } finally { settlePast('not delivered'); } });
   setup.handOff(); // its close handler now ends the run and releases what it holds, exactly once
   return ended;
   }
