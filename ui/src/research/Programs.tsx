@@ -27,6 +27,7 @@ function status(p: Program): [string, Tone] {
   if (p.code === 'due') return ['Due now', 'shipped'];
   if (p.code === 'disabled') return ['Paused', 'neutral'];
   if (p.code === 'seat_disabled') return ['Researcher is off', 'needs'];
+  if (p.code === 'backlog') return ['Waiting for research items to finish', 'needs'];
   if (p.code === 'funnel') return ['Waiting for grooming', 'needs'];
   if (p.code === 'cadence') return [`Eligible ${until(p.next_eligible_at)}`, 'neutral'];
   if (p.code === 'window') return [p.window === 'market' ? 'Waits for market hours' : 'Waits for the close', 'neutral'];
