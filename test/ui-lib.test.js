@@ -148,3 +148,19 @@ test('formatting helpers and the stream contract', () => {
   const fresher = sync.mergeDetail({ discussions: [{ id: 7, status: 'running' }] }, { discussions: [{ id: 7, status: 'approved' }] }, sync.emptyPending());
   assert.equal(fresher.discussions[0].status, 'approved', 'a refetch beats what was shown');
 });
+
+test('the Research page follows the research backlog live: a research ticket moving refreshes the snapshot, and live eligibility never touches the saved settings', () => {
+  const S = { tickets: [{ key: 'R-1', title: 'idea', status: 'needs_human', research_program: 'product-discovery' }, { key: 'T-1', title: 'work', status: 'todo' }], agents: [], events: [], runs: [], settings: {}, incidents: [], councils: {}, questions: {}, detail: null };
+  assert.equal(sync.applyDelta(S, { type: 'ticket', data: { key: 'R-1', status: 'wontdo', research_program: 'product-discovery' } }).meta, true, 'a research item closing can drain the backlog');
+  assert.equal(sync.applyDelta(S, { type: 'ticket', data: { key: 'R-1', status: 'proposed' } }).meta, true, 'a partial delta of a known research ticket counts too');
+  assert.equal(sync.applyDelta(S, { type: 'ticket', data: { key: 'T-1', status: 'in_progress' } }).meta, false, 'ordinary work does not refetch');
+  S.settings = { team: '{}', research_backlog_max: '8', daily_budget_usd: '150' };
+  assert.equal(sync.applyDelta(S, { type: 'settings', data: { ...S.settings, research_backlog_max: '3' } }).meta, true, 'the backlog limit changed');
+  assert.equal(sync.applyDelta(S, { type: 'settings', data: { ...S.settings, daily_budget_usd: '200' } }).meta, false, 'an unrelated setting does not');
+  const saved = { id: 'p', label: 'P', seat: 'pm', enabled: true, intervalMinutes: 60, maxProposals: 3, code: 'backlog', ok: false, reason: 'full', last_run_at: null };
+  const live = { ...saved, label: 'Renamed elsewhere', maxProposals: 1, code: 'due', ok: true, reason: 'Due', last_run_at: '2026-10-11T10:00:00Z' };
+  const shown = P.withLive(saved, live);
+  assert.deepEqual([shown.code, shown.ok, shown.reason, shown.last_run_at], ['due', true, 'Due', '2026-10-11T10:00:00Z']);
+  assert.deepEqual([shown.label, shown.maxProposals], ['P', 3], 'settings stay those of the loaded list');
+  assert.equal(P.withLive(saved, { ...live, id: 'other' }), saved); assert.equal(P.withLive(saved, null), saved);
+});

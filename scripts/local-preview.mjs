@@ -339,3 +339,20 @@ if (process.env.SIGMADESK_PREVIEW_AGED === '1') {
   const open = all.find((t) => t.status === 'todo');
   if (open) store.updateAgent('senior-be', { current_ticket: open.key }); // a seat on a ticket: its panel shows the ticket card
 }
+// SIGMADESK_PREVIEW_RESEARCH_HELD=n: n research proposals held for the owner after their second review (the research backlog).
+const heldResearch = Math.min(20, Number(process.env.SIGMADESK_PREVIEW_RESEARCH_HELD) || 0);
+if (heldResearch) {
+  const rr = await import('../src/research-review.js');
+  // The researcher's seat is on so its program can show why it waits; the preview desk stays halted, so nothing runs.
+  const ov = JSON.parse(store.getSettings().team); ov.pm = { ...ov.pm, enabled: true };
+  store.setSetting('team', JSON.stringify(ov)); team.applyTeamOverrides(ov);
+  store.setSetting('pm_enabled', 'true');
+  for (let i = 1; i <= heldResearch; i++) {
+    const t = store.createTicket({ title: `Research idea ${i}: show the fill-rate drift per venue`, type: 'feature', status: 'proposed', reporter: 'pm', source: 'research',
+      description: '## Problem\nFill rates drift by venue.\n## Evidence\nThe fills table.\n## Proposal\nA drift panel.\n## Acceptance criteria\n- per venue\n## Success metric\nFewer missed fills' });
+    const run = store.createRun({ agent_id: 'pm', kind: 'research', program: 'product-discovery', token: `preview-research-${i}`, model: 'demo:fixture' });
+    store.updateRun(run.id, { status: 'success', ended_at: store.now() });
+    rr.open(t, { program: 'product-discovery', maxProposals: 3, review: { minReviewers: 1, reviewers: ['principal-be'] } }, run);
+    store.updateTicket(t.key, { status: 'needs_human', research_review: 'held', resume_status: 'proposed', hold_kind: 'research', progress_msg: 'Research review: rejected by Rowan: the evidence is one table' });
+  }
+}

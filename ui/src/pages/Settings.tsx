@@ -55,7 +55,7 @@ function RequiredChecks() {
 
 /** What the research backlog limit means, with how many research items are open now. */
 function backlogHint(b?: ResearchBacklog | null) {
-  const base = 'New research waits while this many research items are still under review, revision or your decision. 0 stops new research.';
+  const base = 'New research, Run now included, waits while this many research items are under review, revision or your decision, counting room that running sessions hold; 0 stops it.';
   return b ? `${base} Open now: ${b.count}.` : base;
 }
 

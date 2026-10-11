@@ -32,10 +32,19 @@ export function applyDelta(S, m) {
     upsert(list, item);
   };
   switch (m.type) {
-    case 'ticket': upsert(S.tickets, m.data, 'key'); out.feature = m.data.parent_key || m.data.key; break;
+    case 'ticket': {
+      // A research-born ticket moving can fill or drain the research backlog: the snapshot (programs' waiting state) follows.
+      const was = S.tickets.find((x) => x.key === m.data.key);
+      if (m.data.research_program || was?.research_program) out.meta = true;
+      upsert(S.tickets, m.data, 'key'); out.feature = m.data.parent_key || m.data.key; break;
+    }
     case 'agent': { const a = S.agents.find((x) => x.id === m.data.id); if (a) Object.assign(a, m.data); break; }
     case 'run': upsert(S.runs, m.data); if (m.data.status !== 'running') out.meta = true; break;
-    case 'settings': { const teamChanged = S.settings.team !== m.data.team; S.settings = m.data; out.meta = teamChanged; out.research = true; break; }
+    case 'settings': {
+      // The team, and anything that decides whether research may start (the Research page reads that from the snapshot).
+      const changed = ['team', 'research_backlog_max', 'max_open_proposals', 'pm_enabled', 'pm_interval_min', 'research_programs'].some((k) => S.settings[k] !== m.data[k]);
+      S.settings = m.data; out.meta = changed; out.research = true; break;
+    }
     case 'incident': upsert(S.incidents, m.data); break;
     case 'quota': out.meta = true; break;
     case 'discussion': into('discussions', m.data); out.meta = true; break;

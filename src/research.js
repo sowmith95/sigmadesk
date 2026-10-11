@@ -136,10 +136,11 @@ export function eligibility(p, { now = new Date(), settings = store.getSettings(
   const base = { last_run_at: last, next_eligible_at: next };
   if (!p.enabled) return { ...base, ok: false, code: 'disabled', reason: 'Program is off' };
   if (agentById[p.seat]?.enabled === false) return { ...base, ok: false, code: 'seat_disabled', reason: `${agentById[p.seat].name} is disabled` };
-  if (!windowSatisfied(p.window, now)) return { ...base, ok: false, code: 'window', reason: p.window === 'market' ? 'Runs during market hours only' : 'Runs outside market hours only' };
-  if (next && Date.parse(next) > now.getTime()) return { ...base, ok: false, code: 'cadence', reason: `Next session after ${next}` };
+  // Ahead of window and cadence: a full backlog holds every session back, however soon the next one is due.
   const backlog = hooks.backlog(settings);
   if (backlog?.full) return { ...base, ok: false, code: 'backlog', reason: backlog.reason };
+  if (!windowSatisfied(p.window, now)) return { ...base, ok: false, code: 'window', reason: p.window === 'market' ? 'Runs during market hours only' : 'Runs outside market hours only' };
+  if (next && Date.parse(next) > now.getTime()) return { ...base, ok: false, code: 'cadence', reason: `Next session after ${next}` };
   const room = Number(settings.max_open_proposals) - store.ticketsByStatus('proposed').length;
   if (room <= 0) return { ...base, ok: false, code: 'funnel', reason: 'Enough proposals are waiting for grooming' };
   return { ...base, ok: true, code: 'due', reason: 'Due', room };

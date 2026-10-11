@@ -471,7 +471,7 @@ test('creation age on a desktop: Inbox rows, Work cards and the ticket header, a
   await page.close();
 });
 
-// A second preview with tickets created days ago (the first one last year).
+// A second preview with tickets created days ago (the first one last year) and three research items held for the owner.
 const AGE = /^(now|\d+[mhd]|[A-Z][a-z]{2} \d{1,2}(, \d{4})?)$/, DATE = /^[A-Z][a-z]{2} \d{1,2}(, \d{4})?$/;
 const visibleAge = (loc) => loc.evaluate((el) => el.textContent.replace(/^·\s*/, '').replace(/^created\s+/i, ''));
 test('creation age with old dates: phone rows, Work, Features, the next step, search, a seat, the wall and the classic board', { skip, timeout: 120_000 }, async () => {
@@ -527,4 +527,28 @@ test('creation age with old dates: phone rows, Work, Features, the next step, se
     assert.match(await c.getAttribute('aria-label'), CREATED);
     await classic.close();
   } finally { await aged.stop(); }
+});
+
+test('research tags follow the backlog while Research stays open: the cap is reached and drained without a reload', { skip, timeout: 90_000 }, async () => {
+  const desk = await startPreview({ SIGMADESK_PREVIEW_PLAYBOOK: PLAYBOOK, SIGMADESK_PREVIEW_RESEARCH_HELD: '3' });
+  const call = (method, p, b) => fetch(desk.url + p, { method, headers: { 'Content-Type': 'application/json' }, body: b === undefined ? undefined : JSON.stringify(b) }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) }));
+  try {
+    assert.equal((await call('POST', '/api/settings', { key: 'research_backlog_max', value: '4' })).status, 200);
+    const { page, errors } = await openPage(browser, `${desk.url}/#/research`, { width: 1280, height: 900 });
+    const tag = page.locator('article[data-program="product-discovery"] > div').first();
+    const banner = page.locator('[data-research-backlog]');
+    await banner.waitFor();
+    assert.match(await banner.textContent(), /^3 research items open; new research waits at 4/);
+    assert.doesNotMatch(await tag.textContent(), /Waiting for research items to finish/);
+    // Reach the cap: the owner lowers the limit.
+    assert.equal((await call('POST', '/api/settings', { key: 'research_backlog_max', value: '3' })).status, 200);
+    await page.waitForFunction(() => /Waiting for research items to finish/.test(document.querySelector('article[data-program="product-discovery"]')?.textContent || ''), null, { timeout: 5000 });
+    assert.match(await banner.textContent(), /^3 research items are waiting — research resumes when fewer than 3 are open/);
+    // Drain it: the owner rejects one held proposal; nothing reloads the research list, the page still follows.
+    const held = (await call('GET', '/api/state')).body.tickets.find((t) => t.research_program && t.status === 'needs_human');
+    assert.equal((await call('POST', `/api/tickets/${held.key}/decision`, { decision: 'reject', message: 'not now' })).status, 200);
+    await page.waitForFunction(() => !/Waiting for research items to finish/.test(document.querySelector('article[data-program="product-discovery"]')?.textContent || ''), null, { timeout: 5000 });
+    await page.waitForFunction(() => /^2 research items open/.test(document.querySelector('[data-research-backlog]')?.textContent || ''), null, { timeout: 5000 });
+    assert.deepEqual(errors, []); await page.close();
+  } finally { await desk.stop(); }
 });

@@ -17,6 +17,7 @@ export default function ResearchPage() {
   const market = data.market_hours;
   // The live snapshot's count (it refreshes as items finish), else the one loaded with the programs.
   const backlog: ResearchBacklog | null = S.meta.research?.backlog || data.backlog || null;
+  const live: Record<string, Program> = Object.fromEntries(((S.meta.research?.programs || []) as Program[]).map((p) => [p.id, p]));
   return (
     <div className="grid max-w-5xl gap-8">
       <div className="grid gap-1.5">
@@ -32,7 +33,7 @@ export default function ResearchPage() {
         actions={data.configured ? <AsyncButton variant="ghost" size="sm" confirm="Discard saved programs and return to the configuration defaults?"
           run={async () => { await api('POST', '/api/research/programs/reset', {}); setEditing(null); await Promise.all([loadResearch(), loadSnapshot().catch(() => {})]); }} ok="Programs reset to the configuration">Reset to configuration</AsyncButton> : null}>
         <div className="grid gap-3">
-          {saved.map((p) => <ProgramCard key={p.id} program={p} saved={saved} editingRow={editing?.id === p.id ? editing.row || 'label' : null} onEdit={(row) => setEditing({ id: p.id, row })} onClose={() => setEditing(null)} />)}
+          {saved.map((p) => <ProgramCard key={p.id} program={p} live={live[p.id]} saved={saved} editingRow={editing?.id === p.id ? editing.row || 'label' : null} onEdit={(row) => setEditing({ id: p.id, row })} onClose={() => setEditing(null)} />)}
           {editing?.draft ? <article className="grid gap-3 rounded-lg border bg-card p-5"><p className="text-xl">New program</p>
             <ProgramEditor isNew initial={editing.draft as never} saved={saved} onClose={() => setEditing(null)} /></article> : null}
         </div>

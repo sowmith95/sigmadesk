@@ -192,3 +192,14 @@ test('a research session whose preparation fails releases its reserved room', as
   assert.equal(store.getAgentState('pm').status, 'idle');
   store.setSetting('research_backlog_max', '8');
 });
+
+test('a full backlog is the reason a program gives even before its next session is due', () => {
+  atOneBelowTheLimit(); held();
+  const recent = store.createRun({ agent_id: 'pm', kind: 'research', program: 'product-discovery', token: `t-${Math.random()}`, model: 'x' });
+  store.updateRun(recent.id, { status: 'success', ended_at: store.now() }); // a session just ran: by cadence it is not due
+  const e = research.eligibility(research.get('product-discovery'), { settings: store.getSettings() });
+  assert.equal(e.code, 'backlog'); assert.match(e.reason, /4 research items are waiting/);
+  assert.ok(e.next_eligible_at, 'the next session time is still given');
+  store.setSetting('research_backlog_max', '8');
+  assert.equal(research.eligibility(research.get('product-discovery'), { settings: store.getSettings() }).code, 'cadence');
+});
