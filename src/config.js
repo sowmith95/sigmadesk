@@ -277,6 +277,33 @@ const DEFAULTS = {
     // Busy window (limits.busyWindow when enabled, else research.marketHours): tighter everything.
     busy: { statementMs: 3000, lockMs: 500, idleMs: 5000, perRun: 4, perHour: 20, maxLogHours: 1, maxFreshnessMinutes: 120, maxTail: 200 },
   },
+  // Institutional memory (#10): seats search past work through the DESK (`desk kb search`), which runs the KnowledgeHub
+  // CLI itself with an explicit, non-secret environment (never the MCP server, never ~/.claude.json). Every search is
+  // namespace-filtered; personal, journal, *-receipts and code are refused whatever is configured here. The desk also
+  // writes attributable facts (records it owns, no seat prose) back when a ticket closes with a merged PR. Off unless
+  // enabled here; the owner's Settings toggle (knowledge_enabled) is the kill switch.
+  knowledge: {
+    enabled: false,
+    executable: '', // the installed `knowledge-hub` script, e.g. ~/projects/KnowledgeHub/.venv/bin/knowledge-hub
+    // Passed to the CLI explicitly; nothing else from the desk's environment reaches it (PATH/HOME/LANG aside).
+    env: { QDRANT_HOST: 'localhost', QDRANT_PORT: '6333', OLLAMA_URL: 'http://localhost:11434', KB_SQLITE_PATH: '' },
+    namespaces: [], // [] = the project's own namespace (its name, lowercased)
+    writeNamespace: '', // '' = the first of namespaces
+    fingerprint: '', // the store target's fingerprint (doctor prints it); set it to refuse writes when the chunker or model changes
+    autoKinds: ['implement', 'design', 'investigate', 'decide', 'groom', 'consult'], // runs that get a "Past work" block at launch
+    searchKinds: ['implement', 'design', 'investigate', 'decide', 'groom', 'consult', 'mention', 'research', 'triage', 'respond'],
+    perRun: 12, // searches per run, the automatic one included
+    runBytes: 49152, // search output one run may receive in total
+    defaultK: 3,
+    maxK: 5,
+    maxBytes: 8192, // one search result block
+    excerptChars: 500,
+    pastWorkBytes: 1536, // the automatic block at launch
+    deadlineSeconds: 15, // one search, queue wait included
+    queueMax: 6, // searches waiting behind the one in flight (one knowledge process desk-wide)
+    writeDeadlineSeconds: 120, // one note write (embedding a note is slower than a search)
+    maxAttempts: 10, // note writes before the outbox gives up and shows the failure
+  },
   // Who gets production read access, for how long: time-boxed, revocable grants. The owner grants anything; the EM and
   // the SRE may approve a seat's request within this policy (never for themselves); anything beyond it goes to the
   // owner's Inbox. Saved Access-sheet edits (settings.access_policy) win over this.
@@ -415,6 +442,9 @@ export function loadConfig(file = deskPaths({ home: homeOf(process.env), legacyR
   c.ops.pgpassFile = expandHome(c.ops.pgpassFile);
   c.ops.pgServiceFile = expandHome(c.ops.pgServiceFile);
   c.packages.python = expandHome(c.packages.python || '');
+  c.knowledge = { ...c.knowledge, env: { ...(c.knowledge.env || {}) } }; // never mutate the shared defaults
+  c.knowledge.executable = expandHome(c.knowledge.executable || '');
+  if (c.knowledge.env.KB_SQLITE_PATH) c.knowledge.env.KB_SQLITE_PATH = expandHome(c.knowledge.env.KB_SQLITE_PATH);
   const pathClaude = which('claude');
   c.bins.claude = c.bins.claude || (pathClaude && !wrapperProblem(pathClaude) ? pathClaude : path.join(os.homedir(), '.local/bin/claude'));
   c.bins.gh = c.bins.gh || which('gh') || 'gh';
@@ -541,6 +571,19 @@ export function validateConfig(c = config) {
   if (dlg.peerAccess !== undefined && typeof dlg.peerAccess !== 'boolean') problems.push('delegation.peerAccess must be true or false');
   if (dlg.rulesSection !== undefined && !(typeof dlg.rulesSection === 'string' && dlg.rulesSection.trim() && dlg.rulesSection.length <= 120 && !/[\n#]/.test(dlg.rulesSection)))
     problems.push('delegation.rulesSection must be a playbook heading (text without #, at most 120 characters)');
+  // Knowledge (#10): numbers in range, an absolute executable, only plain environment values reach the CLI.
+  const kn = c.knowledge || {};
+  const intIn = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
+  if (typeof kn.enabled !== 'boolean') problems.push('knowledge.enabled must be true or false');
+  if (kn.enabled && !(typeof kn.executable === 'string' && path.isAbsolute(kn.executable))) problems.push('knowledge.executable must be the absolute path of the installed knowledge-hub script');
+  if (kn.enabled && /(^|\/)python[\d.]*$/.test(String(kn.executable))) problems.push('knowledge.executable must be the knowledge-hub script, not python (python -m knowledge_hub starts the MCP server)');
+  if (!Array.isArray(kn.namespaces) || !kn.namespaces.every((n) => typeof n === 'string')) problems.push('knowledge.namespaces must be a list of namespace names');
+  if (!kn.env || typeof kn.env !== 'object' || !Object.entries(kn.env).every(([k, v]) => ['QDRANT_HOST', 'QDRANT_PORT', 'QDRANT_GRPC_PORT', 'QDRANT_COLLECTION', 'OLLAMA_URL', 'OLLAMA_MODEL', 'KB_SQLITE_PATH'].includes(k) && ['string', 'number'].includes(typeof v) && !credentialLike(v)))
+    problems.push('knowledge.env may only set QDRANT_HOST/PORT/GRPC_PORT/COLLECTION, OLLAMA_URL/MODEL and KB_SQLITE_PATH (no credentials)');
+  if (!(intIn(kn.perRun, 1, 50) && intIn(kn.maxK, 1, 5) && intIn(kn.defaultK, 1, kn.maxK) && intIn(kn.maxBytes, 1024, 8192) && intIn(kn.excerptChars, 50, 500)
+    && intIn(kn.pastWorkBytes, 256, 1536) && intIn(kn.deadlineSeconds, 2, 15) && intIn(kn.queueMax, 0, 20) && intIn(kn.runBytes, 1024, 262144)
+    && intIn(kn.writeDeadlineSeconds, 10, 600) && intIn(kn.maxAttempts, 1, 50)))
+    problems.push('knowledge limits out of range (perRun 1-50, maxK ≤ 5, maxBytes ≤ 8192, excerptChars ≤ 500, pastWorkBytes ≤ 1536, deadlineSeconds ≤ 15)');
   const modelList = (v) => Array.isArray(v) && v.every((id) => typeof id === 'string' && /^[\w.:-]{1,80}$/.test(id));
   for (const id of ['claude', 'codex', 'perplexity']) if (!modelList(c.engines[id]?.models)) problems.push(`engines.${id}.models must be a list of model ids`);
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');

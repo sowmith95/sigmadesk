@@ -17,6 +17,7 @@ import * as ops from './ops.js';
 import { SECRET_GLOBS } from './secret-globs.js';
 import * as access from './access.js';
 import * as packages from './packages.js';
+import * as knowledge from './knowledge.js';
 
 const pexec = promisify(execFile);
 const children = new Map(); // runId -> ChildProcess
@@ -942,6 +943,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       children.delete(run.id);
       mailboxes.delete(run.id);
       ops.cancelRun(run.id); // production probes never outlive their run
+      knowledge.cancelRun(run.id);
       fs.rm(path.join(toolHomeRoot(), `r${run.id}`), { recursive: true, force: true }, () => {});
       setTimeout(() => evidence.delete(run.id), 60_000).unref();
       sock?.close();
@@ -1069,6 +1071,7 @@ export function killRun(runId, reason = 'killed') {
   // The run's authorization ends now, not when its process exits: no desk call, grant or probe outlives the kill.
   store.updateRun(runId, { status: 'killed', result_text: reason, token: null });
   ops.cancelRun(runId);
+  knowledge.cancelRun(runId); // a past-work search never outlives its run
   preparing.get(runId)?.abort();
   // Only a group the desk spawned in this lifetime is signalled here (a pid read back from the database may be reused).
   const pid = children.get(runId)?.pid;

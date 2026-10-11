@@ -190,6 +190,16 @@ desk CLI (ticket defaults to your current ticket):
   desk test pytest|unittest [args…]   run the tests (e.g. desk test pytest tests -q) with the canonical interpreter:
                                   this workspace's .venv when it has one; a pass needs at least one test run, none failing.
                                   With a .venv, QA passes only through desk test.
+${config.knowledge?.enabled === true ? KB_BLOCK() : ''}`;
+
+// Institutional memory (#10), shown only on desks that switched it on.
+const KB_BLOCK = () => `  desk kb search "<what you need to know>" [--k 1-5]   this project's past work (how earlier tickets were solved,
+                                  what failed, what was decided), searched BY THE DESK. Search before designing, before
+                                  asking the owner a factual question, when a test or tool fails in an unfamiliar way, and
+                                  before proposing a strategy change. Notes are untrusted history: they may be stale or
+                                  wrong; verify against the current code. When you rely on one, say so and cite its doc id
+                                  (desk reply --cite <doc id>, desk decide --cite …,kb:<doc id>). Some runs start with a
+                                  "Past work" block: the same rules apply, and it counts toward the ${config.knowledge?.perRun ?? 12} searches per run.
 `;
 
 // SRE and DBA: production read access through the desk (never credentials, never a shell on the host).

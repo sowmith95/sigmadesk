@@ -560,6 +560,74 @@ CREATE TABLE IF NOT EXISTS delegated_decisions (
 );
 CREATE INDEX IF NOT EXISTS delegated_decisions_status ON delegated_decisions(status);
 CREATE INDEX IF NOT EXISTS delegated_decisions_ticket ON delegated_decisions(ticket_key, id);
+-- Institutional memory (#10). Every past-work search the desk ran (or refused) for a run: the automatic one at launch and
+-- each desk kb search. counted = it used the run's allowance (refusals do not).
+CREATE TABLE IF NOT EXISTS knowledge_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  run_id INTEGER,
+  agent_id TEXT,
+  ticket_key TEXT,
+  source TEXT NOT NULL,           -- search | auto
+  query TEXT,                     -- redacted, bounded
+  k INTEGER,
+  namespaces TEXT,                -- JSON: the namespace filter passed to the store
+  outcome TEXT NOT NULL,          -- ok | empty | refused | error | timeout | cancelled
+  results INTEGER DEFAULT 0,
+  doc_ids TEXT,                   -- JSON, in the order shown
+  bytes INTEGER DEFAULT 0,
+  duration_ms INTEGER,
+  counted INTEGER NOT NULL DEFAULT 0,
+  detail TEXT
+);
+CREATE INDEX IF NOT EXISTS knowledge_audit_run ON knowledge_audit(run_id);
+CREATE INDEX IF NOT EXISTS knowledge_audit_ts ON knowledge_audit(ts);
+-- The notes a run was actually shown: the only ids its replies and decisions may cite.
+CREATE TABLE IF NOT EXISTS knowledge_exposures (
+  run_id INTEGER NOT NULL,
+  doc_id TEXT NOT NULL,
+  title TEXT,
+  url TEXT,
+  source TEXT,                    -- search | auto
+  ts TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (run_id, doc_id)
+);
+-- Citations of exposed notes in a tagged reply or a delegated decision (metrics: cited answers resolved without escalation).
+CREATE TABLE IF NOT EXISTS knowledge_citations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  doc_id TEXT NOT NULL,
+  kind TEXT NOT NULL,             -- reply | decide
+  ref INTEGER,                    -- the mention delivery or delegated decision
+  ts TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS knowledge_citations_ts ON knowledge_citations(ts);
+-- Notes the desk writes back: enqueued in the transaction of the qualifying transition, body frozen (content-hash URL),
+-- written and verified by exact read-back by the outbox worker. status: pending | verified | failed | refused.
+CREATE TABLE IF NOT EXISTS knowledge_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_key TEXT NOT NULL,
+  kind TEXT NOT NULL,             -- facts
+  trigger TEXT,                   -- what made it: merged | deploy watch | reconcile
+  url TEXT UNIQUE NOT NULL,       -- kb://sigmadesk/<project>/ticket/<KEY>/facts/<sha256 of body>
+  namespace TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  format TEXT NOT NULL,           -- the body's versioned format
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  last_error TEXT,
+  target TEXT,                    -- JSON: the store's target fingerprint at the last answer
+  doc_id TEXT,
+  chunk_count INTEGER,
+  verified_at TEXT,
+  created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS knowledge_outbox_status ON knowledge_outbox(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS knowledge_outbox_ticket ON knowledge_outbox(ticket_key);
 `;
 
 export function openDb(file = config.dbPath) {
@@ -650,7 +718,9 @@ function migrate() {
       // tool calls and commands counted for a step-bounded run (tagged runs), persisted as they happen
       steps: 'INTEGER DEFAULT 0',
       pid_start: 'TEXT', // the engine process's start time: a restart only signals a pid that is provably the same process
-      profile_hash: 'TEXT' }, // Codex: hash of the permission profile the session was created under (a changed profile is never resumed)
+      profile_hash: 'TEXT', // Codex: hash of the permission profile the session was created under (a changed profile is never resumed)
+      // #10: the "Past work" snapshot this run launched with (query, policy, ordered ids, scores, excerpt hashes, status)
+      knowledge_hash: 'TEXT', knowledge_meta: 'TEXT' },
   };
   for (const [table, cols] of Object.entries(want)) {
     const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -768,6 +838,9 @@ export function settingDefaults() {
     // Production read access for seats holding a grant (also needs ops.enabled in the config). Off by default;
     // switching it off is the emergency stop: probes in flight are cancelled.
     ops_enabled: 'false',
+    // Past-work search and note writing (#10; also needs knowledge.enabled in the config). Switching it off is the kill
+    // switch: searches in flight are cancelled and the outbox waits.
+    knowledge_enabled: 'true',
     // Owner's access policy (JSON, '' = config access.policy). Edited through the Access sheet (validated as a whole).
     access_policy: '',
     // Delegation (#9): the owner's matrix (JSON {kinds, peerAccess}, '' = config delegation.*), the emergency "Escalate
@@ -795,7 +868,7 @@ export function setSetting(key, value) {
   }
   if (key === 'assign_mode' && !['balanced', 'fixed'].includes(String(value))) throw Object.assign(new Error('assign_mode must be balanced or fixed'), { status: 400 });
   if (key === 'groom_engine' && !['codex', 'seat'].includes(String(value))) throw Object.assign(new Error('groom_engine must be codex or seat'), { status: 400 });
-  if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'draft_prs', 'team_confirmed', 'auto_fallback', 'ops_enabled'].includes(key) && !['true', 'false'].includes(String(value)))
+  if (['paused', 'pm_enabled', 'github_sync', 'open_draft_prs', 'draft_prs', 'team_confirmed', 'auto_fallback', 'ops_enabled', 'knowledge_enabled'].includes(key) && !['true', 'false'].includes(String(value)))
     throw Object.assign(new Error(`${key} must be true or false`), { status: 400 });
   writeSetting(key, value);
 }
@@ -1551,3 +1624,48 @@ export function kvByPrefix(prefix) {
   db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
   return q('SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key').all(prefix, `${prefix}\uffff`);
 }
+
+// ---------- institutional memory (#10) ----------
+export function insertKnowledgeAudit(a) {
+  const info = q('INSERT INTO knowledge_audit(run_id,agent_id,ticket_key,source,query,k,namespaces,outcome,results,doc_ids,bytes,duration_ms,counted,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(
+    a.run_id ?? null, a.agent_id ?? null, a.ticket_key ?? null, String(a.source || 'search'), a.query == null ? null : redact(String(a.query)).slice(0, 300), a.k ?? null,
+    JSON.stringify(a.namespaces || []), String(a.outcome), a.results ?? 0, JSON.stringify(a.doc_ids || []), a.bytes ?? 0, a.duration_ms ?? null, a.counted ? 1 : 0,
+    a.detail == null ? null : redact(String(a.detail)).slice(0, 500));
+  return Number(info.lastInsertRowid);
+}
+/** Searches that used a run's allowance, and the bytes it was handed. */
+export const knowledgeUsage = (runId) => q('SELECT COUNT(*) n, COALESCE(SUM(bytes),0) bytes FROM knowledge_audit WHERE run_id=? AND counted=1').get(runId);
+export const knowledgeAuditOfRun = (runId) => q('SELECT * FROM knowledge_audit WHERE run_id=? ORDER BY id').all(runId);
+export const knowledgeAuditSince = (iso) => q('SELECT * FROM knowledge_audit WHERE ts >= ? ORDER BY id').all(iso);
+export function recordKnowledgeExposures(runId, rows, source) {
+  const ins = q('INSERT OR IGNORE INTO knowledge_exposures(run_id,doc_id,title,url,source) VALUES (?,?,?,?,?)');
+  for (const r of rows) ins.run(runId, String(r.doc_id), r.title == null ? null : String(r.title).slice(0, 300), r.url == null ? null : String(r.url).slice(0, 500), source);
+}
+export const knowledgeExposures = (runId) => q('SELECT * FROM knowledge_exposures WHERE run_id=? ORDER BY ts, doc_id').all(runId);
+export function recordKnowledgeCitations(runId, docIds, kind, ref = null) {
+  const ins = q('INSERT INTO knowledge_citations(run_id,doc_id,kind,ref) VALUES (?,?,?,?)');
+  for (const d of docIds) ins.run(runId, String(d), kind, ref);
+}
+export const knowledgeCitationsSince = (iso) => q('SELECT * FROM knowledge_citations WHERE ts >= ? ORDER BY id').all(iso);
+/** Enqueue a frozen note; the URL (content-hash versioned) is its identity, so a repeat is a no-op. → the row. */
+export function enqueueKnowledgeNote(n) {
+  q(`INSERT OR IGNORE INTO knowledge_outbox(ticket_key,kind,trigger,url,namespace,title,body,body_sha256,format,next_attempt_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(n.ticket_key, n.kind, n.trigger ?? null, n.url, n.namespace, n.title, n.body, n.body_sha256, n.format, now());
+  return q('SELECT * FROM knowledge_outbox WHERE url=?').get(n.url);
+}
+export const getKnowledgeNote = (id) => q('SELECT * FROM knowledge_outbox WHERE id=?').get(id) || null;
+export const knowledgeNotesFor = (key) => q('SELECT * FROM knowledge_outbox WHERE ticket_key=? ORDER BY id').all(key);
+export const dueKnowledgeNotes = (at = now(), limit = 10) => q("SELECT * FROM knowledge_outbox WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY id LIMIT ?").all(at, limit);
+export const recentKnowledgeNotes = (limit = 50) => q('SELECT id,ticket_key,kind,trigger,url,namespace,title,body_sha256,format,status,attempts,next_attempt_at,last_error,target,doc_id,chunk_count,verified_at,created_at,updated_at FROM knowledge_outbox ORDER BY id DESC LIMIT ?').all(limit);
+export const knowledgeOutboxCounts = () => Object.fromEntries(q('SELECT status, COUNT(*) n FROM knowledge_outbox GROUP BY status').all().map((r) => [r.status, r.n]));
+export const knowledgeNotesSince = (iso) => q('SELECT id,ticket_key,status,attempts,last_error,verified_at,created_at,updated_at FROM knowledge_outbox WHERE created_at >= ? OR verified_at >= ? OR updated_at >= ? ORDER BY id').all(iso, iso, iso);
+const NOTE_FIELDS = new Set(['status', 'attempts', 'next_attempt_at', 'last_error', 'target', 'doc_id', 'chunk_count', 'verified_at']);
+export function updateKnowledgeNote(id, patch) {
+  const cols = Object.keys(patch).filter((k) => NOTE_FIELDS.has(k));
+  if (cols.length) q(`UPDATE knowledge_outbox SET ${cols.map((c) => `${c}=?`).join(',')}, updated_at=? WHERE id=?`).run(...cols.map((c) => patch[c] ?? null), now(), id);
+  return getKnowledgeNote(id);
+}
+export const runsStartedSince = (iso) => q('SELECT id, kind, agent_id FROM runs WHERE started_at >= ? ORDER BY id').all(iso);
+/** The PR-merged event of a ticket (the qualifying "closed with a merged PR" fact), newest first. */
+export const mergedEventOf = (key) => q("SELECT id, ts, text FROM events WHERE ticket_key=? AND kind='github' AND text LIKE 'PR merged on GitHub%' ORDER BY id DESC LIMIT 1").get(key) || null;
+export const runsOfTicket = (key) => q('SELECT id, kind, agent_id, model, status, started_at, ended_at FROM runs WHERE ticket_key=? ORDER BY id').all(key);

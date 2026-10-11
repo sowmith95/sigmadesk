@@ -415,11 +415,13 @@ export function parseFileCite(id) {
  * from its brief (E). A repository file (file:) may be cited as well, never instead of an E. Every id must be one its
  * run was given, or a file that exists at the pinned base (badFiles: the cited files that do not).
  */
-export function citationProblem(ids = [], { rules = new Set(), evidence = new Set(), badFiles = new Set() } = {}) {
+export function citationProblem(ids = [], { rules = new Set(), evidence = new Set(), badFiles = new Set(), kb = new Set() } = {}) {
   if (!ids.length) return 'cites nothing from its brief';
   const isFile = (id) => !!parseFileCite(id) && !badFiles.has(id);
-  const unknown = ids.filter((id) => !rules.has(id) && !evidence.has(id) && !isFile(id));
-  if (unknown.length) return `cites ${unknown.join(', ')}, which ${unknown.length === 1 ? 'is' : 'are'} not in its brief or the repository`;
+  // kb:<doc id> (#10): a past-work note this run was shown; like a file, it may be added, never instead of an R and an E.
+  const isKb = (id) => String(id).startsWith('kb:') && kb.has(String(id).slice(3));
+  const unknown = ids.filter((id) => !rules.has(id) && !evidence.has(id) && !isFile(id) && !isKb(id));
+  if (unknown.length) return `cites ${unknown.join(', ')}, which ${unknown.length === 1 ? 'is' : 'are'} not in its brief or the repository${kb.size ? ' (nor a past-work note it was shown)' : ''}`;
   if (!ids.some((id) => rules.has(id))) return 'cites none of the standing rules you marked for a delegate to apply alone';
   if (!ids.some((id) => evidence.has(id))) return 'cites no numbered evidence from its brief (a file citation does not replace one)';
   return null;
