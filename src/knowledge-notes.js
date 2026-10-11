@@ -278,7 +278,7 @@ export async function attempt(row) {
     }
     return retry(r.code === 3 ? `the stored copy did not match (${line(j?.reason || 'read-back mismatch', 120)})` : `writing: ${kb.cliErrorSummary(r)}`, t2);
   } finally {
-    if (held) kb.release();
+    if (held) kb.releaseAfter(op); // the lane is free only once the write's process group is gone
     kb.closeOp(op);
   }
 }

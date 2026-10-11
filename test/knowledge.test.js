@@ -1322,3 +1322,39 @@ test('round 6 — a search settles at its deadline and its whole process group i
     assert.equal(alive(), 0, 'no descendant survived');
   } finally { config.knowledge.executable = fake; config.knowledge.deadlineSeconds = 15; }
 });
+
+test('round 7 — the lane stays held until a stopped process group is gone; the first caller still settles at its deadline', async () => {
+  const log = path.join(tmp, 'resist.log');
+  fs.rmSync(log, { force: true });
+  const exe = path.join(tmp, 'kh-resist');
+  fs.writeFileSync(exe, `#!/usr/bin/env node
+const fs = require('fs');
+const q = process.argv[process.argv.length - 1];
+// At its own start, is any earlier process of this fixture still alive? (The lane must never overlap them.)
+const earlier = fs.existsSync(${JSON.stringify(log)}) ? fs.readFileSync(${JSON.stringify(log)}, 'utf8').trim().split('\\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+const overlapping = earlier.filter((e) => { try { process.kill(e.pid, 0); return true; } catch { return false; } }).map((e) => e.pid);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ q, pid: process.pid, start: Date.now(), overlapping }) + '\\n');
+if (q.includes('resist')) { process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); }
+else process.stdout.write(JSON.stringify({ contract: 1, results: [] }));
+`);
+  fs.chmodSync(exe, 0o755);
+  config.knowledge.executable = exe;
+  const entries = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  try {
+    config.knowledge.deadlineSeconds = 1;
+    const t0 = Date.now();
+    const first = search(mkRun(), 'resist the stop').catch((e) => e);
+    config.knowledge.deadlineSeconds = 6; // the successor's own deadline leaves room to wait for the lane
+    const second = search(mkRun(), 'the queued successor');
+    const e1 = await first;
+    const settled = Date.now() - t0;
+    assert.match(String(e1.message), /did not answer within/);
+    assert.ok(settled < 1400, `the first caller settled after ${settled} ms`);
+    await second;
+    const [a, b] = [entries().find((e) => e.q.includes('resist')), entries().find((e) => e.q.includes('successor'))];
+    assert.ok(a && b, 'both ran');
+    assert.deepEqual(b.overlapping, [], `the successor started ${b.start - a.start} ms after the predecessor while it was still alive`);
+    assert.equal(alive(a.pid), false);
+  } finally { config.knowledge.executable = fake; config.knowledge.deadlineSeconds = 15; }
+});

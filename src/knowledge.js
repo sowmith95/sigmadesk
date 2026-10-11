@@ -192,20 +192,51 @@ const KILL_GRACE_MS = 500; // SIGTERM to the CLI's process group, then SIGKILL a
  * in its own process group: a timeout, a cancellation or a cap ends the call AT ONCE (streams destroyed, whatever
  * descendants still hold the pipes) and the whole group gets SIGTERM, then SIGKILL after a short grace.
  */
-export function runCli(op, args, { input = null, deadlineAt, stdoutCap = 512 << 10, stderrCap = 16 << 10 } = {}) {
+export async function runCli(op, args, opts = {}) {
+  // One process at a time on the lane: a previous call of the same operation must be gone before the next spawns.
+  if (op?.terminated) await op.terminated;
+  return runOnce(op, args, opts);
+}
+/** Release the lane only once the operation's last process group is confirmed gone (callers settle earlier). */
+export function releaseAfter(op) { (op?.terminated || Promise.resolve()).then(() => release(), () => release()); }
+const TERMINATE_WAIT_MS = 2000; // after SIGKILL: the longest the lane waits for a process group that will not go away
+function runOnce(op, args, { input = null, deadlineAt, stdoutCap = 512 << 10, stderrCap = 16 << 10 } = {}) {
   return new Promise((resolve) => {
     if (op?.cancelled) return resolve({ code: null, reason: 'cancelled', stdout: '', stderr: '', ms: 0 });
     const started = Date.now();
     let child, done = false, reason = null;
     const out = [], err = [];
     let outN = 0, errN = 0, timer = null;
+    // Termination is separate from settlement: the caller gets its answer at once, the lane waits for this.
+    let leaderExited = false, termResolve = null, watching = false, lingerKilled = false;
+    const terminated = new Promise((r) => { termResolve = r; });
+    if (op) op.terminated = terminated;
+    const groupAlive = () => { if (!child?.pid) return false; try { process.kill(-child.pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+    const watch = () => {
+      if (watching) return;
+      watching = true;
+      const t0 = Date.now();
+      const tick = () => {
+        if (leaderExited && !groupAlive()) return termResolve(true);
+        // A finished CLI that left descendants behind: they are stopped the same way.
+        if (leaderExited && !reason && !lingerKilled) { lingerKilled = true; killGroup('SIGTERM'); setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS).unref(); }
+        if (Date.now() - t0 > KILL_GRACE_MS + TERMINATE_WAIT_MS) {
+          try { store.logEvent({ kind: 'error', agent_id: 'system', text: `a knowledge-hub process group (pid ${child?.pid}) outlived its SIGKILL; the knowledge lane was released after ${((KILL_GRACE_MS + TERMINATE_WAIT_MS) / 1000).toFixed(1)}s` }); } catch { /* no store (doctor) */ }
+          return termResolve(false);
+        }
+        setTimeout(tick, 25); // not unref'd: the lane must be released even if nothing else keeps the process busy (bounded)
+      };
+      tick();
+    };
     const finish = (code) => {
       if (done) return;
       done = true; clearTimeout(timer); if (op) op.kill = null;
+      watch();
       resolve({ code, reason, stdout: decodeCapped(Buffer.concat(out), stdoutCap), stderr: decodeCapped(Buffer.concat(err), stderrCap), ms: Date.now() - started });
     };
-    try { child = spawn(config.knowledge.executable, args, { env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], shell: false, detached: true }); } catch (e) { reason = 'spawn'; err.push(Buffer.from(String(e.message))); return finish(null); }
+    try { child = spawn(config.knowledge.executable, args, { env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], shell: false, detached: true }); } catch (e) { reason = 'spawn'; leaderExited = true; err.push(Buffer.from(String(e.message))); return finish(null); }
     if (op) op.started = true;
+    child.on('exit', () => { leaderExited = true; });
     const killGroup = (sig) => { if (!child.pid) return; try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch { /* gone */ } } };
     const stop = (why) => {
       if (done || reason) return;
@@ -222,7 +253,7 @@ export function runCli(op, args, { input = null, deadlineAt, stdoutCap = 512 << 
     const take = (list, d, n, cap) => { const room = cap - n; if (room <= 0) return n; const part = d.length > room ? d.subarray(0, room) : d; list.push(part); n += part.length; if (n >= cap) stop('capped'); return n; };
     child.stdout.on('data', (d) => { outN = take(out, d, outN, stdoutCap); });
     child.stderr.on('data', (d) => { errN = take(err, d, errN, stderrCap); });
-    child.on('error', (e) => { errN = take(err, Buffer.from(`\n${e.code || e.message}`), errN, stderrCap); if (!child.pid) { reason = reason || 'spawn'; finish(null); } });
+    child.on('error', (e) => { errN = take(err, Buffer.from(`\n${e.code || e.message}`), errN, stderrCap); if (!child.pid) { reason = reason || 'spawn'; leaderExited = true; finish(null); } });
     child.stdin.on('error', () => {});
     child.stdin.end(input ?? '');
     child.on('close', (code) => finish(code));
@@ -457,7 +488,7 @@ export async function runSearch(run, { query: raw, k: rawK, source = 'search', m
     event(`${lead} → ${shown.length} note${shown.length === 1 ? '' : 's'}`);
     return { outcome: 'ok', text, shown, ms, bytes, target, dropped, duplicates };
   } finally {
-    if (held) release();
+    if (held) releaseAfter(op); // the answer is already settled; the lane waits until the process group is gone
     closeOp(op);
     bump(reserved, run.id, -1); bump(reservedBytes, run.id, -cap);
   }
