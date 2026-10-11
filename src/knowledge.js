@@ -200,6 +200,8 @@ export async function runCli(op, args, opts = {}) {
     const why = await waitForPrevious(op, opts.deadlineAt);
     if (why) return { code: null, reason: why, stdout: '', stderr: '', ms: Date.now() - started };
   }
+  // The predecessor can resolve after the deadline passed but before its timer ran: an expired deadline never spawns.
+  if (Number.isFinite(opts.deadlineAt) && Date.now() >= opts.deadlineAt) return { code: null, reason: 'timeout', stdout: '', stderr: '', ms: 0 };
   return runOnce(op, args, opts);
 }
 /** null once the previous call's process group is gone; 'timeout' or 'cancelled' if the caller's deadline or cancellation comes first. */

@@ -1426,3 +1426,33 @@ setInterval(() => {}, 1000);
     kb.closeOp(op2);
   } finally { config.knowledge.executable = fake; }
 });
+
+test('round 9 — a deadline that expired while the previous call was ending never spawns, even if the predecessor resolves first', async () => {
+  const log = path.join(tmp, 'expired9.log');
+  fs.rmSync(log, { force: true });
+  const exe = path.join(tmp, 'kh-expired9');
+  fs.writeFileSync(exe, `#!/usr/bin/env node
+require('fs').appendFileSync(${JSON.stringify(log)}, process.argv[process.argv.length - 1] + '\\n');
+process.stdout.write('{}');
+`);
+  fs.chmodSync(exe, 0o755);
+  config.knowledge.executable = exe;
+  const spawned = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : []);
+  try {
+    // Delayed-resolution replay: the predecessor is already gone (its promise resolves in a microtask, before the
+    // zero-delay deadline timer runs), but the caller's deadline has passed.
+    const op = kb.newOp({ kind: 'write' });
+    op.terminated = Promise.resolve(true);
+    const r = await kb.runCli(op, ['ingest-text', 'expired-after-wait'], { deadlineAt: Date.now() - 1 });
+    assert.equal(r.reason, 'timeout');
+    assert.ok(!op.started, 'no process was spawned after the wait');
+    // No predecessor at all: an already-expired deadline does not spawn either.
+    const op2 = kb.newOp({ kind: 'search' });
+    const r2 = await kb.runCli(op2, ['search', 'expired-no-wait'], { deadlineAt: Date.now() - 1 });
+    assert.equal(r2.reason, 'timeout');
+    assert.ok(!op2.started, 'no process was spawned for an expired deadline');
+    await sleep(300);
+    assert.deepEqual(spawned(), [], 'nothing spawned for an expired deadline');
+    kb.closeOp(op); kb.closeOp(op2);
+  } finally { config.knowledge.executable = fake; }
+});
