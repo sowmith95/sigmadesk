@@ -31,10 +31,29 @@ const line = (s, n = 300) => (kb.credentialLike(s) ? WITHHELD_FIELD : kb.safeCut
 const short = (sha) => (sha === WITHHELD_FIELD ? sha : sha ? String(sha).slice(0, 12) : '-');
 // Every SOURCE field is checked before anything is formatted: a field with credential-like text becomes the withheld
 // marker, whichever record it came from (area, builder, pr_url, verdict labels, test arguments, incident samples …).
-const F = (v) => ((typeof v === 'string' || typeof v === 'number') && kb.credentialLike(String(v)) ? WITHHELD_FIELD : v);
+const F = (v) => {
+  if (typeof v === 'string' || typeof v === 'number') return kb.credentialLike(String(v)) ? WITHHELD_FIELD : v;
+  if (v && typeof v === 'object') { let j = ''; try { j = JSON.stringify(v) ?? ''; } catch { return WITHHELD_FIELD; } return kb.credentialLike(j) ? WITHHELD_FIELD : v; }
+  return v;
+};
+/**
+ * The final string of one interpolated value, or null when its shape is not allowed. Allowed: string, number, boolean,
+ * bigint, null/undefined (empty). Anything else — arrays, objects, Buffers, symbols, functions — is withheld, never
+ * stringified into a note.
+ */
+function interpolated(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'bigint') return String(v);
+  return null;
+}
 /** The one door into a facts body: every value interpolated into it (project identity, ticket and record fields,
  * values the builder derives) is checked, and a credential-like one becomes the withheld marker. */
-const V = (strings, ...vals) => strings.reduce((acc, part, i) => acc + part + (i < vals.length ? String(F(vals[i] ?? '')) : ''), '');
+export const V = (strings, ...vals) => strings.reduce((acc, part, i) => {
+  if (i >= vals.length) return acc + part;
+  const s = interpolated(vals[i]); // converted to its final string first, then checked
+  return acc + part + (s === null || kb.credentialLike(s) ? WITHHELD_FIELD : s);
+}, '');
 const safe = (o) => (o && typeof o === 'object' && !Array.isArray(o) ? Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Array.isArray(v) ? v.map(F) : F(v)])) : F(o));
 const SHA = /^[0-9a-f]{7,40}$/;
 
