@@ -10,6 +10,15 @@ import { KINDS as DELEGATION_KINDS, validMode as validDelegationMode } from './d
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+// Institutional memory (#10): the most the configuration may allow. knowledge.* can only narrow these.
+export const KNOWLEDGE_SEARCH_KINDS = Object.freeze(['decide', 'mention', 'research', 'triage', 'respond', 'implement', 'design', 'investigate', 'groom', 'consult']);
+export const KNOWLEDGE_AUTO_KINDS = Object.freeze(['implement', 'design', 'investigate', 'decide', 'groom', 'consult']);
+export const KNOWLEDGE_MAX_PER_RUN = 12;
+// The environment KnowledgeHub reads (knowledge_hub/config.py). The target (collection, embedding model and dimension,
+// chunker) is pinned here so the store the desk writes to cannot drift with KnowledgeHub's own defaults.
+export const KNOWLEDGE_ENV_KEYS = Object.freeze(['QDRANT_HOST', 'QDRANT_PORT', 'QDRANT_GRPC_PORT', 'KB_COLLECTION', 'KB_EMBEDDING_MODEL', 'KB_EMBEDDING_DIM',
+  'KB_CHUNK_SIZE', 'KB_CHUNK_OVERLAP', 'OLLAMA_URL', 'KB_SQLITE_PATH']);
+
 const DEFAULTS = {
   // Set by the setup wizard for a new project: what the owner already approved there (e.g. the team).
   bootstrap: {},
@@ -277,6 +286,34 @@ const DEFAULTS = {
     // Busy window (limits.busyWindow when enabled, else research.marketHours): tighter everything.
     busy: { statementMs: 3000, lockMs: 500, idleMs: 5000, perRun: 4, perHour: 20, maxLogHours: 1, maxFreshnessMinutes: 120, maxTail: 200 },
   },
+  // Institutional memory (#10): seats search past work through the DESK (`desk kb search`), which runs the KnowledgeHub
+  // CLI itself with an explicit, non-secret environment (never the MCP server, never ~/.claude.json). Every search is
+  // namespace-filtered; names mentioning personal, journal, career, receipts or code are refused whatever is configured here. The desk also
+  // writes attributable facts (records it owns, no seat prose) back when a ticket closes with a merged PR. Off unless
+  // enabled here; the owner's Settings toggle (knowledge_enabled) is the kill switch.
+  knowledge: {
+    enabled: false,
+    executable: '', // the installed `knowledge-hub` script, e.g. ~/projects/KnowledgeHub/.venv/bin/knowledge-hub
+    // Passed to the CLI explicitly; nothing else from the desk's environment reaches it (PATH/HOME/LANG aside).
+    env: { QDRANT_HOST: 'localhost', QDRANT_PORT: '6333', QDRANT_GRPC_PORT: '6334', KB_COLLECTION: 'knowledge_hub', KB_EMBEDDING_MODEL: 'nomic-embed-text',
+      KB_EMBEDDING_DIM: '768', KB_CHUNK_SIZE: '256', KB_CHUNK_OVERLAP: '32', OLLAMA_URL: 'http://localhost:11434', KB_SQLITE_PATH: '' },
+    namespaces: [], // [] = the project's own namespace (its name, lowercased)
+    writeNamespace: '', // '' = the first of namespaces
+    fingerprint: '', // the store target's fingerprint (doctor prints it); also pinned automatically by the first verified note
+    autoKinds: [...KNOWLEDGE_AUTO_KINDS], // runs that get a "Past work" block at launch (a subset of KNOWLEDGE_AUTO_KINDS)
+    searchKinds: [...KNOWLEDGE_SEARCH_KINDS], // runs that may use desk kb search (a subset of KNOWLEDGE_SEARCH_KINDS)
+    perRun: 12, // searches per run, the automatic one included (at most KNOWLEDGE_MAX_PER_RUN)
+    runBytes: 49152, // search output one run may receive in total
+    defaultK: 3,
+    maxK: 5,
+    maxBytes: 8192, // one search result block
+    excerptChars: 500,
+    pastWorkBytes: 1536, // the automatic block at launch
+    deadlineSeconds: 15, // one search, queue wait included
+    queueMax: 6, // searches waiting behind the one in flight (one knowledge process desk-wide)
+    writeDeadlineSeconds: 120, // one note write (embedding a note is slower than a search)
+    maxAttempts: 10, // note writes before the outbox gives up and shows the failure
+  },
   // Who gets production read access, for how long: time-boxed, revocable grants. The owner grants anything; the EM and
   // the SRE may approve a seat's request within this policy (never for themselves); anything beyond it goes to the
   // owner's Inbox. Saved Access-sheet edits (settings.access_policy) win over this.
@@ -415,6 +452,9 @@ export function loadConfig(file = deskPaths({ home: homeOf(process.env), legacyR
   c.ops.pgpassFile = expandHome(c.ops.pgpassFile);
   c.ops.pgServiceFile = expandHome(c.ops.pgServiceFile);
   c.packages.python = expandHome(c.packages.python || '');
+  c.knowledge = { ...c.knowledge, env: { ...(c.knowledge.env || {}) } }; // never mutate the shared defaults
+  c.knowledge.executable = expandHome(c.knowledge.executable || '');
+  if (c.knowledge.env.KB_SQLITE_PATH) c.knowledge.env.KB_SQLITE_PATH = expandHome(c.knowledge.env.KB_SQLITE_PATH);
   const pathClaude = which('claude');
   c.bins.claude = c.bins.claude || (pathClaude && !wrapperProblem(pathClaude) ? pathClaude : path.join(os.homedir(), '.local/bin/claude'));
   c.bins.gh = c.bins.gh || which('gh') || 'gh';
@@ -541,6 +581,22 @@ export function validateConfig(c = config) {
   if (dlg.peerAccess !== undefined && typeof dlg.peerAccess !== 'boolean') problems.push('delegation.peerAccess must be true or false');
   if (dlg.rulesSection !== undefined && !(typeof dlg.rulesSection === 'string' && dlg.rulesSection.trim() && dlg.rulesSection.length <= 120 && !/[\n#]/.test(dlg.rulesSection)))
     problems.push('delegation.rulesSection must be a playbook heading (text without #, at most 120 characters)');
+  // Knowledge (#10): numbers in range, an absolute executable, only plain environment values reach the CLI.
+  const kn = c.knowledge || {};
+  const intIn = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
+  if (typeof kn.enabled !== 'boolean') problems.push('knowledge.enabled must be true or false');
+  if (kn.enabled && !(typeof kn.executable === 'string' && path.isAbsolute(kn.executable))) problems.push('knowledge.executable must be the absolute path of the installed knowledge-hub script');
+  if (kn.enabled && /(^|\/)python[\d.]*$/.test(String(kn.executable))) problems.push('knowledge.executable must be the knowledge-hub script, not python (python -m knowledge_hub starts the MCP server)');
+  if (!Array.isArray(kn.namespaces) || !kn.namespaces.every((n) => typeof n === 'string')) problems.push('knowledge.namespaces must be a list of namespace names');
+  if (!kn.env || typeof kn.env !== 'object' || !Object.entries(kn.env).every(([k, v]) => KNOWLEDGE_ENV_KEYS.includes(k) && ['string', 'number'].includes(typeof v) && !credentialLike(v)))
+    problems.push(`knowledge.env may only set ${KNOWLEDGE_ENV_KEYS.join(', ')} (no credentials)`);
+  const subset = (v, max) => Array.isArray(v) && v.every((x) => max.includes(x));
+  if (!subset(kn.searchKinds, KNOWLEDGE_SEARCH_KINDS)) problems.push(`knowledge.searchKinds may only narrow ${KNOWLEDGE_SEARCH_KINDS.join(', ')}`);
+  if (!subset(kn.autoKinds, KNOWLEDGE_AUTO_KINDS)) problems.push(`knowledge.autoKinds may only narrow ${KNOWLEDGE_AUTO_KINDS.join(', ')}`);
+  if (!(intIn(kn.perRun, 1, KNOWLEDGE_MAX_PER_RUN) && intIn(kn.maxK, 1, 5) && intIn(kn.defaultK, 1, kn.maxK) && intIn(kn.maxBytes, 1024, 8192) && intIn(kn.excerptChars, 50, 500)
+    && intIn(kn.pastWorkBytes, 256, 1536) && intIn(kn.deadlineSeconds, 2, 15) && intIn(kn.queueMax, 0, 20) && intIn(kn.runBytes, 1024, 262144)
+    && intIn(kn.writeDeadlineSeconds, 10, 600) && intIn(kn.maxAttempts, 1, 50)))
+    problems.push('knowledge limits out of range (perRun 1-12, maxK ≤ 5, maxBytes ≤ 8192, excerptChars ≤ 500, pastWorkBytes ≤ 1536, deadlineSeconds ≤ 15)');
   const modelList = (v) => Array.isArray(v) && v.every((id) => typeof id === 'string' && /^[\w.:-]{1,80}$/.test(id));
   for (const id of ['claude', 'codex', 'perplexity']) if (!modelList(c.engines[id]?.models)) problems.push(`engines.${id}.models must be a list of model ids`);
   if (!(c.advisors.reserveUsd > 0 && c.advisors.timeoutSeconds >= 5 && c.advisors.timeoutSeconds <= 300 && c.advisors.maxOutputTokens >= 256 && c.advisors.maxOutputTokens <= 8000)) problems.push('invalid advisor reservation, timeout or output-token limit');

@@ -59,6 +59,14 @@
     "peerAccess": false,
     "rulesSection": "Standing rules the EM may apply alone"
   },
+  "knowledge": {
+    "enabled": false,
+    "executable": "~/projects/KnowledgeHub/.venv/bin/knowledge-hub",
+    "env": { "QDRANT_HOST": "localhost", "QDRANT_PORT": "6333", "KB_COLLECTION": "knowledge_hub", "KB_EMBEDDING_MODEL": "nomic-embed-text", "KB_EMBEDDING_DIM": "768",
+      "KB_CHUNK_SIZE": "256", "KB_CHUNK_OVERLAP": "32", "OLLAMA_URL": "http://localhost:11434", "KB_SQLITE_PATH": "~/knowledge-hub-data/metadata.db" },
+    "namespaces": ["my-project"],
+    "perRun": 12
+  },
   "github": {
     "sync": true,
     "openDraftPrs": true,

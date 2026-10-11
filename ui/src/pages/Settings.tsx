@@ -59,6 +59,40 @@ function backlogHint(b?: ResearchBacklog | null) {
   return b ? `${base} Open now: ${b.count}.` : base;
 }
 
+type KnowledgeFailure = { id: number | null; ticket_key: string; status: string; attempts: number; last_error: string | null };
+/** Past-work search and the notes the desk writes back (#10): scope, budget, what was written, and the week's numbers. */
+function KnowledgeSettings() {
+  const k = S.meta.knowledge;
+  if (!k) return null;
+  const m = k.metrics || {};
+  const o = k.outbox || {};
+  const pct = (x: number) => `${Math.round((x || 0) * 100)}%`;
+  const retry = async (id: number) => { try { await api('POST', `/api/knowledge/notes/${id}/retry`); toast('Trying again'); } catch (e) { toast((e as Error).message, true); } };
+  return (
+    <Group>
+      <Bool k="knowledge_enabled" label="Past-work search" hint={k.configured ? 'Seats can search how earlier work was solved, and the desk writes facts back when a ticket merges. Off stops every search at once.' : 'Not set up on this desk: set knowledge.enabled and knowledge.executable in the config first.'} />
+      <div className="grid gap-1 py-3 text-[13px] text-muted-foreground">
+        <p><b className="font-medium text-foreground">Searches</b> {k.namespaces?.length ? k.namespaces.join(', ') : 'nothing (no allowed namespace)'}. Never searched, whatever the config says: {k.deny}.</p>
+        {(k.refused_namespaces || []).length > 0 && <p>Left out of your config: {(k.refused_namespaces as { namespace: string; why: string }[]).map((r) => `${r.namespace} (${r.why})`).join(', ')}.</p>}
+        <p>Up to {k.per_run} searches per run, the automatic one included. Runs that start with past work: {(k.auto_kinds || []).join(', ').replaceAll('_', ' ')}. Notes are shown as untrusted history and reach the seat's model provider.</p>
+        <p>Facts written to {k.write_namespace || 'nowhere (no allowed namespace)'}: {o.verified || 0} written, {o.pending || 0} waiting, {(o.failed || 0) + (o.refused || 0)} failed. Only records the desk owns, never seat-written text.</p>
+      </div>
+      <div className="grid gap-1 py-3 text-[13px] text-muted-foreground">
+        <b className="font-medium text-foreground">This week</b>
+        <p>{m.searches_per_run ?? 0} searches per run · {pct(m.share_searched)} of runs searched · {m.cited_resolved ?? 0} cited answers settled without coming to you · {m.notes_written ?? 0} notes written · {m.outbox_failures ?? 0} write problems</p>
+      </div>
+      {(k.failures || []).length > 0 && <div className="grid gap-2 py-3">
+        <b className="font-medium">Notes that did not write</b>
+        {(k.failures as KnowledgeFailure[]).map((f) => (
+          <div key={f.id ?? `q-${f.ticket_key}`} className="flex items-center justify-between gap-3 text-[13px]">
+            <span className="min-w-0 text-muted-foreground"><span className="font-mono text-foreground">{f.ticket_key}</span> · {f.status === 'pending' ? `trying again (${f.attempts} tries so far)` : f.status === 'not queued' ? 'not queued (retried after a restart)' : f.status} · {f.last_error || 'no reason recorded'}</span>
+            {f.id != null && f.status !== 'pending' && <Button variant="secondary" size="sm" onClick={() => retry(f.id as number)}>Try again</Button>}
+          </div>))}
+      </div>}
+    </Group>
+  );
+}
+
 export default function SettingsPage() {
   const progs = S.meta.research?.programs || [];
   return (
@@ -99,6 +133,7 @@ export default function SettingsPage() {
           {S.meta.ops?.busy && <p>Market hours now: tighter timeouts and budgets.</p>}
         </div>
       </Group></Section>
+      <Section title="Knowledge"><KnowledgeSettings /></Section>
       <Section title="Models per seat"><div className="divide-y rounded-lg border bg-card">
         {S.agents.map((a: { id: string; name: string; role: string; engine?: string; model?: string; enabled?: boolean }) => { const r = S.meta.routing?.[a.id] || {}; return (
           <button key={a.id} type="button" onClick={() => openSheet({ type: 'models', id: a.id })} className="flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-secondary">

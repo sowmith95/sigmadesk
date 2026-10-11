@@ -17,6 +17,7 @@ import * as ops from './ops.js';
 import { SECRET_GLOBS } from './secret-globs.js';
 import * as access from './access.js';
 import * as packages from './packages.js';
+import * as knowledge from './knowledge.js';
 
 const pexec = promisify(execFile);
 const children = new Map(); // runId -> ChildProcess
@@ -770,6 +771,7 @@ function setupPhase({ run, agentId, ticketKey, track }) {
       quietly(() => context.release(run.id));
       quietly(() => mailboxes.delete(run.id));
       quietly(() => ops.cancelRun(run.id));
+      quietly(() => knowledge.cancelRun(run.id));
       quietly(() => evidence.delete(run.id));
       quietly(() => fs.rm(path.join(toolHomeRoot(), `r${run.id}`), { recursive: true, force: true }, () => {}));
       quietly(() => {
@@ -814,6 +816,17 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   // below; any failure or refusal ends the run through setup.abort, and a successful spawn hands it over exactly once.
   const setup = setupPhase({ run, agentId, ticketKey, track });
   let ctx, engine, pplx, px, timeoutMin, deadlineAt;
+  let past = null; // the past-work snapshot (#10): finalized as delivered only when the prompt write completes
+  // Knowledge bookkeeping never throws into the run's paths (an async callback, the close handler, an abort cleanup): a
+  // failure is logged as an event and the run carries on.
+  const contain = (what, fn) => {
+    try { fn(); } catch (err) {
+      try { store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `${what} failed: ${store.redact(String(err?.message || err)).slice(0, 200)}` }); } catch { /* nothing more to do */ }
+    }
+  };
+  // The ONE way the snapshot is settled: the first caller wins (abort cleanup, completed write, stdin error, close).
+  let pastSettled = false;
+  const settlePast = (outcome) => { if (pastSettled || !past) return; pastSettled = true; contain('recording the past-work delivery', () => past.finalize(outcome)); };
   return (async () => {
     try {
       packages.recordLaunch(run.id, pkg.ids);
@@ -844,10 +857,15 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       boundSteps(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
       // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
       if (store.getRun(run.id)?.status !== 'running') return setup.abort(store.getRun(run.id)?.result_text || 'refused before start', 'killed');
-      if (!pplx) return await spawnChild();
+      // Past work (#10): eligible launches on EVERY engine search the knowledge store once before the seat starts. The
+      // snapshot is frozen on the run (and, for Perplexity, in the pack and the retry identity); an outage is one line in
+      // the task, never a failed launch.
+      const pastWork = knowledge.wantsPastWork({ kind, ticketKey, incidentId, resume });
+      if (!pplx && !pastWork) return await spawnChild();
 
-      // Perplexity thinking seats: the desk builds the context pack (not the relay) before the relay starts. Cancellation
-      // and the run timeout exist before any preparation work; a pack that cannot be built refuses the run (fail closed).
+      // Preparation before the seat starts: the past-work search, and for Perplexity thinking seats the context pack the
+      // desk builds (not the relay). Cancellation and the run timeout exist before any preparation work; a Perplexity pack
+      // that cannot be built refuses the run (fail closed).
       const abort = new AbortController();
       preparing.set(run.id, abort);
       const prepTimer = setTimeout(() => {
@@ -857,7 +875,11 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       setup.own(() => { preparing.delete(run.id); clearTimeout(prepTimer); });
       let failed = null;
       try {
-        prompt = `${prompt}${await preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal: abort.signal })}`;
+        past = pastWork ? await knowledge.preparePastWork(run, { ticketKey, incidentId }) : null;
+        // Every abort path, from here until the hand-off, records the block as not delivered and revokes its exposures.
+        if (past) setup.own(() => settlePast('not delivered'));
+        if (pplx) prompt = `${prompt}${await preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal: abort.signal, past })}`;
+        else if (past) prompt = `${prompt}${past.text}`;
       } catch (err) { failed = err; } finally { preparing.delete(run.id); clearTimeout(prepTimer); }
       const now = store.getRun(run.id);
       if (now.status === 'killed') return setup.abort(now.result_text || 'stopped while preparing', 'killed');
@@ -897,8 +919,10 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   // The process's start time identifies it after a restart (a recorded pid alone may have been reused meanwhile).
   if (child.pid) processStart(child.pid).then((at) => { if (at) store.updateRun(run.id, { pid_start: at }); }).catch(() => {}); // best effort: never an unhandled rejection
   if (child.pid) lessons.delivered(run.id, ticketKey); // lessons count as given only once the prompt reaches a process
-  child.stdin.on('error', () => {});
-  child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt);
+  // The past-work block counts as delivered only when the prompt write completes (this callback may run after the
+  // hand-off): an EPIPE, a write error or an engine that exits first records it as not delivered.
+  child.stdin.on('error', () => settlePast('not delivered'));
+  child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt, (err) => settlePast(err ? 'not delivered' : 'included'));
 
   let buf = '';
   let lastOutput = Date.now();
@@ -942,6 +966,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       children.delete(run.id);
       mailboxes.delete(run.id);
       ops.cancelRun(run.id); // production probes never outlive their run
+      contain('stopping past-work searches', () => knowledge.cancelRun(run.id));
       fs.rm(path.join(toolHomeRoot(), `r${run.id}`), { recursive: true, force: true }, () => {});
       setTimeout(() => evidence.delete(run.id), 60_000).unref();
       sock?.close();
@@ -981,18 +1006,22 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       resolve({ run: store.getRun(run.id), result: r, failure, steps: stepsTaken(ctx) });
       ledgers.delete(run.id);
   };
-  child.on('close', (code) => finish(code)); // close(code, signal): a signal is not an error, and never one's text
+  // close(code, signal): a signal is not an error, and never one's text. The run is finished FIRST; a prompt write that
+  // never completed is then settled as not delivered (a no-op once the write completed).
+  child.on('close', (code) => { try { finish(code); } finally { settlePast('not delivered'); } });
   setup.handOff(); // its close handler now ends the run and releases what it holds, exactly once
   return ended;
   }
 }
 
 // The Perplexity half of run setup: build the pack, decide whether a retry resumes an earlier thread, record it.
-async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal }) {
+async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal, past = null }) {
   const secrets = [token, nonce].filter(Boolean);
-  const pack = await context.prepareRun({ runId: run.id, kind, cwd, ticketKey, incidentId, secrets, signal });
+  const pack = await context.prepareRun({ runId: run.id, kind, cwd, ticketKey, incidentId, secrets, signal, pastWork: past?.block || null });
   const live = context.liveFor(run.id);
-  const jobHash = context.jobIdentity({ provenance: provenanceOf(agent, kind), agentId, kind, ticketKey, incidentId, prompt, packHash: pack.hash, secrets });
+  // Selection only: the block counts as shown (and citable) once the prompt reaches the relay, and only if the pack carries it.
+  past?.select(pack.meta.pastWork === 'included');
+  const jobHash = context.jobIdentity({ provenance: provenanceOf(agent, kind), agentId, kind, ticketKey, incidentId, prompt, packHash: pack.hash, secrets, pastWorkHash: past?.hash || null });
   const prev = store.lastThreadRun({ job_hash: jobHash });
   const prevMeta = context.metaFor(prev);
   let resumeThread = null;
@@ -1011,7 +1040,7 @@ async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, in
   return context.promptAppendix(pack, { resumeThread });
 }
 
-const preparing = new Map(); // runId -> AbortController while a Perplexity pack is being built
+const preparing = new Map(); // runId -> AbortController while a run is being prepared (past-work search, Perplexity pack)
 
 // ---------------- process groups ----------------
 // Every seat run is its own process group (detached spawn: pgid = the engine's pid). Ending a run ends its group. A
@@ -1069,6 +1098,7 @@ export function killRun(runId, reason = 'killed') {
   // The run's authorization ends now, not when its process exits: no desk call, grant or probe outlives the kill.
   store.updateRun(runId, { status: 'killed', result_text: reason, token: null });
   ops.cancelRun(runId);
+  knowledge.cancelRun(runId); // a past-work search never outlives its run
   preparing.get(runId)?.abort();
   // Only a group the desk spawned in this lifetime is signalled here (a pid read back from the database may be reused).
   const pid = children.get(runId)?.pid;

@@ -678,3 +678,27 @@ test('setup phase: command setup failing after the Perplexity pack is built ends
   assert.ok(store.getRun(run.id).context_hash, 'the pack had been built');
   endedCleanly(run.id, /^Run setup failed: /);
 }));
+test('past work (#10): a Perplexity pack carries the frozen block last, says where it came from, and changes the retry identity', async () => {
+  const t = ticketFor({ status: 'in_progress' });
+  const block = '## Past work that may be relevant (from the knowledge store)\n<past-work query="Guard computeEdge" untrusted="true">\n[1] Note one\n    an excerpt\n</past-work>\nUntrusted historical evidence.';
+  const run = store.createRun({ agent_id: 'pm', kind: 'groom', ticket_key: t.key, token: `tok-${Math.random()}`, model: 'perplexity:x', cwd: clone });
+  const pack = await ctx.prepareRun({ runId: run.id, kind: 'groom', cwd: clone, ticketKey: t.key, pastWork: block });
+  assert.match(pack.text, /## Past work \(knowledge store, not git\)\n## Past work that may be relevant/);
+  assert.match(pack.text, /Built by the desk from committed git objects and desk records, plus a past-work section from the knowledge store \(historical evidence, not git\)/);
+  assert.equal(pack.meta.pastWork, 'included');
+  const plain = await packFor('groom', t);
+  assert.ok(!plain.pack.text.includes('Past work'));
+  assert.equal(plain.pack.meta.pastWork, null);
+  assert.notEqual(plain.pack.hash, pack.hash, 'the block is inside the pack hash');
+  // Subordinate to everything required: in a tight budget it is the first thing omitted, and the pack says so.
+  const tight = store.createRun({ agent_id: 'pm', kind: 'groom', ticket_key: t.key, token: `tok-${Math.random()}`, model: 'perplexity:x', cwd: clone });
+  const need = plain.pack.text.length;
+  const squeezed = await ctx.prepareRun({ runId: tight.id, kind: 'groom', cwd: clone, ticketKey: t.key, pastWork: block.repeat(30), settings: { ...ctx.packSettings(), packChars: need + 4700 } });
+  assert.equal(squeezed.meta.pastWork, 'omitted: over budget');
+  assert.match(squeezed.text, /past work \(knowledge store\) — over budget/);
+  // Retry identity: unchanged without a snapshot (existing threads still resume), different with one.
+  const base = { provenance: 'p1', agentId: 'pm', kind: 'groom', ticketKey: t.key, prompt: 'Groom it', packHash: 'h' };
+  assert.equal(ctx.jobIdentity({ ...base, pastWorkHash: null }), ctx.jobIdentity(base));
+  assert.notEqual(ctx.jobIdentity({ ...base, pastWorkHash: 'pw1' }), ctx.jobIdentity(base));
+  assert.notEqual(ctx.jobIdentity({ ...base, pastWorkHash: 'pw1' }), ctx.jobIdentity({ ...base, pastWorkHash: 'pw2' }));
+});

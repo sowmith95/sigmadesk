@@ -458,7 +458,7 @@ export function denial(run, probe, settings = store.getSettings()) {
 }
 
 // ---------------- redaction ----------------
-const CRED_KEY = /(pass(word|wd|phrase)?|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?key|credential|authorization|^auth$|dsn|conn(ection)?[_-]?str(ing)?|database[_-]?url|db[_-]?url|cookie|session[_-]?id|signature|^key$|[_-]key$|_pin$|^pin$)/i;
+export const CRED_KEY = /(pass(word|wd|phrase)?|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?key|credential|authorization|^auth$|dsn|conn(ection)?[_-]?str(ing)?|database[_-]?url|db[_-]?url|cookie|session[_-]?id|signature|^key$|[_-]key$|_pin$|^pin$)/i;
 /** Recursively blank credential-named fields of JSON values. */
 export function redactJsonValue(v) {
   if (Array.isArray(v)) return v.map(redactJsonValue);

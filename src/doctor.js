@@ -64,4 +64,10 @@ if (config.watch.enabled) {
   }
 } else warn('watch desk disabled (no on-call SRE)');
 
+// Institutional memory (#10): the knowledge-hub executable, its `search --json` contract, the store and its fingerprint.
+{
+  const { doctorChecks } = await import('./knowledge.js');
+  for (const c of await doctorChecks().catch((e) => [{ level: 'bad', msg: `knowledge: check failed (${e.message})` }])) (c.level === 'ok' ? ok : c.level === 'bad' ? bad : warn)(c.msg);
+}
+
 console.log(process.exitCode ? '\nFix the ✖ items, then `npm start`.' : '\nReady. `npm start`, open the UI, press "Open desk".');

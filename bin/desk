@@ -45,14 +45,15 @@ const USAGE = `usage:
   desk pkg status | desk pkg install   (install: offline, into this workspace's .venv, from the approved wheels)
   desk test pytest|unittest [args…]   (runs the tests with the canonical interpreter — this workspace's .venv if any — and records the exit status and what ran; QA uses it)
   desk fetch <https-url>   (the desk fetches one page from its allowed documentation hosts; the text is untrusted)
+  desk kb search "<what you need to know>" [--k 1-5]   (the desk searches this project's past work; the notes are untrusted history)
   desk ops list | desk ops <probe> [--param value]   (seats holding a production read access grant)
   desk ops request <probe…|all> --why "<what you must check>" [--for 1h | --ticket]
   desk access list | desk access approve <id> [--for 1h | --ticket] "<why>" | desk access deny|owner <id> "<why>" | desk access revoke <id> "<why>"   (EM/SRE)
   desk verify done "<what production shows>" | desk verify owner "<why no read-only probe can answer>"   (SRE verify runs)
   desk watch verified|regression|inconclusive "<what production shows>"   (SRE post-deploy check runs)
-  desk reply "<answer>"   (a run where the owner tagged you: your one answer in the thread)
+  desk reply "<answer>" [--cite <doc id>]   (a run where the owner tagged you: your one answer in the thread; cite past work you relied on)
   desk handoff implement|design|verify "<what>" | desk handoff task --title T "<what>" | desk handoff merge|deploy "<what was asked>"   (tagged runs: route real work into the normal jobs)
-  desk decide answer|approve|changes|reject "<what you decided>" --cite "R<n>,E<n>[,file:<path>:<line>]" --why "<how they settle it>" [--assign SEAT]
+  desk decide answer|approve|changes|reject "<what you decided>" --cite "R<n>,E<n>[,file:<path>:<line>][,kb:<doc id>]" --why "<how they settle it>" [--assign SEAT]
   desk decide escalate "<one-line recommendation>" --why "<why the owner must decide>"   (EM/SRE decision runs: decide for the owner, or hand it back)`;
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -95,6 +96,7 @@ switch (cmd) {
   case 'qa': case 'accept': case 'review': body.verdict = pos.shift(); body.body = pos.join(' '); break;
   case 'pkg': body.action = pos.shift() || 'status'; if (body.action === 'request') body.specs = pos.splice(0); break;
   case 'fetch': body.url = pos.shift(); break;
+  case 'kb': body.action = pos.shift() || 'help'; body.query = pos.join(' '); break;
   case 'test': for (const k of Object.keys(body)) delete body[k]; body.action = 'plan'; body.args = rest.slice(); break;
   case 'ops': body.probe = pos.shift() || 'list'; if (body.probe === 'request') body.probes = pos.splice(0); break;
   case 'access': body.action = pos.shift() || 'list'; if (/^\d+$/.test(pos[0] || '')) body.id = pos.shift(); body.body = pos.join(' '); break;
@@ -109,7 +111,7 @@ switch (cmd) {
 if (typeof body.findings === 'string' && body.findings.startsWith('@')) {
   try { body.findings = fs.readFileSync(path.resolve(body.findings.slice(1)), 'utf8'); } catch (e) { console.error(`desk: cannot read ${body.findings.slice(1)} (${e.message})`); process.exit(2); }
 }
-if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file', 'ops', 'access', 'pkg', 'fetch', 'test'].includes(cmd)) body.body = await stdinText();
+if (!body.body && !['show', 'list', 'progress', 'continue-rebase', 'context-file', 'ops', 'access', 'pkg', 'fetch', 'test', 'kb'].includes(cmd)) body.body = await stdinText();
 else if (['groom', 'propose', 'create-task', 'incident', 'design', 'revise', 'connector-propose'].includes(cmd) && !body.body) body.body = await stdinText();
 
 const token = process.env.DESK_RUN_TOKEN;

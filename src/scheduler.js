@@ -27,6 +27,8 @@ import * as ops from './ops.js';
 import * as access from './access.js';
 import * as packages from './packages.js';
 import * as netfetch from './netfetch.js';
+import * as knowledge from './knowledge.js';
+import './knowledge-notes.js'; // registers the close hook that queues past-work notes (#10)
 import * as mentions from './mentions.js';
 import * as deploywatch from './deploywatch.js';
 import * as delegation from './delegation.js';
@@ -188,7 +190,7 @@ export function buildDecision(t, { ctx = assignContext(), overlay = {}, taken = 
 
 export function setStatus(key, status, extra = {}) {
   const before = store.getTicket(key)?.status;
-  const t = store.updateTicket(key, { status, ...extra });
+  const t = store.updateTicket(key, { status, ...extra }); // a close commits with its past-work note (#10, store.onTicketDone)
   github.syncIssueState(key);
   // A hold whose kind is delegated (#9) is announced by the delegation only if it comes back to the owner.
   if (status !== before && status === 'needs_human' && !delegation.deferNotice(t)) notify('needs_human', t, 'needs you');
@@ -1294,14 +1296,19 @@ function fmtTicket(t, comments) {
 }
 
 export async function deskAction(run, cmd, body = {}) {
-  const agentId = run.agent_id;
+  // A past-work search refused by its run's command gate is audited like every other refusal (#10).
+  try { admitCommand(run, cmd, body); } catch (err) { if (cmd === 'kb') knowledge.auditRefusal(run, body, err.message); throw err; }
+  return carryOut(run, cmd, body);
+}
+/** The per-run-kind gates and the step allowance: throws when this run may not send this command now. */
+function admitCommand(run, cmd, body) {
   if (run.kind === 'product_review') need(['context-file'].includes(cmd), 'Product reviewers are read-only; return a structured report, not desk mutations');
   if (run.kind === 'council_review') need(false, 'council calls cannot invoke desk commands');
   if (run.kind === 'feature_groom') need(false, 'a grooming session is read-only: return the plan JSON as your final answer');
   if (run.kind === 'epic_review') need(['list', 'show', 'consult', 'context-file'].includes(cmd), 'an epic review reads and consults; return the review JSON as your final answer');
   // Research kinds are authorized by the run, not the seat: proposals come from research runs that carry a program,
   // a revision run may only revise its own proposal, and reviewers/assessors are read-only.
-  if (run.kind === 'research') need(['show', 'list', 'comment', 'needs-human', 'progress', 'propose', 'connector-propose', 'context-file'].includes(cmd), 'research runs read and file proposals; they do not groom, design or build');
+  if (run.kind === 'research') need(['show', 'list', 'comment', 'needs-human', 'progress', 'propose', 'connector-propose', 'context-file', 'kb'].includes(cmd), 'research runs read and file proposals; they do not groom, design or build');
   if (run.kind === 'research_revision') need(['show', 'list', 'comment', 'progress', 'revise', 'context-file'].includes(cmd), 'a revision run may only revise its own proposal');
   if (['research_review', 'connector_assessment'].includes(run.kind)) need(['show', 'list', 'context-file'].includes(cmd), 'reviewers are read-only; return the structured JSON as your final answer');
   if (run.kind === 'owner_discussion') {
@@ -1309,7 +1316,7 @@ export async function deskAction(run, cmd, body = {}) {
     need(!body.key || body.key === run.ticket_key, 'discussion belongs to its original ticket');
   }
   if (run.kind === 'mention') {
-    need(['show', 'list', 'reply', 'comment', 'handoff', 'ops', 'context-file'].includes(cmd), 'a tagged run reads, answers with desk reply and routes real work with desk handoff; it cannot do that itself');
+    need(['show', 'list', 'reply', 'comment', 'handoff', 'ops', 'kb', 'context-file'].includes(cmd), 'a tagged run reads, answers with desk reply and routes real work with desk handoff; it cannot do that itself');
     need(!body.key || body.key === run.ticket_key, 'answer on the ticket you were tagged in');
     // Bound to a live delivery of THIS run (a cancelled tag or a stopped run has no more say), with an action allowance
     // the desk counts itself, whatever the engine reports (socket and mailbox requests alike).
@@ -1323,7 +1330,7 @@ export async function deskAction(run, cmd, body = {}) {
   // A decision run (#9) reads the brief and the ticket and answers with exactly one desk decide, within an action
   // allowance the desk counts itself.
   if (run.kind === 'decide') {
-    need(['show', 'list', 'decide', 'context-file'].includes(cmd), 'a decision run reads the ticket and finishes with desk decide');
+    need(['show', 'list', 'decide', 'kb', 'context-file'].includes(cmd), 'a decision run reads the ticket (and past work: desk kb search) and finishes with desk decide');
     need(!body.key || body.key === run.ticket_key, 'decide on the decision you were given');
     const used = (decideActions.get(run.id) || 0) + 1;
     decideActions.set(run.id, used);
@@ -1336,7 +1343,6 @@ export async function deskAction(run, cmd, body = {}) {
   // A step-bounded run's desk request (a tagged reply, a decision run, a post-deploy check) is a step of its own,
   // admitted BEFORE it is carried out: past the allowance the run is stopped and nothing it asked for happens.
   if (runner.isStepBounded(run.kind)) runner.admitDeskCall(run);
-  return carryOut(run, cmd, body);
 }
 /** What a desk command does, once the gates above let its run send it. */
 async function carryOut(run, cmd, body) {
@@ -1410,7 +1416,12 @@ async function carryOut(run, cmd, body) {
     case 'handoff': {
       const m = mentions.forRun(run);
       need(m && m.run_id === run.id, 'this run carries no tagged message');
-      if (cmd === 'reply') { replyToMention(m, agentId, body.body); ev(`answered the owner's tag: ${String(body.body || '').slice(0, 140)}`); return 'Reply posted. If real work is needed, route it with desk handoff; otherwise stop now.'; }
+      if (cmd === 'reply') {
+        // --cite <doc id>: only notes this run was shown (#10); the reply says which, the citation is recorded.
+        const cited = knowledge.replyCitations(run, body.cite);
+        replyToMention(m, agentId, `${String(body.body || '').trim()}${cited.footer}`);
+        if (cited.ids.length) store.recordKnowledgeCitations(run.id, cited.ids, 'reply', m.id);
+        ev(`answered the owner's tag: ${String(body.body || '').slice(0, 140)}`); return 'Reply posted. If real work is needed, route it with desk handoff; otherwise stop now.'; }
       return mentionHandoff(run, m, ticket, body, ev);
     }
     case 'comment':
@@ -1792,6 +1803,9 @@ async function carryOut(run, cmd, body) {
       // Production read probes: gating (setting, seat, run kind), budgets and redaction live in ops.js, so the socket
       // and the mailbox transport get exactly the same answer.
       return ops.handle(run, body);
+    case 'kb':
+      // Past-work search (#10): scope, budget, redaction and audit live in knowledge.js (socket and mailbox alike).
+      return knowledge.command(run, body);
     case 'access': {
       // EM and SRE review who has production read access: list, decide requests within the owner's policy, revoke.
       const a = String(body.action || 'list');
