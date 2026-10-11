@@ -81,11 +81,13 @@ export function resultProblem(r, allowed = namespaces()) {
   // characters, no absolute path, no "//" except right after a scheme, no dot segments.
   const raw = typeof r.url === 'string' ? r.url : '';
   if (!raw) return 'no URL';
-  if (/[^A-Za-z0-9._~:/@+=,-]/.test(raw)) return 'URL with characters outside the plain set';
+  if (/[^A-Za-z0-9._~:/+=,-]/.test(raw)) return 'URL with characters outside the plain set'; // no @: userinfo is refused outright
   if (raw.startsWith('/')) return 'absolute path';
-  if (raw.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, '').includes('//')) return 'URL with an empty segment';
-  if (/(^|\/)\.\.?(\/|$)/.test(raw)) return 'URL with dot segments';
-  if (credentialLike(raw)) return 'URL with credential-like text';
+  // Path checks run on what follows any "scheme:" or "scheme://" (kb:../code/x and kb:./personal/x are dot segments).
+  const path = raw.replace(/^[A-Za-z][A-Za-z0-9+.-]*:(\/\/)?/, '');
+  if (path.startsWith('/') || path.includes('//')) return 'URL with an empty segment';
+  if (/(^|\/)\.\.?(\/|$)/.test(path)) return 'URL with dot segments';
+  if (credentialLike(raw, { runs: false })) return 'URL with credential-like text';
   const url = canonicalUrl(raw);
   const scheme = (url.match(/^([a-z][a-z0-9+.-]*):/) || [])[1] || null;
   if (scheme && DENIED_SCHEMES.has(scheme)) return `denied scheme ${scheme}`;
@@ -284,32 +286,38 @@ function openQuoteAt(t) {
   return -1;
 }
 /**
- * Credential-like text is WITHHELD, never edited: redaction leaked in three review rounds, so a passage that contains a
- * credential-like key or value anywhere is not shown at all. Key-like form = a word (CRED_KEY or an alias) followed by
- * an optional quote or emphasis and then ':' or '=', in any case, quoted or not, after escaped quotes are unescaped.
- * Ordinary prose ("pass the tests", "the session layer") does not withhold; "password: >", "\"token\": {" and
- * "Bearer abc…" do. Values: the provider formats ops.js knows, JWTs, credentials in URLs, long mixed-case or hex runs
- * (a 40- or 64-character hex run is a commit or content hash and does not count).
+ * Credential-like text is WITHHELD, never edited. The detector is deliberately broad and simple; over-withholding is
+ * accepted. After escaped quotes are unescaped, and in any case, a passage is credential-like when it contains:
+ *  (a) a token of any length containing pass, secret, token, key, auth, cred, bearer, cookie, session or private,
+ *      followed by an optional quote, backtick or * and then ':' or '=' (so "pass the tests" stays, "bypass=1" does not);
+ *  (b) "Bearer " or "Basic " followed by anything;
+ *  (c) credentials in a URL ("://" followed by "…@");
+ *  (d) a run of 24+ characters of [A-Za-z0-9+/_=-] mixing letters and digits, except exactly 40- or 64-character
+ *      lowercase hex (commit and content hashes) — skipped for URLs, which the URL rules judge;
+ *  (e) a known provider format or a JWT.
+ * Out of scope for v1 (README → Past work → Limits): translated or homoglyph keys, unkeyed values split across lines,
+ * entity-encoded colons, command-line flags such as -p.
  */
-const CRED_ALIAS = /(creds?|credentials?|bearer|authori[sz]ation|^auth$|cookies?|session|private[_-]?key|client[_-]?secret|[_-]key$|[_-]token$|[_-]secret$|pass)/i;
-const KEY_LIKE = /(?:^|[^A-Za-z0-9_])["'`*_]*([A-Za-z][A-Za-z0-9_.-]{0,60})["'`*_]*\s*[:=]/g;
+const CRED_SUBSTRINGS = /(pass|secret|token|key|auth|cred|bearer|cookie|session|private)/i;
+const KEY_TOKEN = /([A-Za-z0-9_.-]+)["'`*]*\s*[:=]/g;
 const SECRET_VALUES = [
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/, /\bsk-[A-Za-z0-9_-]{10,}/, /\bgh[pousr]_[A-Za-z0-9]{16,}/, /\bgithub_pat_\w{16,}/, /\bAKIA[0-9A-Z]{16}\b/,
   /\bxox[baprs]-[\w-]{10,}/, /\bAIza[\w-]{30,}/, /\b(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{12,}/, /\bglpat-[\w-]{16,}/, /\bnpm_[A-Za-z0-9]{30,}/,
-  /\bSG\.[\w-]{16,}\.[\w-]{16,}/, /\bhf_[A-Za-z0-9]{30,}/, /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/, /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/i,
-  /[a-z][\w+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i,
+  /\bSG\.[\w-]{16,}\.[\w-]{16,}/, /\bhf_[A-Za-z0-9]{30,}/, /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/,
 ];
+const AUTH_SCHEME = /\b(?:Bearer|Basic)\s+\S/i;
+const URL_USERINFO = /:\/\/[^/\s]*@/;
 const secretRun = (t) => {
-  for (const [v] of t.matchAll(/[A-Za-z0-9+_=-]{32,}/g)) {
-    if (/^[0-9a-f]+$/i.test(v)) { if (v.length !== 40 && v.length !== 64) return true; continue; }
-    if (/[A-Z]/.test(v) && /[a-z]/.test(v) && /\d/.test(v)) return true;
+  for (const [v] of t.matchAll(/[A-Za-z0-9+/_=-]{24,}/g)) {
+    if (/^[0-9a-f]+$/.test(v) && (v.length === 40 || v.length === 64)) continue;
+    if (/[A-Za-z]/.test(v) && /\d/.test(v)) return true;
   }
   return false;
 };
-export function credentialLike(text) {
+export function credentialLike(text, { runs = true } = {}) {
   const t = String(text ?? '').replace(/\\+(["'])/g, '$1');
-  for (const [, key] of t.matchAll(KEY_LIKE)) if (CRED_KEY.test(key) || CRED_ALIAS.test(key)) return true;
-  return SECRET_VALUES.some((re) => re.test(t)) || secretRun(t);
+  for (const [, key] of t.matchAll(KEY_TOKEN)) if (CRED_SUBSTRINGS.test(key) || CRED_KEY.test(key)) return true;
+  return AUTH_SCHEME.test(t) || URL_USERINFO.test(t) || SECRET_VALUES.some((re) => re.test(t)) || (runs && secretRun(t));
 }
 export const WITHHELD = 'excerpt withheld: it contains credential-like text';
 /** ops.js redaction (a first pass for text that is still shown; the withhold rule decides what is shown at all). */
@@ -550,8 +558,6 @@ export function replyCitations(run, raw) {
 }
 
 // ---------------- owner view ----------------
-/** Closes whose past-work note could not be queued (written by knowledge-notes.js; shown in the outbox health). */
-const enqueueErrors = () => { try { return JSON.parse(store.kvGet('knowledge:enqueue-errors') || '[]'); } catch { return []; } };
 const weekAgo = (now) => new Date(now - 7 * 864e5).toISOString();
 /** Weekly numbers: searches per run, share of runs that searched, cited answers resolved without escalation, notes, failures. */
 export function metrics(now = Date.now()) {
@@ -572,7 +578,7 @@ export function metrics(now = Date.now()) {
     else if (c.kind === 'reply') { const m = c.ref ? store.getMention(c.ref) : null; if (m?.status === 'replied' && !m.routed) resolved += 1; else if (m) escalated += 1; }
   }
   const notes = store.knowledgeNotesSince(since);
-  const notQueued = enqueueErrors().filter((x) => x.at >= since).length;
+  const notQueued = store.enqueueFailureCount(since); // every unresolved one, however many
   return {
     since, searches: counted.filter((a) => a.source === 'search').length, automatic: counted.filter((a) => a.source === 'auto').length,
     refused: audits.filter((a) => a.outcome === 'refused').length, failed: audits.filter((a) => ['error', 'timeout'].includes(a.outcome)).length,
@@ -591,7 +597,8 @@ export function describe(settings = store.getSettings(), now = Date.now()) {
     deny: DENY_TEXT, write_namespace: writeNamespace(), per_run: perRun(), max_k: k.maxK, auto_kinds: autoKinds(), search_kinds: searchKinds(),
     lane: laneState(), target: store.kvGet('knowledge:target'), outbox: store.knowledgeOutboxCounts(), failures: store.recentKnowledgeNotes(50).filter((n) => n.status === 'failed' || n.status === 'refused' || (n.status === 'pending' && n.last_error)).slice(0, 10)
       .map((n) => ({ id: n.id, ticket_key: n.ticket_key, status: n.status, attempts: n.attempts, last_error: n.last_error, next_attempt_at: n.next_attempt_at }))
-      .concat(enqueueErrors().slice(-10).map((x) => ({ id: null, ticket_key: x.ticket_key, status: 'not queued', attempts: 0, last_error: x.error, next_attempt_at: null }))),
+      .concat(store.enqueueFailures(20).map((x) => ({ id: null, ticket_key: x.ticket_key, status: 'not queued', attempts: 0, last_error: x.error, next_attempt_at: null }))), // presentation only
+    not_queued: store.enqueueFailureCount(),
     metrics: metrics(now),
   };
 }

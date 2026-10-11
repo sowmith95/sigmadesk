@@ -611,6 +611,12 @@ CREATE TABLE IF NOT EXISTS ticket_specs (
   reporter TEXT,
   created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- Closes whose past-work note could not be queued: durable until a later attempt queues one (every one counted).
+CREATE TABLE IF NOT EXISTS knowledge_enqueue_failures (
+  ticket_key TEXT PRIMARY KEY,
+  error TEXT,
+  at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 -- Notes the desk writes back: enqueued in the transaction of the qualifying transition, body frozen (content-hash URL),
 -- written and verified by exact read-back by the outbox worker. status: pending | verified | failed | refused.
 CREATE TABLE IF NOT EXISTS knowledge_outbox (
@@ -1704,3 +1710,9 @@ export function knowledgeTransitionsSince(iso) {
   return [...keys];
 }
 export function deleteKnowledgeExposures(runId, source) { q('DELETE FROM knowledge_exposures WHERE run_id=? AND source=?').run(runId, source); }
+export function recordEnqueueFailure(key, error) {
+  q('INSERT INTO knowledge_enqueue_failures(ticket_key,error,at) VALUES (?,?,?) ON CONFLICT(ticket_key) DO UPDATE SET error=excluded.error, at=excluded.at').run(key, redact(String(error)).slice(0, 300), now());
+}
+export function clearEnqueueFailure(key) { q('DELETE FROM knowledge_enqueue_failures WHERE ticket_key=?').run(key); }
+export const enqueueFailures = (limit = 20) => q('SELECT * FROM knowledge_enqueue_failures ORDER BY at DESC LIMIT ?').all(limit);
+export const enqueueFailureCount = (since = '') => q('SELECT COUNT(*) n FROM knowledge_enqueue_failures WHERE at >= ?').get(since).n;

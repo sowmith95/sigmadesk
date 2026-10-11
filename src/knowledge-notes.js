@@ -28,7 +28,11 @@ const json = (s, d = null) => { try { return s == null ? d : JSON.parse(s); } ca
 // A field with credential-like text anywhere is withheld whole (never edited); others are redacted, then shortened.
 const WITHHELD_FIELD = '[withheld: credential-like text]';
 const line = (s, n = 300) => (kb.credentialLike(s) ? WITHHELD_FIELD : kb.safeCut(kb.scrubText(s).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(), n));
-const short = (sha) => (sha ? String(sha).slice(0, 12) : '-');
+const short = (sha) => (sha === WITHHELD_FIELD ? sha : sha ? String(sha).slice(0, 12) : '-');
+// Every SOURCE field is checked before anything is formatted: a field with credential-like text becomes the withheld
+// marker, whichever record it came from (area, builder, pr_url, verdict labels, test arguments, incident samples …).
+const F = (v) => ((typeof v === 'string' || typeof v === 'number') && kb.credentialLike(String(v)) ? WITHHELD_FIELD : v);
+const safe = (o) => (o && typeof o === 'object' && !Array.isArray(o) ? Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Array.isArray(v) ? v.map(F) : F(v)])) : F(o));
 const SHA = /^[0-9a-f]{7,40}$/;
 
 const resolvedIncidents = (key) => store.incidentsOfTicket(key).filter((i) => i.status === 'resolved');
@@ -46,14 +50,15 @@ export function qualifies(key) {
  * → { title, body } or null when the ticket does not qualify.
  */
 export function buildFacts(key) {
-  const t = store.getTicket(key);
-  if (!t || !qualifies(key)) return null;
-  const merged = store.mergedEventOf(key);
+  if (!store.getTicket(key) || !qualifies(key)) return null;
+  const t = safe(store.getTicket(key));
+  const merged = safe(store.mergedEventOf(key));
   const out = [];
   const add = (...l) => out.push(...l);
   const mergedAt = merged ? (String(merged.text).match(/at (\S+)$/) || [])[1] || merged.ts : null;
-  const deploys = store.deploysForTicket(key);
-  const mergeSha = [...new Set([json(store.kvGet(`deploy:none:${key}`))?.merge_sha, ...deploys.map((d) => d.merge_sha)].filter((s) => SHA.test(String(s || ''))))];
+  const deploys = store.deploysForTicket(key).map(safe);
+  const mergeSha = [...new Set([F(json(store.kvGet(`deploy:none:${key}`))?.merge_sha), ...deploys.map((d) => d.merge_sha)].filter((s) => SHA.test(String(s || ''))))];
+  const contributors = (json(t.contributors, []) || []).map(F);
   add(`# Facts: ${key} — ${line(t.title, 200)}`, '',
     `Recorded by SigmaDesk from its own records when ${key} closed ${merged ? 'with a merged pull request' : 'and its incident was resolved'}. Attributable facts only: each section names the records it comes from. Seat-written narrative (submission notes, review summaries, replies, lessons, claimed root causes) is not included.`,
     `Format: ${FORMAT} · project ${config.projectId || config.project.name}`, '',
@@ -61,45 +66,45 @@ export function buildFacts(key) {
     `- ${key} · type ${t.type || '-'} · area ${t.area || '-'} · complexity ${t.complexity || '-'} · priority ${t.priority || '-'} · risk ${t.risk || 'unrecorded'}${t.parent_key ? ` · part of ${t.parent_key}` : ''}`,
     `- Closed ${t.done_at || '-'}${merged ? ` · pull request ${t.pr_url || '-'} merged ${mergedAt}  [GitHub PR sync event ${merged.id}]` : ' · no merged pull request'}`,
     `- QA-passed commit ${t.qa_sha || '-'} · head ${t.head_sha || '-'}${mergeSha.length ? ` · merge commit ${mergeSha.join(', ')}  [merge/deploy record]` : ''}`,
-    `- Builder ${t.builder || '-'}${json(t.contributors, []).length ? ` · contributors ${json(t.contributors, []).join(', ')}` : ''}`, '');
+    `- Builder ${t.builder || '-'}${contributors.length ? ` · contributors ${contributors.join(', ')}` : ''}`, '');
   // The spec as recorded when the ticket was created — never today's description (seats append to it), never comments.
-  const spec = store.getTicketSpec(key);
+  const spec = safe(store.getTicketSpec(key));
   if (spec) {
     const acc = acceptanceOf(spec.description);
     add(`## Specification  [ticket at creation, written by ${line(spec.reporter || 'unknown', 40)} at ${spec.created_at}, sha256 ${sha256(`${spec.title}\n${spec.description}`).slice(0, 12)}]`,
       clip(acc || spec.description || '(no description)', 3000), '');
   } else add('## Specification  [ticket at creation]', '- not recorded (the ticket predates the frozen record)', '');
-  const files = json(store.kvGet(`diff-files:${key}`), null);
+  const files = (a => (Array.isArray(a) ? a.map(F) : a))(json(store.kvGet(`diff-files:${key}`), null));
   add(`## Files changed  [desk diff record at the QA-passed commit ${short(t.qa_sha)}]`);
   if (Array.isArray(files) && files.length) { add(...files.slice(0, 200).map((f) => `- ${line(f, 200)}`)); if (files.length > 200) add(`- …and ${files.length - 200} more`); }
   else add('- not recorded');
   add('');
-  const qa = store.qaVerdicts(key);
+  const qa = store.qaVerdicts(key).map(safe);
   add('## QA verdicts  [qa_verdicts]', ...(qa.length ? qa.map((v) => `- #${v.id} ${v.verdict}${v.reason ? ` (${v.reason})` : ''} at ${short(v.sha)} · builder ${v.builder || '-'} on ${v.model || '-'} · run ${v.run_id ?? '-'} · ${v.ts}`) : ['- none recorded']), '');
   const runs = store.runsOfTicket(key);
-  const tests = runs.flatMap((r) => json(store.kvGet(`desk-test:${r.id}`), []).map((x) => ({ ...x, run: r })));
+  const tests = runs.flatMap((r) => json(store.kvGet(`desk-test:${r.id}`), []).map((x) => ({ ...safe(x), tests: x.tests ? safe(x.tests) : x.tests, run: safe(r) })));
   add('## Test runs through desk test  [desk test records]', ...(tests.length ? tests.map((x) => `- run ${x.run.id} (${x.run.kind}, ${x.run.agent_id}): ${line((x.args || []).join(' '), 160)} → exit ${x.status}${x.tests ? ` · ${x.tests.tests} tests, ${x.tests.failures} failed, ${x.tests.errors} errors, ${x.tests.skipped} skipped` : ''} at ${short(x.sha)}${x.problem ? ` · not counted: ${line(x.problem, 120)}` : ''} · ${x.at || '-'}`) : ['- none recorded']), '');
-  const reviews = store.listPrReviews(key);
-  const findings = store.listFindings(key);
+  const reviews = store.listPrReviews(key).map(safe);
+  const findings = store.listFindings(key).map(safe);
   add('## Review verdicts  [pr_reviews; finding text excluded]', ...(reviews.length ? reviews.map((r) => {
     const f = findings.filter((x) => x.review_id === r.id);
     return `- ${r.role} ${r.seat}: ${r.verdict} (${r.state}) at ${short(r.sha)} · round ${r.round} · run ${r.run_id ?? '-'}${f.length ? ` · ${f.length} finding(s), ${f.filter((x) => x.blocking).length} blocking, resolutions ${[...new Set(f.map((x) => x.resolution))].sort().join('/')}` : ''} · ${r.updated_at}`;
   }) : ['- none recorded']), '');
-  const watches = store.watchesForTicket(key);
+  const watches = store.watchesForTicket(key).map(safe);
   add('## Deploys and post-deploy checks  [deploy_history, deploy_watches, watch_checkpoints]');
   if (!deploys.length && !watches.length) add('- none recorded at the time of this note');
   for (const d of deploys) add(`- deploy ${d.workflow} run ${d.run_id} attempt ${d.run_attempt} of ${short(d.merge_sha)} → ${d.status}${d.conclusion ? ` (${d.conclusion})` : ''}${d.target ? ` · target ${d.target}` : ''} · ${d.completed_at || d.started_at || d.recorded_at}`);
   for (const w of watches) {
-    const cps = store.checkpointsOf(w.id).map((c) => `${c.name} ${c.verdict || c.status}${c.limited ? ' (limited)' : ''}${c.completed_at ? ` ${c.completed_at}` : ''}`);
+    const cps = store.checkpointsOf(w.id).map(safe).map((c) => `${c.name} ${c.verdict || c.status}${c.limited ? ' (limited)' : ''}${c.completed_at ? ` ${c.completed_at}` : ''}`);
     add(`- watch ${w.id} of ${short(w.merge_sha)}: ${w.status}${w.hold ? ' · deploy hold' : ''}${cps.length ? ` · checkpoints: ${cps.join('; ')}` : ''}`);
   }
   add('');
-  const incidents = store.incidentsOfTicket(key);
+  const incidents = store.incidentsOfTicket(key).map(safe);
   if (incidents.length) {
     add('## Incidents  [incidents; samples are production log lines — untrusted data]');
     for (const i of incidents) {
       add(`- #${i.id} ${line(i.label, 120)} · signature ${line(i.signature, 40)} · seen ${i.count}× · first ${i.first_seen} · last ${i.last_seen} · ${i.status}${i.resolved_at ? ` ${i.resolved_at}` : ''}`);
-      for (const s of json(i.samples, []).slice(-3)) add(`  - [${line(s.ts, 40)}] ${line(s.line, 300)}`);
+      for (const s of (json(i.samples, []) || []).slice(-3).map(safe)) add(`  - [${line(s.ts, 40)}] ${line(s.line, 300)}`);
     }
     add('');
   }
@@ -132,25 +137,27 @@ export function enqueueTicketFacts(key, { trigger = 'merged' } = {}) {
     const bodySha = sha256(facts.body);
     const row = store.enqueueKnowledgeNote({ ticket_key: key, kind: 'facts', trigger, url: noteUrl(key, bodySha), namespace: ns, title: facts.title, body: facts.body, body_sha256: bodySha, format: FORMAT });
     if (autoFlush && row && !row.attempts && row.status === 'pending') setImmediate(() => { flush().catch(() => {}); });
-    if (row) clearEnqueueError(key);
+    if (row) store.clearEnqueueFailure(key);
     return row;
   } catch (err) {
-    // The close goes ahead without its note (on purpose); the failure is visible as an event and in the outbox health.
-    const why = store.redact(String(err.message)).slice(0, 200);
-    try {
-      store.logEvent({ kind: 'error', agent_id: 'system', ticket_key: key, text: `past-work note for ${key} was not queued: ${why} (reconciliation retries)` });
-      const list = enqueueErrors().filter((x) => x.ticket_key !== key);
-      store.kvSet('knowledge:enqueue-errors', JSON.stringify([...list, { ticket_key: key, error: why, at: store.now() }].slice(-20)));
-    } catch { /* nothing more to do */ }
+    reportEnqueueFailure(key, err);
     return null;
   }
+}
+/**
+ * The close goes ahead without its note (on purpose); the failure is visible as an event and stays in the outbox health
+ * (a durable row per ticket, every one counted) until a later attempt queues the note.
+ */
+function reportEnqueueFailure(key, err) {
+  const why = store.redact(String(err?.message ?? err)).slice(0, 200);
+  try {
+    store.logEvent({ kind: 'error', agent_id: 'system', ticket_key: key, text: `past-work note for ${key} was not queued: ${why} (reconciliation retries)` });
+    store.recordEnqueueFailure(key, why);
+  } catch { /* nothing more to do */ }
 }
 // Every close, whatever path sets the ticket done, runs inside the closing transaction.
 store.onTicketDone((key) => { enqueueTicketFacts(key, { trigger: store.mergedEventOf(key) ? 'merged' : 'incident resolved' }); });
 
-/** Closes whose note could not be queued (the outbox health shows them until a later attempt queues one). */
-export function enqueueErrors() { try { return JSON.parse(store.kvGet('knowledge:enqueue-errors') || '[]'); } catch { return []; } }
-function clearEnqueueError(key) { const list = enqueueErrors(); if (list.some((x) => x.ticket_key === key)) store.kvSet('knowledge:enqueue-errors', JSON.stringify(list.filter((x) => x.ticket_key !== key))); }
 
 /** A post-deploy watch concluded: a new version of the facts (now with its deploy evidence), if the ticket qualifies. */
 export function onWatchConcluded(key) { if (key && qualifies(key)) enqueueTicketFacts(key, { trigger: 'post-deploy watch' }); }
@@ -167,9 +174,12 @@ export function reconcile() {
   const keys = new Set([...store.ticketsByStatus('done').filter((t) => t.done_at && t.done_at >= since).map((t) => t.key), ...store.knowledgeTransitionsSince(since)]);
   let n = 0;
   for (const key of keys) {
-    const facts = qualifies(key) ? buildFacts(key) : null;
-    if (!facts || store.knowledgeNoteByUrl(noteUrl(key, sha256(facts.body)))) continue;
-    if (store.transaction(() => enqueueTicketFacts(key, { trigger: 'reconcile' }))) n += 1;
+    // Each candidate on its own: a malformed record fails that ticket (reported like any failed enqueue), not the pass.
+    try {
+      const facts = qualifies(key) ? buildFacts(key) : null;
+      if (!facts || store.knowledgeNoteByUrl(noteUrl(key, sha256(facts.body)))) continue;
+      if (store.transaction(() => enqueueTicketFacts(key, { trigger: 'reconcile' }))) n += 1;
+    } catch (err) { reportEnqueueFailure(key, err); }
   }
   return n;
 }
