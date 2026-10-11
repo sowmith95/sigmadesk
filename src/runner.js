@@ -845,10 +845,15 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       boundSteps(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
       // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
       if (store.getRun(run.id)?.status !== 'running') return setup.abort(store.getRun(run.id)?.result_text || 'refused before start', 'killed');
-      if (!pplx) return await spawnChild();
+      // Past work (#10): eligible launches on EVERY engine search the knowledge store once before the seat starts. The
+      // snapshot is frozen on the run (and, for Perplexity, in the pack and the retry identity); an outage is one line in
+      // the task, never a failed launch.
+      const pastWork = knowledge.wantsPastWork({ kind, ticketKey, incidentId, resume });
+      if (!pplx && !pastWork) return await spawnChild();
 
-      // Perplexity thinking seats: the desk builds the context pack (not the relay) before the relay starts. Cancellation
-      // and the run timeout exist before any preparation work; a pack that cannot be built refuses the run (fail closed).
+      // Preparation before the seat starts: the past-work search, and for Perplexity thinking seats the context pack the
+      // desk builds (not the relay). Cancellation and the run timeout exist before any preparation work; a Perplexity pack
+      // that cannot be built refuses the run (fail closed).
       const abort = new AbortController();
       preparing.set(run.id, abort);
       const prepTimer = setTimeout(() => {
@@ -858,7 +863,9 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       setup.own(() => { preparing.delete(run.id); clearTimeout(prepTimer); });
       let failed = null;
       try {
-        prompt = `${prompt}${await preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal: abort.signal })}`;
+        const past = pastWork ? await knowledge.preparePastWork(run, { ticketKey, incidentId }) : null;
+        if (pplx) prompt = `${prompt}${await preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal: abort.signal, past })}`;
+        else if (past) prompt = `${prompt}${past.text}`;
       } catch (err) { failed = err; } finally { preparing.delete(run.id); clearTimeout(prepTimer); }
       const now = store.getRun(run.id);
       if (now.status === 'killed') return setup.abort(now.result_text || 'stopped while preparing', 'killed');
@@ -990,11 +997,11 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
 }
 
 // The Perplexity half of run setup: build the pack, decide whether a retry resumes an earlier thread, record it.
-async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal }) {
+async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal, past = null }) {
   const secrets = [token, nonce].filter(Boolean);
-  const pack = await context.prepareRun({ runId: run.id, kind, cwd, ticketKey, incidentId, secrets, signal });
+  const pack = await context.prepareRun({ runId: run.id, kind, cwd, ticketKey, incidentId, secrets, signal, pastWork: past?.block || null });
   const live = context.liveFor(run.id);
-  const jobHash = context.jobIdentity({ provenance: provenanceOf(agent, kind), agentId, kind, ticketKey, incidentId, prompt, packHash: pack.hash, secrets });
+  const jobHash = context.jobIdentity({ provenance: provenanceOf(agent, kind), agentId, kind, ticketKey, incidentId, prompt, packHash: pack.hash, secrets, pastWorkHash: past?.hash || null });
   const prev = store.lastThreadRun({ job_hash: jobHash });
   const prevMeta = context.metaFor(prev);
   let resumeThread = null;
@@ -1013,7 +1020,7 @@ async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, in
   return context.promptAppendix(pack, { resumeThread });
 }
 
-const preparing = new Map(); // runId -> AbortController while a Perplexity pack is being built
+const preparing = new Map(); // runId -> AbortController while a run is being prepared (past-work search, Perplexity pack)
 
 // ---------------- process groups ----------------
 // Every seat run is its own process group (detached spawn: pgid = the engine's pid). Ending a run ends its group. A
