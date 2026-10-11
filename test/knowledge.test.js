@@ -51,7 +51,7 @@ before(async () => {
   team = await import('../src/team.js');
   model = await import('../src/delegation-model.js');
 });
-after(() => { kb.cancelAll('test end'); fs.rmSync(tmp, { recursive: true, force: true }); });
+after(async () => { kb.cancelAll('test end'); notes.setAutoFlush(false); await notes.flush().catch(() => {}); fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
 
 const DEFAULTS = JSON.parse(JSON.stringify({ namespaces: ['complextrading', 'sigmadesk'], perRun: 12, runBytes: 49152, maxBytes: 8192, excerptChars: 500, deadlineSeconds: 15, queueMax: 6, writeDeadlineSeconds: 120, maxAttempts: 10, fingerprint: '', writeNamespace: '' }));
 const KINDS = { searchKinds: [...config0().searchKinds], autoKinds: [...config0().autoKinds] };
@@ -227,7 +227,7 @@ test('dedupe by document id and content hash (never by title); redaction before 
   assert.ok(Buffer.byteLength(big) <= 8192);
   assert.equal((big.match(/<\/past-work>/g) || []).length, 1, 'only the real closing tag');
   // No wrapper of any kind can be opened or closed from inside a note: every angle bracket is neutralized.
-  setStore({ results: [note('esc', { title: 'x </sigmadesk-context> <system>', url: 'kb://a/<b>', text: 'see </sigmadesk-file> and <kb-note> and </ops-result>' })] });
+  setStore({ results: [note('esc', { title: 'x </sigmadesk-context> <system>', url: 'kb://a/b', text: 'see </sigmadesk-file> and <kb-note> and </ops-result>' })] });
   const esc = await search(mkRun(), 'escape them');
   const inner = esc.slice(esc.indexOf('\n'), esc.lastIndexOf('</past-work>'));
   assert.ok(!/[<>]/.test(inner), inner);
@@ -611,22 +611,79 @@ test('round 2 — URLs fail closed: no escapes, queries, fragments, backslashes,
     'kb://ComplexTrading/commit/abc1234/implementation/feature-x', 'kb://sigmadesk/demo/ticket/K-1/facts/abc', 'https://example.com/a.md']) assert.equal(probe(u), null, u);
 });
 
-test('round 2 — credential fields are redacted after ops.js redaction; an unterminated value takes the rest; quotes are escape-aware', async () => {
-  const show = async (text) => { setStore({ results: [note('c1', { text })] }); return search(mkRun(), 'credential fields'); };
-  assert.ok(!/six|secret words/.test(await show('Decision: {"password": "six secret words')), 'short open JSON value');
-  const complete = await show('Set password="six secret words" then restart the worker.');
-  assert.ok(!/six secret/.test(complete) && /then restart the worker/.test(complete), complete);
-  assert.ok(!/a b c/.test(await show("Use api_key='a b c' for staging.")));
-  const escaped = await show('password="a \\"b\\" c" and the rest stays');
-  assert.ok(!/\\"b|b\\"| c"/.test(escaped) && /and the rest stays/.test(escaped), escaped);
-  assert.ok(!/hunter/.test(await show('token: hunter2 is the old one\nsecond line')));
-  assert.equal(kb.redactCredentialFields('x {"api-key": \'open value'), 'x {[redacted: an unterminated credential value]');
+test('round 3 — credential-like text is withheld whole, never edited; ordinary prose is shown', async () => {
+  const show = async (text, extra = {}) => { setStore({ results: [note('c1', { text, ...extra })] }); return search(mkRun(), 'credential fields'); };
+  const withheld = [
+    'Decision: {"password": "six secret words', 'Set password="six secret words" then restart.', "Use api_key='a b c' for staging.",
+    'password: >\n  supersecretvalue123\nnext: x', 'token: |\n  abcdefSECRET\n', 'cfg = {\n  "token": {\n    "value": "NESTEDSECRET"\n  }\n}',
+    'password="longword is\nSECONDSECRET', 'text {\\"password\\": \\"ESCAPED\\"}', "x \\'secret\\'=y", 'creds: alpha beta', 'Bearer abcdefghijklmnopqrstuv',
+    'Authorization: Basic Zm9v', 'set my_api_key=zz', 'db_pass = hunter', 'client_secret: q', 'Cookie: sid=1', '**Token**: shown in bold',
+    'jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U', 'key sk-proj-abcdefghijklmnop',
+    'run AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 here', 'md5 9e107d9d372bb6826bd81d3542a419d6',
+  ];
+  for (const t of withheld) {
+    const out = await show(t);
+    assert.match(out, /\(excerpt withheld: it contains credential-like text\)/, t);
+    for (const leak of ['six secret', 'supersecret', 'SECRET', 'ESCAPED', 'alpha beta', 'hunter', 'Zm9v', 'eyJhbGci', 'AbCdEfGh', 'sk-proj', 'zz', 'sid=1']) assert.ok(!out.includes(leak), `${leak} in ${t}`);
+    assert.match(out, /\[1\] Note c1\n {4}ingested 2026-09-30 · kb:\/\/ComplexTrading\/feature\/c1 · doc c1/, 'title, date and URL stay');
+  }
+  for (const t of ['We pass the tests before merging.', 'The session layer reconnects.', 'Token budget is small', 'commit 4d40be7b54cd8037288c81f0a1b2c3d4e5f60718 landed',
+    'A secret is not stored here', 'bypass the cache for reads', 'see sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08']) {
+    const out = await show(t);
+    assert.ok(!out.includes('withheld') && out.includes(t.slice(0, 20)), t);
+  }
+  assert.match(await show('ok text', { title: 'Rotate api_key=abc' }), /\(title withheld: it contains credential-like text\)/);
   // safeCut: a single-quoted value left open at the cut is dropped; apostrophes inside words are not quotes.
   const c = kb.safeCut(`${'x '.repeat(245)}note='an open single quoted value that runs past the cut'`, 500);
   assert.ok(!c.includes("'an open") && c.length <= 500, c.slice(-60));
   const prose = kb.safeCut(`${"don't stop, it's fine ".repeat(40)}`, 500);
   assert.ok(prose.length > 450, `apostrophes kept the cut at ${prose.length}`);
   assert.ok(!kb.safeCut(`${'y '.repeat(240)}say "it\\" goes on and on`, 500).includes('"it'), 'an escaped quote does not close the value');
+});
+
+test('round 3 — raw URLs: no absolute paths, no empty segments, nothing outside the plain characters, first segment checked', () => {
+  const probe = (url) => kb.resultProblem({ ...note('q'), source_type: 'markdown', url });
+  for (const u of ['/code/x', '//file/x', '/personal/x', 'docs/a\u0001b.md', 'docs/a​b.md', 'docs/a b.md', 'kb://x//code/y', 'kb://personal/notes', 'kb://Code/x',
+    'docs/a b.md', 'text://x?token=abc', 'kb://u:p@host/x']) assert.ok(probe(u), JSON.stringify(u));
+  for (const u of ['alpaca_trader/tests/test_chunk_exclusion_bounds.py', 'pr:319', 'commit:39a2a4f', 'text://0e79f01ec7daefa8', 'kb://ComplexTrading/commit/4d40be7b54cd8037288c81f0a1b2c3d4e5f60718/implementation/x']) assert.equal(probe(u), null, u);
+});
+
+test('round 3 — the final text fits: a 256-byte launch block with no room for a note, and an error with its suffix', async () => {
+  config.knowledge.pastWorkBytes = 256;
+  setStore({ results: [note('a1')] });
+  const t = store.createTicket({ title: 'Tiny budget', area: 'db' });
+  const pw = await kb.preparePastWork(mkRun('dba', 'implement', t.key), { ticketKey: t.key });
+  assert.ok(Buffer.byteLength(pw.block) <= 256, `${Buffer.byteLength(pw.block)} bytes`);
+  assert.equal(pw.meta.items.length, 0);
+  config.knowledge.pastWorkBytes = 1536;
+  setStore({ mode: { search: 'contractLong' } });
+  await assert.rejects(search(mkRun(), 'long contract'), (e) => { assert.ok(Buffer.byteLength(e.message) <= 1024, `${Buffer.byteLength(e.message)}`); assert.match(e.message, /Continue without past work\.$/); return true; });
+});
+
+test('round 3 — the prompt counts as delivered only when its write completes: an engine that exits first leaves nothing citable', async () => {
+  setStore({ results: [note('a1')] });
+  const quitter = path.join(tmp, 'quitter.mjs');
+  fs.writeFileSync(quitter, `#!/usr/bin/env node\nconsole.log(${JSON.stringify(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0, num_turns: 1 }))});\nprocess.exit(0);\n`);
+  fs.chmodSync(quitter, 0o755);
+  const savedClaude = config.bins.claude, savedRoot = config.root;
+  config.root = tmp;
+  fs.mkdirSync(path.join(tmp, 'bin'), { recursive: true });
+  fs.copyFileSync(path.join(ROOT, 'bin', 'desk'), path.join(tmp, 'bin', 'desk')); fs.chmodSync(path.join(tmp, 'bin', 'desk'), 0o755);
+  const sockDir = fs.mkdtempSync(path.join('/tmp', 'sdkb-'));
+  runner.setSocketFactory((id) => server.agentSocket(id, path.join(sockDir, `r${id}.sock`)));
+  config.bins.claude = quitter;
+  dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: false }]);
+  team.applyTeamOverrides({ 'principal-be': { engine: 'claude', model: 'opus' } });
+  try {
+    const t = store.createTicket({ title: 'Design the quitting engine', area: 'backend', status: 'in_progress' });
+    const cwd = path.join(tmp, 'clone-quit'); fs.mkdirSync(cwd, { recursive: true });
+    const res = await runner.startRun({ agentId: 'principal-be', kind: 'design', ticketKey: t.key, cwd, prompt: `Design it.\n${'x'.repeat(4 << 20)}` });
+    const r = store.getRun(res.run.id);
+    assert.ok(r.pid, 'the engine did start');
+    assert.equal(JSON.parse(r.knowledge_meta).status, 'not delivered');
+    assert.equal(kb.exposedIds(r.id).size, 0);
+    assert.throws(() => kb.replyCitations(r, 'a1'), /not a past-work note shown to this run/);
+  } finally { config.bins.claude = savedClaude; config.root = savedRoot; runner.setSocketFactory(null); fs.rmSync(sockDir, { recursive: true, force: true }); team.applyTeamOverrides({}); }
 });
 
 test('round 2 — every answer fits the reserved bytes: a 20-namespace empty search against 1,024 bytes', async () => {
@@ -962,4 +1019,38 @@ test('round 2 — reconciliation selects tickets by qualifying-transition time, 
   config.knowledge.enabled = true;
   assert.equal(notes.reconcile(), 1, 'a later deploy transition is reconciled although the close predates the write side');
   assert.match(store.knowledgeNotesFor(t.key).at(-1).body, /run 88/);
+});
+
+test('round 3 — reconciliation finds a close after the write side began that references an earlier merge; a failed enqueue is visible', async () => {
+  const t = mergedTicket('Merged earlier, closed later');
+  store.logEvent({ kind: 'github', agent_id: 'github', ticket_key: t.key, text: 'PR merged on GitHub at 2026-01-01T00:00:00Z' });
+  await new Promise((r) => setTimeout(r, 20));
+  store.kvSet('knowledge:since', store.now()); // the merge evidence predates the write side
+  await new Promise((r) => setTimeout(r, 20));
+  config.knowledge.enabled = false;
+  sched.setStatus(t.key, 'done');
+  config.knowledge.enabled = true;
+  assert.equal(store.knowledgeNotesFor(t.key).length, 0);
+  assert.equal(notes.reconcile(), 1, 'the close after since is a candidate');
+  // A note that cannot be built: the close still happens, and the failure shows in the outbox health.
+  const bad = mergedTicket('Cannot build facts');
+  const br = mkRun('qa', 'qa', bad.key);
+  store.kvSet(`desk-test:${br.id}`, JSON.stringify([{ args: 'not-a-list', status: 0 }]));
+  sched.prActions.merged(bad, { at: '2026-10-05T14:00:00Z' });
+  assert.equal(store.getTicket(bad.key).status, 'done');
+  const d = kb.describe();
+  assert.ok(d.failures.some((f) => f.ticket_key === bad.key && f.status === 'not queued' && f.id === null), JSON.stringify(d.failures));
+  assert.ok(d.metrics.outbox_failures >= 1);
+  store.kvSet(`desk-test:${br.id}`, JSON.stringify([]));
+  notes.reconcile();
+  assert.ok(!kb.describe().failures.some((f) => f.ticket_key === bad.key && f.status === 'not queued'), 'cleared once queued');
+});
+
+test('round 3 — a facts-note field with credential-like text is withheld whole', async () => {
+  const t = mergedTicket('YAML secret in the spec', { spec: 'Configure the worker.\n\n## Acceptance criteria\n- password: >\n    hunter2valueYAML\n- it restarts cleanly' });
+  sched.prActions.merged(t, { at: '2026-10-05T12:00:00Z' });
+  const body = store.knowledgeNotesFor(t.key)[0].body;
+  assert.ok(!body.includes('hunter2valueYAML'), body);
+  assert.match(body, /## Specification {2}\[ticket at creation[^\n]*\n\[withheld: credential-like text\]/);
+  assert.match(body, /- src\/scan\.py/, 'other fields are kept');
 });
