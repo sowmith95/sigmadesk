@@ -253,7 +253,7 @@ function FeatureDoc({ fkey }: { fkey: string }) {
           </>}
           {!plan && kids.length > 0 && <DocSection title="Tasks"><EpicTree root={t.key} /></DocSection>}
           {plan && extra.length > 0 && <DocSection title="Other tasks"><ul className="grid gap-1.5">{extra.map((k) => <li key={k.key} className="flex items-center gap-2"><button type="button" className="min-w-0 flex-1 text-left hover:underline" onClick={() => openTicket(k.key)}>{nameOf(k)}</button>
-            {k.after_key && <span className="text-xs text-muted-foreground">after {k.after_key}</span>}<Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag></li>)}</ul></DocSection>}
+            {k.after_key && <span className="text-xs text-muted-foreground">after {k.after_key}</span>}<Tag tone={k.status === 'done' ? 'shipped' : 'neutral'}>{STAGE_LABEL[k.status] || k.status}</Tag><CreatedAge at={k.created_at} /></li>)}</ul></DocSection>}
         </article>
         <div className={cn('grid content-start gap-4 lg:sticky lg:top-20', p && p.status !== 'approved' && !['done', 'wontdo'].includes(t.status) && 'max-lg:order-first')}>
           <Session t={t} p={p} history={(fd?.data?.history || []) as FeaturePlan[]} edits={edits} />

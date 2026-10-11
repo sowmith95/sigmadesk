@@ -1,6 +1,7 @@
 // SigmaDesk client: one snapshot, then a live SSE stream of deltas. No framework, no innerHTML for data.
 import * as prsUi from './prs.js';
 import { nameOf, linkKeys } from './names.js';
+import { createdAge, createdTitle } from './created.js';
 import { portrait, presenceOf } from './avatars.js';
 
 const COLUMNS = [
@@ -327,6 +328,7 @@ function ticketCard(t) {
   return h('button', { class: `card ${live ? 'live' : ''}`, type: 'button', onclick: () => openTicket(t.key) },
     h('div', { class: 'card-top' }, h('span', { class: `pri ${t.priority}` }, t.priority), h('span', {}, t.type),
       h('span', { class: 'spacer' }), t.issue_number ? h('span', { title: 'GitHub issue' }, `#${t.issue_number}`) : null, t.pr_url ? h('span', { title: 'draft PR' }, '⇡PR') : null,
+      createdAge(t.created_at) ? h('time', { class: 'age', 'data-created': true, datetime: t.created_at, title: createdTitle(t.created_at), 'aria-label': createdTitle(t.created_at) }, createdAge(t.created_at)) : null,
       h('span', { class: 'key' }, t.key)),
     h('div', { class: 'card-title' }, nameOf(t)),
     nameOf(t) !== t.title ? h('div', { class: 'card-sub' }, t.title) : null,

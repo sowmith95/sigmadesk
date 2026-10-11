@@ -470,3 +470,61 @@ test('creation age on a desktop: Inbox rows, Work cards and the ticket header, a
   assert.deepEqual(errors, []);
   await page.close();
 });
+
+// A second preview with tickets created days ago (the first one last year).
+const AGE = /^(now|\d+[mhd]|[A-Z][a-z]{2} \d{1,2}(, \d{4})?)$/, DATE = /^[A-Z][a-z]{2} \d{1,2}(, \d{4})?$/;
+const visibleAge = (loc) => loc.evaluate((el) => el.textContent.replace(/^·\s*/, '').replace(/^created\s+/i, ''));
+test('creation age with old dates: phone rows, Work, Features, the next step, search, a seat, the wall and the classic board', { skip, timeout: 120_000 }, async () => {
+  const aged = await startPreview({ SIGMADESK_PREVIEW_PLAYBOOK: PLAYBOOK, SIGMADESK_PREVIEW_AGED: '1' });
+  try {
+    const phone = await openPage(browser, `${aged.url}/#/inbox`, { width: 390, height: 844 });
+    await phone.page.waitForSelector('[data-lane] article[data-ticket] [data-row-meta] time[data-created]');
+    const rows = await phone.page.$$eval('[data-lane] article[data-ticket]', (els) => els.map((el) => {
+      const meta = el.querySelector('[data-row-meta]'), age = meta.querySelector('time[data-created]');
+      const box = (x) => x.getBoundingClientRect(), one = (x) => box(x).height < 1.9 * parseFloat(getComputedStyle(x).fontSize);
+      return { key: el.dataset.ticket, text: age.innerText, one: one(el.querySelector('h3')) && one(meta), inside: box(age).right <= box(meta).right + 0.5 && box(age).width > 0 };
+    }));
+    assert.ok(rows.length >= 3);
+    for (const r of rows) { assert.match(r.text, DATE, `${r.key} shows its date`); assert.deepEqual([r.one, r.inside], [true, true], `${r.key}: two lines, the date in full`); }
+    assert.ok(await phone.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    assert.deepEqual(phone.errors, []); await phone.page.close();
+
+    const { page, errors } = await openPage(browser, `${aged.url}/#/work`, { width: 1440, height: 900 });
+    await page.waitForSelector('article[data-key] time[data-created]');
+    const years = await page.locator('time[data-created]', { hasText: /, \d{4}$/ }).count();
+    assert.ok(years >= 1, 'a ticket from last year says the year');
+    for (const t of await page.locator('article[data-key] time[data-created]').all()) assert.match(await visibleAge(t), DATE);
+    // Features: cards and the feature page, with its next step and every task row.
+    await go(page, '#/features');
+    const card = page.locator('article[data-feature]', { hasText: 'Fill audit' }).first(); await card.waitFor();
+    assert.match(await visibleAge(card.locator('time[data-created]')), DATE, 'feature card');
+    await card.locator('h3 button').click();
+    await page.locator('[data-next-step] time[data-created]').first().waitFor();
+    assert.match(await visibleAge(page.locator('[data-next-step] time[data-created]').first()), DATE, 'next step');
+    // Ticket search rows.
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+k' : 'Control+k');
+    const option = page.locator('[cmdk-item] time[data-created]').first(); await option.waitFor();
+    assert.match(await visibleAge(option), DATE, 'search row');
+    await page.keyboard.press('Escape');
+    // A seat on a ticket: its panel card.
+    await go(page, '#/team');
+    await page.getByRole('button', { name: 'Jordan', exact: true }).first().click(); // the preview puts Jordan on a ticket
+    const seatCard = page.locator('[role="dialog"] time[data-created]').first(); await seatCard.waitFor();
+    assert.match(await visibleAge(seatCard), DATE, 'seat panel');
+    assert.deepEqual(errors, []); await page.close();
+
+    // The wall and the classic board have no app chrome: plain pages.
+    const wall = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
+    await wall.goto(`${aged.url}/?wall=1`);
+    await wall.waitForSelector('[data-exception] time[data-created]');
+    assert.match(await visibleAge(wall.locator('[data-exception] time[data-created]').first()), DATE, 'wall exception card');
+    await wall.close();
+    const classic = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    await classic.goto(`${aged.url}/classic.html`);
+    await classic.waitForSelector('.card time[data-created]');
+    const c = classic.locator('.card time[data-created]').first();
+    assert.match(await c.textContent(), DATE, 'classic board card');
+    assert.match(await c.getAttribute('aria-label'), CREATED);
+    await classic.close();
+  } finally { await aged.stop(); }
+});

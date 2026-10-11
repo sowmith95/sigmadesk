@@ -12,7 +12,7 @@ import { Panel } from '@/components/desk/Panel';
 import { AsyncButton } from '@/components/desk/AsyncButton';
 import { ChoiceChips } from '@/components/desk/Choices';
 import { Field, SwitchRow } from '@/components/desk/Fields';
-import { SeatAvatar, StatTile, Key } from '@/components/desk/Bits';
+import { SeatAvatar, StatTile, Key, CreatedAge } from '@/components/desk/Bits';
 import type { Agent } from '@/types';
 
 type Row = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -60,7 +60,7 @@ export function SeatPanel() {
   const pct = (x: number | null | undefined) => (x == null ? 'n/a' : `${Math.round(x * 100)}%`);
   return (
     <Panel title={a.name} head={<div className="flex items-center gap-3"><SeatAvatar id={a.id} size="lg" /><span className="text-sm text-muted-foreground">{a.role}. {pr.text}.</span></div>} onClose={closeSheet}>
-      {a.current_ticket && <button type="button" onClick={() => openTicket(a.current_ticket!)} className="flex items-center justify-between gap-3 rounded-lg border bg-card px-4 py-3 text-left hover:bg-secondary"><b>{tname(a.current_ticket)}</b><Key k={a.current_ticket} /></button>}
+      {a.current_ticket && <button type="button" onClick={() => openTicket(a.current_ticket!)} className="flex items-center justify-between gap-3 rounded-lg border bg-card px-4 py-3 text-left hover:bg-secondary"><b className="min-w-0 flex-1">{tname(a.current_ticket)}</b><CreatedAge at={ticketByKey(a.current_ticket)?.created_at} /><Key k={a.current_ticket} /></button>}
       <p className="text-sm text-muted-foreground">Runs on {route.engine || a.engine}{(route.model ?? a.model) ? `, ${route.model ?? a.model}` : ''}{route.effort || a.effort ? `, effort ${route.effort || a.effort}` : ''}{route.fallback ? `; fallback: ${route.reason}` : ''}</p>
       {run && <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-card px-4 py-3"><span className="font-mono text-sm">{run.kind} run, {money(run.reserve_usd)} reserved</span><span className="flex-1" />
         <AsyncButton variant="destructive" size="sm" confirm={`Stop ${a.name}'s current run?`} run={() => api('POST', `/api/runs/${run.id}/kill`, {})} ok="Stopping the run">Stop run</AsyncButton></div>}

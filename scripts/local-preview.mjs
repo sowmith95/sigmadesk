@@ -329,3 +329,13 @@ if (process.env.SIGMADESK_DECISION_DEMO === '1') {
   access.ownerGrant({ seat: 'sre', probes: ['*'], minutes: 45, ticket_key: null, standing: false, reason: 'Preview: checking the fill counts' });
   store.addParticipants(contracts.key, ['sre'], 'owner'); // the SRE's timed grant shows in that ticket's autonomy line
 }
+
+// Opt-in fixtures for browser tests (#11), off by default so the standard preview stays as it is.
+// SIGMADESK_PREVIEW_AGED=1: tickets were created days ago (dates on chips), the first one last year.
+if (process.env.SIGMADESK_PREVIEW_AGED === '1') {
+  const all = store.listTickets().reverse();
+  all.forEach((t, i) => store.handle().prepare('UPDATE tickets SET created_at=? WHERE key=?')
+    .run(new Date(Date.now() - (i === 0 ? 400 : 9 + i) * 86400_000).toISOString(), t.key));
+  const open = all.find((t) => t.status === 'todo');
+  if (open) store.updateAgent('senior-be', { current_ticket: open.key }); // a seat on a ticket: its panel shows the ticket card
+}
