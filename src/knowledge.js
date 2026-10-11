@@ -193,9 +193,26 @@ const KILL_GRACE_MS = 500; // SIGTERM to the CLI's process group, then SIGKILL a
  * descendants still hold the pipes) and the whole group gets SIGTERM, then SIGKILL after a short grace.
  */
 export async function runCli(op, args, opts = {}) {
-  // One process at a time on the lane: a previous call of the same operation must be gone before the next spawns.
-  if (op?.terminated) await op.terminated;
+  // One process at a time on the lane: a previous call of the same operation must be gone before the next spawns. The
+  // wait counts toward the caller's deadline and ends on its cancellation: then the call settles and nothing spawns.
+  if (op?.terminated) {
+    const started = Date.now();
+    const why = await waitForPrevious(op, opts.deadlineAt);
+    if (why) return { code: null, reason: why, stdout: '', stderr: '', ms: Date.now() - started };
+  }
   return runOnce(op, args, opts);
+}
+/** null once the previous call's process group is gone; 'timeout' or 'cancelled' if the caller's deadline or cancellation comes first. */
+function waitForPrevious(op, deadlineAt) {
+  return new Promise((resolve) => {
+    let settled = false, timer = null;
+    const onKill = () => end('cancelled');
+    const end = (why) => { if (settled) return; settled = true; clearTimeout(timer); if (op.kill === onKill) op.kill = null; resolve(why); };
+    if (op.cancelled) return end('cancelled');
+    op.kill = onKill; // cancelOp (run end, kill switch) calls op.kill
+    if (Number.isFinite(deadlineAt)) timer = setTimeout(() => end('timeout'), Math.max(0, deadlineAt - Date.now()));
+    op.terminated.then(() => end(null), () => end(null));
+  });
 }
 /** Release the lane only once the operation's last process group is confirmed gone (callers settle earlier). */
 export function releaseAfter(op) { (op?.terminated || Promise.resolve()).then(() => release(), () => release()); }
@@ -211,7 +228,16 @@ function runOnce(op, args, { input = null, deadlineAt, stdoutCap = 512 << 10, st
     let leaderExited = false, termResolve = null, watching = false, lingerKilled = false;
     const terminated = new Promise((r) => { termResolve = r; });
     if (op) op.terminated = terminated;
-    const groupAlive = () => { if (!child?.pid) return false; try { process.kill(-child.pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+    // Signals to the group: once its disappearance (ESRCH) is observed, every pending escalation is cancelled and the pgid
+    // is never signalled again (it may already belong to an unrelated, newer process group).
+    let gone = false;
+    const sigTimers = new Set();
+    const markGone = () => { if (gone) return; gone = true; for (const t of sigTimers) clearTimeout(t); sigTimers.clear(); };
+    const later = (fn, ms) => { const t = setTimeout(() => { sigTimers.delete(t); fn(); }, ms); t.unref(); sigTimers.add(t); };
+    const groupAlive = () => {
+      if (gone || !child?.pid) return false;
+      try { process.kill(-child.pid, 0); return true; } catch (e) { if (e.code === 'EPERM') return true; markGone(); return false; }
+    };
     const watch = () => {
       if (watching) return;
       watching = true;
@@ -219,7 +245,7 @@ function runOnce(op, args, { input = null, deadlineAt, stdoutCap = 512 << 10, st
       const tick = () => {
         if (leaderExited && !groupAlive()) return termResolve(true);
         // A finished CLI that left descendants behind: they are stopped the same way.
-        if (leaderExited && !reason && !lingerKilled) { lingerKilled = true; killGroup('SIGTERM'); setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS).unref(); }
+        if (leaderExited && !reason && !lingerKilled) { lingerKilled = true; killGroup('SIGTERM'); later(() => killGroup('SIGKILL'), KILL_GRACE_MS); }
         if (Date.now() - t0 > KILL_GRACE_MS + TERMINATE_WAIT_MS) {
           try { store.logEvent({ kind: 'error', agent_id: 'system', text: `a knowledge-hub process group (pid ${child?.pid}) outlived its SIGKILL; the knowledge lane was released after ${((KILL_GRACE_MS + TERMINATE_WAIT_MS) / 1000).toFixed(1)}s` }); } catch { /* no store (doctor) */ }
           return termResolve(false);
@@ -237,12 +263,19 @@ function runOnce(op, args, { input = null, deadlineAt, stdoutCap = 512 << 10, st
     try { child = spawn(config.knowledge.executable, args, { env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], shell: false, detached: true }); } catch (e) { reason = 'spawn'; leaderExited = true; err.push(Buffer.from(String(e.message))); return finish(null); }
     if (op) op.started = true;
     child.on('exit', () => { leaderExited = true; });
-    const killGroup = (sig) => { if (!child.pid) return; try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch { /* gone */ } } };
+    const killGroup = (sig) => {
+      if (gone || !child.pid) return;
+      if (leaderExited && !groupAlive()) return; // checked right before sending: an exited leader and ESRCH mean done
+      try { process.kill(-child.pid, sig); } catch (e) {
+        if (e.code === 'ESRCH') markGone();
+        else if (!leaderExited) { try { child.kill(sig); } catch { /* gone */ } }
+      }
+    };
     const stop = (why) => {
       if (done || reason) return;
       reason = why;
       killGroup('SIGTERM');
-      setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS).unref();
+      later(() => killGroup('SIGKILL'), KILL_GRACE_MS);
       // Settle now: a descendant holding the pipes must not hold the search (or the run's preparation) open.
       for (const st of [child.stdout, child.stderr, child.stdin]) { try { st.destroy(); } catch { /* gone */ } }
       finish(null);

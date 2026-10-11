@@ -316,13 +316,13 @@ test('stream caps: only the remaining capacity is kept, then the process is stop
     const r = await kb.runCli(op, kb.searchArgs('cap me', ['sigmadesk'], 1, 50), { deadlineAt: Date.now() + 10_000, stdoutCap: 1024, stderrCap: 64 });
     assert.equal(r.reason, 'capped');
     assert.equal(Buffer.byteLength(r.stdout), 1024);
-  } finally { kb.closeOp(op); }
+  } finally { await op.terminated; kb.closeOp(op); } // a capped call settles at once; let its process go before the next test
   setStore({ mode: { search: 'crash' } });
   const op2 = kb.newOp({ kind: 'search' });
   try {
     const r = await kb.runCli(op2, kb.searchArgs('cap me', ['sigmadesk'], 1, 50), { deadlineAt: Date.now() + 10_000, stderrCap: 20 });
     assert.ok(Buffer.byteLength(r.stderr) <= 20, `${Buffer.byteLength(r.stderr)}`);
-  } finally { kb.closeOp(op2); }
+  } finally { await op2.terminated; kb.closeOp(op2); }
 });
 
 test('one knowledge process desk-wide, a bounded queue, and a total deadline that includes the wait', async () => {
@@ -734,7 +734,7 @@ test('round 2 — stream caps never decode past the cap, multibyte output includ
     assert.ok(Buffer.byteLength(r.stdout) <= 1024, `stdout ${Buffer.byteLength(r.stdout)}`);
     assert.ok(Buffer.byteLength(r.stderr) <= 20, `stderr ${Buffer.byteLength(r.stderr)}`);
     assert.ok(!r.stdout.includes('�') && !r.stderr.includes('�'));
-  } finally { kb.closeOp(op); }
+  } finally { await op.terminated; kb.closeOp(op); }
 });
 
 // ---------------- write side ----------------
@@ -1357,4 +1357,72 @@ else process.stdout.write(JSON.stringify({ contract: 1, results: [] }));
     assert.deepEqual(b.overlapping, [], `the successor started ${b.start - a.start} ms after the predecessor while it was still alive`);
     assert.equal(alive(a.pid), false);
   } finally { config.knowledge.executable = fake; config.knowledge.deadlineSeconds = 15; }
+});
+
+test('round 8 — once the group is seen gone (ESRCH), no signal is ever sent to that pgid again', async () => {
+  const exe = path.join(tmp, 'kh-linger.sh');
+  // Finishes normally, leaving a descendant that no longer holds the pipes: the linger path sends TERM, then would KILL.
+  fs.writeFileSync(exe, '#!/bin/sh\nsleep 5 >/dev/null 2>&1 </dev/null &\necho \'{"contract":1,"results":[]}\'\n');
+  fs.chmodSync(exe, 0o755);
+  config.knowledge.executable = exe;
+  const realKill = process.kill;
+  const sent = [];
+  process.kill = function (pid, sig) {
+    try { const r = realKill.call(process, pid, sig); sent.push({ pid, sig, t: Date.now() }); return r; }
+    catch (e) { sent.push({ pid, sig, err: e.code, t: Date.now() }); throw e; }
+  };
+  const op = kb.newOp({ kind: 'search' });
+  try {
+    const r = await kb.runCli(op, kb.searchArgs('linger', ['sigmadesk'], 1, 50), { deadlineAt: Date.now() + 5000 });
+    assert.equal(r.code, 0);
+    await op.terminated;
+    await sleep(900); // past the SIGKILL grace: a surviving escalation timer would fire now
+  } finally { process.kill = realKill; kb.closeOp(op); config.knowledge.executable = fake; }
+  const group = sent.filter((x) => x.pid < 0);
+  const goneAt = group.findIndex((x) => x.err === 'ESRCH');
+  assert.ok(goneAt >= 0, `the group's disappearance was observed: ${JSON.stringify(group)}`);
+  assert.deepEqual(group.slice(goneAt + 1), [], 'nothing was sent to the pgid after ESRCH');
+  assert.ok(group.some((x) => x.sig === 'SIGTERM'), 'the lingering descendant was stopped');
+});
+
+test('round 8 — waiting for the previous call ends on the caller\'s deadline or cancellation, and then nothing spawns', async () => {
+  const log = path.join(tmp, 'resist8.log');
+  fs.rmSync(log, { force: true });
+  const exe = path.join(tmp, 'kh-resist8');
+  fs.writeFileSync(exe, `#!/usr/bin/env node
+// The SIGTERM handler is in place before anything is written: an output cap stops it only once it can resist.
+process.on('SIGTERM', () => {});
+require('fs').appendFileSync(${JSON.stringify(log)}, process.argv[process.argv.length - 1] + '\\n');
+process.stdout.write('x'.repeat(4096));
+setInterval(() => {}, 1000);
+`);
+  fs.chmodSync(exe, 0o755);
+  config.knowledge.executable = exe;
+  const spawned = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : []);
+  try {
+    // Deadline during the wait.
+    const op = kb.newOp({ kind: 'write' });
+    assert.equal((await kb.runCli(op, ['doc-status', 'first'], { deadlineAt: Date.now() + 10_000, stdoutCap: 64 })).reason, 'capped'); // stopped; it lives until SIGKILL
+    const t0 = Date.now();
+    const r = await kb.runCli(op, ['ingest-text', 'second-deadline'], { deadlineAt: Date.now() + 100 });
+    assert.equal(r.reason, 'timeout');
+    assert.ok(Date.now() - t0 < 300, `settled after ${Date.now() - t0} ms`);
+    await op.terminated; await sleep(200);
+    assert.ok(!spawned().includes('second-deadline'), 'nothing spawned after the deadline');
+    kb.closeOp(op);
+    // Cancellation during the wait.
+    const run = mkRun();
+    const op2 = kb.newOp({ runId: run.id, kind: 'search' });
+    assert.equal((await kb.runCli(op2, ['search', 'first-cancel'], { deadlineAt: Date.now() + 10_000, stdoutCap: 64 })).reason, 'capped');
+    const t1 = Date.now();
+    const p = kb.runCli(op2, ['search', 'second-cancel'], { deadlineAt: Date.now() + 5000 });
+    await sleep(50);
+    kb.cancelRun(run.id);
+    const r2 = await p;
+    assert.equal(r2.reason, 'cancelled');
+    assert.ok(Date.now() - t1 < 250, `settled after ${Date.now() - t1} ms`);
+    await op2.terminated; await sleep(200);
+    assert.ok(!spawned().includes('second-cancel'), 'nothing spawned after the cancellation');
+    kb.closeOp(op2);
+  } finally { config.knowledge.executable = fake; }
 });
