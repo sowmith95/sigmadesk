@@ -284,12 +284,13 @@ test('setup phase: a spawned and wired run is its close handler\'s alone: it end
 // them ends the run once, with the setup reason: no later exit overwrites it or charges the cap, the process is stopped,
 // and the socket, timers and seat are released.
 const sleeper = path.join(tmp, 'sleepy'); fs.writeFileSync(sleeper, '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
-function throwOnRegister(proto, event) {
+function throwOnRegister(proto, event, nth = 0) {
   const on = proto.on, own = Object.prototype.hasOwnProperty.call(proto, 'on');
   const restore = () => { if (own) proto.on = on; else delete proto.on; };
+  let seen = 0;
   // Only the run's own wiring in spawnChild (a pid lookup or a git call elsewhere registers the same events).
   proto.on = function (ev, fn) {
-    if (ev === event && /at spawnChild /.test(new Error().stack) && !/processStart/.test(new Error().stack)) { restore(); throw new Error(`injected wiring failure (${event})`); }
+    if (ev === event && /at spawnChild /.test(new Error().stack) && !/processStart/.test(new Error().stack) && seen++ === nth) { restore(); throw new Error(`injected wiring failure (${event})`); }
     return on.call(this, ev, fn);
   };
   return restore;
@@ -322,4 +323,58 @@ async function wiringFails(proto, event, { bin = fakeClaude } = {}) {
 
 test('setup phase: a throw registering the output handler (before the exit handler) stops the process and ends the run once', () => wiringFails(Readable.prototype, 'data', { bin: sleeper }));
 test('setup phase: a throw registering the exit handler itself stops the process and ends the run once', () => wiringFails(ChildProcess.prototype, 'close', { bin: sleeper }));
-test('setup phase: a throw after the exit handler is attached, then the process exits: one finalization, the setup reason kept', () => wiringFails(ChildProcess.prototype, 'error'));
+// The child's own error listener now comes first and the exit handler last, so nothing can throw once the exit handler
+// is attached. The race left is an exit arriving right after an abort: a quick-exiting process, wiring failing late.
+test('setup phase: the process exits on its own just after an abort: one finalization, the setup reason kept', () => wiringFails(ChildProcess.prototype, 'close'));
+
+// A missing executable: the child's own error arrives after spawn() returns. Whatever registration throws first, it
+// must never reach the process as an uncaught exception, and the run ends once with the setup reason.
+// In wiring order: the child's error listener (attached first, right after spawn()), stdin, stdout, stderr, the exit handler.
+const POINTS = [['the child error listener', ChildProcess.prototype, 'error', 0], ['the stdin error listener', Readable.prototype, 'error', 0],
+  ['the stdout handler', Readable.prototype, 'data', 0], ['the stderr handler', Readable.prototype, 'data', 1], ['the exit handler', ChildProcess.prototype, 'close', 0]];
+const missing = path.join(tmp, 'no-such-engine');
+for (const [what, proto, event, nth] of POINTS) {
+  test(`setup phase: a missing executable and a throw registering ${what}: no uncaught exception, one finalization`, async () => {
+    await waitIdle();
+    const uncaught = [], onUncaught = (e) => uncaught.push(e);
+    process.on('uncaughtException', onUncaught);
+    const saved = config.bins.claude; config.bins.claude = missing;
+    let restore = () => {};
+    try {
+      await assert.rejects(runner.startRun({ agentId: 'pm', kind: 'implement', prompt: 'x', cwd: repo, onStart: () => { restore = throwOnRegister(proto, event, nth); } }), /injected wiring failure/);
+      await new Promise((r) => setTimeout(r, 300)); // the child's error and close arrive after the abort
+    } finally { restore(); config.bins.claude = saved; process.off('uncaughtException', onUncaught); }
+    assert.deepEqual(uncaught.map((e) => e.message), [], 'nothing reached the process');
+    const run = lastRun(), events = store.recentEvents({ limit: 100 }).filter((e) => e.run_id === run.id);
+    assert.deepEqual([run.status, run.token, run.cost_usd], ['error', null, 0]);
+    assert.match(run.result_text, /^Run setup failed: injected wiring failure/, 'the setup reason is kept');
+    assert.equal(events.filter((e) => /implement run (finished|error|killed)/.test(e.text)).length, 0, 'the exit never finalized it');
+    assert.equal(runner.runningCount(), 0);
+    assert.equal(store.getAgentState('pm').status, 'idle');
+  });
+}
+
+test('setup phase: a missing executable alone ends the run once, from its exit, saying the spawn failed', async () => {
+  await waitIdle();
+  const saved = config.bins.claude; config.bins.claude = missing;
+  let out;
+  try { out = await runner.startRun({ agentId: 'pm', kind: 'implement', prompt: 'x', cwd: repo }); } finally { config.bins.claude = saved; }
+  assert.equal(out.run.status, 'error'); assert.match(out.run.result_text, /^spawn failed: .*ENOENT/);
+  const events = store.recentEvents({ limit: 100 }).filter((e) => e.run_id === out.run.id);
+  assert.equal(events.filter((e) => /^spawn failed/.test(e.text)).length, 1);
+  assert.equal(events.filter((e) => /implement run error/.test(e.text)).length, 1, 'finalized exactly once');
+});
+
+test('a run stopped by a signal records no error event that is only the signal name', async () => {
+  await waitIdle();
+  const saved = config.bins.claude; config.bins.claude = sleeper;
+  let p;
+  try { p = runner.startRun({ agentId: 'pm', kind: 'implement', prompt: 'x', cwd: repo }); } finally { config.bins.claude = saved; }
+  for (let i = 0; i < 100 && !lastRun().pid; i++) await new Promise((r) => setTimeout(r, 20));
+  const id = lastRun().id;
+  assert.ok(runner.killRun(id, 'owner stopped'));
+  const out = await p;
+  assert.deepEqual([out.run.status, out.run.result_text], ['killed', 'owner stopped']);
+  const events = store.recentEvents({ limit: 100 }).filter((e) => e.run_id === id);
+  assert.equal(events.filter((e) => /^SIG[A-Z]+$/.test(e.text)).length, 0, 'SIGTERM is not an error message');
+});

@@ -883,9 +883,16 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   if (sock) env.DESK_SOCKET = sock.path;
   else delete env.DESK_SOCKET;
   const child = spawn(cmd.bin, cmd.args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
+  // Until its exit handler is attached the process is the setup phase's too: an abort stops it. Should a listener below
+  // have failed to attach, the abort gives the child and its stdin one, so their errors cannot crash the desk.
+  const mute = (em) => { if (em && em.listenerCount('error') === 0) em.on('error', () => {}); };
+  setup.own(() => { children.delete(run.id); mute(child); mute(child.stdin); if (child.pid) killGroup(child.pid, { owner: run.id }); });
   children.set(run.id, child);
-  // Until its close handler is attached, the process is the setup phase's too: a failure here stops it as well.
-  setup.own(() => { children.delete(run.id); if (child.pid) killGroup(child.pid, { owner: run.id }); });
+  // Next, before anything else that can throw: a listener for the child's own error (a missing executable, a spawn
+  // with no pid). It only records the error for whichever owner ends the run (an abort during setup, or the exit
+  // handler after the hand-off); it never ends the run itself.
+  let spawnError = null;
+  child.on('error', (err) => { spawnError ||= `spawn failed: ${err.message}`; });
   store.updateRun(run.id, { pid: child.pid });
   // The process's start time identifies it after a restart (a recorded pid alone may have been reused meanwhile).
   if (child.pid) processStart(child.pid).then((at) => { if (at) store.updateRun(run.id, { pid_start: at }); }).catch(() => {}); // best effort: never an unhandled rejection
@@ -927,7 +934,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   // Wiring stays synchronous (outside any Promise executor), so a throw here reaches the setup phase's catch.
   let resolve;
   const ended = new Promise((r) => { resolve = r; });
-  const finish = (code, spawnError = null) => {
+  const finish = (code) => {
       if (!setup.finishing()) return; // an abort already ended it, or it already finished
       if (spawnError) store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: spawnError });
       clearTimeout(timer);
@@ -960,7 +967,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       store.transaction(() => {
         store.updateRun(run.id, {
           status, ended_at: store.now(), cost_usd: cost, cost_estimated: knownCost ? 0 : 1, usage_json: r?.usage ? JSON.stringify(r.usage) : null, num_turns: r?.num_turns ?? null,
-          result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || `exit ${code}`)).slice(0, 8000), token: null,
+          result_text: String(r?.result ?? (prev.status === 'killed' && prev.result_text ? prev.result_text : stderr || spawnError || `exit ${code}`)).slice(0, 8000), token: null,
         });
         onEnd?.(store.getRun(run.id), { steps: stepsTaken(ctx) });
       });
@@ -974,8 +981,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       resolve({ run: store.getRun(run.id), result: r, failure, steps: stepsTaken(ctx) });
       ledgers.delete(run.id);
   };
-  child.on('close', finish);
-  child.on('error', (err) => finish(-1, `spawn failed: ${err.message}`));
+  child.on('close', (code) => finish(code)); // close(code, signal): a signal is not an error, and never one's text
   setup.handOff(); // its close handler now ends the run and releases what it holds, exactly once
   return ended;
   }
