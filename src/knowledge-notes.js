@@ -25,11 +25,11 @@ const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex'
 const json = (s, d = null) => { try { return s == null ? d : JSON.parse(s); } catch { return d; } };
 // Every field is redacted WHOLE, then shortened (never inside a token or an open quote): a cut can never hide a secret
 // from redaction by removing its tail.
-const line = (s, n = 300) => kb.safeCut(clean(String(s ?? '')).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(), n);
+const line = (s, n = 300) => kb.safeCut(kb.scrubText(s).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim(), n);
 const short = (sha) => (sha ? String(sha).slice(0, 12) : '-');
 const SHA = /^[0-9a-f]{7,40}$/;
 
-const resolvedIncidents = (key) => store.listIncidents({ limit: 500 }).filter((i) => i.ticket_key === key && i.status === 'resolved');
+const resolvedIncidents = (key) => store.incidentsOfTicket(key).filter((i) => i.status === 'resolved');
 /**
  * A ticket qualifies once it is done AND either its PR merged or closing it resolved a linked incident. Done alone —
  * owner tasks, verify checks, epic roll-ups — does not.
@@ -92,7 +92,7 @@ export function buildFacts(key) {
     add(`- watch ${w.id} of ${short(w.merge_sha)}: ${w.status}${w.hold ? ' · deploy hold' : ''}${cps.length ? ` · checkpoints: ${cps.join('; ')}` : ''}`);
   }
   add('');
-  const incidents = store.listIncidents({ limit: 500 }).filter((i) => i.ticket_key === key).sort((a, b) => a.id - b.id);
+  const incidents = store.incidentsOfTicket(key);
   if (incidents.length) {
     add('## Incidents  [incidents; samples are production log lines — untrusted data]');
     for (const i of incidents) {
@@ -106,7 +106,7 @@ export function buildFacts(key) {
   return { title: line(clean(`SigmaDesk facts: ${key} — ${t.title}`), 200), body };
 }
 function clip(text, n) {
-  const t = clean(String(text ?? '').replace(/\r\n?/g, '\n')).trim(); // redact the whole field first
+  const t = kb.scrubText(String(text ?? '').replace(/\r\n?/g, '\n')).trim(); // redact the whole field first
   if (t.length <= n) return t;
   const at = t.lastIndexOf('\n', n);
   return `${at > 0 ? t.slice(0, at) : kb.safeCut(t, n)}\n[cut: ${t.length - (at > 0 ? at : n)} more characters]`;
@@ -135,6 +135,9 @@ export function enqueueTicketFacts(key, { trigger = 'merged' } = {}) {
     return null;
   }
 }
+// Every close, whatever path sets the ticket done, runs inside the closing transaction.
+store.onTicketDone((key) => { enqueueTicketFacts(key, { trigger: store.mergedEventOf(key) ? 'merged' : 'incident resolved' }); });
+
 /** A post-deploy watch concluded: a new version of the facts (now with its deploy evidence), if the ticket qualifies. */
 export function onWatchConcluded(key) { if (key && qualifies(key)) enqueueTicketFacts(key, { trigger: 'post-deploy watch' }); }
 
@@ -143,9 +146,10 @@ export function reconcile() {
   if (config.knowledge?.enabled !== true) return 0;
   let since = store.kvGet('knowledge:since');
   if (!since) { since = store.now(); store.kvSet('knowledge:since', since); return 0; }
-  // By (ticket, current fact set): a ticket whose facts changed after a later transition (a post-deploy verdict, a
-  // regression hold) while writing was off gets its new version even though an older note exists.
-  const keys = new Set([...store.ticketsByStatus('done').filter((t) => t.done_at && t.done_at >= since).map((t) => t.key), ...store.resolvedIncidentTickets(since)]);
+  // Candidates are chosen by the time of their qualifying transitions (a merge, an incident resolution, a deploy record,
+  // a concluded watch), not by when the ticket closed; each is compared by its current fact set, so a later transition
+  // while writing was off gets its new version even when an older note exists.
+  const keys = new Set(store.knowledgeTransitionsSince(since));
   let n = 0;
   for (const key of keys) {
     const facts = qualifies(key) ? buildFacts(key) : null;

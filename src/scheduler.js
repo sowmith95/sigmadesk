@@ -28,7 +28,7 @@ import * as access from './access.js';
 import * as packages from './packages.js';
 import * as netfetch from './netfetch.js';
 import * as knowledge from './knowledge.js';
-import * as knowledgeNotes from './knowledge-notes.js';
+import './knowledge-notes.js'; // registers the close hook that queues past-work notes (#10)
 import * as mentions from './mentions.js';
 import * as deploywatch from './deploywatch.js';
 import * as delegation from './delegation.js';
@@ -190,13 +190,7 @@ export function buildDecision(t, { ctx = assignContext(), overlay = {}, taken = 
 
 export function setStatus(key, status, extra = {}) {
   const before = store.getTicket(key)?.status;
-  // Closing commits together with its frozen past-work note (#10) when it qualifies (a merged PR, or an incident the
-  // close resolved); the note never blocks the close.
-  const t = store.transaction(() => {
-    const row = store.updateTicket(key, { status, ...extra });
-    if (status === 'done' && before !== 'done') knowledgeNotes.enqueueTicketFacts(key, { trigger: store.mergedEventOf(key) ? 'merged' : 'incident resolved' });
-    return row;
-  });
+  const t = store.updateTicket(key, { status, ...extra }); // a close commits with its past-work note (#10, store.onTicketDone)
   github.syncIssueState(key);
   // A hold whose kind is delegated (#9) is announced by the delegation only if it comes back to the owner.
   if (status !== before && status === 'needs_human' && !delegation.deferNotice(t)) notify('needs_human', t, 'needs you');
