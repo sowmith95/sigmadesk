@@ -1456,3 +1456,19 @@ process.stdout.write('{}');
     kb.closeOp(op); kb.closeOp(op2);
   } finally { config.knowledge.executable = fake; }
 });
+
+test('round 10 — a deadline that expires between the caller\'s check and the spawn never spawns', async () => {
+  const realNow = Date.now;
+  const D = realNow() + 60_000;
+  let calls = 0;
+  // The first clock read (runCli's own check) sees D - 1; every later read (runOnce, right before spawning) sees D.
+  Date.now = () => (calls++ === 0 ? D - 1 : D);
+  let r, op;
+  try {
+    op = kb.newOp({ kind: 'search' });
+    r = await kb.runCli(op, ['search', 'boundary'], { deadlineAt: D });
+  } finally { Date.now = realNow; }
+  assert.equal(r.reason, 'timeout');
+  assert.ok(!op.started, 'no process was spawned at the deadline boundary');
+  kb.closeOp(op);
+});

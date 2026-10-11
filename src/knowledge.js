@@ -223,6 +223,9 @@ function runOnce(op, args, { input = null, deadlineAt, stdoutCap = 512 << 10, st
   return new Promise((resolve) => {
     if (op?.cancelled) return resolve({ code: null, reason: 'cancelled', stdout: '', stderr: '', ms: 0 });
     const started = Date.now();
+    // Checked here too, with the same timestamp the spawn follows synchronously: a deadline that expired after the
+    // caller's own check still never spawns.
+    if (Number.isFinite(deadlineAt) && started >= deadlineAt) return resolve({ code: null, reason: 'timeout', stdout: '', stderr: '', ms: 0 });
     let child, done = false, reason = null;
     const out = [], err = [];
     let outN = 0, errN = 0, timer = null;
