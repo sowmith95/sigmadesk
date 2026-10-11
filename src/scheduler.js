@@ -866,11 +866,19 @@ export function researchBacklog(settings = store.getSettings()) {
     : `${count} research item${count === 1 ? ' is' : 's are'} waiting — research resumes when fewer than ${max} are open`;
   return { count, max, full, keys, reason };
 }
+// Proposal room taken by research sessions admitted but still preparing (workspace copy before the run exists): set
+// synchronously at admission, before the first await, so two launches can never claim the same room. Handed over to
+// the run when it is created (the run's stored job then holds the room) and released if preparation fails, is cancelled
+// or the run is refused. In memory only: a launch that has not created its run does not survive a restart, so a stored
+// copy would hold room that nothing could release.
+const preparingResearch = new Map(); // launch id → proposals reserved
+let researchLaunches = 0;
+export const preparingResearchRoom = () => [...preparingResearch.values()].reduce((n, v) => n + v, 0);
 // One admission path for scheduled, manual and program-specific research: the program's seat, its engine fit, and a
 // proposal allowance reserved against the global room (net of allowances other running research jobs still hold).
 // The allowance is also capped by the research backlog's free room, so it is ≤ 0 while the backlog is full.
 export function researchAdmission(settings = store.getSettings()) {
-  const held = store.unfinishedRuns().filter((r) => r.kind === 'research' && r.job).reduce((n, r) => { try { const j = JSON.parse(r.job); return n + Math.max(0, (j.maxProposals || 0) - (j.proposals || 0)); } catch { return n; } }, 0);
+  const held = preparingResearchRoom() + store.unfinishedRuns().filter((r) => r.kind === 'research' && r.job).reduce((n, r) => { try { const j = JSON.parse(r.job); return n + Math.max(0, (j.maxProposals || 0) - (j.proposals || 0)); } catch { return n; } }, 0);
   const backlog = researchBacklog(settings);
   const funnel = Number(settings.max_open_proposals) - store.ticketsByStatus('proposed').length - held;
   const room = Math.min(funnel, backlog.max - backlog.count - held);
@@ -891,9 +899,14 @@ export async function launchResearch(focus = '', fence = runner.currentEpoch(), 
   const { room, reason } = researchAdmission(s);
   if (room <= 0) throw Object.assign(new Error(reason), { status: 409 });
   const job = research.job(p, { focus, room });
-  const extra = `Program "${p.label}" (${p.id}). ${job.focus ? `Focus: ${job.focus}. ` : ''}File at most ${job.maxProposals} proposal${job.maxProposals === 1 ? '' : 's'}; each one is reviewed by another seat before grooming.`;
-  const { cwd } = await readonlyJob(p.seat, null);
-  return launch({ fence, agentId: p.seat, kind: 'research', ticket: null, cwd, prompt: promptFor('research', { extra }), job });
+  const id = ++researchLaunches;
+  preparingResearch.set(id, job.maxProposals); // before the first await: the next admission already sees this room taken
+  try {
+    const extra = `Program "${p.label}" (${p.id}). ${job.focus ? `Focus: ${job.focus}. ` : ''}File at most ${job.maxProposals} proposal${job.maxProposals === 1 ? '' : 's'}; each one is reviewed by another seat before grooming.`;
+    const { cwd } = await readonlyJob(p.seat, null);
+    return await launch({ fence, agentId: p.seat, kind: 'research', ticket: null, cwd, prompt: promptFor('research', { extra }), job,
+      onStart: () => preparingResearch.delete(id) }); // the run now exists and its job holds the room
+  } finally { preparingResearch.delete(id); }
 }
 // Independent assessment of a proposed connector: a read-only run whose structured answer lands on the connector record.
 async function launchConnectorAssessment(c, seat, fence) {

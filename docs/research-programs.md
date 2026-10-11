@@ -27,6 +27,9 @@ research decision. Once groomed into ordinary work (`todo` onwards) or closed, i
 holds `research_backlog_max` items or more (Settings → Research, default 8, 0 = never), no program starts a session,
 scheduled or "Run now", and the program reads "Waiting for research items to finish". Reviews, revisions, grooming and
 owner decisions are never held back by it.
+A session's proposal room is reserved the moment it is admitted, before its workspace is prepared, so two sessions
+started together (scheduled, "Run now" or another program) can never both take the last free place; the room passes to
+the run when it starts and is released if preparation fails or the run is refused.
 
 Due programs run oldest-first so list order cannot starve one. Review and revision work is scheduled ahead of new
 discovery, and shares the two-seat review allowance with product reviews; one capacity slot stays free for QA/SRE.

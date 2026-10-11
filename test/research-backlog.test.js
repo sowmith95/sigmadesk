@@ -132,3 +132,63 @@ test('scheduled research waits at the cap and resumes below it; reviews and revi
   assert.equal(sessions().length, before + 1, 'research resumes once fewer than the limit are open');
   store.setSetting('research_backlog_max', '8');
 });
+
+// Two sessions can never claim the same room: admission reserves it synchronously, before the workspace is prepared.
+function secondProgram() {
+  if (research.get('second-look')) return;
+  research.save([...research.programs().map((p) => ({ ...p, intervalMinutes: 15 })), { id: 'second-look', label: 'Second look', seat: 'quant-research', enabled: true, intervalMinutes: 15, window: 'any', focus: '', sources: [],
+    tools: { web: true, connectors: [] }, maxProposals: 3, review: { minReviewers: 1, reviewers: ['principal-be'] } }]);
+}
+function atOneBelowTheLimit() {
+  clear();
+  for (const r of store.unfinishedRuns()) store.updateRun(r.id, { status: 'success', ended_at: store.now() });
+  store.setSetting('research_backlog_max', '4');
+  held(); held(); held();
+  assert.equal(sched.researchAllowance(), 1, 'room for exactly one more research item');
+}
+
+test('concurrent admissions at the limit minus one: a manual run and a program run cannot both take the last room', async () => {
+  await waitIdle(); secondProgram(); atOneBelowTheLimit();
+  store.setSetting('paused', 'false');
+  const before = sessions().length;
+  const first = sched.launchResearch('', undefined, 'product-discovery'); // preparing its workspace, no run yet
+  assert.equal(sched.preparingResearchRoom(), 1, 'the room is reserved before the first await');
+  assert.ok(sched.researchAllowance() <= 0);
+  await assert.rejects(sched.launchResearch('', undefined, 'second-look'), (e) => e.status === 409 && /holds the remaining room/.test(e.message));
+  await first; await waitIdle();
+  store.setSetting('paused', 'true');
+  assert.equal(sessions().length, before + 1, 'exactly one session admitted');
+  assert.equal(JSON.parse(store.getRun(sessions()[0].id).job).maxProposals, 1);
+  assert.equal(sched.preparingResearchRoom(), 0, 'the reservation moved to the run, then the run finished');
+  store.setSetting('research_backlog_max', '8');
+});
+
+test('concurrent admissions at the limit minus one: a scheduled session and a manual one cannot both take the last room', async () => {
+  await waitIdle(); secondProgram(); atOneBelowTheLimit();
+  dueAgain();
+  const before = sessions().length;
+  store.setSetting('paused', 'false');
+  await sched.tick(); // both programs are due and both seats idle: only the first admitted may start
+  await assert.rejects(sched.launchResearch('', undefined, 'product-discovery'), /holds the remaining room|is busy/);
+  await assert.rejects(sched.launchResearch('', undefined, 'second-look'), /holds the remaining room|is busy/);
+  store.setSetting('paused', 'true');
+  await waitIdle();
+  assert.equal(sessions().length, before + 1, 'exactly one session admitted');
+  store.setSetting('research_backlog_max', '8');
+});
+
+test('a research session whose preparation fails releases its reserved room', async () => {
+  await waitIdle(); atOneBelowTheLimit();
+  store.setSetting('paused', 'false');
+  const root = config.workspaceRoot, file = path.join(tmp, 'not-a-dir'); fs.writeFileSync(file, 'x');
+  config.workspaceRoot = path.join(file, 'ws'); // the workspace copy cannot be made
+  try {
+    const launching = sched.launchResearch('', undefined, 'product-discovery');
+    assert.equal(sched.preparingResearchRoom(), 1);
+    await assert.rejects(launching);
+  } finally { config.workspaceRoot = root; store.setSetting('paused', 'true'); }
+  assert.equal(sched.preparingResearchRoom(), 0, 'released on failure');
+  assert.equal(sched.researchAllowance(), 1, 'the room is free again');
+  assert.equal(store.getAgentState('pm').status, 'idle');
+  store.setSetting('research_backlog_max', '8');
+});
