@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
-import { config } from './config.js';
+import { config, KNOWLEDGE_SEARCH_KINDS, KNOWLEDGE_AUTO_KINDS, KNOWLEDGE_MAX_PER_RUN, KNOWLEDGE_ENV_KEYS } from './config.js';
 import * as store from './db.js';
 import { clean } from './ops.js';
 import { agentById } from './team.js';
@@ -27,62 +27,89 @@ const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex'
 const refuse = (msg, status = 403) => Object.assign(new Error(msg), { status, refused: true });
 
 // ---------------- scope ----------------
-const NS_RE = /^[a-z0-9][a-z0-9._:-]{0,63}$/; // KnowledgeHub's own namespace rule
-/** Namespaces that are never searched or written, whatever the configuration says. */
-export function deniedNamespace(ns) {
-  const s = String(ns ?? '').trim().toLowerCase();
-  return !s || /^(personal|journal|code)([._:-]|$)/.test(s) || /(^|[._:-])receipts$/.test(s);
+// A namespace is searchable only if it is EXACTLY a configured name, has a plain shape, and names nothing private or
+// noisy anywhere in it, whatever the separator: "complextrading-receipts-v2", "receipts:archive" and "codex-notes" are
+// all refused (fail closed: a false refusal costs a config edit, a false pass leaks a diary).
+const NS_SHAPE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
+export const FORBIDDEN_TOKENS = Object.freeze(['personal', 'journal', 'career', 'receipt', 'code']);
+export function deniedNamespace(ns) { const s = String(ns ?? '').toLowerCase(); return !s || FORBIDDEN_TOKENS.some((t) => s.includes(t)); }
+/** Why a namespace may not be searched or written, or null. */
+export function namespaceProblem(n) {
+  if (typeof n !== 'string' || !NS_SHAPE.test(n)) return 'not a plain namespace name (lowercase letters, digits, dots and dashes)';
+  if (deniedNamespace(n)) return 'never searched (private or noise)';
+  return null;
 }
-export const DENY_TEXT = 'personal, journal, code and any *-receipts namespace';
-export const defaultNamespace = () => String(config.project?.name || 'project').toLowerCase().replace(/[^a-z0-9._:-]+/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 64) || 'project';
-const configured = () => (Array.isArray(config.knowledge?.namespaces) && config.knowledge.namespaces.length ? config.knowledge.namespaces : [defaultNamespace()]).map((n) => String(n).trim());
-/** The namespace filter every search passes: configured (or the project's own) minus the deny list. */
-export function namespaces() { return [...new Set(configured())].filter((n) => NS_RE.test(n) && !deniedNamespace(n)); }
+export const DENY_TEXT = 'any name containing personal, journal, career, receipt or code';
+export const defaultNamespace = () => String(config.project?.name || 'project').toLowerCase().replace(/[^a-z0-9.-]+/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 64) || 'project';
+const configured = () => (Array.isArray(config.knowledge?.namespaces) && config.knowledge.namespaces.length ? config.knowledge.namespaces : [defaultNamespace()]);
+/** The namespace filter every search passes: the configured names that pass namespaceProblem, exactly as written. */
+export function namespaces() { return [...new Set(configured())].filter((n) => !namespaceProblem(n)); }
 const ns = namespaces;
 /** Configured namespaces the desk will not use, with why (Settings and doctor show them). */
 export function refusedNamespaces() {
-  return [...new Set(configured())].filter((n) => !NS_RE.test(n) || deniedNamespace(n)).map((n) => ({ namespace: n, why: deniedNamespace(n) ? 'never searched (private or noise)' : 'not a valid namespace name' }));
+  return [...new Set(configured())].filter((n) => namespaceProblem(n)).map((n) => ({ namespace: String(n), why: namespaceProblem(n) }));
 }
-/** Where desk-authored notes go: knowledge.writeNamespace, else the first search namespace; never a denied one. */
+/** Where desk-authored notes go: knowledge.writeNamespace, else the first search namespace; never a refused one. */
 export function writeNamespace() {
-  const w = String(config.knowledge?.writeNamespace || namespaces()[0] || '').trim();
-  return w && NS_RE.test(w) && !deniedNamespace(w) ? w : null;
+  const w = config.knowledge?.writeNamespace || namespaces()[0] || '';
+  return w && !namespaceProblem(w) ? w : null;
 }
-// Routes that must never reach a seat even if the store mislabels them: career memory, the work diary and raw git
-// receipts (kb://<repo>/commit/<sha>/commit|push/…). Implementation notes live under …/commit/<sha>/implementation/…
-// and stay allowed.
-const DENY_URL = [/^career-memory:\/\//i, /^journal:\/\//i, /^kb:\/\/[^/]+\/commit\/[0-9a-f]{7,40}\/(commit|push)(\/|$)/i];
-const DENY_TYPES = new Set(['code', 'journal']); // seats already hold the repository; the diary is personal
+// Results: the URL is canonicalized FIRST (control characters and whitespace removed, scheme lowercased), so a padded
+// " career-memory://…" is judged as what a seat would read. Only these schemes, never a git receipt route
+// (kb://<repo>/commit/<sha>/commit|push/…; implementation notes under …/implementation/… stay allowed), only prose types.
+const URL_SCHEMES = new Set(['kb', 'text', 'https', 'complextrading']);
+const RESULT_TYPES = new Set(['markdown', 'text']);
+const RECEIPT_ROUTE = /^kb:\/\/[^/]+\/commit\/[0-9a-f]{7,40}\/(commit|push)(\/|$)/i;
+const PRIVATE_ROUTE = /career-memory|(^|[/:])journal[:/]/i;
 const DOC_ID = /^[\w.:-]{1,80}$/;
+/** The URL as the policy (and the seat) sees it, or null when it has no scheme. */
+export function canonicalUrl(raw) {
+  const t = String(raw ?? '').replace(/[\u0000-\u0020\u007f-\u00a0\u1680\u2000-\u200f\u2028-\u202f\u205f\u3000\ufeff]+/g, '');
+  const m = t.match(/^([A-Za-z][A-Za-z0-9+.-]*):/);
+  return m ? `${m[1].toLowerCase()}${t.slice(m[1].length)}` : null;
+}
 /** Why one search answer may not be shown, or null. */
 export function resultProblem(r, allowed = namespaces()) {
   if (!r || typeof r !== 'object' || typeof r.doc_id !== 'string' || !DOC_ID.test(r.doc_id)) return 'malformed result';
-  if (typeof r.namespace !== 'string' || !allowed.includes(r.namespace) || deniedNamespace(r.namespace)) return `namespace ${r.namespace ?? '(none)'} is outside the filter`;
-  if (DENY_URL.some((re) => re.test(String(r.url || '')))) return 'denied route';
-  if (DENY_TYPES.has(String(r.source_type || ''))) return `denied type ${r.source_type}`;
+  if (typeof r.namespace !== 'string' || !allowed.includes(r.namespace) || namespaceProblem(r.namespace)) return `namespace ${r.namespace ?? '(none)'} is outside the filter`;
+  const url = canonicalUrl(r.url);
+  if (!url) return 'no URL';
+  const scheme = url.slice(0, url.indexOf(':'));
+  if (!URL_SCHEMES.has(scheme)) return `denied scheme ${scheme}`;
+  if (RECEIPT_ROUTE.test(url) || PRIVATE_ROUTE.test(url)) return 'denied route';
+  if (!RESULT_TYPES.has(r.source_type)) return `denied type ${r.source_type ?? '(none)'}`;
   return null;
 }
-export const POLICY = { v: 1, deny: DENY_TEXT, urls: DENY_URL.map(String), types: [...DENY_TYPES], dedupe: 'doc_id+content_hash', disclosure: DISCLOSURE };
+export const POLICY = { v: 2, deny: DENY_TEXT, schemes: [...URL_SCHEMES], types: [...RESULT_TYPES], routes: [String(RECEIPT_ROUTE), String(PRIVATE_ROUTE)], dedupe: 'doc_id+content_hash', disclosure: DISCLOSURE };
 export const policyVersion = () => sha256(JSON.stringify({ ...POLICY, ns: namespaces(), maxBytes: config.knowledge.maxBytes, excerpt: config.knowledge.excerptChars })).slice(0, 12);
+// Run kinds and the per-run ceiling: fixed maxima in code, the configuration may only narrow them.
+const narrowed = (max, list) => max.filter((k) => (Array.isArray(list) ? list : max).includes(k));
+export const searchKinds = () => narrowed(KNOWLEDGE_SEARCH_KINDS, config.knowledge?.searchKinds);
+export const autoKinds = () => narrowed(KNOWLEDGE_AUTO_KINDS, config.knowledge?.autoKinds);
+export const perRun = () => Math.min(KNOWLEDGE_MAX_PER_RUN, Math.max(1, Number(config.knowledge?.perRun) || KNOWLEDGE_MAX_PER_RUN));
 
 // ---------------- gating ----------------
 export function enabled(settings = null) { return config.knowledge?.enabled === true && (settings || store.getSettings()).knowledge_enabled !== 'false'; }
 function baseDenial(run, { source = 'search' } = {}) {
   if (config.knowledge?.enabled !== true) return 'past-work search is not set up on this desk (owner: knowledge.enabled in the config)';
   if (store.getSettings().knowledge_enabled === 'false') return 'past-work search is switched off (owner: Settings → Knowledge)';
-  if (source === 'search' && !(config.knowledge.searchKinds || []).includes(run.kind)) return `past-work search is not available in a ${String(run.kind).replaceAll('_', ' ')} run`;
+  if (source === 'search' && !searchKinds().includes(run.kind)) return `past-work search is not available in a ${String(run.kind).replaceAll('_', ' ')} run`;
   if (!store.getRun(run.id)?.token) return 'this run has ended';
   if (!namespaces().length) return `no namespace is allowed for search (owner: knowledge.namespaces; ${DENY_TEXT} are never searched)`;
   return null;
 }
-const reserved = new Map(); // runId -> searches admitted but not finished (counted against the allowance before any wait)
+// Searches and bytes admitted but not finished: reserved BEFORE any wait, so queued calls cannot overspend together.
+const reserved = new Map(); // runId -> searches
+const reservedBytes = new Map(); // runId -> bytes
+const MIN_ANSWER = 1024; // below this a run has no room for even one note
 function budgetProblem(runId) {
   const used = store.knowledgeUsage(runId);
-  const n = used.n + (reserved.get(runId) || 0);
-  if (n >= config.knowledge.perRun) return `this run used its ${config.knowledge.perRun} past-work searches; work with what you have`;
-  if (used.bytes >= config.knowledge.runBytes) return `this run received its ${Math.round(config.knowledge.runBytes / 1024)} KB of past work; work with what you have`;
+  if (used.n + (reserved.get(runId) || 0) >= perRun()) return `this run used its ${perRun()} past-work searches; work with what you have`;
+  if (remainingBytes(runId, used) < MIN_ANSWER) return `this run received its ${Math.round(config.knowledge.runBytes / 1024)} KB of past work; work with what you have`;
   return null;
 }
+const remainingBytes = (runId, used = store.knowledgeUsage(runId)) => config.knowledge.runBytes - used.bytes - (reservedBytes.get(runId) || 0);
+const bump = (m, k, d) => { const n = (m.get(k) || 0) + d; if (n > 0) m.set(k, n); else m.delete(k); };
 export function validQuery(raw) {
   const q = String(raw ?? '').replace(/\s+/g, ' ').trim();
   if (q.length < 3 || q.length > 300) throw refuse('desk kb search "<what you need to know, 3-300 characters>"', 400);
@@ -97,11 +124,10 @@ function validK(raw) {
 }
 
 // ---------------- the knowledge process: explicit environment, one at a time ----------------
-const ENV_KEYS = ['QDRANT_HOST', 'QDRANT_PORT', 'QDRANT_GRPC_PORT', 'QDRANT_COLLECTION', 'OLLAMA_URL', 'OLLAMA_MODEL', 'KB_SQLITE_PATH'];
 /** The only environment the CLI sees: no inherited keys, tokens or Python settings — the store's coordinates only. */
 export function cliEnv() {
   const env = { PATH: process.env.PATH || '/usr/bin:/bin', HOME: os.homedir(), LANG: process.env.LANG || 'en_US.UTF-8' };
-  for (const k of ENV_KEYS) { const v = config.knowledge?.env?.[k]; if (v !== undefined && v !== null && v !== '') env[k] = String(v); }
+  for (const k of KNOWLEDGE_ENV_KEYS) { const v = config.knowledge?.env?.[k]; if (v !== undefined && v !== null && v !== '') env[k] = String(v); }
   return env;
 }
 const OPS = new Map(); // op id -> { runId, kind, cancelled, kill, onCancel }
@@ -160,8 +186,10 @@ export function runCli(op, args, { input = null, deadlineAt, stdoutCap = 512 << 
     };
     if (op) op.kill = () => stop('cancelled');
     timer = setTimeout(() => stop('timeout'), Math.max(1, deadlineAt - Date.now()));
-    child.stdout.on('data', (d) => { if (outN >= stdoutCap) return; out.push(d); outN += d.length; if (outN >= stdoutCap) stop('capped'); });
-    child.stderr.on('data', (d) => { if (errN >= stderrCap) return; err.push(d); errN += d.length; if (errN >= stderrCap) stop('capped'); });
+    // Only the remaining capacity is kept; reaching the cap stops the process.
+    const take = (list, d, n, cap) => { const room = cap - n; if (room <= 0) return n; const part = d.length > room ? d.subarray(0, room) : d; list.push(part); n += part.length; if (n >= cap) stop('capped'); return n; };
+    child.stdout.on('data', (d) => { outN = take(out, d, outN, stdoutCap); });
+    child.stderr.on('data', (d) => { errN = take(err, d, errN, stderrCap); });
     child.on('error', (e) => { err.push(Buffer.from(`\n${e.code || e.message}`)); if (!child.pid) { reason = reason || 'spawn'; finish(null); } });
     child.stdin.on('error', () => {});
     child.stdin.end(input ?? '');
@@ -198,27 +226,42 @@ export function selectResults(results, { allowed = namespaces(), k = config.know
     if (resultProblem(r, allowed)) { dropped += 1; continue; }
     if (docs.has(r.doc_id) || (r.content_hash && hashes.has(r.content_hash))) { duplicates += 1; continue; }
     docs.add(r.doc_id); if (r.content_hash) hashes.add(r.content_hash);
-    if (kept.length < k) kept.push(r);
+    if (kept.length < k) kept.push({ ...r, url: canonicalUrl(r.url) });
   }
   return { kept, dropped, duplicates };
 }
 const oneLine = (s) => String(s ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
 const cut = (s, n) => (s.length > n ? `${s.slice(0, Math.max(0, n - 1))}…` : s);
-const escTags = (s) => String(s).replace(/<\/?\s*(past-work|kb-note)/gi, (m) => m.replace('<', '&lt;'));
-const attr = (s) => String(s).replace(/["<>&]/g, '_');
-const day = (iso) => (/^\d{4}-\d{2}-\d{2}/.test(String(iso || '')) ? String(iso).slice(0, 10) : 'date unknown');
-/** Redact the whole value first, then shorten: truncation never cuts a secret in half before redaction sees it. */
-export function excerptOf(r, n) {
-  let t = String(r.excerpt ?? '');
-  if (r.truncated) { const sp = t.lastIndexOf(' '); t = sp > 0 ? t.slice(0, sp) : ''; } // the store cut it: drop the partial last word first
-  t = oneLine(clean(t));
-  return cut(t, n) + (r.truncated && t.length <= n ? ' …' : '');
+/** Untrusted text can never open or close any wrapper (past-work, sigmadesk-context, …): every angle bracket is neutralized. */
+export const neutral = (s) => String(s ?? '').replace(/</g, '‹').replace(/>/g, '›');
+const attr = (s) => neutral(s).replace(/["&]/g, '_');
+/** Shorten REDACTED text to at most n characters, the ellipsis included, never ending inside a token or a quoted value. */
+export function safeCut(t, n) {
+  t = String(t ?? '');
+  if (t.length <= n) return t;
+  let c = t.slice(0, Math.max(0, n - 1));
+  const sp = c.search(/\s\S*$/); // drop back to before the token the cut landed in
+  c = sp >= 0 ? c.slice(0, sp) : '';
+  if ((c.match(/"/g) || []).length % 2) c = c.slice(0, c.lastIndexOf('"')); // and before a quoted value it left open
+  return `${c.trimEnd()}…`;
 }
+// Identifiers (URLs, doc ids) have no spaces: after full redaction they are shortened at a separator instead.
+const cutIdent = (t, n) => { t = String(t ?? ''); if (t.length <= n) return t; const c = t.slice(0, n - 1); const at = Math.max(c.lastIndexOf('/'), c.lastIndexOf('?'), c.lastIndexOf('#')); return `${at > 0 ? c.slice(0, at + 1) : ''}…`; };
+const FULL_CHUNK = 5000; // KnowledgeHub's chunk ceiling: excerpts arrive whole, so redaction always sees complete values
+const day = (iso) => (/^\d{4}-\d{2}-\d{2}/.test(String(iso || '')) ? String(iso).slice(0, 10) : 'date unknown');
+/**
+ * The excerpt a seat sees: the WHOLE chunk redacted first, then shortened (≤ n characters, ellipsis included). A chunk
+ * the store itself cut short may end inside a secret that redaction cannot recognise any more: it is withheld.
+ */
+export function excerptOf(r, n) {
+  if (r.truncated) return '(excerpt withheld: the store cut this passage short)';
+  return neutral(safeCut(oneLine(clean(String(r.excerpt ?? ''))), n));
+}
+export const titleOf = (r) => neutral(safeCut(oneLine(clean(r.title || '(untitled)')), 160));
+export const urlOf = (r) => neutral(cutIdent(oneLine(clean(r.url || '')), 240));
 export function entryText(r, i, { excerptChars = config.knowledge.excerptChars } = {}) {
-  const title = escTags(cut(oneLine(clean(r.title || '(untitled)')), 160));
-  const url = escTags(cut(oneLine(clean(r.url || '')), 240));
   const score = Number.isFinite(Number(r.score)) ? Number(r.score).toFixed(2) : '?';
-  return `[${i}] ${title}\n    ingested ${day(r.ingested_at)} · ${url} · doc ${r.doc_id} · ${r.namespace} · score ${score}\n    ${escTags(excerptOf(r, excerptChars))}`;
+  return `[${i}] ${titleOf(r)}\n    ingested ${day(r.ingested_at)} · ${urlOf(r)} · doc ${r.doc_id} · ${r.namespace} · score ${score}\n    ${excerptOf(r, excerptChars)}`;
 }
 /** The wrapped block: entries in rank order while they fit under maxBytes (the disclosure included). */
 export function renderBlock(query, kept, { maxBytes = config.knowledge.maxBytes, excerptChars = config.knowledge.excerptChars, label = 'past-work' } = {}) {
@@ -243,7 +286,7 @@ const nameOf = (id) => agentById[id]?.name?.split(/\s+/)[0] || id;
  * timeout | cancelled. Never throws. Every call is audited and becomes a plain ticket event.
  * source: 'search' (desk kb search) or 'auto' (the Past work block at launch); both count toward the run's allowance.
  */
-export async function runSearch(run, { query: raw, k: rawK, source = 'search', maxBytes = config.knowledge.maxBytes, excerptChars = config.knowledge.excerptChars } = {}) {
+export async function runSearch(run, { query: raw, k: rawK, source = 'search', maxBytes = config.knowledge.maxBytes, excerptChars = config.knowledge.excerptChars, expose = source === 'search' } = {}) {
   const started = Date.now();
   const ns = namespaces();
   let query = String(raw ?? '').slice(0, 300), k = null;
@@ -260,7 +303,9 @@ export async function runSearch(run, { query: raw, k: rawK, source = 'search', m
   try { query = validQuery(raw); k = validK(rawK); } catch (e) { return no('refused', e.message); }
   const denied = baseDenial(run, { source }) || budgetProblem(run.id);
   if (denied) return no('refused', denied);
-  reserved.set(run.id, (reserved.get(run.id) || 0) + 1);
+  // Reserve one search and this answer's bytes now (at most the room left), before any wait in the queue.
+  const cap = Math.min(maxBytes, remainingBytes(run.id));
+  bump(reserved, run.id, 1); bump(reservedBytes, run.id, cap);
   const op = newOp({ runId: run.id, kind: 'search' });
   const deadlineAt = started + config.knowledge.deadlineSeconds * 1000;
   let held = false;
@@ -269,7 +314,7 @@ export async function runSearch(run, { query: raw, k: rawK, source = 'search', m
     const late = op.cancelled ? `cancelled: ${op.cancelled}` : baseDenial(run, { source });
     if (late) return no(op.cancelled ? 'cancelled' : 'refused', late);
     const topK = Math.min(20, k * 3 + 2); // over-fetch: several chunks of one document collapse into one note
-    const r = await runCli(op, searchArgs(query, ns, topK, Math.max(excerptChars + 100, 300)), { deadlineAt });
+    const r = await runCli(op, searchArgs(query, ns, topK, FULL_CHUNK), { deadlineAt }); // whole chunks: redaction sees complete values
     if (op.cancelled || r.reason === 'cancelled') return no('cancelled', `cancelled: ${op.cancelled || 'stopped'}`, r.ms > 0);
     if (r.reason === 'timeout') return no('timeout', cliErrorSummary(r), true);
     if (r.reason || r.code !== 0) return no('error', cliErrorSummary(r), op.started);
@@ -284,18 +329,28 @@ export async function runSearch(run, { query: raw, k: rawK, source = 'search', m
       event(`${lead} → no notes`);
       return { outcome: 'empty', text, shown: [], ms, bytes: Buffer.byteLength(text), target, dropped, duplicates };
     }
-    const { text, shown } = renderBlock(query, kept, { maxBytes, excerptChars });
+    const { text, shown } = renderBlock(query, kept, { maxBytes: cap, excerptChars });
     const bytes = Buffer.byteLength(text);
-    store.recordKnowledgeExposures(run.id, shown.map((x) => ({ doc_id: x.doc_id, title: oneLine(clean(x.title || '')), url: oneLine(clean(x.url || '')) })), source);
+    // An explicit search is delivered as it returns; the launch block records its exposures only once it is delivered.
+    if (expose) exposeNotes(run.id, shown, source);
     audit({ outcome: 'ok', counted: true, results: shown.length, doc_ids: shown.map((x) => x.doc_id), bytes, duration_ms: ms, detail: dropped || duplicates ? `${dropped} dropped by policy, ${duplicates} duplicate(s)` : null });
     event(`${lead} → ${shown.length} note${shown.length === 1 ? '' : 's'}`);
     return { outcome: 'ok', text, shown, ms, bytes, target, dropped, duplicates };
   } finally {
     if (held) release();
     closeOp(op);
-    const n = (reserved.get(run.id) || 1) - 1;
-    if (n) reserved.set(run.id, n); else reserved.delete(run.id);
+    bump(reserved, run.id, -1); bump(reservedBytes, run.id, -cap);
   }
+}
+/** The notes a run was actually shown: the only ones it may cite. */
+function exposeNotes(runId, shown, source) {
+  store.recordKnowledgeExposures(runId, shown.map((x) => ({ doc_id: x.doc_id, title: titleOf(x), url: urlOf(x) })), source);
+}
+/** A desk kb call the transport refused before it reached the search (the run kind's own command gate): audited too. */
+export function auditRefusal(run, body = {}, reason = '') {
+  const q = String(body.query ?? body.body ?? '').slice(0, 300);
+  store.insertKnowledgeAudit({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key, source: 'search', query: clean(q), namespaces: ns(), outcome: 'refused', detail: reason, counted: false });
+  store.logEvent({ run_id: run.id, agent_id: run.agent_id, ticket_key: run.ticket_key || null, kind: 'action', text: `${nameOf(run.agent_id)} searched past work: '${cut(oneLine(clean(q)), 80)}' → refused: ${String(reason).slice(0, 200)}` });
 }
 
 /** `desk kb search "<query>" [--k N]` and `desk kb` (help). */
@@ -305,7 +360,7 @@ export async function command(run, body = {}) {
     const used = store.knowledgeUsage(run.id);
     const no = baseDenial(run);
     return [`Past-work search: desk kb search "<what you need to know>" [--k 1-${config.knowledge.maxK}]`,
-      `Searches: ${ns().join(', ') || '(none allowed)'} · ${used.n} of ${config.knowledge.perRun} used in this run (the automatic Past work block counts)`,
+      `Searches: ${ns().join(', ') || '(none allowed)'} · ${used.n} of ${perRun()} used in this run (the automatic Past work block counts)`,
       no ? `Not available to you now: ${no}.` : 'Cite a note you rely on with --cite <doc id> on desk reply or desk decide (kb:<doc id>).'].join('\n');
   }
   if (action !== 'search') throw refuse('desk kb search "<query>" [--k N]', 400);
@@ -317,7 +372,7 @@ export async function command(run, body = {}) {
 // ---------------- the Past work block at launch ----------------
 /** Does this launch get a Past work block? (Positive allowlist; resumed sessions already have theirs.) */
 export function wantsPastWork({ kind, ticketKey = null, incidentId = null, resume = null } = {}) {
-  return enabled() && !resume && (config.knowledge.autoKinds || []).includes(kind) && !!(ticketKey || incidentId);
+  return enabled() && !resume && autoKinds().includes(kind) && !!(ticketKey || incidentId);
 }
 /** Ticket title + area (or the incident's label and signature text): what the launch searches for. */
 export function pastWorkQuery({ ticketKey = null, incidentId = null } = {}) {
@@ -327,24 +382,35 @@ export function pastWorkQuery({ ticketKey = null, incidentId = null } = {}) {
   return inc ? oneLine(`${inc.label || ''} ${inc.normalized || ''}`).slice(0, 300) : '';
 }
 /**
- * Retrieve once for an eligible launch and freeze what was shown. Never throws and never fails the launch: an outage
- * gives an explicit "past work unavailable" line. → { text (to append to the task), hash, meta (the snapshot) }.
+ * Retrieve once for an eligible launch. Never throws and never fails the launch: an outage gives an explicit "past
+ * work unavailable" line. → { text (for the task), block, hash, meta, finalize(status) }. The snapshot is stored now as
+ * 'prepared'; finalize records what reached the seat — 'included' (its notes become citable), 'omitted' (a Perplexity
+ * pack left it out: nothing citable) or 'not delivered' (the run never started).
  */
 export async function preparePastWork(run, { ticketKey = null, incidentId = null } = {}) {
   const query = pastWorkQuery({ ticketKey, incidentId });
+  const excerptChars = Math.min(240, config.knowledge.excerptChars);
   let r;
-  try { r = await runSearch(run, { query, source: 'auto', maxBytes: config.knowledge.pastWorkBytes, excerptChars: Math.min(240, config.knowledge.excerptChars) }); }
+  try { r = await runSearch(run, { query, source: 'auto', maxBytes: config.knowledge.pastWorkBytes, excerptChars, expose: false }); }
   catch (e) { r = { outcome: 'error', text: 'the knowledge store failed', shown: [], detail: String(e.message) }; }
-  const status = r.outcome === 'ok' ? 'included' : r.outcome === 'empty' ? 'empty' : r.outcome === 'refused' ? 'omitted' : 'unavailable';
+  const status = r.outcome === 'ok' ? 'prepared' : r.outcome === 'empty' ? 'empty' : r.outcome === 'refused' ? 'omitted' : 'unavailable';
   const block = r.outcome === 'ok' ? `## Past work that may be relevant (from the knowledge store)\n${r.text}`
     : r.outcome === 'empty' ? `## Past work\nNo past work matched this task in the knowledge store.`
-      : `## Past work\nPast work unavailable (${r.text}). Continue without it.`;
-  const meta = { v: 1, contract: CONTRACT, policy: policyVersion(), query: cut(clean(query), 300), namespaces: ns(), status, reason: status === 'included' || status === 'empty' ? null : r.text,
-    items: (r.shown || []).map((x) => ({ doc_id: x.doc_id, url: oneLine(clean(x.url || '')).slice(0, 300), ingested_at: x.ingested_at ?? null, score: x.score ?? null, similarity: x.similarity ?? null, excerpt_sha256: sha256(excerptOf(x, 240)) })),
-    target: r.target || null, bytes: Buffer.byteLength(block) };
+      : `## Past work\nPast work unavailable (${neutral(r.text)}). Continue without it.`;
+  // What the seat is shown, as shown (redacted, bounded): the audit can be read without the store.
+  const items = (r.shown || []).map((x) => { const excerpt = excerptOf(x, excerptChars); return { doc_id: x.doc_id, title: titleOf(x), url: urlOf(x), ingested_at: x.ingested_at ?? null, score: x.score ?? null, similarity: x.similarity ?? null, excerpt, excerpt_sha256: sha256(excerpt) }; });
+  const meta = { v: 2, contract: CONTRACT, policy: policyVersion(), query: cut(neutral(clean(query)), 300), namespaces: ns(), reason: r.outcome === 'ok' || r.outcome === 'empty' ? null : neutral(r.text), items, target: r.target || null, bytes: Buffer.byteLength(block) };
   const hash = sha256(JSON.stringify([meta, block]));
-  store.updateRun(run.id, { knowledge_hash: hash, knowledge_meta: JSON.stringify({ ...meta, hash }) });
-  return { text: `\n\n${block}\n`, block, hash, meta };
+  const save = (st) => store.updateRun(run.id, { knowledge_hash: hash, knowledge_meta: JSON.stringify({ ...meta, status: st, hash }) });
+  save(status);
+  let done = false;
+  const finalize = (outcome) => {
+    if (done || status !== 'prepared') return;
+    done = true;
+    save(outcome);
+    if (outcome === 'included') exposeNotes(run.id, r.shown, 'auto');
+  };
+  return { text: `\n\n${block}\n`, block, hash, meta: { ...meta, status }, finalize };
 }
 
 // ---------------- citations ----------------
@@ -364,7 +430,8 @@ export function replyCitations(run, raw) {
   const seen = new Map(store.knowledgeExposures(run.id).map((x) => [x.doc_id, x]));
   const unknown = ids.filter((id) => !seen.has(id));
   if (unknown.length) throw refuse(`--cite ${unknown.join(', ')}: not a past-work note shown to this run (cite the doc id from a desk kb search or the Past work block)`, 400);
-  const footer = `\n\n📚 Past work cited: ${ids.map((id) => `${cut(seen.get(id).title || id, 100)} (doc ${id})`).join('; ')}`;
+  // Only the validated doc id and the (already redacted, neutralized) title it was shown under.
+  const footer = `\n\n📚 Past work cited: ${ids.map((id) => `${neutral(safeCut(seen.get(id).title || 'note', 100))} (doc ${id})`).join('; ')}`;
   return { ids, footer };
 }
 
@@ -375,7 +442,7 @@ export function metrics(now = Date.now()) {
   const since = weekAgo(now);
   const audits = store.knowledgeAuditSince(since);
   const counted = audits.filter((a) => a.counted);
-  const kinds = new Set(config.knowledge.searchKinds || []);
+  const kinds = new Set(searchKinds());
   const runs = store.runsStartedSince(since).filter((r) => kinds.has(r.kind));
   const searched = new Set(counted.filter((a) => a.source === 'search').map((a) => a.run_id));
   const cites = store.knowledgeCitationsSince(since);
@@ -404,8 +471,8 @@ export function describe(settings = store.getSettings(), now = Date.now()) {
   const k = config.knowledge || {};
   return {
     configured: k.enabled === true, on: settings.knowledge_enabled !== 'false', executable: k.executable || '', namespaces: ns(), refused_namespaces: refusedNamespaces(),
-    deny: DENY_TEXT, write_namespace: writeNamespace(), per_run: k.perRun, max_k: k.maxK, auto_kinds: k.autoKinds || [], search_kinds: k.searchKinds || [],
-    lane: laneState(), outbox: store.knowledgeOutboxCounts(), failures: store.recentKnowledgeNotes(50).filter((n) => n.status === 'failed' || n.status === 'refused' || (n.status === 'pending' && n.last_error)).slice(0, 10)
+    deny: DENY_TEXT, write_namespace: writeNamespace(), per_run: perRun(), max_k: k.maxK, auto_kinds: autoKinds(), search_kinds: searchKinds(),
+    lane: laneState(), target: store.kvGet('knowledge:target'), outbox: store.knowledgeOutboxCounts(), failures: store.recentKnowledgeNotes(50).filter((n) => n.status === 'failed' || n.status === 'refused' || (n.status === 'pending' && n.last_error)).slice(0, 10)
       .map((n) => ({ id: n.id, ticket_key: n.ticket_key, status: n.status, attempts: n.attempts, last_error: n.last_error, next_attempt_at: n.next_attempt_at })),
     metrics: metrics(now),
   };

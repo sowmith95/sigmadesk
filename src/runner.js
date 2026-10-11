@@ -771,6 +771,7 @@ function setupPhase({ run, agentId, ticketKey, track }) {
       quietly(() => context.release(run.id));
       quietly(() => mailboxes.delete(run.id));
       quietly(() => ops.cancelRun(run.id));
+      quietly(() => knowledge.cancelRun(run.id));
       quietly(() => evidence.delete(run.id));
       quietly(() => fs.rm(path.join(toolHomeRoot(), `r${run.id}`), { recursive: true, force: true }, () => {}));
       quietly(() => {
@@ -815,6 +816,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   // below; any failure or refusal ends the run through setup.abort, and a successful spawn hands it over exactly once.
   const setup = setupPhase({ run, agentId, ticketKey, track });
   let ctx, engine, pplx, px, timeoutMin, deadlineAt;
+  let past = null; // the past-work snapshot (#10): finalized as delivered only when the prompt write completes
   return (async () => {
     try {
       packages.recordLaunch(run.id, pkg.ids);
@@ -863,7 +865,9 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       setup.own(() => { preparing.delete(run.id); clearTimeout(prepTimer); });
       let failed = null;
       try {
-        const past = pastWork ? await knowledge.preparePastWork(run, { ticketKey, incidentId }) : null;
+        past = pastWork ? await knowledge.preparePastWork(run, { ticketKey, incidentId }) : null;
+        // Every abort path, from here until the hand-off, records the block as not delivered and revokes its exposures.
+        if (past) setup.own(() => past.finalize('not delivered'));
         if (pplx) prompt = `${prompt}${await preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, incidentId, prompt, token, nonce, ctx, signal: abort.signal, past })}`;
         else if (past) prompt = `${prompt}${past.text}`;
       } catch (err) { failed = err; } finally { preparing.delete(run.id); clearTimeout(prepTimer); }
@@ -905,8 +909,12 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   // The process's start time identifies it after a restart (a recorded pid alone may have been reused meanwhile).
   if (child.pid) processStart(child.pid).then((at) => { if (at) store.updateRun(run.id, { pid_start: at }); }).catch(() => {}); // best effort: never an unhandled rejection
   if (child.pid) lessons.delivered(run.id, ticketKey); // lessons count as given only once the prompt reaches a process
-  child.stdin.on('error', () => {});
-  child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt);
+  // The past-work block counts as delivered only when the prompt write completes (this callback may run after the
+  // hand-off): an EPIPE, a write error or an engine that exits first records it as not delivered.
+  let promptSettled = false;
+  const promptDone = (ok) => { if (promptSettled) return; promptSettled = true; past?.finalize(ok ? 'included' : 'not delivered'); };
+  child.stdin.on('error', () => promptDone(false));
+  child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt, (err) => promptDone(!err));
 
   let buf = '';
   let lastOutput = Date.now();
@@ -990,7 +998,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       resolve({ run: store.getRun(run.id), result: r, failure, steps: stepsTaken(ctx) });
       ledgers.delete(run.id);
   };
-  child.on('close', (code) => finish(code)); // close(code, signal): a signal is not an error, and never one's text
+  child.on('close', (code) => { promptDone(false); finish(code); }); // close(code, signal): a signal is not an error, and never one's text (promptDone: no-op once the write completed)
   setup.handOff(); // its close handler now ends the run and releases what it holds, exactly once
   return ended;
   }
@@ -1001,6 +1009,8 @@ async function preparePerplexity({ run, agent, agentId, kind, cwd, ticketKey, in
   const secrets = [token, nonce].filter(Boolean);
   const pack = await context.prepareRun({ runId: run.id, kind, cwd, ticketKey, incidentId, secrets, signal, pastWork: past?.block || null });
   const live = context.liveFor(run.id);
+  // Only a block the pack actually carries is shown (and citable); one left out for size is recorded as omitted.
+  past?.finalize(pack.meta.pastWork === 'included' ? 'included' : 'omitted');
   const jobHash = context.jobIdentity({ provenance: provenanceOf(agent, kind), agentId, kind, ticketKey, incidentId, prompt, packHash: pack.hash, secrets, pastWorkHash: past?.hash || null });
   const prev = store.lastThreadRun({ job_hash: jobHash });
   const prevMeta = context.metaFor(prev);

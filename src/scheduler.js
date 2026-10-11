@@ -1296,7 +1296,12 @@ function fmtTicket(t, comments) {
 }
 
 export async function deskAction(run, cmd, body = {}) {
-  const agentId = run.agent_id;
+  // A past-work search refused by its run's command gate is audited like every other refusal (#10).
+  try { admitCommand(run, cmd, body); } catch (err) { if (cmd === 'kb') knowledge.auditRefusal(run, body, err.message); throw err; }
+  return carryOut(run, cmd, body);
+}
+/** The per-run-kind gates and the step allowance: throws when this run may not send this command now. */
+function admitCommand(run, cmd, body) {
   if (run.kind === 'product_review') need(['context-file'].includes(cmd), 'Product reviewers are read-only; return a structured report, not desk mutations');
   if (run.kind === 'council_review') need(false, 'council calls cannot invoke desk commands');
   if (run.kind === 'feature_groom') need(false, 'a grooming session is read-only: return the plan JSON as your final answer');
@@ -1338,7 +1343,6 @@ export async function deskAction(run, cmd, body = {}) {
   // A step-bounded run's desk request (a tagged reply, a decision run, a post-deploy check) is a step of its own,
   // admitted BEFORE it is carried out: past the allowance the run is stopped and nothing it asked for happens.
   if (runner.isStepBounded(run.kind)) runner.admitDeskCall(run);
-  return carryOut(run, cmd, body);
 }
 /** What a desk command does, once the gates above let its run send it. */
 async function carryOut(run, cmd, body) {
