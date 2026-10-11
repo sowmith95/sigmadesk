@@ -29,6 +29,7 @@ async function main() {
   if (wait) await sleep(wait);
   if (mode === 'crash') { process.stderr.write('Traceback: qdrant_client ConnectionRefusedError: [Errno 61] Connection refused api_key=sk-ant-FAKESECRETVALUE000111222\n'); log(); process.exit(1); }
   if (cmd === 'search') {
+    if (mode === 'utf8') { process.stderr.write('€'.repeat(100)); process.stdout.write('€'.repeat(2000)); log(); return; }
     if (mode === 'badjson') { process.stdout.write('Results:\n1. something\n'); log(); return; }
     if (mode === 'huge') { process.stdout.write('{"contract":1,"results":['); for (let i = 0; i < 2000; i++) process.stdout.write(`${JSON.stringify({ doc_id: `d${i}`, excerpt: 'x'.repeat(1000) })},`); log(); return; }
     const ns = all('--namespace');

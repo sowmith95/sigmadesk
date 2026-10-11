@@ -601,6 +601,82 @@ test('Perplexity: a pack too small for the past-work block records it as omitted
   }
 });
 
+test('round 2 — URLs fail closed: no escapes, queries, fragments, backslashes, dot segments, non-ASCII or denied first segments', () => {
+  const probe = (url) => kb.resultProblem({ ...note('q'), source_type: 'markdown', url });
+  for (const u of ['career%2Dmemory:fact/1', 'code/x', 'file/x', 'journal/2026/x', 'personal/notes.md', 'my-receipts/x', 'CODE/x',
+    'kb://ComplexTrading/commit/abc1234/%70ush/main', 'kb://ComplexTrading/commit/abc1234/./push/main', 'kb://ComplexTrading/commit/abc1234/x/../push/main',
+    'kb://ComplexTrading/commit/abc1234/push?x', 'kb://ComplexTrading/commit/abc1234/PUSH/main', 'docs/x/abc1234/push/y', 'kb://x/a/..', 'kb://x/a/.',
+    'pr:319#frag', 'docs\\x.md', 'docs/ünicode.md', 'kb://x/‹y›']) assert.ok(probe(u), u);
+  for (const u of ['alpaca_trader/tests/test_chunk_exclusion_bounds.py', '.claude/plans/plan-x.md', 'docs/research/burst.md', 'pr:319', 'commit:39a2a4f',
+    'kb://ComplexTrading/commit/abc1234/implementation/feature-x', 'kb://sigmadesk/demo/ticket/K-1/facts/abc', 'https://example.com/a.md']) assert.equal(probe(u), null, u);
+});
+
+test('round 2 — credential fields are redacted after ops.js redaction; an unterminated value takes the rest; quotes are escape-aware', async () => {
+  const show = async (text) => { setStore({ results: [note('c1', { text })] }); return search(mkRun(), 'credential fields'); };
+  assert.ok(!/six|secret words/.test(await show('Decision: {"password": "six secret words')), 'short open JSON value');
+  const complete = await show('Set password="six secret words" then restart the worker.');
+  assert.ok(!/six secret/.test(complete) && /then restart the worker/.test(complete), complete);
+  assert.ok(!/a b c/.test(await show("Use api_key='a b c' for staging.")));
+  const escaped = await show('password="a \\"b\\" c" and the rest stays');
+  assert.ok(!/\\"b|b\\"| c"/.test(escaped) && /and the rest stays/.test(escaped), escaped);
+  assert.ok(!/hunter/.test(await show('token: hunter2 is the old one\nsecond line')));
+  assert.equal(kb.redactCredentialFields('x {"api-key": \'open value'), 'x {[redacted: an unterminated credential value]');
+  // safeCut: a single-quoted value left open at the cut is dropped; apostrophes inside words are not quotes.
+  const c = kb.safeCut(`${'x '.repeat(245)}note='an open single quoted value that runs past the cut'`, 500);
+  assert.ok(!c.includes("'an open") && c.length <= 500, c.slice(-60));
+  const prose = kb.safeCut(`${"don't stop, it's fine ".repeat(40)}`, 500);
+  assert.ok(prose.length > 450, `apostrophes kept the cut at ${prose.length}`);
+  assert.ok(!kb.safeCut(`${'y '.repeat(240)}say "it\\" goes on and on`, 500).includes('"it'), 'an escaped quote does not close the value');
+});
+
+test('round 2 — every answer fits the reserved bytes: a 20-namespace empty search against 1,024 bytes', async () => {
+  config.knowledge.namespaces = Array.from({ length: 20 }, (_, i) => `complextrading-area-${String(i).padStart(2, '0')}-${'x'.repeat(36)}`);
+  config.knowledge.runBytes = 1024;
+  setStore({ results: [] });
+  const run = mkRun();
+  const out = await search(run, 'nothing will match this');
+  assert.ok(Buffer.byteLength(out) <= 1024, `${Buffer.byteLength(out)} bytes`);
+  assert.match(out, /in 20 namespaces/);
+  assert.ok(store.knowledgeAuditOfRun(run.id)[0].bytes <= 1024);
+  assert.match(await kb.command(mkRun(), {}), /Searches: 20 namespaces/);
+});
+
+test('round 2 — Perplexity: a startup failure after the pack was built leaves the block not delivered and nothing citable', async () => {
+  const ctx = await import('../src/context.js');
+  setStore({ results: [note('a1'), note('b2')] });
+  const savedPx = { ...config.engines.perplexity };
+  const seat = team.agentById.pm;
+  const savedSeat = { engine: seat.engine, model: seat.model };
+  const savedClaude = config.bins.claude;
+  dispatch.setAvailability([{ id: 'perplexity', available: true }, { id: 'claude', available: true }, { id: 'codex', available: false }]);
+  Object.assign(seat, { engine: 'perplexity', model: 'pplx_asi_kimi_k3' });
+  const cwd = path.join(tmp, 'clone-pplx-fail'); fs.mkdirSync(cwd, { recursive: true });
+  try {
+    config.bins.claude = path.join(tmp, 'no-such-relay'); // the pack is built, then the relay cannot start
+    const t = store.createTicket({ title: 'Groom the failing relay', area: 'backend', status: 'proposed' });
+    const out = await runner.startRun({ agentId: 'pm', kind: 'groom', ticketKey: t.key, cwd, prompt: 'Groom it.', track: false });
+    const r = store.getRun(out.run.id);
+    assert.equal(JSON.parse(r.context_meta).pastWork, 'included', 'the pack carried the block');
+    const meta = JSON.parse(r.knowledge_meta);
+    assert.equal(meta.selected, true);
+    assert.equal(meta.status, 'not delivered');
+    assert.equal(kb.exposedIds(r.id).size, 0);
+    assert.throws(() => kb.replyCitations(r, 'a1'), /not a past-work note shown to this run/);
+    void ctx;
+  } finally { config.bins.claude = savedClaude; Object.assign(config.engines.perplexity, savedPx); Object.assign(seat, savedSeat); }
+});
+
+test('round 2 — stream caps never decode past the cap, multibyte output included', async () => {
+  setStore({ mode: { search: 'utf8' } });
+  const op = kb.newOp({ kind: 'search' });
+  try {
+    const r = await kb.runCli(op, kb.searchArgs('euro', ['sigmadesk'], 1, 50), { deadlineAt: Date.now() + 10_000, stdoutCap: 1024, stderrCap: 20 });
+    assert.ok(Buffer.byteLength(r.stdout) <= 1024, `stdout ${Buffer.byteLength(r.stdout)}`);
+    assert.ok(Buffer.byteLength(r.stderr) <= 20, `stderr ${Buffer.byteLength(r.stderr)}`);
+    assert.ok(!r.stdout.includes('�') && !r.stderr.includes('�'));
+  } finally { kb.closeOp(op); }
+});
+
 // ---------------- write side ----------------
 function mergedTicket(title = 'Bounded chunk window', extra = {}) {
   const t = store.createTicket({ title, description: extra.spec ?? `Make the scan bounded.\n\n## Acceptance criteria\n- the query uses a half-open window\n- a test pins it`, area: 'db', complexity: 'S', status: 'review', reporter: 'pm' });
@@ -851,4 +927,39 @@ test('owner view and doctor: Settings data, weekly metrics, deny list shown, con
   assert.match(probe({ maxBytes: 9000 })[0], /out of range/);
   // Only the names KnowledgeHub reads: the old guesses are refused.
   for (const k of ['QDRANT_COLLECTION', 'OLLAMA_MODEL']) assert.match(probe({ env: { ...config.knowledge.env, [k]: 'x' } })[0], /may only set QDRANT_HOST/);
+});
+
+test('round 2 — every close qualifies through the store hook: owner task done, and an old incident behind 501 newer ones', async () => {
+  // ownerTaskDone sets done directly: the close still queues the facts of the incident it resolved.
+  const ot = store.createTicket({ title: 'Restart the ingestor by hand', area: 'infra' });
+  store.updateTicket(ot.key, { owner_task: 1 });
+  const i1 = store.recordIncident({ signature: 'sig-owner-1', normalized: 'IngestStall', source_index: 0, label: 'stock-ingestor', project: 'demo', line: 'stall', ts: '2026-10-01T09:00:00Z' });
+  store.updateIncident(i1.id, { status: 'ticketed', ticket_key: ot.key });
+  sched.ownerTaskDone(ot.key, { notes: 'restarted it' });
+  const [on] = store.knowledgeNotesFor(ot.key);
+  assert.ok(on, 'owner task close queued its note');
+  assert.equal(on.trigger, 'incident resolved');
+  // The linked incident is found by ticket, however many newer incidents exist.
+  const old = store.createTicket({ title: 'Old incident ticket', area: 'infra' });
+  const oi = store.recordIncident({ signature: 'sig-old-linked', normalized: 'OldFailure', source_index: 0, label: 'api', project: 'demo', line: 'old', ts: '2020-01-01T00:00:00Z' });
+  store.updateIncident(oi.id, { status: 'ticketed', ticket_key: old.key });
+  for (let i = 0; i < 501; i++) store.recordIncident({ signature: `sig-noise-${i}`, normalized: `Noise ${i}`, source_index: 0, label: 'noise', project: 'demo', line: 'n', ts: `2026-10-0${1 + (i % 9)}T10:00:00Z` });
+  sched.setStatus(old.key, 'done');
+  assert.equal(store.knowledgeNotesFor(old.key).length, 1, 'qualified despite 501 newer incidents');
+  assert.match(store.knowledgeNotesFor(old.key)[0].body, /OldFailure|sig-old-linked/);
+});
+
+test('round 2 — reconciliation selects tickets by qualifying-transition time, not by when they closed', async () => {
+  config.knowledge.enabled = false;
+  const t = mergedTicket('Closed long before');
+  sched.prActions.merged(t, { at: '2026-01-05T12:00:00Z' });
+  config.knowledge.enabled = true;
+  store.kvSet('knowledge:since', new Date(Date.now() + 1000).toISOString()); // the write side began after this close
+  await new Promise((r) => setTimeout(r, 1100));
+  assert.equal(notes.reconcile(), 0, 'nothing transitioned since');
+  config.knowledge.enabled = false;
+  store.recordDeploy({ deploy_key: `late-${t.key}`, merge_sha: 'c'.repeat(40), ticket_key: t.key, workflow: 'deploy.yml', run_id: 88, status: 'success', source: 'desk' });
+  config.knowledge.enabled = true;
+  assert.equal(notes.reconcile(), 1, 'a later deploy transition is reconciled although the close predates the write side');
+  assert.match(store.knowledgeNotesFor(t.key).at(-1).body, /run 88/);
 });
