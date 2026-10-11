@@ -68,7 +68,7 @@ export function GateSuggestions({ root }: { root: string }) {
         const replaces = t?.after_key && byKey(t.after_key)?.status !== 'done' ? byKey(t.after_key) : null;
         return (
           <li key={`${g.key}>${g.after}`} data-gate={`${g.key}>${g.after}`} className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-            <span className="min-w-0 flex-1 basis-60 text-sm"><button type="button" className="hover:underline" onClick={() => openTicket(g.key)}>{t ? nameOf(t) : g.key}</button> waits for <button type="button" className="hover:underline" onClick={() => openTicket(g.after)}>{a ? nameOf(a) : g.after}</button>
+            <span className="min-w-0 flex-1 basis-60 text-sm"><button type="button" className="hover:underline" onClick={() => openTicket(g.key)}>{t ? nameOf(t) : g.key}</button> <CreatedAge at={t?.created_at} className="text-xs" /> waits for <button type="button" className="hover:underline" onClick={() => openTicket(g.after)}>{a ? nameOf(a) : g.after}</button>
               {replaces && <span className="text-muted-foreground"> (it now waits for {nameOf(replaces)}; this replaces that)</span>}</span>
             <AsyncButton size="sm" variant="secondary" confirm={replaces ? `${g.key} can wait for only one task. Replace ${replaces.key} with ${g.after}?` : undefined}
               run={() => api('PATCH', `/api/tickets/${g.key}`, { after_key: g.after })} ok={`${g.key} now waits for ${g.after}`}>Make {g.key} wait for {g.after}</AsyncButton>

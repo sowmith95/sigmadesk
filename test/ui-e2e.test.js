@@ -474,7 +474,7 @@ test('creation age on a desktop: Inbox rows, Work cards and the ticket header, a
 // A second preview with tickets created days ago (the first one last year) and three research items held for the owner.
 const AGE = /^(now|\d+[mhd]|[A-Z][a-z]{2} \d{1,2}(, \d{4})?)$/, DATE = /^[A-Z][a-z]{2} \d{1,2}(, \d{4})?$/;
 const visibleAge = (loc) => loc.evaluate((el) => el.textContent.replace(/^·\s*/, '').replace(/^created\s+/i, ''));
-test('creation age with old dates: phone rows, Work, Features, the next step, search, a seat, Details → Tasks, the wall and the classic board, its sheets included', { skip, timeout: 120_000 }, async () => {
+test('creation age with old dates: phone rows, Work, Features, the next step, unrecorded order, search, a seat, Details → Tasks, the wall and the classic board, its sheets included', { skip, timeout: 120_000 }, async () => {
   const aged = await startPreview({ SIGMADESK_PREVIEW_PLAYBOOK: PLAYBOOK, SIGMADESK_PREVIEW_AGED: '1' });
   try {
     const phone = await openPage(browser, `${aged.url}/#/inbox`, { width: 390, height: 844 });
@@ -501,6 +501,8 @@ test('creation age with old dates: phone rows, Work, Features, the next step, se
     await card.locator('h3 button').click();
     await page.locator('[data-next-step] time[data-created]').first().waitFor();
     assert.match(await visibleAge(page.locator('[data-next-step] time[data-created]').first()), DATE, 'next step');
+    const gate = page.locator('[data-gate] time[data-created]').first(); await gate.waitFor();
+    assert.match(await visibleAge(gate), DATE, 'order written but not recorded');
     // Ticket search rows.
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+k' : 'Control+k');
     const option = page.locator('[cmdk-item] time[data-created]').first(); await option.waitFor();
