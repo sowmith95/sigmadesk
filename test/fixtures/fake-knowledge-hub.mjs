@@ -15,7 +15,7 @@ const start = Date.now();
 let stdin = '';
 const log = (extra = {}) => fs.appendFileSync(`${file}.log`, `${JSON.stringify({ argv, env: process.env, stdin, start, end: Date.now(), ...extra })}\n`);
 process.on('SIGTERM', () => { log({ killed: 'SIGTERM' }); process.exit(143); });
-const target = st.target || { collection: 'knowledge_hub', embedding_model: 'nomic-embed-text', embedding_dim: 768, chunk_size: 256, chunk_overlap: 32, fingerprint: 'fp-test-0001' };
+const target = st.targets?.[argv[0]] ?? st.target ?? { collection: 'knowledge_hub', embedding_model: 'nomic-embed-text', embedding_dim: 768, chunk_size: 256, chunk_overlap: 32, fingerprint: 'fp-test-0001' };
 const opt = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
 const all = (name) => argv.flatMap((a, i) => (a === name ? [argv[i + 1]] : []));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
