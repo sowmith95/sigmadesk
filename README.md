@@ -143,6 +143,11 @@ the pending task (or explicitly approves guarded draft publication); corrections
 to the engineer; rejection closes the ticket while retaining local work. Stale decisions are rejected. Draft approval
 does not merge a PR: use **Review draft PR** for the final owner-controlled merge.
 
+Every ticket row and card (Inbox, Work, Features, the ticket header, the wall's exception cards) says how long ago the
+ticket was created: "now", "12m", "3h", "2d", then the date ("Oct 7") after a week. Hover it (or read it with a screen
+reader) for the full local time, "Created Oct 7, 2026, 3:37 PM". On a phone the age sits at the right of a row's second
+line, and the other facts clip before it does.
+
 **Auto route** recognizes explicit requests to discuss with the manager/principals. These enter a durable read-only
 discussion queue and preserve the implementation blocker. The manager restates intent, consults up to two principals
 once each, and records a response on the same ticket. The composer also offers explicit discussion, answer and comment

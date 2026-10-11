@@ -4,7 +4,7 @@ import { Fragment } from 'react';
 import { ChevronRight, Layers } from 'lucide-react';
 import { nameOf } from '../../../../public/names.js';
 import { S, openTicket, openFeature } from '@/store.js';
-import { Tag, SeatAvatar, type Tone } from './Bits';
+import { Tag, SeatAvatar, CreatedAge, type Tone } from './Bits';
 import { STAGE_LABEL } from './Work';
 import { OwnerTag } from './Flow';
 import { cn } from '@/lib/utils';
@@ -100,7 +100,7 @@ export function EpicTree({ root, depth = 0, max = 3, hideDone = false }: { root:
               {(live?.id || k.assignee) && <SeatAvatar id={live?.id || k.assignee} />}
               <OwnerTag t={k} />
               <Tag tone={toneOf(k)}>{live ? 'Working' : STAGE_LABEL[k.status] || k.status}</Tag>
-              <span className="font-mono text-xs text-muted-foreground">{k.key}</span>
+              <CreatedAge at={k.created_at} className="text-xs" /><span className="font-mono text-xs text-muted-foreground">{k.key}</span>
               {waiting && <span className="basis-full pl-4 text-xs text-muted-foreground">waits for {nameOf(dep!)} ({dep!.key})</span>}
               {parentWait && depth === 0 && <span className="basis-full pl-4 text-xs text-muted-foreground">waits for {nameOf(parentWait)} ({parentWait.key}), with its epic</span>}
             </div>

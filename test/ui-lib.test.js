@@ -92,6 +92,24 @@ test('the program sentence reads naturally', () => {
   assert.ok(P.sentence(d, agents).filter((p) => p.slot).length === 5);
 });
 
+test('creation age on ticket chips: whole units rounded down, a date after a week, the year only when it differs, the future is "now"', () => {
+  const now = Date.parse('2026-10-11T15:00:00Z'), back = (s) => new Date(now - s * 1000).toISOString(), UTC = { timeZone: 'UTC' };
+  const age = (s) => F.createdAge(back(s), now, UTC);
+  assert.equal(age(0), 'now'); assert.equal(age(59), 'now'); assert.equal(age(60), '1m');
+  assert.equal(age(12 * 60), '12m'); assert.equal(age(59 * 60 + 59), '59m'); assert.equal(age(3600), '1h');
+  assert.equal(age(23 * 3600), '23h'); assert.equal(age(24 * 3600 - 1), '23h'); assert.equal(age(24 * 3600), '1d');
+  assert.equal(age(6 * 86400 + 23 * 3600), '6d'); assert.equal(age(7 * 86400 - 1), '6d'); assert.equal(age(7 * 86400), 'Oct 4');
+  assert.equal(F.createdAge('2026-10-07T15:37:00Z', Date.parse('2026-10-20T09:00:00Z'), UTC), 'Oct 7');
+  assert.equal(F.createdAge('2025-12-20T12:00:00Z', Date.parse('2026-01-03T12:00:00Z'), UTC), 'Dec 20, 2025', 'last year says the year');
+  assert.equal(F.createdAge('2026-12-31T23:30:00Z', Date.parse('2027-01-01T00:10:00Z'), UTC), '40m', 'a recent ticket across New Year is still an age');
+  assert.equal(F.createdAge('2026-10-11T15:05:00Z', now, UTC), 'now', 'a creation time ahead of this clock (skew) is "now"');
+  assert.equal(F.createdAge('2026-11-11T15:00:00Z', now, UTC), 'now');
+  assert.equal(F.createdAge(null, now), ''); assert.equal(F.createdAge('not a date', now), '');
+  assert.equal(F.createdTitle('2026-10-07T19:37:00Z', { timeZone: 'America/New_York' }), 'Created Oct 7, 2026, 3:37 PM');
+  assert.equal(F.createdTitle('2026-10-07T09:05:00Z', UTC), 'Created Oct 7, 2026, 9:05 AM');
+  assert.equal(F.createdTitle(undefined), '');
+});
+
 test('formatting helpers and the stream contract', () => {
   const now = Date.parse('2026-10-04T12:00:00Z');
   assert.equal(F.ago('2026-10-04T11:58:00Z', now), '2 min ago'); assert.equal(F.until('2026-10-04T14:00:00Z', now), 'in 2 h'); assert.equal(F.waited('2026-10-04T11:59:40Z', now), 'waiting under a minute');

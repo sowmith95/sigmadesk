@@ -427,3 +427,46 @@ test('delegation (#9): Settings follows the playbook as the owner edits it, with
   assert.deepEqual(errors, []);
   await page.close();
 });
+
+const CREATED = /^Created [A-Z][a-z]{2} \d{1,2}, \d{4}, \d{1,2}:\d{2} [AP]M$/;
+test('creation age: an Inbox row on a 390 px phone stays two lines with its age showing in full', { skip, timeout: 60_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 390, height: 844 });
+  await page.waitForSelector('[data-lane] article[data-ticket]');
+  const rows = await page.$$eval('[data-lane] article[data-ticket]', (els) => els.map((el) => {
+    const meta = el.querySelector('[data-row-meta]'), age = meta?.querySelector('time[data-created]'), title = el.querySelector('h3');
+    const box = (x) => x.getBoundingClientRect(), line = (x) => box(x).height < 1.9 * parseFloat(getComputedStyle(x).fontSize);
+    return { key: el.dataset.ticket, text: age?.innerText, label: age?.getAttribute('aria-label'), hover: age?.getAttribute('title'), titleLine: line(title), metaLine: meta && line(meta),
+      inside: !!age && box(age).width > 0 && box(age).right <= box(meta).right + 0.5 && box(age).left >= box(meta).left, brief: !!el.querySelector('[data-brief-line]'), height: box(el).height };
+  }));
+  assert.ok(rows.length >= 3, 'rows to check');
+  for (const r of rows) {
+    assert.match(r.text || '', /^(now|\d+[mhd]|[A-Z][a-z]{2} \d{1,2}(, \d{4})?)$/, `${r.key}: the age, without the desktop separator`);
+    assert.match(r.label || '', CREATED); assert.equal(r.hover, r.label, 'hover shows the same full time');
+    assert.deepEqual([r.titleLine, r.metaLine, r.inside], [true, true, true], `${r.key}: one title line, one metadata line, the age never cut`);
+    if (!r.brief) assert.ok(r.height < 90, `${r.key}: two lines and padding, not ${r.height}px`);
+  }
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no sideways scrolling');
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('creation age on a desktop: Inbox rows, Work cards and the ticket header, and the research backlog on Research', { skip, timeout: 60_000 }, async () => {
+  const { page, errors } = await openPage(browser, `${preview.url}/#/inbox`, { width: 1280, height: 900 });
+  await page.waitForSelector('[data-lane] article[data-ticket] [data-row-meta] time[data-created]');
+  assert.match(await page.locator('[data-lane] article[data-ticket] [data-row-meta] time[data-created]').first().textContent(), /^· (now|\d+[mhd]|[A-Z][a-z]{2} \d+)/, 'inline after the facts');
+  await go(page, '#/work');
+  await page.waitForSelector('article[data-key] time[data-created]');
+  const cards = await page.locator('article[data-key]').count(), aged = await page.locator('article[data-key] time[data-created]').count();
+  assert.ok(cards > 0 && aged >= cards, `every Work card says when it was created (${aged} of ${cards})`);
+  assert.match(await page.locator('article[data-key] time[data-created]').first().getAttribute('aria-label'), CREATED);
+  await page.locator('article[data-key] > button').first().click();
+  const head = page.locator('time[data-created]', { hasText: /^Created / }).first();
+  await head.waitFor();
+  assert.match(await head.textContent(), /^Created (just now|\d+[mhd] ago|[A-Z][a-z]{2} \d+)/);
+  await go(page, '#/research');
+  const backlog = page.locator('[data-research-backlog]');
+  await backlog.waitFor();
+  assert.match(await backlog.textContent(), /research items? (open; new research waits at \d+|are waiting — research resumes when fewer than \d+ are open)/);
+  assert.deepEqual(errors, []);
+  await page.close();
+});
