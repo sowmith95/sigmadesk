@@ -18,7 +18,7 @@ import { clean } from './ops.js';
 import { acceptanceOf } from './context.js';
 import * as kb from './knowledge.js';
 
-export const FORMAT = 'sigmadesk-ticket-facts/1';
+export const FORMAT = 'sigmadesk-ticket-facts/1'; // also written literally in the body's Format line
 let autoFlush = true; // a new note is written right away (tests drive the worker step by step instead)
 export function setAutoFlush(on) { autoFlush = on !== false; }
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
@@ -32,6 +32,9 @@ const short = (sha) => (sha === WITHHELD_FIELD ? sha : sha ? String(sha).slice(0
 // Every SOURCE field is checked before anything is formatted: a field with credential-like text becomes the withheld
 // marker, whichever record it came from (area, builder, pr_url, verdict labels, test arguments, incident samples …).
 const F = (v) => ((typeof v === 'string' || typeof v === 'number') && kb.credentialLike(String(v)) ? WITHHELD_FIELD : v);
+/** The one door into a facts body: every value interpolated into it (project identity, ticket and record fields,
+ * values the builder derives) is checked, and a credential-like one becomes the withheld marker. */
+const V = (strings, ...vals) => strings.reduce((acc, part, i) => acc + part + (i < vals.length ? String(F(vals[i] ?? '')) : ''), '');
 const safe = (o) => (o && typeof o === 'object' && !Array.isArray(o) ? Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Array.isArray(v) ? v.map(F) : F(v)])) : F(o));
 const SHA = /^[0-9a-f]{7,40}$/;
 
@@ -59,58 +62,59 @@ export function buildFacts(key) {
   const deploys = store.deploysForTicket(key).map(safe);
   const mergeSha = [...new Set([F(json(store.kvGet(`deploy:none:${key}`))?.merge_sha), ...deploys.map((d) => d.merge_sha)].filter((s) => SHA.test(String(s || ''))))];
   const contributors = (json(t.contributors, []) || []).map(F);
-  add(`# Facts: ${key} — ${line(t.title, 200)}`, '',
-    `Recorded by SigmaDesk from its own records when ${key} closed ${merged ? 'with a merged pull request' : 'and its incident was resolved'}. Attributable facts only: each section names the records it comes from. Seat-written narrative (submission notes, review summaries, replies, lessons, claimed root causes) is not included.`,
-    `Format: ${FORMAT} · project ${config.projectId || config.project.name}`, '',
+  add(V`# Facts: ${key} — ${line(t.title, 200)}`, '',
+    V`Recorded by SigmaDesk from its own records when ${key} closed ${merged ? 'with a merged pull request' : 'and its incident was resolved'}. Attributable facts only: each section names the records it comes from. Seat-written narrative (submission notes, review summaries, replies, lessons, claimed root causes) is not included.`,
+    V`Format: sigmadesk-ticket-facts/1 · project ${config.projectId || config.project.name}`, '', // the literal is FORMAT
     '## Ticket  [ticket record]',
-    `- ${key} · type ${t.type || '-'} · area ${t.area || '-'} · complexity ${t.complexity || '-'} · priority ${t.priority || '-'} · risk ${t.risk || 'unrecorded'}${t.parent_key ? ` · part of ${t.parent_key}` : ''}`,
-    `- Closed ${t.done_at || '-'}${merged ? ` · pull request ${t.pr_url || '-'} merged ${mergedAt}  [GitHub PR sync event ${merged.id}]` : ' · no merged pull request'}`,
-    `- QA-passed commit ${t.qa_sha || '-'} · head ${t.head_sha || '-'}${mergeSha.length ? ` · merge commit ${mergeSha.join(', ')}  [merge/deploy record]` : ''}`,
-    `- Builder ${t.builder || '-'}${contributors.length ? ` · contributors ${contributors.join(', ')}` : ''}`, '');
+    V`- ${key} · type ${t.type || '-'} · area ${t.area || '-'} · complexity ${t.complexity || '-'} · priority ${t.priority || '-'} · risk ${t.risk || 'unrecorded'}${t.parent_key ? V` · part of ${t.parent_key}` : ''}`,
+    V`- Closed ${t.done_at || '-'}${merged ? V` · pull request ${t.pr_url || '-'} merged ${mergedAt}  [GitHub PR sync event ${merged.id}]` : ' · no merged pull request'}`,
+    V`- QA-passed commit ${t.qa_sha || '-'} · head ${t.head_sha || '-'}${mergeSha.length ? V` · merge commit ${mergeSha.join(', ')}  [merge/deploy record]` : ''}`,
+    V`- Builder ${t.builder || '-'}${contributors.length ? V` · contributors ${contributors.join(', ')}` : ''}`, '');
   // The spec as recorded when the ticket was created — never today's description (seats append to it), never comments.
   const spec = safe(store.getTicketSpec(key));
   if (spec) {
     const acc = acceptanceOf(spec.description);
-    add(`## Specification  [ticket at creation, written by ${line(spec.reporter || 'unknown', 40)} at ${spec.created_at}, sha256 ${sha256(`${spec.title}\n${spec.description}`).slice(0, 12)}]`,
+    add(V`## Specification  [ticket at creation, written by ${line(spec.reporter || 'unknown', 40)} at ${spec.created_at}, sha256 ${sha256(`${spec.title}\n${spec.description}`).slice(0, 12)}]`,
       clip(acc || spec.description || '(no description)', 3000), '');
   } else add('## Specification  [ticket at creation]', '- not recorded (the ticket predates the frozen record)', '');
   const files = (a => (Array.isArray(a) ? a.map(F) : a))(json(store.kvGet(`diff-files:${key}`), null));
-  add(`## Files changed  [desk diff record at the QA-passed commit ${short(t.qa_sha)}]`);
-  if (Array.isArray(files) && files.length) { add(...files.slice(0, 200).map((f) => `- ${line(f, 200)}`)); if (files.length > 200) add(`- …and ${files.length - 200} more`); }
+  add(V`## Files changed  [desk diff record at the QA-passed commit ${short(t.qa_sha)}]`);
+  if (Array.isArray(files) && files.length) { add(...files.slice(0, 200).map((f) => V`- ${line(f, 200)}`)); if (files.length > 200) add(V`- …and ${files.length - 200} more`); }
   else add('- not recorded');
   add('');
   const qa = store.qaVerdicts(key).map(safe);
-  add('## QA verdicts  [qa_verdicts]', ...(qa.length ? qa.map((v) => `- #${v.id} ${v.verdict}${v.reason ? ` (${v.reason})` : ''} at ${short(v.sha)} · builder ${v.builder || '-'} on ${v.model || '-'} · run ${v.run_id ?? '-'} · ${v.ts}`) : ['- none recorded']), '');
+  add('## QA verdicts  [qa_verdicts]', ...(qa.length ? qa.map((v) => V`- #${v.id} ${v.verdict}${v.reason ? V` (${v.reason})` : ''} at ${short(v.sha)} · builder ${v.builder || '-'} on ${v.model || '-'} · run ${v.run_id ?? '-'} · ${v.ts}`) : ['- none recorded']), '');
   const runs = store.runsOfTicket(key);
   const tests = runs.flatMap((r) => json(store.kvGet(`desk-test:${r.id}`), []).map((x) => ({ ...safe(x), tests: x.tests ? safe(x.tests) : x.tests, run: safe(r) })));
-  add('## Test runs through desk test  [desk test records]', ...(tests.length ? tests.map((x) => `- run ${x.run.id} (${x.run.kind}, ${x.run.agent_id}): ${line((x.args || []).join(' '), 160)} → exit ${x.status}${x.tests ? ` · ${x.tests.tests} tests, ${x.tests.failures} failed, ${x.tests.errors} errors, ${x.tests.skipped} skipped` : ''} at ${short(x.sha)}${x.problem ? ` · not counted: ${line(x.problem, 120)}` : ''} · ${x.at || '-'}`) : ['- none recorded']), '');
+  add('## Test runs through desk test  [desk test records]', ...(tests.length ? tests.map((x) => V`- run ${x.run.id} (${x.run.kind}, ${x.run.agent_id}): ${line((x.args || []).join(' '), 160)} → exit ${x.status}${x.tests ? V` · ${x.tests.tests} tests, ${x.tests.failures} failed, ${x.tests.errors} errors, ${x.tests.skipped} skipped` : ''} at ${short(x.sha)}${x.problem ? V` · not counted: ${line(x.problem, 120)}` : ''} · ${x.at || '-'}`) : ['- none recorded']), '');
   const reviews = store.listPrReviews(key).map(safe);
   const findings = store.listFindings(key).map(safe);
   add('## Review verdicts  [pr_reviews; finding text excluded]', ...(reviews.length ? reviews.map((r) => {
     const f = findings.filter((x) => x.review_id === r.id);
-    return `- ${r.role} ${r.seat}: ${r.verdict} (${r.state}) at ${short(r.sha)} · round ${r.round} · run ${r.run_id ?? '-'}${f.length ? ` · ${f.length} finding(s), ${f.filter((x) => x.blocking).length} blocking, resolutions ${[...new Set(f.map((x) => x.resolution))].sort().join('/')}` : ''} · ${r.updated_at}`;
+    return V`- ${r.role} ${r.seat}: ${r.verdict} (${r.state}) at ${short(r.sha)} · round ${r.round} · run ${r.run_id ?? '-'}${f.length ? V` · ${f.length} finding(s), ${f.filter((x) => x.blocking).length} blocking, resolutions ${[...new Set(f.map((x) => x.resolution))].sort().join('/')}` : ''} · ${r.updated_at}`;
   }) : ['- none recorded']), '');
   const watches = store.watchesForTicket(key).map(safe);
   add('## Deploys and post-deploy checks  [deploy_history, deploy_watches, watch_checkpoints]');
   if (!deploys.length && !watches.length) add('- none recorded at the time of this note');
-  for (const d of deploys) add(`- deploy ${d.workflow} run ${d.run_id} attempt ${d.run_attempt} of ${short(d.merge_sha)} → ${d.status}${d.conclusion ? ` (${d.conclusion})` : ''}${d.target ? ` · target ${d.target}` : ''} · ${d.completed_at || d.started_at || d.recorded_at}`);
+  for (const d of deploys) add(V`- deploy ${d.workflow} run ${d.run_id} attempt ${d.run_attempt} of ${short(d.merge_sha)} → ${d.status}${d.conclusion ? V` (${d.conclusion})` : ''}${d.target ? V` · target ${d.target}` : ''} · ${d.completed_at || d.started_at || d.recorded_at}`);
   for (const w of watches) {
-    const cps = store.checkpointsOf(w.id).map(safe).map((c) => `${c.name} ${c.verdict || c.status}${c.limited ? ' (limited)' : ''}${c.completed_at ? ` ${c.completed_at}` : ''}`);
-    add(`- watch ${w.id} of ${short(w.merge_sha)}: ${w.status}${w.hold ? ' · deploy hold' : ''}${cps.length ? ` · checkpoints: ${cps.join('; ')}` : ''}`);
+    const cps = store.checkpointsOf(w.id).map(safe).map((c) => V`${c.name} ${c.verdict || c.status}${c.limited ? ' (limited)' : ''}${c.completed_at ? V` ${c.completed_at}` : ''}`);
+    add(V`- watch ${w.id} of ${short(w.merge_sha)}: ${w.status}${w.hold ? ' · deploy hold' : ''}${cps.length ? V` · checkpoints: ${cps.join('; ')}` : ''}`);
   }
   add('');
   const incidents = store.incidentsOfTicket(key).map(safe);
   if (incidents.length) {
     add('## Incidents  [incidents; samples are production log lines — untrusted data]');
     for (const i of incidents) {
-      add(`- #${i.id} ${line(i.label, 120)} · signature ${line(i.signature, 40)} · seen ${i.count}× · first ${i.first_seen} · last ${i.last_seen} · ${i.status}${i.resolved_at ? ` ${i.resolved_at}` : ''}`);
-      for (const s of (json(i.samples, []) || []).slice(-3).map(safe)) add(`  - [${line(s.ts, 40)}] ${line(s.line, 300)}`);
+      add(V`- #${i.id} ${line(i.label, 120)} · signature ${line(i.signature, 40)} · seen ${i.count}× · first ${i.first_seen} · last ${i.last_seen} · ${i.status}${i.resolved_at ? V` ${i.resolved_at}` : ''}`);
+      for (const s of (json(i.samples, []) || []).slice(-3).map(safe)) add(V`  - [${line(s.ts, 40)}] ${line(s.line, 300)}`);
     }
     add('');
   }
   // Redaction over the whole note (ops.js rules), then normalized whitespace: the body is what the hash covers.
+  // Assembly, not a value: every piece above already came through V.
   const body = `${clean(out.join('\n')).replace(/[ \t]+$/gm, '').trim()}\n`;
-  return { title: line(clean(`SigmaDesk facts: ${key} — ${t.title}`), 200), body };
+  return { title: line(clean(V`SigmaDesk facts: ${key} — ${t.title}`), 200), body };
 }
 function clip(text, n) {
   if (kb.credentialLike(text)) return WITHHELD_FIELD;
@@ -177,7 +181,9 @@ export function reconcile() {
     // Each candidate on its own: a malformed record fails that ticket (reported like any failed enqueue), not the pass.
     try {
       const facts = qualifies(key) ? buildFacts(key) : null;
-      if (!facts || store.knowledgeNoteByUrl(noteUrl(key, sha256(facts.body)))) continue;
+      if (!facts) continue;
+      // The current facts are already queued or written: any earlier "not queued" failure for this ticket is resolved.
+      if (store.knowledgeNoteByUrl(noteUrl(key, sha256(facts.body)))) { store.clearEnqueueFailure(key); continue; }
       if (store.transaction(() => enqueueTicketFacts(key, { trigger: 'reconcile' }))) n += 1;
     } catch (err) { reportEnqueueFailure(key, err); }
   }

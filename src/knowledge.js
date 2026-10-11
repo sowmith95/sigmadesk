@@ -291,7 +291,7 @@ function openQuoteAt(t) {
  *  (a) a token of any length containing pass, secret, token, key, auth, cred, bearer, cookie, session or private,
  *      followed by an optional quote, backtick or * and then ':' or '=' (so "pass the tests" stays, "bypass=1" does not);
  *  (b) "Bearer " or "Basic " followed by anything;
- *  (c) credentials in a URL ("://" followed by "…@");
+ *  (c) credentials in a URL ("://" then any non-space run containing "@" before the next whitespace);
  *  (d) a run of 24+ characters of [A-Za-z0-9+/_=-] mixing letters and digits, except exactly 40- or 64-character
  *      lowercase hex (commit and content hashes) — skipped for URLs, which the URL rules judge;
  *  (e) a known provider format or a JWT.
@@ -306,7 +306,7 @@ const SECRET_VALUES = [
   /\bSG\.[\w-]{16,}\.[\w-]{16,}/, /\bhf_[A-Za-z0-9]{30,}/, /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/,
 ];
 const AUTH_SCHEME = /\b(?:Bearer|Basic)\s+\S/i;
-const URL_USERINFO = /:\/\/[^/\s]*@/;
+const URL_USERINFO = /:\/\/\S*@/; // any non-space run after :// that reaches an @ before the next whitespace
 const secretRun = (t) => {
   for (const [v] of t.matchAll(/[A-Za-z0-9+/_=-]{24,}/g)) {
     if (/^[0-9a-f]+$/.test(v) && (v.length === 40 || v.length === 64)) continue;

@@ -1115,3 +1115,63 @@ test('round 4 — reconciliation isolates each candidate; unresolved failures ar
   assert.equal(d.failures.filter((f) => f.status === 'not queued').length, 20);
   store.kvSet('knowledge:since', store.now());
 });
+
+test('round 5 — URL credentials with a slash before the @ are withheld', async () => {
+  setStore({ results: [note('u1', { text: 'clone https://user:tiny/part@host/path then build' })] });
+  const out = await search(mkRun(), 'url credentials');
+  assert.match(out, /excerpt withheld: it contains credential-like text/);
+  assert.ok(!out.includes('tiny/part'));
+  assert.equal(kb.credentialLike('see https://example.com/a and mail me @ noon'), false, 'an @ after whitespace is not userinfo');
+});
+
+test('round 5 — every value interpolated into a facts body passes the withhold check (instrumented, one input at a time)', async () => {
+  const SECRET = 'syntheticcredential1234567890';
+  const savedProject = config.projectId;
+  const inject = [
+    ['project identity', () => { config.projectId = SECRET; }, () => { config.projectId = savedProject; }],
+    ...['title', 'type', 'area', 'complexity', 'priority', 'risk', 'parent_key', 'pr_url', 'qa_sha', 'head_sha', 'builder'].map((f) => [`ticket.${f}`, (t) => store.updateTicket(t.key, { [f]: SECRET })]),
+    ['contributors', (t) => store.updateTicket(t.key, { contributors: JSON.stringify([SECRET]) })],
+    ['diff files', (t) => store.kvSet(`diff-files:${t.key}`, JSON.stringify([SECRET]))],
+    ['qa verdict', (t) => store.recordQaVerdict({ ticket_key: t.key, run_id: 1, sha: SECRET, verdict: SECRET, reason: SECRET, builder: SECRET, model: SECRET })],
+    ['desk test', (t) => store.kvSet(`desk-test:${mkRun('qa', 'qa', t.key).id}`, JSON.stringify([{ args: [SECRET], status: SECRET, sha: SECRET, tests: { tests: SECRET, failures: 0, errors: 0, skipped: 0 }, problem: SECRET, at: SECRET }]))],
+    ['review', (t) => { const r = store.createPrReview({ ticket_key: t.key, seat: SECRET, role: SECRET, sha: SECRET }); store.updatePrReview(r.id, { verdict: SECRET, state: SECRET }); }],
+    ['deploy', (t) => store.recordDeploy({ deploy_key: `d-${t.key}`, merge_sha: SECRET, ticket_key: t.key, workflow: SECRET, run_id: 5, status: SECRET, conclusion: SECRET, target: SECRET, source: 'desk' })],
+    ['incident', (t) => { const i = store.recordIncident({ signature: `sig-${t.key}`, normalized: 'x', source_index: 0, label: SECRET, project: 'demo', line: SECRET, ts: SECRET }); store.updateIncident(i.id, { status: 'resolved', ticket_key: t.key }); }],
+    ['merge event', (t) => store.logEvent({ kind: 'github', agent_id: 'github', ticket_key: t.key, text: `PR merged on GitHub at ${SECRET}` })],
+  ];
+  for (const [name, set, undo] of inject) {
+    const t = mergedTicket(`Probe ${name}`);
+    sched.prActions.merged(store.getTicket(t.key), { at: '2026-10-05T12:00:00Z' });
+    set(t); // after the close, so the newest merge event (and every other record) carries the probe
+    try {
+      const facts = notes.buildFacts(t.key);
+      assert.ok(facts, name);
+      assert.ok(!facts.body.includes(SECRET) && !facts.title.includes(SECRET), `${name} reached the facts body`);
+      assert.match(facts.body, /Format: sigmadesk-ticket-facts\/1 · project /);
+    } finally { undo?.(); }
+  }
+});
+
+test('round 5 — a stale "not queued" failure clears when the current facts already match a queued version', async () => {
+  try { store.handle().exec('DELETE FROM knowledge_enqueue_failures'); } catch { /* older schema */ }
+  notes.setAutoFlush(false);
+  try {
+    const t = mergedTicket('Queued, then corrupted, then restored');
+    const run = mkRun('qa', 'qa', t.key);
+    const good = store.kvGet(`desk-test:${store.runsOfTicket(t.key).find((r) => r.kind === 'qa').id}`);
+    sched.prActions.merged(t, { at: '2026-10-05T12:00:00Z' });
+    assert.equal(store.knowledgeNotesFor(t.key).length, 1, 'queued');
+    store.kvSet('knowledge:since', '2000-01-01T00:00:00Z');
+    store.kvSet(`desk-test:${run.id}`, JSON.stringify([{ args: 'not-a-list', status: 0 }]));
+    const mine = () => store.enqueueFailures(10_000).filter((x) => x.ticket_key === t.key).length;
+    notes.reconcile();
+    assert.equal(mine(), 1, 'the corrupted record is a failure');
+    const before = kb.describe().not_queued;
+    store.kvSet(`desk-test:${run.id}`, JSON.stringify([]));
+    assert.ok(good);
+    notes.reconcile();
+    assert.equal(mine(), 0, 'cleared: the current facts match the queued version');
+    assert.equal(kb.describe().not_queued, before - 1, 'the count drops by exactly this one');
+    assert.equal(store.knowledgeNotesFor(t.key).length, 1, 'no new version was needed');
+  } finally { notes.setAutoFlush(true); store.kvSet('knowledge:since', store.now()); }
+});
