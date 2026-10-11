@@ -742,27 +742,35 @@ export const runBudget = (agentId, kind = null) => {
 export const reservationFor = (run) => run?.reserve_usd || engineOf({ engine: String(run?.model || '').split(':')[0] }).budgetUsd({ model: String(run?.model || '').split(':').slice(1).join(':') });
 
 /**
- * The setup phase of one run, from its row's insertion until its process is spawned. It owns what the run holds in
- * that window (the seat's working state, the step ledger, a prepared context pack, the preparation timer, the socket
- * and mailbox, the tool home) and ends exactly once: handOff() when the process exists (its close handler takes over),
- * or abort(reason, status) on any failure or refusal. abort is idempotent and never downgrades a run that has already
- * stopped: a run the owner, a stop-all or a timeout killed keeps its status and reason, and only the cleanup happens.
+ * The setup phase of one run, from its row's insertion until its process is fully wired up. It owns what the run holds
+ * in that window (the seat's working state, the step ledger, a prepared context pack, the preparation timer, the
+ * socket, mailbox, tool home, run timers and the spawned process) and one flag says who finalizes the run, exactly once:
+ *   'setup'   → abort(reason, status) claims it ('aborted'), or handOff() gives it to the process ('handed')
+ *   'handed'  → the close/exit handler claims it with finishing() ('finished')
+ * Whichever claims first finalizes; the other is a no-op. So a process exit after an abort never overwrites the setup
+ * reason or charges the cap, and an abort after the hand-off never touches the run. abort never downgrades a run that
+ * has already stopped: a run the owner, a stop-all or a timeout killed keeps its status and reason; only cleanup runs.
  */
 function setupPhase({ run, agentId, ticketKey, track }) {
-  let open = true;
+  let state = 'setup';
   const owned = [];
   const quietly = (fn) => { try { fn(); } catch { /* keep releasing the rest */ } };
   const result = () => ({ run: store.getRun(run.id), result: null, failure: null });
   return {
     own(release) { owned.push(release); },
-    handOff() { open = false; owned.length = 0; },
+    /** The process is wired up: its close handler owns the run from now on. False if an abort already claimed it. */
+    handOff() { if (state !== 'setup') return false; state = 'handed'; owned.length = 0; return true; },
+    /** The close/exit handler's claim: true exactly once, and only for a run that was handed off. */
+    finishing() { if (state !== 'handed') return false; state = 'finished'; return true; },
     abort(reason, status = 'error') {
-      if (!open) return result();
-      open = false;
+      if (state !== 'setup') return result();
+      state = 'aborted';
       for (const release of owned.splice(0).reverse()) quietly(release);
       quietly(() => ledgers.delete(run.id));
       quietly(() => context.release(run.id));
       quietly(() => mailboxes.delete(run.id));
+      quietly(() => ops.cancelRun(run.id));
+      quietly(() => evidence.delete(run.id));
       quietly(() => fs.rm(path.join(toolHomeRoot(), `r${run.id}`), { recursive: true, force: true }, () => {}));
       quietly(() => {
         const now = store.getRun(run.id);
@@ -836,7 +844,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       boundSteps(run, ctx.maxSteps ?? null); // the desk counts its requests against the same allowance
       // onStart may have refused the run (or a stop arrived): a run that is not running never spawns.
       if (store.getRun(run.id)?.status !== 'running') return setup.abort(store.getRun(run.id)?.result_text || 'refused before start', 'killed');
-      if (!pplx) return spawnChild();
+      if (!pplx) return await spawnChild();
 
       // Perplexity thinking seats: the desk builds the context pack (not the relay) before the relay starts. Cancellation
       // and the run timeout exist before any preparation work; a pack that cannot be built refuses the run (fail closed).
@@ -856,7 +864,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       // The circuit breaker may have tripped while the pack was being built: re-check the fence right before spawning.
       if (fence != null && fence !== epoch) return setup.abort('stopped by stop-all while preparing', 'killed');
       if (failed) return setup.abort(`Run refused: the context pack could not be built — ${store.redact(failed.message).slice(0, 300)}`, 'error');
-      return spawnChild();
+      return await spawnChild();
     } catch (err) {
       setup.abort(`Run setup failed: ${store.redact(String(err?.message || err)).slice(0, 300)}`, 'error');
       throw err;
@@ -880,7 +888,7 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   setup.own(() => { children.delete(run.id); if (child.pid) killGroup(child.pid, { owner: run.id }); });
   store.updateRun(run.id, { pid: child.pid });
   // The process's start time identifies it after a restart (a recorded pid alone may have been reused meanwhile).
-  if (child.pid) processStart(child.pid).then((at) => { if (at) store.updateRun(run.id, { pid_start: at }); });
+  if (child.pid) processStart(child.pid).then((at) => { if (at) store.updateRun(run.id, { pid_start: at }); }).catch(() => {}); // best effort: never an unhandled rejection
   if (child.pid) lessons.delivered(run.id, ticketKey); // lessons count as given only once the prompt reaches a process
   child.stdin.on('error', () => {});
   child.stdin.end(cmd.wrapPrompt ? cmd.wrapPrompt(prompt) : prompt);
@@ -916,11 +924,12 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
   }, Math.max(1000, deadlineAt - Date.now()));
   setup.own(() => clearTimeout(timer));
 
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (code) => {
-      if (settled) return;
-      settled = true;
+  // Wiring stays synchronous (outside any Promise executor), so a throw here reaches the setup phase's catch.
+  let resolve;
+  const ended = new Promise((r) => { resolve = r; });
+  const finish = (code, spawnError = null) => {
+      if (!setup.finishing()) return; // an abort already ended it, or it already finished
+      if (spawnError) store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: spawnError });
       clearTimeout(timer);
       if (idleTimer) clearInterval(idleTimer);
       children.delete(run.id);
@@ -964,14 +973,11 @@ export function startRun({ agentId, kind, ticketKey = null, prompt, cwd, track =
       if (track) store.updateAgent(agentId, { status: 'idle', current_kind: null, current_ticket: null, current_run: null, last_action_at: store.now() });
       resolve({ run: store.getRun(run.id), result: r, failure, steps: stepsTaken(ctx) });
       ledgers.delete(run.id);
-    };
-    child.on('close', finish);
-    child.on('error', (err) => {
-      store.logEvent({ run_id: run.id, agent_id: agentId, ticket_key: ticketKey, kind: 'error', text: `spawn failed: ${err.message}` });
-      finish(-1);
-    });
-    setup.handOff(); // its close handler now ends the run and releases what it holds, exactly once
-  });
+  };
+  child.on('close', finish);
+  child.on('error', (err) => finish(-1, `spawn failed: ${err.message}`));
+  setup.handOff(); // its close handler now ends the run and releases what it holds, exactly once
+  return ended;
   }
 }
 

@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, ChildProcess } from 'node:child_process';
+import { Readable } from 'node:stream';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sigmadesk-backlog-'));
 const repo = path.join(tmp, 'repo'); fs.mkdirSync(repo);
@@ -278,3 +279,47 @@ test('setup phase: a spawned and wired run is its close handler\'s alone: it end
   assert.equal(events.filter((e) => /Run setup failed/.test(e.text)).length, 0, 'the setup phase never ended it');
   assert.equal(events.filter((e) => /implement run (finished|error|killed)/.test(e.text)).length, 1, 'ended exactly once');
 });
+
+// Wiring the spawned process (its stream and exit handlers) is still the setup phase. A throw while registering any of
+// them ends the run once, with the setup reason: no later exit overwrites it or charges the cap, the process is stopped,
+// and the socket, timers and seat are released.
+const sleeper = path.join(tmp, 'sleepy'); fs.writeFileSync(sleeper, '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
+function throwOnRegister(proto, event) {
+  const on = proto.on, own = Object.prototype.hasOwnProperty.call(proto, 'on');
+  const restore = () => { if (own) proto.on = on; else delete proto.on; };
+  // Only the run's own wiring in spawnChild (a pid lookup or a git call elsewhere registers the same events).
+  proto.on = function (ev, fn) {
+    if (ev === event && /at spawnChild /.test(new Error().stack) && !/processStart/.test(new Error().stack)) { restore(); throw new Error(`injected wiring failure (${event})`); }
+    return on.call(this, ev, fn);
+  };
+  return restore;
+}
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+async function wiringFails(proto, event, { bin = fakeClaude } = {}) {
+  await waitIdle();
+  const closed = [], savedBin = config.bins.claude;
+  runner.setSocketFactory((id) => ({ path: path.join(tmp, `r${id}.sock`), close: () => closed.push(id) }));
+  config.bins.claude = bin;
+  let restore = () => {};
+  try {
+    await assert.rejects(runner.startRun({ agentId: 'pm', kind: 'implement', prompt: 'x', cwd: repo, onStart: () => { restore = throwOnRegister(proto, event); } }), new RegExp(`injected wiring failure \\(${event}\\)`));
+  } finally { restore(); runner.setSocketFactory(null); config.bins.claude = savedBin; }
+  const id = lastRun().id, pid = lastRun().pid;
+  for (let i = 0; i < 120 && pid && alive(pid); i++) await new Promise((r) => setTimeout(r, 25));
+  await new Promise((r) => setTimeout(r, 300)); // room for a late exit handler to (wrongly) finalize again
+  const run = store.getRun(id);
+  assert.ok(pid, 'the process had been spawned');
+  assert.equal(alive(pid), false, 'the process was stopped');
+  assert.deepEqual([run.status, run.token, !!run.ended_at, run.cost_usd, run.cost_estimated || 0], ['error', null, true, 0, 0], 'ended once, no cap charged');
+  assert.match(run.result_text, new RegExp(`^Run setup failed: injected wiring failure \\(${event}\\)`), 'the setup reason is kept');
+  const events = store.recentEvents({ limit: 100 }).filter((e) => e.run_id === id);
+  assert.equal(events.filter((e) => /Run setup failed/.test(e.text)).length, 1);
+  assert.equal(events.filter((e) => /implement run (finished|error|killed)/.test(e.text)).length, 0, 'the exit handler never finalized it');
+  assert.deepEqual(closed, [id], 'the socket was closed once');
+  assert.equal(runner.runningCount(), 0, 'the child is no longer tracked');
+  assert.deepEqual([store.getAgentState('pm').status, store.getAgentState('pm').current_run ?? null], ['idle', null]);
+}
+
+test('setup phase: a throw registering the output handler (before the exit handler) stops the process and ends the run once', () => wiringFails(Readable.prototype, 'data', { bin: sleeper }));
+test('setup phase: a throw registering the exit handler itself stops the process and ends the run once', () => wiringFails(ChildProcess.prototype, 'close', { bin: sleeper }));
+test('setup phase: a throw after the exit handler is attached, then the process exits: one finalization, the setup reason kept', () => wiringFails(ChildProcess.prototype, 'error'));
