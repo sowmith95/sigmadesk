@@ -17,12 +17,12 @@ const cfg = path.join(tmp, 'config.json');
 fs.writeFileSync(cfg, JSON.stringify({ project: { repoPath: repo, ticketPrefix: 'B' }, github: { sync: false }, bins: { claude: fakeClaude }, sandbox: { enabled: false },
   pm: { enabled: true, intervalMinutes: 1, maxOpenProposals: 50 }, research: { review: { minReviewers: 1, reviewers: ['principal-be'] } } }));
 process.env.SIGMADESK_CONFIG = cfg; process.env.SIGMADESK_WORKSPACES = path.join(tmp, 'ws');
-let store, sched, research, rr, dispatch, config;
+let store, sched, research, rr, dispatch, config, runner;
 before(async () => {
   ({ config } = await import('../src/config.js')); config.root = tmp; config.dataDir = path.join(tmp, 'data');
   store = await import('../src/db.js'); store.openDb(':memory:');
   dispatch = await import('../src/dispatch.js'); dispatch.setAvailability([{ id: 'claude', available: true }, { id: 'codex', available: false }]);
-  sched = await import('../src/scheduler.js'); research = await import('../src/research.js'); rr = await import('../src/research-review.js');
+  sched = await import('../src/scheduler.js'); runner = await import('../src/runner.js'); research = await import('../src/research.js'); rr = await import('../src/research-review.js');
   store.setSetting('max_concurrent', '6');
 });
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -219,4 +219,62 @@ test('a run whose setup fails after its row exists ends as an error: it holds no
   assert.equal(sched.researchAllowance(), 1, 'the room is free again');
   assert.deepEqual([store.getAgentState('pm').status, store.getAgentState('pm').current_run ?? null], ['idle', null]);
   store.setSetting('research_backlog_max', '8');
+});
+
+// ---- the setup phase of a run (src/runner.js setupPhase): fault injection on the store, no production seams ----
+/** After a statement matching `after` is prepared (immediately when null), let `skip` matching reads through, then fail one. */
+function failRead(target, { after = null, skip = 0 } = {}) {
+  const db = store.handle(), prepare = db.prepare;
+  let armed = !after, left = skip;
+  db.prepare = function (sql) {
+    if (!armed && after.test(sql)) armed = true;
+    else if (armed && target.test(sql) && left-- <= 0) { db.prepare = prepare; return { get() { throw new Error('injected read failure'); }, all() { throw new Error('injected read failure'); }, run() { throw new Error('injected read failure'); } }; }
+    return prepare.call(this, sql);
+  };
+  return () => { db.prepare = prepare; };
+}
+const RUN_READ = /^SELECT \* FROM runs WHERE id=\?$/;
+const lastRun = () => store.getRun(store.recentRuns(1)[0].id);
+
+test('setup phase: a read failing right before the spawn decision ends the run and frees the seat', async () => {
+  await waitIdle();
+  let restore = () => {};
+  try {
+    await assert.rejects(runner.startRun({ agentId: 'pm', kind: 'implement', prompt: 'x', cwd: repo, onStart: () => { restore = failRead(RUN_READ); } }), /injected read failure/);
+  } finally { restore(); }
+  const run = lastRun();
+  assert.deepEqual([run.status, !!run.ended_at, run.token, run.pid ?? null], ['error', true, null, null]);
+  assert.match(run.result_text, /^Run setup failed: injected read failure/);
+  assert.deepEqual([store.getAgentState('pm').status, store.getAgentState('pm').current_run ?? null], ['idle', null]);
+});
+
+test('setup phase: a start callback that stops the run and then throws keeps the stop and its reason', async () => {
+  await waitIdle();
+  await assert.rejects(runner.startRun({ agentId: 'pm', kind: 'implement', prompt: 'x', cwd: repo, onStart: (r) => { runner.killRun(r.id, 'owner stopped'); throw new Error('callback broke'); } }), /callback broke/);
+  const run = lastRun();
+  assert.deepEqual([run.status, run.result_text, run.token, !!run.ended_at], ['killed', 'owner stopped', null, true], 'never downgraded to an error');
+  assert.equal(store.getAgentState('pm').status, 'idle');
+});
+
+test('setup phase: a failure after the spawn but before the run is wired up stops the process and ends the run', async () => {
+  await waitIdle();
+  const db = store.handle();
+  db.exec("CREATE TRIGGER fail_pid BEFORE UPDATE OF pid ON runs BEGIN SELECT RAISE(ABORT, 'pid write failed'); END;");
+  try { await assert.rejects(runner.startRun({ agentId: 'pm', kind: 'implement', prompt: 'x', cwd: repo }), /pid write failed/); }
+  finally { db.exec('DROP TRIGGER fail_pid'); }
+  const run = lastRun();
+  assert.deepEqual([run.status, run.token, !!run.ended_at], ['error', null, true]);
+  assert.match(run.result_text, /^Run setup failed: pid write failed/);
+  assert.equal(store.getAgentState('pm').status, 'idle'); // and the test process can exit: the half-wired child was stopped
+});
+
+test('setup phase: a spawned and wired run is its close handler\'s alone: it ends once, from the process exit', async () => {
+  await waitIdle();
+  const out = await runner.startRun({ agentId: 'pm', kind: 'implement', prompt: 'x', cwd: repo });
+  assert.ok(out.run.pid, 'it was spawned');
+  assert.notEqual(out.run.status, 'running');
+  assert.doesNotMatch(out.run.result_text || '', /Run setup failed/);
+  const events = store.recentEvents({ limit: 50 }).filter((e) => e.run_id === out.run.id);
+  assert.equal(events.filter((e) => /Run setup failed/.test(e.text)).length, 0, 'the setup phase never ended it');
+  assert.equal(events.filter((e) => /implement run (finished|error|killed)/.test(e.text)).length, 1, 'ended exactly once');
 });
