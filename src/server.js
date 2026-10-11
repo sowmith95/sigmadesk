@@ -42,6 +42,8 @@ import * as packages from './packages.js';
 import * as decision from './decision.js';
 import * as autonomy from './autonomy.js';
 import * as delegation from './delegation.js';
+import * as knowledge from './knowledge.js';
+import * as knowledgeNotes from './knowledge-notes.js';
 
 const PUBLIC = path.join(config.root, 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -385,10 +387,15 @@ async function ownerRoute(req, res) {
     const b = await readBody(req);
     store.setSetting(b.key, b.value);
     if (b.key === 'ops_enabled' && String(b.value) !== 'true') ops.cancelAll(); // emergency stop: nothing keeps running
+    if (b.key === 'knowledge_enabled' && String(b.value) !== 'true') knowledge.cancelAll(); // kill switch: searches and note writes stop
+    if (b.key === 'knowledge_enabled' && String(b.value) === 'true') knowledgeNotes.flush().catch(() => {});
     store.logEvent({ kind: 'system', agent_id: 'owner', text: `setting ${b.key} = ${b.value}` });
     return send(res, 200, store.getSettings());
   }
   // Production read access: the owner grants, decides requests, revokes and sets the approver policy.
+  // Institutional memory (#10): the outbox for Settings → Knowledge, and another try of a failed note.
+  if (req.method === 'GET' && p === '/api/knowledge') return send(res, 200, { ...knowledge.describe(), notes: store.recentKnowledgeNotes(50) });
+  if (req.method === 'POST' && (mm = m('^/api/knowledge/notes/(\\d+)/retry$'))) return send(res, 200, { ok: true, note: knowledgeNotes.retryNote(Number(mm[1])) });
   if (req.method === 'GET' && p === '/api/access') { access.sweep(); return send(res, 200, access.details()); }
   if (req.method === 'POST' && p === '/api/access/grant') {
     const b = await readBody(req);
@@ -720,8 +727,11 @@ export async function main() {
   // Post-deploy watch on its own timer: monitoring production never depends on the merge train or reviews being on.
   setInterval(() => deploywatch.sweep({ lock: mergetrain.deployState() }).catch((err) => console.error('post-deploy watch:', err.message)), 60_000);
   setInterval(() => sched.retryPublications(), 5 * 60_000);
+  // Past-work notes (#10): reconcile transitions missed while the write side was off, then write what is due.
+  setTimeout(() => { try { knowledgeNotes.reconcile(); } catch (err) { console.error('knowledge reconcile:', err.message); } knowledgeNotes.flush().catch(() => {}); }, 20_000);
+  setInterval(() => knowledgeNotes.flush().catch((err) => console.error('knowledge notes:', err.message)), 60_000);
   // Seats' runs and the Codex usage RPC end before the desk does: nothing it started keeps writing into its data afterwards.
-  const shutdown = () => { council.cancelAll(); advisors.cancelAll(); Promise.allSettled([runner.shutdownAll('desk shutdown'), usage.stopAll()]).finally(() => process.exit(0)); };
+  const shutdown = () => { council.cancelAll(); advisors.cancelAll(); knowledge.cancelAll('desk shutdown'); Promise.allSettled([runner.shutdownAll('desk shutdown'), usage.stopAll()]).finally(() => process.exit(0)); };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }

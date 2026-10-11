@@ -30,6 +30,7 @@ import * as github from './github.js';
 import * as prs from './prs.js';
 import { agentById, BUILDERS } from './team.js';
 import { notify } from './notify.js';
+import * as knowledgeNotes from './knowledge-notes.js';
 
 const DW = () => config.deployWatch || {};
 export const enabled = () => DW().enabled !== false;
@@ -815,6 +816,7 @@ function rollUp(watchId) {
   const limited = all.some((c) => c.limited);
   store.updateWatch(w.id, { status, verdict_note: status === 'verified' ? `every check passed${limited ? ' (limited: no ticket criteria)' : ''}` : `${all.filter((c) => c.verdict !== 'verified').map((c) => checkpointLabel(c.name)).join(', ') || 'a check'} inconclusive` });
   if (w.ticket_key) store.logEvent({ kind: 'action', agent_id: 'system', ticket_key: w.ticket_key, text: status === 'verified' ? `verified in production after deploy (${short(w.merge_sha)})${limited ? ' — limited' : ''}` : `production verification inconclusive (${short(w.merge_sha)})` });
+  knowledgeNotes.onWatchConcluded(w.ticket_key); // #10: a new version of the ticket's facts, now with its post-deploy results
 }
 
 // ---------------- regressions ----------------
@@ -847,6 +849,7 @@ function holdRegression(w, cp, ev) {
   store.updateWatch(w.id, { status: 'regression', hold: 1, hold_kind: 'regression', cleared_by: null, cleared_at: null,
     verdict_note: `${checkpointLabel(cp.name)}: ${(ev.items || []).filter((i) => i.result === 'fail').map((i) => i.criterion).join(', ') || 'the SRE suspects a regression'}` });
   for (const c of store.checkpointsOf(w.id)) if (['pending', 'needs_sre', 'unschedulable'].includes(c.status)) store.updateCheckpoint(c.id, { status: 'superseded', completed_at: iso(clock.now()) });
+  knowledgeNotes.onWatchConcluded(w.ticket_key); // #10: the regression is part of the ticket's recorded facts
   const page = `Regression suspected after deploying ${ticketName(t)} (${short(w.merge_sha)}). Deploying merges are on hold until you clear it.`;
   if (t) say(t, `regression:${w.id}`, `🚨 **${page}**\n\n${signalsOf(ev)}\n\nAn incident ticket and a revert for you to merge are being prepared.`, w.merge_sha);
   store.logEvent({ kind: 'error', agent_id: 'sre', ticket_key: w.ticket_key, text: page });

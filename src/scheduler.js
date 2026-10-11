@@ -28,6 +28,7 @@ import * as access from './access.js';
 import * as packages from './packages.js';
 import * as netfetch from './netfetch.js';
 import * as knowledge from './knowledge.js';
+import * as knowledgeNotes from './knowledge-notes.js';
 import * as mentions from './mentions.js';
 import * as deploywatch from './deploywatch.js';
 import * as delegation from './delegation.js';
@@ -2453,7 +2454,8 @@ export const prActions = {
   merged(t, a) {
     store.addComment(t.key, 'system', `🎉 **Merged on GitHub**${a.at ? ` at ${a.at}` : ''}.`);
     store.logEvent({ kind: 'github', agent_id: 'github', ticket_key: t.key, text: `PR merged on GitHub${a.at ? ` at ${a.at}` : ''}` }); // team stats count it as shipped
-    setStatus(t.key, 'done', { progress: 100, progress_msg: 'merged' });
+    // The qualifying transition and its frozen past-work note commit together (#10); the note never blocks it.
+    store.transaction(() => { setStatus(t.key, 'done', { progress: 100, progress_msg: 'merged' }); knowledgeNotes.enqueueTicketFacts(t.key, { trigger: 'merged' }); });
     teamStats.invalidate();
   },
   closed(t, a) {
