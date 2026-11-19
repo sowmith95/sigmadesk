@@ -257,34 +257,82 @@ export function ensureWorkspace(ticket) {
     const branch = ticket.branch || `${config.project.branchPrefix}${ticket.key.toLowerCase()}-${slugify(ticket.title)}`;
     const base = config.project.baseBranch;
     if (!fs.existsSync(path.join(dir, '.git'))) {
-      fs.mkdirSync(config.workspaceRoot, { recursive: true });
-      // --no-hardlinks: a hardlinked object edited in a clone would corrupt the owner's checkout.
-      await git(['clone', '--quiet', '--no-hardlinks', config.project.repoPath, dir]);
-      const { stdout: origin } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
-      if (origin.trim()) {
-        await git(['-C', dir, 'remote', 'set-url', 'origin', origin.trim()]);
-        await git(['-C', dir, 'fetch', '--quiet', 'origin', base]);
-      }
-      const remoteBranch = await git(['-C', dir, 'ls-remote', '--heads', 'origin', branch]).then((r) => r.stdout.trim()).catch(() => '');
-      if (remoteBranch) {
-        await git(['-C', dir, 'fetch', '--quiet', 'origin', branch]);
-        await git(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${branch}`]);
-      } else {
-        await git(['-C', dir, 'checkout', '-q', '-b', branch, `origin/${base}`]);
-      }
-      for (const p of config.project.copyPaths) {
-        const src = path.join(config.project.repoPath, p);
-        const dst = path.join(dir, p);
-        if (!fs.existsSync(src) || fs.existsSync(dst)) continue;
-        fs.mkdirSync(path.dirname(dst), { recursive: true });
-        // APFS copy-on-write clone when available (instant, no extra disk); plain copy otherwise.
-        await pexec('cp', os.platform() === 'darwin' ? ['-cR', src, dst] : ['-R', '--reflink=auto', src, dst], { timeout: 600_000 })
-          .catch(() => pexec('cp', ['-R', src, dst], { timeout: 600_000 }));
+      // Built in a staging dir and renamed into place only when finished: a half-built workspace (with a .git) would
+      // be taken as done by the check above, and `cp` into an existing dir nests the copy inside it.
+      const stage = guardWorkspacePath(path.join(config.workspaceRoot, `.stage-${ticket.key}-${process.pid}`));
+      removeStages(ticket.key); // ours from an earlier failure, or a crashed process's (any pid): none is in use under the lock
+      try {
+        await prepareWorkspaceGit(stage);
+        // Common to both preparations: the owner's CURRENT origin (a template reused at an unchanged base keeps the
+        // URL it was built with) and the current base, never the template's up-to-10-minute-old one.
+        const { stdout: url } = await git(['-C', config.project.repoPath, 'remote', 'get-url', 'origin']).catch(() => ({ stdout: '' }));
+        await git(['-C', stage, 'remote', 'set-url', 'origin', url.trim() || config.project.repoPath]);
+        await git(['-c', 'protocol.file.allow=always', '-C', stage, 'fetch', '--quiet', '--no-tags', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`]);
+        const remoteBranch = await git(['-C', stage, 'ls-remote', '--heads', 'origin', branch]).then((r) => r.stdout.trim()).catch(() => '');
+        if (remoteBranch) {
+          await git(['-c', 'protocol.file.allow=always', '-C', stage, 'fetch', '--quiet', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+          await git(['-C', stage, 'checkout', '-q', '-b', branch, `origin/${branch}`]);
+        } else {
+          await git(['-C', stage, 'checkout', '-q', '-b', branch, `origin/${base}`]);
+        }
+        for (const p of config.project.copyPaths) {
+          const src = path.join(config.project.repoPath, p);
+          const dst = path.join(stage, p);
+          if (!fs.existsSync(src) || fs.existsSync(dst)) continue;
+          fs.mkdirSync(path.dirname(dst), { recursive: true });
+          // APFS copy-on-write clone when available (instant, no extra disk); plain copy otherwise.
+          await pexec('cp', os.platform() === 'darwin' ? ['-cR', src, dst] : ['-R', '--reflink=auto', src, dst], { timeout: 600_000 })
+            .catch(() => pexec('cp', ['-R', src, dst], { timeout: 600_000 }));
+        }
+        // An empty leftover dir is replaced; anything else in the workspace's place is kept and refused, as `git clone`
+        // into a non-empty dir always was.
+        try { fs.rmdirSync(dir); } catch (e) { if (e.code !== 'ENOENT') throw new Error(`refusing to replace a non-empty workspace without .git: ${dir}`); }
+        fs.renameSync(stage, dir);
+      } catch (e) {
+        removeTree(stage); // a failed fetch or checkout fails the ticket as before; it never leaves a half-built clone
+        throw e;
       }
     }
     breakHardlinks(dir);
     return { dir, branch };
   });
+}
+
+/**
+ * The .git of a new builder workspace, in `stage` (which must not exist): a copy-on-write copy of the desk's trusted
+ * template's .git — base history only, its object files shared on disk until a seat rewrites them — else, when the
+ * template cannot be built or copied, a full `git clone --no-hardlinks` of the owner's checkout (the old way).
+ *
+ * The copy is a builder clone, so it must behave like `git clone` did: the template's trusted `filter.*` drivers are
+ * removed (a builder's tree holds the committed bytes; refresh and sync compare against an unfiltered trusted clone),
+ * with its info/attributes, and its index is deleted, so the checkout that follows writes every file from its blob
+ * rather than trusting stat data copied from the template's smudged tree (with core.checkStat=minimal a smudged file
+ * can otherwise survive `reset --hard` and still read as clean). Only the .git is copied: an index-less checkout
+ * rewrites every file anyway.
+ */
+async function prepareWorkspaceGit(stage) {
+  try {
+    const tpl = await scratchTemplate();
+    fs.mkdirSync(stage);
+    const src = path.join(tpl, '.git'), dst = path.join(stage, '.git'); // dst must not exist: cp would nest into it
+    await pexec('cp', os.platform() === 'darwin' ? ['-cR', src, dst] : ['-R', '--reflink=auto', src, dst], { timeout: 600_000 })
+      .catch(() => { removeTree(dst); return pexec('cp', ['-R', src, dst], { timeout: 600_000 }); });
+    if (!fs.lstatSync(dst).isDirectory()) throw new Error('the copied .git is not a directory');
+    // Exit 1 is "no such keys"; any other failure must not pass for "no filters" (the copy would keep them): it throws
+    // into the fallback clone below.
+    const { stdout } = await git(['-C', stage, 'config', '--local', '--name-only', '--get-regexp', '^filter\\.']).catch((e) => {
+      if (e.code === 1) return { stdout: '' };
+      throw e;
+    });
+    const sections = [...new Set(stdout.split('\n').filter(Boolean).map((k) => k.slice(0, k.lastIndexOf('.'))))];
+    for (const s of sections) await git(['-C', stage, 'config', '--local', '--remove-section', s]);
+    for (const f of ['index', path.join('info', 'attributes')]) fs.rmSync(path.join(dst, f), { force: true });
+  } catch (e) {
+    console.warn(`[workspace] template copy failed, cloning the owner's checkout instead: ${e.message}`);
+    removeTree(stage);
+    // --no-hardlinks: a hardlinked object edited in a clone would corrupt the owner's checkout.
+    await git(['clone', '--quiet', '--no-hardlinks', config.project.repoPath, stage]);
+  }
 }
 
 // Shared scratch clone for read-only seats (PM research, grooming, consults, triage), reset to the base
@@ -490,11 +538,35 @@ export function pushBranch(key, branch, sha, { lease } = {}) {
   });
 }
 
+/**
+ * Delete a ticket's workspace (done / wontdo). Under the git lock, so it runs after any build of that workspace in
+ * progress: a build stages its clone elsewhere and renames it into place last, and a removal that ran first would find
+ * nothing and then see the clone appear behind it. Returns a promise; callers need not wait.
+ */
 export function removeWorkspace(key) {
-  const dir = workspaceDir(key);
-  let safe; try { safe = guardWorkspacePath(dir); } catch { return; }
-  if (fs.existsSync(safe)) removeTree(safe);
+  return withGitLock(async () => {
+    removeStages(key);
+    const dir = workspaceDir(key);
+    let safe; try { safe = guardWorkspacePath(dir); } catch { return; }
+    if (fs.existsSync(safe)) removeTree(safe);
+  });
 }
+
+/**
+ * Remove leftover build stages (`.stage-<key>-<pid>`) — of one ticket, or of all with no key. Call under the git lock:
+ * every stage of this process is then finished (renamed into place or removed), so any left is a dead process's.
+ * One desk process per project (its server lock) makes another live process's stage impossible.
+ */
+function removeStages(key = null) {
+  let names; try { names = fs.readdirSync(config.workspaceRoot); } catch { return 0; }
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^\\.stage-${key ? esc(key) : '.+'}-\\d+$`);
+  let n = 0;
+  for (const name of names.filter((x) => re.test(x))) { removeTree(path.join(config.workspaceRoot, name)); n += 1; } // never follows a link
+  return n;
+}
+/** Startup: clear build stages a crashed desk left behind (each can hold a whole checkout). */
+export const sweepStages = () => withGitLock(async () => removeStages());
 
 // ---------------- sandbox + CLI arguments ----------------
 // Claude Code stores sessions per working directory: ~/.claude/projects/<cwd with non-alphanumerics as '-'>/<id>.jsonl

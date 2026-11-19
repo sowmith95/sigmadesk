@@ -195,7 +195,8 @@ export function setStatus(key, status, extra = {}) {
   // A hold whose kind is delegated (#9) is announced by the delegation only if it comes back to the owner.
   if (status !== before && status === 'needs_human' && !delegation.deferNotice(t)) notify('needs_human', t, 'needs you');
   if (status !== before && status === 'ready_for_human') notify('ready_for_human', t, 'ready for your review');
-  if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key); // clones are full copies now; free the disk
+  // Frees the disk; serialized after any build of this workspace still in progress (it would otherwise reappear).
+  if (['done', 'wontdo'].includes(status)) runner.removeWorkspace(key).catch((e) => console.warn(`[workspace] removing ${key}: ${e.message}`));
   if (['done', 'wontdo'].includes(status)) store.clearReservation(key);
   if (t.parent_key) rollupParent(t.parent_key);
   return t;
@@ -1218,6 +1219,7 @@ export function repairGuardHolds() {
 }
 
 export function recoverOrphans() {
+  runner.sweepStages().catch((e) => console.warn(`[workspace] sweeping build stages: ${e.message}`)); // a crash mid-build
   repairGuardHolds();
   productReview.recover();
   researchReview.recover();

@@ -649,7 +649,7 @@ test('final check: workspace paths stay inside the workspaces root, and the temp
   const link = path.join(config.workspaceRoot, 'M-777');
   fs.rmSync(link, { force: true }); fs.symlinkSync(runner.templateDir(), link);
   assert.throws(() => runner.guardWorkspacePath(link), /refusing/);
-  runner.removeWorkspace('M-777');
+  await runner.removeWorkspace('M-777');
   assert.ok(fs.existsSync(path.join(runner.templateDir(), '.git')), 'removing a planted link never deletes the template');
   fs.unlinkSync(link);
   // Seats can never read the data dir (where the template lives), in either engine.
